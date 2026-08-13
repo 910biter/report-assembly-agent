@@ -1,0 +1,180 @@
+{% extends "base.html" %}
+{% block title %}工作台 — 报告整编 Agent{% endblock %}
+{% block content %}
+<div class="page-header">
+  <div>
+    <h1>工作台</h1>
+    <p class="page-subtitle">从这里新建报告任务，并跟进待审核报告、最近任务与系统状态。</p>
+  </div>
+</div>
+
+<section class="dashboard-grid">
+  <div class="card hero-create" id="new-task">
+    <div class="section-kicker">主操作</div>
+    <h2>新建报告任务</h2>
+    <form id="task-form">
+      <label>报告主题</label>
+      <input type="text" name="theme" required placeholder="例如：大学生暑期社会实践活动总结报告">
+      <label>材料</label>
+      <input type="file" name="files" multiple>
+      <details class="soft-details">
+        <summary>从材料库选择已有材料</summary>
+        <div id="existing-materials" class="pick-list muted">正在加载材料库……</div>
+      </details>
+      <label>报告要求</label>
+      <textarea name="requirements" rows="3" placeholder="补充格式、语言、侧重点等要求"></textarea>
+      <label>模板</label>
+      <select name="variant_id">
+        <option value="">使用默认模板</option>
+        {% for p in template_options %}
+        <option value="{{ p.id }}" {% if p.status == 'locked' %}selected{% endif %}>
+          {{ p.name or ('#' + p.id|string) }}{% if p.status == 'locked' %}（默认）{% endif %}
+        </option>
+        {% endfor %}
+      </select>
+      <details class="soft-details">
+        <summary>高级配置</summary>
+        <p class="muted">当前版本会自动复用解析缓存、模板样式和业务规则。高级生成策略后续可在此处展开。</p>
+      </details>
+      <input type="hidden" name="existing_material_ids" id="existing-material-ids">
+      <button type="submit">创建并开始</button>
+    </form>
+    <p id="task-result" class="muted"></p>
+  </div>
+
+  <div class="stack">
+    <section class="card">
+      <div class="card-title-row">
+        <h2>待审核报告</h2>
+        <a class="link" href="/reports">进入报告库</a>
+      </div>
+      <div id="review-reports" class="compact-list"></div>
+    </section>
+    <section class="card">
+      <div class="card-title-row">
+        <h2>系统状态</h2>
+        <a class="link" href="/settings">系统设置</a>
+      </div>
+      <div id="system-status" class="muted">正在检查……</div>
+    </section>
+  </div>
+</section>
+
+<section class="dashboard-grid secondary">
+  <section class="card">
+    <div class="card-title-row">
+      <h2>最近任务</h2>
+      <a class="link" href="/tasks">查看全部</a>
+    </div>
+    <div id="recent-tasks" class="compact-list"></div>
+  </section>
+  <section class="card">
+    <div class="card-title-row">
+      <h2>最近完成报告</h2>
+      <a class="link" href="/reports">查看全部</a>
+    </div>
+    <div id="final-reports" class="compact-list"></div>
+  </section>
+</section>
+{% endblock %}
+
+{% block scripts %}
+const selectedMaterials = new Set();
+
+document.getElementById("task-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const form = e.target;
+  document.getElementById("existing-material-ids").value = [...selectedMaterials].join(",");
+  const res = await fetch("/api/tasks", { method: "POST", body: new FormData(form) });
+  const data = await res.json();
+  if (data.task_id) {
+    document.getElementById("task-result").textContent = "任务已创建，正在跳转……";
+    location.href = "/tasks/" + data.task_id;
+  } else {
+    document.getElementById("task-result").textContent = "创建失败：" + (data.error || JSON.stringify(data));
+  }
+});
+
+async function loadDashboard() {
+  const [taskRes, reportRes, materialRes, healthRes] = await Promise.all([
+    fetch("/api/tasks"),
+    fetch("/api/reports"),
+    fetch("/api/materials"),
+    fetch("/api/health")
+  ]);
+  const tasks = await taskRes.json();
+  const reports = await reportRes.json();
+  const materials = await materialRes.json();
+  const health = await healthRes.json();
+  renderRecentTasks(tasks);
+  renderReports(reports);
+  renderMaterialPicker(materials);
+  renderHealth(health);
+}
+
+function renderRecentTasks(tasks) {
+  const box = document.getElementById("recent-tasks");
+  const rows = tasks.slice(0, 5);
+  box.innerHTML = rows.length ? rows.map(t => `
+    <a class="compact-item" href="/tasks/${escapeHtml(t.task_id)}">
+      <b>${escapeHtml(t.theme || "未命名任务")}</b>
+      <span>${stageName(t.stage)} · ${t.material_count || 0} 份材料</span>
+    </a>`).join("") : '<div class="empty small">暂无任务</div>';
+}
+
+function renderReports(reports) {
+  const review = reports.filter(r => isReviewableReport(r)).slice(0, 5);
+  const finalReports = reports.filter(r => r.status === "final").slice(0, 5);
+  document.getElementById("review-reports").innerHTML = review.length ? review.map(reportItem).join("") : '<div class="empty small">暂无待审核报告</div>';
+  document.getElementById("final-reports").innerHTML = finalReports.length ? finalReports.map(reportItem).join("") : '<div class="empty small">暂无已完成报告</div>';
+}
+
+function isReviewableReport(r) {
+  const stage = (r.task || {}).stage;
+  return r.status !== "final" && ["review", "done"].includes(stage);
+}
+
+function reportItem(r) {
+  return `<a class="compact-item" href="/reports/${r.id}">
+    <b>${escapeHtml(r.title || "未命名报告")}</b>
+    <span>${r.sentence_count || 0} 句 · ${r.task ? escapeHtml(r.task.theme || r.task.task_id) : "未绑定任务"}</span>
+  </a>`;
+}
+
+function renderMaterialPicker(materials) {
+  const box = document.getElementById("existing-materials");
+  const rows = materials.slice(0, 30);
+  box.innerHTML = rows.length ? rows.map(m => `
+    <label class="check-row">
+      <input type="checkbox" value="${m.id}">
+      <span>${escapeHtml(m.filename)} <em>${m.file_type} · ${m.unit_count || 0} 单元</em></span>
+    </label>`).join("") : '<p class="muted">材料库暂无可复用材料。</p>';
+  box.querySelectorAll("input[type=checkbox]").forEach(input => {
+    input.addEventListener("change", () => {
+      input.checked ? selectedMaterials.add(input.value) : selectedMaterials.delete(input.value);
+    });
+  });
+}
+
+function renderHealth(health) {
+  const box = document.getElementById("system-status");
+  if (health.error) {
+    box.innerHTML = `<span class="badge red">异常</span> ${escapeHtml(health.error)}`;
+    return;
+  }
+  const models = Object.entries(health.models || {}).map(([name, ok]) => `${escapeHtml(name)}：${ok ? "可用" : "不可用"}`).join(" / ");
+  box.innerHTML = `<span class="badge green">正常</span> ${models || "模型状态正常"}`;
+}
+
+function stageName(stage) {
+  return ({created:"已创建", parsing:"材料准备", dedup:"材料准备", material_analysis:"分析规划", planning:"分析规划", evidence:"分析规划", conflict:"分析规划", analysis:"分析规划", writing:"报告生成", review:"待审核", done:"已完成", failed:"失败"})[stage] || stage || "未知";
+}
+
+function escapeHtml(text) {
+  const div = document.createElement("div");
+  div.textContent = text == null ? "" : String(text);
+  return div.innerHTML;
+}
+
+loadDashboard();
+{% endblock %}

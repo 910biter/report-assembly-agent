@@ -1,0 +1,161 @@
+{% extends "base.html" %}
+{% block title %}材料库 — 报告整编 Agent{% endblock %}
+{% block content %}
+<div class="page-header">
+  <div>
+    <h1>材料库</h1>
+    <p class="page-subtitle">管理可复用材料，查看解析状态和所属任务。</p>
+  </div>
+</div>
+
+<section class="asset-layout">
+  <div class="asset-list card">
+    <div class="filters">
+      <input id="q" type="text" placeholder="搜索文件名">
+      <select id="task-filter"><option value="">全部任务</option></select>
+      <select id="type-filter"><option value="">全部类型</option></select>
+      <select id="status-filter">
+        <option value="">全部状态</option>
+        <option value="parsed">已解析</option>
+        <option value="empty">无解析内容</option>
+        <option value="duplicate">重复材料</option>
+      </select>
+    </div>
+    <div id="materials"></div>
+  </div>
+  <div class="asset-detail card">
+    <div id="preview" class="empty">选择材料查看详情</div>
+  </div>
+</section>
+{% endblock %}
+
+{% block scripts %}
+let ITEMS = [];
+let selected = null;
+let detailTab = "overview";
+let DETAIL = null;
+
+async function load() {
+  const res = await fetch("/api/materials");
+  ITEMS = await res.json();
+  hydrateFilters();
+  renderMaterials();
+}
+
+function hydrateFilters() {
+  const taskSelect = document.getElementById("task-filter");
+  const typeSelect = document.getElementById("type-filter");
+  if (taskSelect.options.length === 1) {
+    const tasks = new Map();
+    ITEMS.forEach(m => (m.tasks || []).forEach(t => tasks.set(t.task_id, t.theme || t.task_id)));
+    taskSelect.innerHTML += [...tasks.entries()].map(([id, name]) => `<option value="${escapeHtml(id)}">${escapeHtml(name)}</option>`).join("");
+  }
+  if (typeSelect.options.length === 1) {
+    [...new Set(ITEMS.map(m => m.file_type).filter(Boolean))].forEach(t => {
+      typeSelect.innerHTML += `<option value="${escapeHtml(t)}">${escapeHtml(t)}</option>`;
+    });
+  }
+  document.querySelectorAll(".filters input,.filters select").forEach(el => el.addEventListener("input", renderMaterials));
+}
+
+function filteredItems() {
+  const q = document.getElementById("q").value.trim().toLowerCase();
+  const task = document.getElementById("task-filter").value;
+  const type = document.getElementById("type-filter").value;
+  const status = document.getElementById("status-filter").value;
+  return ITEMS.filter(m => {
+    if (q && !m.filename.toLowerCase().includes(q)) return false;
+    if (task && !(m.tasks || []).some(t => t.task_id === task)) return false;
+    if (type && m.file_type !== type) return false;
+    if (status === "parsed" && !m.unit_count) return false;
+    if (status === "empty" && m.unit_count) return false;
+    if (status === "duplicate" && !m.is_duplicate) return false;
+    return true;
+  });
+}
+
+function renderMaterials() {
+  const box = document.getElementById("materials");
+  const rows = filteredItems();
+  box.innerHTML = rows.length ? rows.map(m => `
+    <button class="asset-row ${selected === m.id ? "selected" : ""}" data-id="${m.id}">
+      <span>
+        <b>${escapeHtml(m.filename)}</b>
+        <em>${m.file_type} · ${m.unit_count || 0} 单元 · ${(m.tasks || []).length || 0} 个任务</em>
+      </span>
+      <span class="row-badges">
+        <i class="status-dot ${m.unit_count ? "ok" : "warn"}"></i>
+        ${m.is_duplicate ? '<span class="badge amber">重复</span>' : ""}
+      </span>
+    </button>`).join("") : '<div class="empty">没有符合条件的材料</div>';
+  box.querySelectorAll(".asset-row").forEach(el => el.addEventListener("click", () => show(Number(el.dataset.id))));
+}
+
+async function show(id) {
+  selected = id;
+  renderMaterials();
+  const res = await fetch("/api/materials/" + id);
+  DETAIL = await res.json();
+  detailTab = "overview";
+  renderDetail();
+}
+
+function renderDetail() {
+  const box = document.getElementById("preview");
+  if (!DETAIL) return;
+  box.innerHTML = `<div class="detail-header">
+    <div>
+      <h2>${escapeHtml(DETAIL.filename)}</h2>
+      <p class="muted">${DETAIL.file_type} · ${DETAIL.units.length} 个解析单元</p>
+    </div>
+    ${DETAIL.is_duplicate ? '<span class="badge amber">重复材料</span>' : '<span class="badge green">可用</span>'}
+  </div>
+  <div class="tabs compact-tabs">
+    ${["overview","content","meta"].map(t => `<button class="tab ${detailTab === t ? "active" : ""}" onclick="detailTab='${t}';renderDetail()">${tabName(t)}</button>`).join("")}
+  </div>
+  <div>${renderDetailTab()}</div>`;
+}
+
+function renderDetailTab() {
+  if (detailTab === "overview") {
+    return `<div class="overview-grid">
+      ${metricCard("解析状态", DETAIL.units.length ? "已解析" : "无内容", "材料是否可用于提取事实")}
+      ${metricCard("内容单元", `${DETAIL.units.length} 个`, "文本、表格、图片等")}
+      ${metricCard("所属任务", `${(DETAIL.tasks || []).length} 个`, "可点击返回任务")}
+    </div>
+    <div class="task-tags">${(DETAIL.tasks || []).map(t => `<a class="task-tag" href="/tasks/${escapeHtml(t.task_id)}">${escapeHtml(t.theme || t.task_id)}</a>`).join("") || '<span class="muted">未绑定任务</span>'}</div>`;
+  }
+  if (detailTab === "meta") {
+    return `<div class="progress-row"><b>文件类型</b><span>${escapeHtml(DETAIL.file_type)}</span></div>
+      <div class="progress-row"><b>重复状态</b><span>${DETAIL.is_duplicate ? "重复材料" : "非重复材料"}</span></div>
+      <div class="progress-row"><b>所属任务</b><span>${(DETAIL.tasks || []).map(t => t.task_id).join("、") || "无"}</span></div>`;
+  }
+  return groupedUnits(DETAIL.units).map(group => `<details class="unit-group">
+    <summary>${escapeHtml(group.label)}（${group.items.length}）</summary>
+    ${group.items.slice(0, 20).map(u => `<div class="unit-block ${u.kind}">
+      <b>${unitLabel(u)}</b>
+      <p>${escapeHtml(u.content || "")}</p>
+      ${u.image_desc ? `<details class="soft-details"><summary>解析详情</summary><p class="muted">${escapeHtml(u.image_desc)}</p></details>` : ""}
+    </div>`).join("")}
+  </details>`).join("") || '<div class="empty">暂无解析内容</div>';
+}
+
+function groupedUnits(units) {
+  const map = new Map();
+  units.forEach(u => {
+    const key = u.page ? `第 ${u.page} 页` : unitLabel(u);
+    if (!map.has(key)) map.set(key, []);
+    map.get(key).push(u);
+  });
+  return [...map.entries()].map(([label, items]) => ({label, items}));
+}
+function unitLabel(u) { return u.kind === "image" ? "图片" : u.kind === "table" ? "表格" : "段落"; }
+function tabName(t) { return ({overview:"概览", content:"解析内容", meta:"元数据"})[t]; }
+function metricCard(label, value, hint) { return `<div class="metric-card"><span>${escapeHtml(label)}</span><b>${escapeHtml(value)}</b><em>${escapeHtml(hint)}</em></div>`; }
+function escapeHtml(text) {
+  const div = document.createElement("div");
+  div.textContent = text == null ? "" : String(text);
+  return div.innerHTML;
+}
+load();
+{% endblock %}

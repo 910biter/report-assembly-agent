@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}系统设置 — 报告整编 Agent{% endblock %}
+{% block content %}
+<div class="page-header"><h1>系统设置</h1></div>
+<div class="settings-grid">
+  <section class="card">
+    <h2>模型服务</h2>
+    <div id="gateway"></div>
+  </section>
+  <section class="card">
+    <h2>运行信息</h2>
+    <div id="runtime"></div>
+  </section>
+</div>
+{% endblock %}
+
+{% block scripts %}
+async function load() {
+  const res = await fetch("/api/health");
+  const h = await res.json();
+  const gw = document.getElementById("gateway");
+  if (h.error) {
+    gw.innerHTML = `<div class="error">无法连接模型服务: ${escapeHtml(h.error)}</div>`;
+  } else {
+    gw.innerHTML = `
+      <div class="panel-value"><b>版本:</b> ${h.version}</div>
+      <div class="panel-value" style="margin-top:6px"><b>模型:</b></div>
+      ${Object.entries(h.models).map(([name, ok]) =>
+        `<div class="panel-value">${name}: <span class="badge ${ok ? "green" : "red"}">${ok ? "在位" : "缺失"}</span></div>`).join("")}
+    `;
+  }
+  document.getElementById("runtime").innerHTML = `
+    <div class="panel-value"><b>网关地址:</b> ${escapeHtml(h.gateway_url || "")}</div>
+    <div class="panel-value"><b>数据目录:</b> ${escapeHtml(h.runtime_root || "")}</div>
+    <div class="panel-value"><b>服务说明:</b> 模型推理走远端,解析/存储/导出全本地</div>`;
+}
+function escapeHtml(text) {
+  const div = document.createElement("div");
+  div.textContent = text;
+  return div.innerHTML;
+}
+load();
+{% endblock %}

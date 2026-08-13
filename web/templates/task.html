@@ -1,0 +1,396 @@
+{% extends "base.html" %}
+{% block title %}任务工作台 — 报告整编 Agent{% endblock %}
+{% block content %}
+<div class="task-shell">
+  <section class="card task-hero">
+    <div>
+      <div class="section-kicker">任务</div>
+      <h1 id="theme">任务 {{ task_id }}</h1>
+      <p id="task-meta" class="muted">正在加载任务信息……</p>
+    </div>
+    <div class="actions-row">
+      <button id="run-task-btn" class="button" style="display:none">开始运行</button>
+      <a id="report-top-link" class="button secondary" href="#" style="display:none">查看报告</a>
+      <button id="finalize-top-btn" style="display:none">完成审核</button>
+    </div>
+  </section>
+
+  <section class="card">
+    <div id="user-progress" class="user-progress"></div>
+    <div id="overview-alerts"></div>
+  </section>
+
+  <nav class="tabs">
+    <button class="tab active" data-tab="overview">概览</button>
+    <button class="tab" data-tab="materials">材料</button>
+    <button class="tab" data-tab="analysis">分析</button>
+    <button class="tab" data-tab="report">报告</button>
+  </nav>
+
+  <section class="card tab-panel active" id="tab-overview">
+    <h2>当前关注</h2>
+    <div id="next-actions" class="overview-grid"></div>
+    <details class="soft-details" id="run-details">
+      <summary>运行详情</summary>
+      <div id="progress-detail"></div>
+    </details>
+  </section>
+
+  <section class="card tab-panel" id="tab-materials">
+    <h2>任务材料</h2>
+    <div id="materials"></div>
+  </section>
+
+  <section class="card tab-panel" id="tab-analysis">
+    <h2>分析结果</h2>
+    <div id="quality-overview"></div>
+    <div class="analysis-tabs">
+      <button class="mini-tab active" data-analysis="facts">事实</button>
+      <button class="mini-tab" data-analysis="inferences">分析判断</button>
+      <button class="mini-tab" data-analysis="conflicts">冲突与待核验</button>
+      <button class="mini-tab" data-analysis="qa">质量检查</button>
+    </div>
+    <div id="analysis"></div>
+  </section>
+
+  <section class="card tab-panel" id="tab-report">
+    <h2>报告</h2>
+    <div id="report-entry" class="empty">报告生成后可在这里审核、编辑和导出。</div>
+  </section>
+</div>
+{% endblock %}
+
+{% block scripts %}
+const USER_STAGES = [
+  { key: "materials", label: "材料准备", internals: ["created", "parsing", "dedup"] },
+  { key: "analysis", label: "分析规划", internals: ["material_analysis", "planning", "evidence", "conflict", "analysis"] },
+  { key: "writing", label: "报告生成", internals: ["writing"] },
+  { key: "review", label: "审核完成", internals: ["review", "done"] },
+];
+let TASK = null;
+let MATERIALS = null;
+let ANALYSIS = null;
+let activeAnalysis = "facts";
+let lastMaterialVersion = "";
+let lastAnalysisVersion = "";
+
+document.querySelectorAll(".tab").forEach(btn => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".tab").forEach(b => b.classList.remove("active"));
+    document.querySelectorAll(".tab-panel").forEach(p => p.classList.remove("active"));
+    btn.classList.add("active");
+    document.getElementById("tab-" + btn.dataset.tab).classList.add("active");
+    if (btn.dataset.tab === "materials") loadMaterials();
+    if (btn.dataset.tab === "analysis") loadAnalysis();
+  });
+});
+document.querySelectorAll(".mini-tab").forEach(btn => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".mini-tab").forEach(b => b.classList.remove("active"));
+    btn.classList.add("active");
+    activeAnalysis = btn.dataset.analysis;
+    renderAnalysis();
+  });
+});
+
+async function poll() {
+  const res = await fetch("/api/tasks/{{ task_id }}");
+  TASK = await res.json();
+  renderTask(TASK);
+  const versions = TASK.versions || {};
+  const materialVersion = String(versions.materials || JSON.stringify([TASK.stage, TASK.material_ids, TASK.parse_progress, TASK.material_analysis_progress, TASK.task_profile]));
+  const analysisVersion = String(versions.analysis || JSON.stringify([TASK.fact_ids, TASK.inference_ids, TASK.conflict_ids, TASK.business_qa, TASK.qa_notes]));
+  if (document.getElementById("tab-materials").classList.contains("active") && materialVersion !== lastMaterialVersion) {
+    lastMaterialVersion = materialVersion;
+    loadMaterials();
+  }
+  if (document.getElementById("tab-analysis").classList.contains("active") && analysisVersion !== lastAnalysisVersion) {
+    lastAnalysisVersion = analysisVersion;
+    loadAnalysis();
+  }
+  if (!["review", "done", "failed"].includes(TASK.stage)) setTimeout(poll, 4000);
+}
+
+function renderTask(task) {
+  const stage = task.stage || "created";
+  document.getElementById("theme").textContent = task.theme || "未命名任务";
+  document.getElementById("task-meta").textContent = [
+    `状态：${stageName(stage)}`,
+    queueText(task),
+    `创建时间：${task.created_at || "—"}`,
+    `材料：${(task.material_ids || []).length} 份`,
+    `模板：${task.template_id ? "#" + task.template_id : "默认"}`
+  ].filter(Boolean).join(" · ");
+  renderRunButton(task);
+  renderUserProgress(stage, task);
+  renderOverview(task);
+  renderProgressDetail(task);
+  renderReportEntry(task);
+}
+
+function renderUserProgress(stage, task) {
+  const currentIndex = userStageIndex(stage);
+  document.getElementById("user-progress").innerHTML = USER_STAGES.map((s, i) => {
+    const cls = i < currentIndex || stage === "done" ? "done" : i === currentIndex ? "active" : "waiting";
+    const status = cls === "done" ? "已完成" : cls === "active" ? stageProgressText(stage, task) : "等待中";
+    return `<div class="user-step ${cls}">
+      <b>${s.label}</b>
+      <span>${escapeHtml(status)}</span>
+    </div>`;
+  }).join("");
+}
+
+function renderOverview(task) {
+  const issues = [...(task.qa_notes || []), ...(((task.business_qa || {}).issues) || [])];
+  const coverage = task.business_coverage || {};
+  const scale = task.report_scale_plan || task.preliminary_scale_plan || {};
+  const facts = (task.fact_ids || []).length;
+  const reportReady = isReportReviewable(task);
+  const partialReport = !!task.report_id && !reportReady;
+  const scaleWarning = scale.needs_negotiation
+    ? `<div class="notice warning">用户目标与证据承载能力冲突：${escapeHtml(scale.reason || "系统已按质量红线压到安全规模。")}</div>`
+    : "";
+  document.getElementById("overview-alerts").innerHTML = task.error
+    ? `<div class="notice danger">任务失败：${escapeHtml(task.error)}</div>`
+    : issues.length ? `<div class="notice warning">发现 ${issues.length} 个待核验问题，建议进入“分析”查看质量检查。</div>`
+    : scaleWarning
+      ? scaleWarning
+    : reportReady ? `<div class="notice success">报告已生成，可以进入“报告”审核。</div>`
+    : partialReport ? `<div class="notice">报告草稿正在生成，当前阶段：${stageName(task.stage)}。</div>`
+    : task.stage === "created" ? `<div class="notice">任务已创建，点击“开始运行”后进入队列。</div>`
+    : `<div class="notice">任务正在运行，当前阶段：${stageName(task.stage)}</div>`;
+  document.getElementById("next-actions").innerHTML = [
+    metricCard("材料数量", `${(task.material_ids || []).length} 份`, "进入“材料”查看解析状态"),
+    metricCard("事实数量", `${facts} 条`, "进入“分析”查看事实与依据"),
+    metricCard("证据覆盖", coverage.coverage != null ? `${Math.round(coverage.coverage * 100)}%` : "待生成", "覆盖不足时会列出待补材料"),
+    metricCard("目标规模", scale.effective_target_words ? `${scale.effective_target_words} 字` : scale.target_words ? `${scale.target_words} 字` : "自动", scale.user_requested_words ? `用户目标 ${scale.user_requested_words} 字` : "按材料自动估算"),
+    metricCard("报告状态", reportReady ? (task.stage === "done" ? "已完成" : "待审核") : partialReport ? "生成中" : "未生成", nextActionText(task)),
+  ].join("");
+}
+
+function renderProgressDetail(task) {
+  const timings = task.stage_timings || {};
+  const durations = task.stage_durations || {};
+  const llm = task.llm_stats || {};
+  const token = task.token_efficiency || {};
+  const buckets = token.token_buckets || {};
+  const drivers = token.scale_drivers || {};
+  const rows = [];
+  if (task.parse_progress) rows.push(["材料解析", progressPair(task.parse_progress)]);
+  if (task.material_analysis_progress) rows.push(["材料理解", progressPair(task.material_analysis_progress)]);
+  if (task.evidence_progress) rows.push(["事实提取", progressPair(task.evidence_progress)]);
+  if (task.write_progress) rows.push(["章节写作", progressPair(task.write_progress) + (task.write_progress.chapter ? ` · ${task.write_progress.chapter}` : "")]);
+  if (task.queue_status && task.queue_status.status) rows.push(["任务队列", queueText(task) || task.queue_status.status]);
+  const scale = task.report_scale_plan || task.preliminary_scale_plan || {};
+  if (scale.stage) rows.push(["规模计划", scaleSummary(scale)]);
+  if (Object.keys(durations).length) rows.push(["步骤耗时", Object.entries(durations).map(([k, v]) => `${k}: ${v}s`).join(" / ")]);
+  if (Object.keys(timings).length) rows.push(["阶段耗时", Object.entries(timings).map(([k, v]) => `${k}: ${v}s`).join(" / ")]);
+  if (llm.calls) rows.push(["模型调用", `${llm.calls} 次 · 输入约 ${llm.chars || 0} 字符 · 重试 ${llm.retries || 0} 次`]);
+  if (token.total_output_tokens) rows.push(["Token效率", `输出 ${token.total_output_tokens} · 最终正文约 ${token.final_report_tokens_est || 0} · 正文效率 ${percent(token.final_token_efficiency)}`]);
+  if (buckets.necessary_proxy_tokens) rows.push(["中间信息", `必要性代理 ${percent(buckets.necessary_proxy_share)} · 可压缩代理 ${percent(buckets.compressible_proxy_share)} · 重试浪费 ${percent(token.retry_waste_rate)}`]);
+  if (buckets.returned_tokens) rows.push(["Token漏斗", `返回→解析 ${percent(buckets.returned_to_parsed_share)} · 解析→入库 ${percent(buckets.parsed_to_persisted_share)} · 入库→最终 ${percent(buckets.persisted_to_final_share)}`]);
+  if (buckets.candidate_total) rows.push(["冲突候选", `送检 ${buckets.candidate_count}/${buckets.candidate_total} · 压缩后保留 ${percent(buckets.candidate_compression_share)}`]);
+  if (drivers.writer_output_tokens_per_final_token) rows.push(["效率驱动", `写作膨胀 ${drivers.writer_output_tokens_per_final_token}x · 事实利用 ${percent(token.fact_utilization_rate)} · 推断利用 ${percent(token.inference_utilization_rate)}`]);
+  document.getElementById("progress-detail").innerHTML = rows.length
+    ? rows.map(([k, v]) => `<div class="progress-row"><b>${escapeHtml(k)}</b><span>${escapeHtml(v)}</span></div>`).join("")
+    : '<p class="muted">暂无运行详情。</p>';
+}
+
+function renderRunButton(task) {
+  const btn = document.getElementById("run-task-btn");
+  const queueStatus = (task.queue_status || {}).status;
+  const canRun = ["created", "failed"].includes(task.stage || "created") && !["queued", "running"].includes(queueStatus);
+  btn.style.display = canRun ? "inline-block" : "none";
+  btn.disabled = false;
+  btn.textContent = task.stage === "failed" ? "重新运行" : "开始运行";
+  btn.onclick = async () => {
+    btn.disabled = true;
+    btn.textContent = "正在加入队列";
+    const res = await fetch("/api/tasks/{{ task_id }}/run", { method: "POST" });
+    const data = await res.json();
+    if (data.status === "queued") {
+      btn.textContent = "已加入队列";
+    } else if (data.status === "already_queued") {
+      btn.textContent = "已在队列中";
+    } else if (data.status === "already_running") {
+      btn.textContent = "正在运行";
+    } else {
+      btn.textContent = "开始运行";
+      btn.disabled = false;
+    }
+    await poll();
+  };
+}
+
+function renderReportEntry(task) {
+  const topLink = document.getElementById("report-top-link");
+  const topBtn = document.getElementById("finalize-top-btn");
+  const box = document.getElementById("report-entry");
+  if (!task.report_id) {
+    topLink.style.display = "none";
+    topBtn.style.display = "none";
+    box.innerHTML = '<div class="empty">报告尚未生成。</div>';
+    return;
+  }
+  const reportReady = isReportReviewable(task);
+  topLink.style.display = "inline-block";
+  topLink.href = "/reports/" + task.report_id;
+  topBtn.style.display = task.stage === "review" ? "inline-block" : "none";
+  topBtn.onclick = () => finalize(task.report_id, topBtn);
+  box.innerHTML = `<div class="report-actions-card">
+    <p>${reportReady ? (task.stage === "done" ? "报告已完成审核。" : "报告已生成，建议先进入报告编辑器完成审核。") : "报告草稿正在生成中，当前仅用于断点续写，暂不建议审核或导出。"}</p>
+    <div class="actions-row">
+      ${reportReady ? `<a class="button" href="/reports/${task.report_id}">进入报告编辑器</a>` : `<a class="button secondary" href="/reports/${task.report_id}">查看当前草稿</a>`}
+      ${task.stage === "review" ? `<button onclick="finalize(${task.report_id}, this)">完成审核</button>` : ""}
+      ${reportReady ? `<a class="button secondary" href="/api/reports/${task.report_id}/export">导出 Word</a>` : ""}
+    </div>
+  </div>`;
+}
+
+async function loadMaterials() {
+  const res = await fetch("/api/tasks/{{ task_id }}/materials");
+  MATERIALS = await res.json();
+  const roles = ((TASK || {}).task_profile || {}).role_matrix || [];
+  const roleByName = new Map(roles.map(r => [r.filename, r]));
+  const parsedCount = MATERIALS.length ? MATERIALS[0].parsed_count : 0;
+  const analysisSummary = MATERIALS.length
+    ? `<div class="muted" style="margin-bottom:8px">材料处理:解析 ${parsedCount}/${MATERIALS.length} 份完成</div>`
+    : "";
+  document.getElementById("materials").innerHTML = analysisSummary + (MATERIALS.length ? MATERIALS.map(m => {
+    const role = roleByName.get(m.filename);
+    const parseBadge = m.parse_status === "ok" ? ["green", "已解析"]
+      : m.parse_status === "error" ? ["red", "解析异常"]
+      : ["gray", "未解析"];
+    return `<div class="data-row">
+      <div>
+        <b>${escapeHtml(m.filename)}</b>
+        <p class="muted">${m.file_type} · ${m.units_count} 单元 · ${m.pages.length ? m.pages.length + " 页" : "页数未知"}</p>
+      </div>
+      <div class="row-badges">
+        <span class="badge ${parseBadge[0]}">${parseBadge[1]}</span>
+        ${role ? `<span class="badge gray">${escapeHtml(role.role_label)}</span>` : ""}
+        ${m.is_duplicate ? `<span class="badge amber">重复</span>` : ""}
+      </div>
+    </div>`;
+  }).join("") : '<div class="empty">暂无材料</div>');
+}
+
+async function loadAnalysis() {
+  const res = await fetch("/api/tasks/{{ task_id }}/analysis");
+  ANALYSIS = await res.json();
+  renderQualityOverview();
+  renderAnalysis();
+}
+
+function renderQualityOverview() {
+  const qa = (TASK || {}).business_qa || {};
+  const coverage = (TASK || {}).business_coverage || {};
+  document.getElementById("quality-overview").innerHTML = `<div class="overview-grid">
+    ${metricCard("事实", `${(ANALYSIS.facts || []).length} 条`, "带材料来源")}
+    ${metricCard("分析判断", `${(ANALYSIS.inferences || []).filter(i => i.source_level === "MATERIAL_INFERENCE").length} 条`, "基于事实推理")}
+    ${metricCard("待核验", `${((ANALYSIS.conflicts || []).length) + ((qa.issues || []).length)} 项`, "冲突与质量问题")}
+    ${metricCard("证据覆盖", coverage.coverage != null ? `${Math.round(coverage.coverage * 100)}%` : "待生成", coverage.status || "—")}
+  </div>`;
+}
+
+function renderAnalysis() {
+  if (!ANALYSIS) return;
+  const box = document.getElementById("analysis");
+  if (activeAnalysis === "facts") {
+    box.innerHTML = (ANALYSIS.facts || []).length ? ANALYSIS.facts.map(f => `<details class="analysis-card">
+      <summary><b>${escapeHtml(f.content)}</b><span>${(f.evidence || []).length} 个来源</span></summary>
+      ${(f.evidence || []).map(e => `<div class="panel-quote">${escapeHtml(e.source_file)}${e.page ? " 第" + e.page + "页" : ""}：${escapeHtml(e.quote)}</div>`).join("")}
+    </details>`).join("") : '<div class="empty">暂无事实</div>';
+  } else if (activeAnalysis === "inferences") {
+    const items = (ANALYSIS.inferences || []).filter(i => i.source_level === "MATERIAL_INFERENCE");
+    box.innerHTML = items.length ? items.map(i => `<div class="analysis-card">
+      <b>${escapeHtml(i.content)}</b>
+      <p class="muted">依据事实：${(i.based_fact_ids || []).join("、") || "无"} · 可信度：需人工复核</p>
+    </div>`).join("") : '<div class="empty">暂无分析判断</div>';
+  } else if (activeAnalysis === "conflicts") {
+    box.innerHTML = (ANALYSIS.conflicts || []).length ? ANALYSIS.conflicts.map(c => `<div class="analysis-card warning-card">
+      <b>${escapeHtml(c.fact_key)}</b>
+      ${(c.entries || []).map(e => `<p class="muted">${escapeHtml(e.file)}：${escapeHtml(e.statement)}</p>`).join("")}
+    </div>`).join("") : '<div class="empty">暂无冲突</div>';
+  } else {
+    const issues = [...((TASK || {}).qa_notes || []), ...((((TASK || {}).business_qa || {}).issues) || [])];
+    box.innerHTML = issues.length ? issues.map(i => `<div class="analysis-card warning-card">
+      <b>${escapeHtml(i.type || "质量问题")}</b>
+      <p>${escapeHtml(i.note || i.quote || "")}</p>
+    </div>`).join("") : '<div class="empty">暂无质量问题</div>';
+  }
+}
+
+async function finalize(reportId, btn) {
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "正在完成";
+  }
+  await fetch("/api/reports/" + reportId + "/finalize", { method: "POST" });
+  await poll();
+}
+
+function userStageIndex(stage) {
+  if (["created", "parsing", "dedup"].includes(stage)) return 0;
+  if (["material_analysis", "planning", "evidence", "conflict", "analysis"].includes(stage)) return 1;
+  if (stage === "writing") return 2;
+  if (["review", "done"].includes(stage)) return 3;
+  return 0;
+}
+function stageProgressText(stage, task) {
+  if ((task.queue_status || {}).status === "queued") return "排队中";
+  if (stage === "parsing" && task.parse_progress) return progressPair(task.parse_progress);
+  if (stage === "evidence" && task.evidence_progress) return progressPair(task.evidence_progress);
+  if (stage === "writing" && task.write_progress) return progressPair(task.write_progress);
+  return stage === "done" ? "已完成" : "正在进行";
+}
+function queueText(task) {
+  const q = task.queue_status || {};
+  if (q.status === "queued") return `排队中：第 ${q.position || "?"} 位`;
+  if (q.status === "running") return q.queue_wait_seconds != null ? `已等待 ${q.queue_wait_seconds}s 后开始运行` : "队列运行中";
+  if (q.status === "failed") return "队列执行失败";
+  return "";
+}
+function progressPair(p) {
+  return p && p.total ? `${p.done || 0}/${p.total}` : "正在进行";
+}
+function percent(value) {
+  if (value == null || value === "") return "—";
+  return `${Math.round(Number(value || 0) * 1000) / 10}%`;
+}
+function scaleSummary(scale) {
+  const parts = [];
+  const isFinal = scale.stage === "final" || scale.effective_target_words;
+  if (scale.user_requested_words) parts.push(`用户期望 ${scale.user_requested_words} 字`);
+  if (isFinal && scale.effective_target_words) parts.push(`生成目标 ${scale.effective_target_words} 字`);
+  if (isFinal && scale.max_safe_words) parts.push(`证据承载上限 ${scale.max_safe_words} 字`);
+  if (!isFinal) parts.push("正在根据材料与证据估算");
+  if (isFinal && scale.scale_risk) parts.push(`规模风险：${scaleRiskText(scale.scale_risk)}`);
+  return parts.join(" · ") || "自动估算";
+}
+function scaleRiskText(value) {
+  return ({low:"较低", medium:"需关注", high:"较高"})[value] || value;
+}
+function stageName(stage) {
+  return ({created:"已创建", parsing:"材料准备", dedup:"材料整理", material_analysis:"材料理解", planning:"分析规划", evidence:"事实提取", conflict:"冲突核验", analysis:"综合分析", writing:"报告生成", review:"待审核", done:"已完成", failed:"失败"})[stage] || stage || "未知";
+}
+function nextActionText(task) {
+  if (task.stage === "review") return "下一步：完成审核";
+  if (task.stage === "done") return "可导出或归档使用";
+  if (task.report_id && !isReportReviewable(task)) return "等待章节生成完成";
+  if (task.report_id) return "进入报告编辑器";
+  return "等待系统生成";
+}
+function isReportReviewable(task) {
+  return !!task.report_id && (task.critical_path_done === true || ["review", "done"].includes(task.stage));
+}
+function metricCard(label, value, hint) {
+  return `<div class="metric-card"><span>${escapeHtml(label)}</span><b>${escapeHtml(value)}</b><em>${escapeHtml(hint || "")}</em></div>`;
+}
+function escapeHtml(text) {
+  const div = document.createElement("div");
+  div.textContent = text == null ? "" : String(text);
+  return div.innerHTML;
+}
+poll();
+{% endblock %}

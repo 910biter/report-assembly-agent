@@ -1,0 +1,91 @@
+{% extends "base.html" %}
+{% block title %}任务 — 报告整编 Agent{% endblock %}
+{% block content %}
+<div class="page-header">
+  <div>
+    <h1>任务</h1>
+    <p class="page-subtitle">查看每个报告任务的进度、材料、分析和报告。</p>
+  </div>
+  <a class="button" href="/#new-task">新建任务</a>
+</div>
+<section class="card">
+  <div id="tasks"></div>
+</section>
+{% endblock %}
+
+{% block scripts %}
+const STAGE_NAMES = {
+  created: "已创建", parsing: "材料解析中", dedup: "信息整理中", material_analysis: "材料理解中", planning: "规划中",
+  evidence: "事实提取中", conflict: "冲突标注中", analysis: "分析研判中",
+  writing: "报告生成中", review: "待审核", done: "已完成", failed: "失败"
+};
+const STAGE_BADGE = {
+  created: "gray", parsing: "blue", dedup: "blue", material_analysis: "blue", planning: "blue",
+  evidence: "blue", conflict: "amber", analysis: "amber",
+  writing: "amber", review: "amber", done: "green", failed: "red"
+};
+function stageBadge(stage) {
+  return `<span class="badge ${STAGE_BADGE[stage] || 'gray'}">${STAGE_NAMES[stage] || stage}</span>`;
+}
+async function load() {
+  const res = await fetch("/api/tasks");
+  const tasks = await res.json();
+  const box = document.getElementById("tasks");
+  if (!tasks.length) { box.innerHTML = '<div class="empty">暂无任务</div>'; return; }
+  box.innerHTML = tasks.map(t => {
+    const reportLink = t.report_id
+      ? `<a class="link" href="/reports/${t.report_id}">查看报告 →</a>`
+      : (t.stage === "failed"
+          ? `<span class="badge red">失败</span>`
+          : `<a class="link" href="/tasks/${t.task_id}">查看进度 →</a>`);
+    const progress = progressText(t);
+    return `<div class="list-row">
+      <div>
+        <div class="lr-title">${escapeHtml(t.theme || "(无主题)")}</div>
+        <div class="lr-meta">${t.created_at || "—"} | ${t.material_count || 0} 份材料 | ${escapeHtml(progress)}</div>
+      </div>
+      ${stageBadge(t.stage)}
+      <div>
+        <a class="link" href="/tasks/${t.task_id}">任务详情</a>
+        <span style="margin-left:12px">${reportLink}</span>
+        <button class="danger slim-action" onclick="deleteTask('${escapeJs(t.task_id)}')">删除</button>
+      </div>
+    </div>`;
+  }).join("");
+}
+async function deleteTask(taskId) {
+  if (!confirm("确认删除这个任务记录？材料库和报告库中的资产不会被删除。")) return;
+  const res = await fetch(`/api/tasks/${encodeURIComponent(taskId)}`, { method: "DELETE" });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    alert(data.error === "TASK_BUSY" ? "任务正在排队或运行中，暂不能删除。" : "删除失败：" + (data.error || res.status));
+    return;
+  }
+  await load();
+}
+function progressText(t) {
+  const p = t.progress || {};
+  if ((p.queue_status || {}).status === "queued") return `排队中，第 ${p.queue_status.position || "?"} 位`;
+  if ((p.queue_status || {}).status === "running") return "正在运行";
+  if (p.write_progress && p.write_progress.total) {
+    return `写作 ${p.write_progress.done || 0}/${p.write_progress.total}`;
+  }
+  if (p.evidence_progress && p.evidence_progress.total) {
+    return `事实提取 ${p.evidence_progress.done || 0}/${p.evidence_progress.total}`;
+  }
+  if (p.parse_progress && p.parse_progress.total) {
+    return `解析 ${p.parse_progress.done || 0}/${p.parse_progress.total}`;
+  }
+  if (p.total_seconds) return `总耗时 ${p.total_seconds}s`;
+  return "等待运行";
+}
+function escapeHtml(text) {
+  const div = document.createElement("div");
+  div.textContent = text;
+  return div.innerHTML;
+}
+function escapeJs(text) {
+  return String(text == null ? "" : text).replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+}
+load();
+{% endblock %}

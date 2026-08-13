@@ -1,0 +1,82 @@
+{% extends "base.html" %}
+{% block title %}报告库 — 报告整编 Agent{% endblock %}
+{% block content %}
+<div class="page-header">
+  <div>
+    <h1>报告库</h1>
+    <p class="page-subtitle">查看、审核和导出所有任务生成的报告。</p>
+  </div>
+</div>
+<section class="card">
+  <div class="filters report-filters">
+    <input id="q" type="text" placeholder="搜索报告标题">
+    <select id="task-filter"><option value="">全部任务</option></select>
+    <select id="status-filter">
+      <option value="">全部状态</option>
+      <option value="draft">待审核</option>
+      <option value="final">已完成</option>
+    </select>
+  </div>
+  <div id="reports"></div>
+</section>
+{% endblock %}
+
+{% block scripts %}
+let REPORTS = [];
+async function load() {
+  const res = await fetch("/api/reports");
+  REPORTS = await res.json();
+  hydrateFilters();
+  renderReports();
+}
+function hydrateFilters() {
+  const select = document.getElementById("task-filter");
+  if (select.options.length === 1) {
+    const tasks = new Map();
+    REPORTS.forEach(r => { if (r.task) tasks.set(r.task.task_id, r.task.theme || r.task.task_id); });
+    select.innerHTML += [...tasks.entries()].map(([id, theme]) => `<option value="${escapeHtml(id)}">${escapeHtml(theme)}</option>`).join("");
+  }
+  document.querySelectorAll(".filters input,.filters select").forEach(el => el.addEventListener("input", renderReports));
+}
+function renderReports() {
+  const q = document.getElementById("q").value.trim().toLowerCase();
+  const task = document.getElementById("task-filter").value;
+  const status = document.getElementById("status-filter").value;
+  const reports = REPORTS.filter(r => {
+    if (q && !(r.title || "").toLowerCase().includes(q)) return false;
+    if (task && (!r.task || r.task.task_id !== task)) return false;
+    if (status === "draft" && !isReviewableReport(r)) return false;
+    if (status === "final" && r.status !== "final") return false;
+    return true;
+  });
+  const box = document.getElementById("reports");
+  box.innerHTML = reports.length ? reports.map(r => `
+    <div class="list-row report-row">
+      <div>
+        <div class="lr-title">${escapeHtml(r.title || "未命名报告")}</div>
+        <div class="lr-meta">${r.created_at || "—"} · ${r.sentence_count} 句 · ${reportStatusText(r)}</div>
+        <div class="task-tags">${r.task
+          ? `<a class="task-tag" href="/tasks/${escapeHtml(r.task.task_id)}">${escapeHtml(r.task.theme || r.task.task_id)}</a>`
+          : '<span class="muted">未绑定任务</span>'}</div>
+      </div>
+      <div class="actions-row">
+        <a class="link" href="/reports/${r.id}">打开</a>
+        <a class="link" href="/api/reports/${r.id}/export">导出 Word</a>
+      </div>
+    </div>`).join("") : '<div class="empty">没有符合条件的报告</div>';
+}
+function isReviewableReport(r) {
+  const stage = (r.task || {}).stage;
+  return r.status !== "final" && ["review", "done"].includes(stage);
+}
+function reportStatusText(r) {
+  if (r.status === "final") return "已完成";
+  return isReviewableReport(r) ? "待审核" : "生成中";
+}
+function escapeHtml(text) {
+  const div = document.createElement("div");
+  div.textContent = text == null ? "" : String(text);
+  return div.innerHTML;
+}
+load();
+{% endblock %}

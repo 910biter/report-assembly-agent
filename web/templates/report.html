@@ -1,0 +1,322 @@
+{% extends "base.html" %}
+{% block title %}{{ report_title }} — 报告编辑{% endblock %}
+{% block content %}
+<div class="report-workspace">
+  <header class="report-toolbar">
+    <div>
+      <a id="task-link" class="link" href="" style="display:none">返回任务</a>
+      <h1>{{ report_title }}</h1>
+      <p id="save-state" class="muted">已保存</p>
+    </div>
+    <div class="actions-row">
+      <div class="segmented">
+        <button id="edit-mode" class="active">编辑模式</button>
+        <button id="trace-mode">溯源模式</button>
+      </div>
+      <button id="finalize-btn" style="display:none">完成审核</button>
+      <button id="export-btn" class="secondary">导出 Word</button>
+    </div>
+  </header>
+
+  <div class="editor-layout refined">
+    <aside class="editor-toc">
+      <h3>目录</h3>
+      <div id="toc"></div>
+    </aside>
+    <main class="document-canvas" id="report"></main>
+    <aside class="editor-panel">
+      <div class="panel-tabs">
+        <button class="mini-tab active" data-panel="evidence">证据</button>
+        <button class="mini-tab" data-panel="qa">质检</button>
+      </div>
+      <div id="context-panel" class="muted">在溯源模式下点击正文句子查看依据。</div>
+    </aside>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+const LEVEL_NAMES = {
+  MATERIAL_FACT: "材料事实",
+  MATERIAL_INFERENCE: "分析判断",
+  EXTERNAL_INFORMATION: "外部信息",
+  TRANSITION: "过渡句"
+};
+let DATA = null;
+let SENTENCES = {};
+let MODE = "edit";
+let PANEL = "evidence";
+let selectedId = null;
+let saveTimer = null;
+let titleSaveTimer = null;
+let sectionSaveTimers = new Map();
+
+document.getElementById("edit-mode").addEventListener("click", () => setMode("edit"));
+document.getElementById("trace-mode").addEventListener("click", () => setMode("trace"));
+document.querySelectorAll(".panel-tabs .mini-tab").forEach(btn => btn.addEventListener("click", () => {
+  document.querySelectorAll(".panel-tabs .mini-tab").forEach(b => b.classList.remove("active"));
+  btn.classList.add("active");
+  PANEL = btn.dataset.panel;
+  renderPanel();
+}));
+
+function setMode(mode) {
+  MODE = mode;
+  document.getElementById("edit-mode").classList.toggle("active", mode === "edit");
+  document.getElementById("trace-mode").classList.toggle("active", mode === "trace");
+  document.getElementById("report").classList.toggle("trace-enabled", mode === "trace");
+  renderPanel();
+}
+
+function render(data) {
+  DATA = data;
+  const main = document.getElementById("report");
+  const toc = document.getElementById("toc");
+  main.innerHTML = "";
+  toc.innerHTML = "";
+  SENTENCES = {};
+  const title = document.createElement("h1");
+  title.className = "doc-title editable-heading";
+  title.textContent = data.title;
+  title.contentEditable = "true";
+  title.dataset.original = data.title;
+  title.title = "可编辑报告题目";
+  main.appendChild(title);
+  data.sections.forEach((section, si) => {
+    const anchor = "sec-" + si;
+    const h2 = document.createElement("h2");
+    h2.id = anchor;
+    h2.className = "editable-heading";
+    h2.textContent = section.title;
+    h2.contentEditable = "true";
+    h2.dataset.original = section.title;
+    h2.title = "可编辑章节标题";
+    main.appendChild(h2);
+    const tocLink = document.createElement("a");
+    tocLink.href = "#" + anchor;
+    tocLink.textContent = section.title;
+    tocLink.dataset.sectionAnchor = anchor;
+    toc.appendChild(tocLink);
+    for (const para of section.paragraphs) {
+      if ((para.sentences || []).some(s => isListItem(s.content))) {
+        const list = document.createElement("div");
+        list.className = "doc-list";
+        for (const s of para.sentences) {
+          SENTENCES[s.id] = s;
+          const item = document.createElement("p");
+          item.className = isListItem(s.content) ? "doc-list-item" : "doc-paragraph";
+          const span = makeSentenceSpan(s);
+          item.appendChild(span);
+          list.appendChild(item);
+        }
+        main.appendChild(list);
+        continue;
+      }
+      const p = document.createElement("p");
+      p.className = "doc-paragraph";
+      for (const s of para.sentences) {
+        SENTENCES[s.id] = s;
+        const span = makeSentenceSpan(s);
+        p.appendChild(span);
+      }
+      main.appendChild(p);
+    }
+  });
+}
+
+function makeSentenceSpan(s) {
+  const span = document.createElement("span");
+  span.className = "sentence clean-sentence" + (s.selected ? "" : " excluded");
+  span.dataset.id = s.id;
+  span.contentEditable = "true";
+  span.textContent = s.content;
+  span.dataset.original = s.content;
+  return span;
+}
+
+function isListItem(text) {
+  return /^(?:(?:[•*]|-)|[一二三四五六七八九十]+[、.]|\d+[、.])\s*/.test(String(text || "").trim());
+}
+
+document.getElementById("report").addEventListener("click", (e) => {
+  const sentence = e.target.closest(".sentence");
+  if (!sentence) return;
+  selectedId = sentence.dataset.id;
+  document.querySelectorAll(".sentence.selected-sent").forEach(el => el.classList.remove("selected-sent"));
+  sentence.classList.add("selected-sent");
+  if (MODE === "trace") renderPanel();
+});
+
+document.getElementById("report").addEventListener("input", (e) => {
+  if (e.target.classList.contains("doc-title")) {
+    scheduleReportTitleSave(e.target);
+    return;
+  }
+  if (e.target.tagName === "H2" && e.target.classList.contains("editable-heading")) {
+    scheduleSectionTitleSave(e.target);
+    return;
+  }
+  if (!e.target.classList.contains("sentence")) return;
+  setSaveState("正在保存");
+  clearTimeout(saveTimer);
+  const id = e.target.dataset.id;
+  saveTimer = setTimeout(() => saveSentence(id, { content: e.target.textContent }), 600);
+});
+
+async function saveSentence(id, body) {
+  try {
+    const res = await fetch(`/api/reports/{{ report_id }}/sentences/${id}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    });
+    if (!res.ok) throw new Error("save failed");
+    if (SENTENCES[id] && body.content != null) SENTENCES[id].content = body.content;
+    setSaveState("已保存");
+  } catch {
+    setSaveState("保存失败");
+  }
+}
+
+function scheduleReportTitleSave(el) {
+  setSaveState("正在保存");
+  clearTimeout(titleSaveTimer);
+  titleSaveTimer = setTimeout(() => saveReportTitle(el), 700);
+}
+
+async function saveReportTitle(el) {
+  const title = el.textContent.trim();
+  if (!title || title === el.dataset.original) {
+    setSaveState("已保存");
+    return;
+  }
+  try {
+    const res = await fetch(`/api/reports/{{ report_id }}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title })
+    });
+    if (!res.ok) throw new Error("save failed");
+    DATA.title = title;
+    el.dataset.original = title;
+    setSaveState("已保存");
+  } catch {
+    setSaveState("保存失败");
+  }
+}
+
+function scheduleSectionTitleSave(el) {
+  setSaveState("正在保存");
+  const anchor = el.id;
+  if (sectionSaveTimers.has(anchor)) clearTimeout(sectionSaveTimers.get(anchor));
+  sectionSaveTimers.set(anchor, setTimeout(() => saveSectionTitle(el), 700));
+}
+
+async function saveSectionTitle(el) {
+  const oldTitle = el.dataset.original;
+  const newTitle = el.textContent.trim();
+  if (!newTitle || newTitle === oldTitle) {
+    setSaveState("已保存");
+    return;
+  }
+  try {
+    const res = await fetch(`/api/reports/{{ report_id }}/sections`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ old_title: oldTitle, new_title: newTitle })
+    });
+    if (!res.ok) throw new Error("save failed");
+    el.dataset.original = newTitle;
+    const link = document.querySelector(`[data-section-anchor="${el.id}"]`);
+    if (link) link.textContent = newTitle;
+    for (const section of DATA.sections || []) {
+      if (section.title === oldTitle) section.title = newTitle;
+    }
+    setSaveState("已保存");
+  } catch {
+    setSaveState("保存失败");
+  }
+}
+
+function renderPanel() {
+  const box = document.getElementById("context-panel");
+  if (PANEL === "qa") {
+    box.innerHTML = `<div class="panel-section"><h3>质量检查</h3><p class="muted">质量问题会在任务“分析”页集中展示。当前面板保留为报告审核上下文。</p></div>`;
+    return;
+  }
+  if (!selectedId || !SENTENCES[selectedId]) {
+    box.innerHTML = MODE === "trace" ? "点击正文句子查看来源与依据。" : "切换到溯源模式后查看句级依据。";
+    return;
+  }
+  const s = SENTENCES[selectedId];
+  let html = `<div class="panel-section">
+    <h3>来源类型</h3>
+    <div class="panel-value">${LEVEL_NAMES[s.source_level] || s.source_level}</div>
+  </div>
+  <div class="panel-section">
+    <h3>句子操作</h3>
+    <div class="actions-row">
+      <button class="secondary" onclick="toggleSentence(${s.id}, ${s.selected ? "false" : "true"})">${s.selected ? "删除此句" : "恢复此句"}</button>
+    </div>
+  </div>`;
+  if (s.sources.length) {
+    html += `<div class="panel-section"><h3>依据事实</h3>`;
+    for (const src of s.sources) {
+      html += `<div class="panel-value"><b>事实#${src.fact_id}</b> ${escapeHtml(src.content)}</div>`;
+      for (const e of src.evidence) {
+        html += `<div class="panel-value muted">来源文件：${escapeHtml(e.source_file)}${e.page ? " · 第" + e.page + "页" : ""}</div>
+          <div class="panel-quote">原文：${escapeHtml(e.quote)}</div>`;
+      }
+    }
+    html += "</div>";
+  }
+  if (s.inferences.length) {
+    html += `<div class="panel-section"><h3>分析推断</h3>`;
+    for (const inf of s.inferences) {
+      html += `<div class="panel-value"><b>#${inf.inference_id}</b> ${escapeHtml(inf.content)}</div>
+        <div class="panel-value muted">依据事实：${(inf.based_fact_ids || []).join("、") || "无"}</div>
+        ${inf.reasoning_chain ? `<div class="panel-quote">推理：${escapeHtml(inf.reasoning_chain)}</div>` : ""}`;
+    }
+    html += "</div>";
+  }
+  box.innerHTML = html;
+}
+
+async function toggleSentence(id, selected) {
+  await saveSentence(id, { selected, content: SENTENCES[id].content });
+  SENTENCES[id].selected = selected;
+  document.querySelector(`.sentence[data-id="${id}"]`).classList.toggle("excluded", !selected);
+  renderPanel();
+}
+
+document.getElementById("export-btn").addEventListener("click", () => {
+  location.href = `/api/reports/{{ report_id }}/export`;
+});
+document.getElementById("finalize-btn").addEventListener("click", async () => {
+  const btn = document.getElementById("finalize-btn");
+  btn.disabled = true;
+  btn.textContent = "正在完成";
+  await fetch(`/api/reports/{{ report_id }}/finalize`, { method: "POST" });
+  btn.textContent = "已完成";
+});
+
+function setSaveState(text) {
+  document.getElementById("save-state").textContent = text;
+}
+function escapeHtml(text) {
+  const div = document.createElement("div");
+  div.textContent = text == null ? "" : String(text);
+  return div.innerHTML;
+}
+(async () => {
+  const res = await fetch("/api/reports/{{ report_id }}");
+  const data = await res.json();
+  if (data.task_id) {
+    const link = document.getElementById("task-link");
+    link.style.display = "inline-block";
+    link.href = "/tasks/" + data.task_id;
+  }
+  if (data.status !== "final") document.getElementById("finalize-btn").style.display = "inline-block";
+  render(data);
+})();
+{% endblock %}

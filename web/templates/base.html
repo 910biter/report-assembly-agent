@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>{% block title %}报告整编 Agent{% endblock %}</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="brand">报告整编<br>Agent</div>
+    <nav class="side-nav">
+      <a href="/" class="{{ 'active' if active == 'home' }}">工作台</a>
+      <a href="/tasks" class="{{ 'active' if active == 'tasks' }}">任务</a>
+      <a href="/materials" class="{{ 'active' if active == 'materials' }}">材料库</a>
+      <a href="/reports" class="{{ 'active' if active == 'reports' }}">报告库</a>
+      <a href="/style" class="{{ 'active' if active == 'style' }}">模板中心</a>
+      <a href="/settings" class="{{ 'active' if active == 'settings' }}">系统设置</a>
+    </nav>
+    <a class="primary-create" href="/#new-task">新建任务</a>
+  </aside>
+  <main class="workspace">
+    {% block content %}{% endblock %}
+  </main>
+</div>
+<script>
+{% block scripts %}{% endblock %}
+</script>
+</body>
+</html>
