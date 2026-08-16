@@ -678,8 +678,12 @@ class WorkflowController:
         units_by_material, filenames = self._load_units()
         insights = self.task.get("material_insights", [])
         self.cm = ContextManager(self.task, units_by_material, filenames)
+        # Evidence Needs:结构化待证实需求(优先使用 planner 输出,缺失时退回维度+开放发现)
+        needs = plan.get("evidence_needs") or [
+            {"need": d, "dimension": d, "priority": "medium"} for d in plan.get("dimensions", [])
+        ]
         facts = evidence_agent.extract_facts(
-            plan["dimensions"], units_by_material, filenames,
+            needs, units_by_material, filenames,
             cm=self.cm, insights=insights,
             required_facts=plan.get("required_facts", []),
             task_id=self.task_id,
@@ -1575,6 +1579,7 @@ class WorkflowController:
             "core_judgment": row["core_judgment"],
             "narrative_logic": row["narrative_logic"],
             "required_facts": _loads(row["required_facts"]),
+            "evidence_needs": _loads(row["evidence_needs"]) if "evidence_needs" in row.keys() else [],
             "chapter_plans": _loads(row["chapter_plans"]),
             "budget": _loads(row["budget"]),
             "plan_stage": row["plan_stage"] if "plan_stage" in row.keys() else "analysis",

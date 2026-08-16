@@ -250,6 +250,115 @@ class ContextManager:
             "retrieval_strategy": retrieval_strategy,
         }
 
+    def for_first_pass(self, needs: list[dict], insights: list[dict]) -> list[tuple[str, dict]]:
+        """First-pass 合并读取:全部 Evidence Needs 一次打分选候选,多维联合提取。
+
+        与 for_evidence_batches 的区别:查询 = 全部 needs(而非单维度),
+        候选并集 → 一次装箱 → 批次;每批材料只被读取一次,模型按 need 标注输出。
+        """
+        queries = [str(n.get("need", "")).strip() for n in (needs or []) if str(n.get("need", "")).strip()]
+        if not queries:
+            return []
+        return self._build_batches(queries, insights, needs or [], pass_name="first_pass")
+
+    def for_gap_retrieval(self, gaps: list[dict], insights: list[dict]) -> list[tuple[str, dict]]:
+        """Iterative Retrieval:仅针对缺口 Needs 检索(缺什么补什么)。"""
+        queries = [str(n.get("need", "")).strip() for n in (gaps or []) if str(n.get("need", "")).strip()]
+        if not queries:
+            return []
+        return self._build_batches(queries, insights, gaps or [], pass_name="iterative")
+
+    def _build_batches(self, queries: list[str], insights: list[dict],
+                       needs: list[dict], pass_name: str) -> list[tuple[str, dict]]:
+        """按 token 预算装箱:queries 的候选并集 → 批次(候选不删减,只拆批)。"""
+        per_batch_tokens = _evidence_batch_budget()
+        keywords: list[str] = []
+        for insight in insights or []:
+            keywords.extend(insight.get("entities", [])[:4])
+            keywords.extend(insight.get("times", [])[:3])
+
+        # 向量混合检索:预加载单位向量 + 每查询 embed(失败自动回退纯文本)
+        unit_vectors: dict = {}
+        try:
+            from app.retrieval import vector_store
+            if getattr(vector_store, "enabled", False):
+                unit_vectors = vector_store.unit_vectors({
+                    int(u.id) for units in self.units_by_material.values()
+                    for u in units if u.id is not None
+                })
+        except Exception:
+            unit_vectors = {}
+
+        per_material: list[tuple[int, list]] = []
+        for material_id, units in self.units_by_material.items():
+            candidates: dict[int, object] = {}
+            for query in queries:
+                query_vector = None
+                try:
+                    from app.retrieval.embedder import embed_texts
+                    query_vector = embed_texts([query])[0]
+                except Exception:
+                    query_vector = None
+                scored = sorted(
+                    [(_unit_relevance(unit, query, keywords, query_vector, unit_vectors), unit)
+                     for unit in units if (unit.content or "").strip()],
+                    key=lambda pair: pair[0], reverse=True,
+                )
+                cutoff = _dynamic_cutoff([score for score, _unit in scored])
+                for _score, unit in scored[:cutoff]:
+                    candidates.setdefault(id(unit), unit)
+            if candidates:
+                per_material.append((material_id, list(candidates.values())))
+
+        blocks_by_material: list[tuple[int, list]] = []
+        for material_id, selected in per_material:
+            block_units: list = []
+            block_tokens = 0
+            for unit in selected:
+                unit_tokens = _estimate_tokens(unit.content or "")
+                if block_tokens + unit_tokens > per_batch_tokens and block_units:
+                    blocks_by_material.append((material_id, block_units))
+                    block_units, block_tokens = [], 0
+                block_units.append(unit)
+                block_tokens += unit_tokens
+            if block_units:
+                blocks_by_material.append((material_id, block_units))
+
+        batches: list[tuple[list[str], list[int], int, dict]] = []
+        current_blocks: list[str] = []
+        current_materials: list[int] = []
+        current_tokens = 0
+        current_units: dict[int, int] = {}
+        for material_id, selected in blocks_by_material:
+            block = self._label(material_id, selected[0]) + "\n".join(
+                (u.content or "") for u in selected[1:]
+            )
+            block_tokens = _estimate_tokens(block)
+            if current_tokens + block_tokens > per_batch_tokens and current_blocks:
+                batches.append((current_blocks, current_materials, current_tokens, current_units))
+                current_blocks, current_materials, current_tokens, current_units = [], [], 0, {}
+            current_blocks.append(block)
+            current_materials.append(material_id)
+            current_tokens += block_tokens
+            current_units[material_id] = current_units.get(material_id, 0) + len(selected)
+        if current_blocks:
+            batches.append((current_blocks, current_materials, current_tokens, current_units))
+
+        result = []
+        for blocks, material_ids, batch_tokens, batch_units in batches:
+            text = "相关材料片段:\n" + "\n\n".join(blocks)
+            result.append((text, {
+                "pass": pass_name,
+                "batch_material_ids": material_ids,
+                "batch_material_units": batch_units,
+                "batch_material_count": len(material_ids),
+                "retrieved_unit_count": sum(batch_units.values()),
+                "retrieved_chars": sum(len(b) for b in blocks),
+                "context_chars": len(text),
+                "needs": needs,
+            }))
+        return result
+
     def for_evidence_batches(self, dimension: str, insights: list[dict],
                              required_facts: list[str] | None = None) -> list[tuple[str, dict]]:
         """材料全覆盖 Evidence Pass:每份可用材料都获得检查机会。

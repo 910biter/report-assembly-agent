@@ -29,6 +29,13 @@ _SYSTEM = """你是情报报告分析规划师。根据用户主题、材料摘�
     "summary_budget": 摘要字数预算
   },
   "dimensions": ["优先分析维度1", "优先分析维度2", ...],
+  "evidence_needs": [
+    {
+      "need": "需要证实的信息需求(子问题,一句话可查证)",
+      "dimension": "归属分析维度",
+      "priority": "high/medium/low"
+    }
+  ],
   "required_facts": ["证据提取应优先寻找的信息类别"]
 }
 要求:
@@ -92,6 +99,34 @@ _FINAL_SYSTEM = """你是情报报告结构总规划师。现在 Evidence 与 An
 8. 证据不足的主题不得硬设独立章节或小节凑结构,应合并为边界、风险或待补充说明。"""
 
 
+def _normalize_needs(raw) -> list[dict]:
+    """归一化 Evidence Needs(结构化待证实需求):容错模型输出格式。
+
+    [{need, dimension, priority}] 或 [{question/信息需求, ...}] 或扁平字符串列表。
+    """
+    cleaned: list[dict] = []
+    seen: set[str] = set()
+    for item in raw or []:
+        if isinstance(item, str):
+            entry = {"need": item.strip(), "dimension": "核心事实发现", "priority": "medium"}
+        elif isinstance(item, dict):
+            text = str(item.get("need") or item.get("question") or item.get("信息需求") or "").strip()
+            if not text:
+                continue
+            entry = {
+                "need": text,
+                "dimension": str(item.get("dimension") or "核心事实发现").strip(),
+                "priority": str(item.get("priority") or "medium").strip(),
+            }
+        else:
+            continue
+        if not entry["need"] or entry["need"] in seen:
+            continue
+        seen.add(entry["need"])
+        cleaned.append(entry)
+    return cleaned
+
+
 class PlannerAgent(BaseAgent):
     name = "planner"
     role = _SYSTEM
@@ -109,6 +144,7 @@ class PlannerAgent(BaseAgent):
             narrative_logic=str(payload.get("narrative_logic", "")),
             structure=[],
             dimensions=[str(item) for item in payload.get("dimensions", [])],
+            evidence_needs=_normalize_needs(payload.get("evidence_needs")),
             required_facts=[str(item) for item in payload.get("required_facts", [])],
             budget=payload.get("report_budget") if isinstance(payload.get("report_budget"), dict) else {},
             chapter_plans=[],
@@ -157,6 +193,7 @@ def _plan_snapshot(plan: ReportPlan, stage: str) -> dict:
         "narrative_logic": plan.narrative_logic,
         "structure": plan.structure,
         "dimensions": plan.dimensions,
+        "evidence_needs": plan.evidence_needs,
         "required_facts": plan.required_facts,
         "chapter_plans": plan.chapter_plans,
         "budget": plan.budget,
@@ -168,13 +205,14 @@ def save_plan(plan: ReportPlan) -> ReportPlan:
     with connect() as conn:
         cur = conn.execute(
             "INSERT INTO report_plans(title, objective, audience, report_type, core_question, "
-            "core_judgment, narrative_logic, structure, dimensions, required_facts, chapter_plans, "
+            "core_judgment, narrative_logic, structure, dimensions, evidence_needs, required_facts, chapter_plans, "
             "budget, user_requirements, plan_stage, plan_version, analysis_plan_json, final_plan_json) "
-            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (plan.title, plan.objective, plan.audience, plan.report_type,
              plan.core_question, plan.core_judgment, plan.narrative_logic,
              json.dumps(plan.structure, ensure_ascii=False),
              json.dumps(plan.dimensions, ensure_ascii=False),
+             json.dumps(plan.evidence_needs, ensure_ascii=False),
              json.dumps(plan.required_facts, ensure_ascii=False),
              json.dumps(plan.chapter_plans, ensure_ascii=False),
              json.dumps(plan.budget, ensure_ascii=False),
