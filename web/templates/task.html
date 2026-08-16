@@ -175,8 +175,11 @@ function renderProgressDetail(task) {
   const token = task.token_efficiency || {};
   const buckets = token.token_buckets || {};
   const drivers = token.scale_drivers || {};
+  const parseStats = task.parse_stats || {};
   const rows = [];
   if (task.parse_progress) rows.push(["材料解析", progressPair(task.parse_progress)]);
+  if (parseStats.total_files) rows.push(["解析结果", `成功 ${parseStats.success_files || 0} · 部分成功 ${parseStats.partial_files || 0} · 失败 ${parseStats.failed_files || 0} · Units ${parseStats.total_units || 0}`]);
+  if (parseStats.ocr_triggered_files != null && parseStats.total_files) rows.push(["OCR触发", `${parseStats.ocr_triggered_files}/${parseStats.total_files} · 平均解析 ${parseStats.avg_parse_seconds || 0}s/份`]);
   if (task.material_analysis_progress) rows.push(["材料理解", progressPair(task.material_analysis_progress)]);
   if (task.evidence_progress) rows.push(["事实提取", progressPair(task.evidence_progress)]);
   if (task.write_progress) rows.push(["章节写作", progressPair(task.write_progress) + (task.write_progress.chapter ? ` · ${task.write_progress.chapter}` : "")]);
@@ -258,8 +261,8 @@ async function loadMaterials() {
     : "";
   document.getElementById("materials").innerHTML = analysisSummary + (MATERIALS.length ? MATERIALS.map(m => {
     const role = roleByName.get(m.filename);
-    const parseBadge = m.parse_status === "ok" ? ["green", "已解析"]
-      : m.parse_status === "error" ? ["red", "解析异常"]
+    const parseBadge = m.parse_status === "error" ? ["red", "解析失败"]
+      : m.units_count > 0 ? ["green", "已解析"]
       : ["gray", "未解析"];
     return `<div class="data-row">
       <div>

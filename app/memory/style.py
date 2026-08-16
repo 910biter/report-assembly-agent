@@ -13,6 +13,7 @@ from pathlib import Path
 from app.config import settings
 from app.db import connect
 from app.gateway import model_gateway
+from app.llm_scheduler import invoke
 from app.models import StyleVariant
 from app.template_engine import compile_template
 
@@ -71,23 +72,32 @@ _VARIANT_PROMPT = """以下为同一机构、同一类型({type})的 {count} 份
 }}"""
 
 
-def analyze_library(reports: list[dict]) -> list[StyleVariant]:
-    """从参考报告构建机构风格库。
+def analyze_library(reports: list[dict], force: bool = False) -> list[StyleVariant]:
+    """从参考报告构建机构风格库(幂等:同一文件默认只产生一个稳定变体)。
 
     reports: [{"filename": str, "text": str, "path": str|None}]
-    流程:逐份提取结构+多位置采样 → LLM 判定体裁 → 按体裁聚类 →
-    每组 LLM 提炼变体(结构/语言/术语) + 规则提取格式(dominant/alternatives) → 落库(draft)。
+    流程:逐份提取结构+多位置采样 → 按文件 hash 查已分析记录(有则复用,
+    不重复生成)→ LLM 判定体裁 → 按体裁聚类 → 每组 LLM 提炼变体 → 落库。
+    force=True 时忽略已有记录重新分析(显式"重新分析"才建新版本)。
     """
     if not reports:
         raise ValueError("NO_HISTORICAL_REPORTS")
     library_id = _ensure_library()
+
+    # 幂等:同一文件(hash)已分析过 → 直接复用已有变体(LLM 分类不稳定不改变模板身份)
+    if not force:
+        reused = _reuse_by_source_hash(reports)
+        if reused is not None:
+            return reused
+
     features = []
     for report in reports:
         text = report.get("text", "")
         headings = _extract_headings(text, report.get("path"))
         samples = _sample_report(text)
         try:
-            payload = model_gateway.generate_json(
+            payload = invoke(
+                "template", model_gateway.generate_json,
                 f"报告文本:\n{text[:_MAX_CHARS_PER_REPORT]}",
                 system=_FEATURE_PROMPT,
             )
@@ -109,7 +119,48 @@ def analyze_library(reports: list[dict]) -> list[StyleVariant]:
     variants = []
     for topic_type, members in groups.items():
         variants.append(_build_variant(library_id, topic_type, members))
+    _record_source_hash(reports, variants)
     return variants
+
+
+def _source_hash(report: dict) -> str:
+    """模板源文件内容 hash(稳定模板身份;无 path 时退回 filename)。"""
+    import hashlib
+    path = report.get("path")
+    try:
+        if path and Path(path).exists():
+            return hashlib.sha256(Path(path).read_bytes()).hexdigest()[:16]
+    except Exception:
+        pass
+    return hashlib.sha256((report.get("filename") or "").encode()).hexdigest()[:16]
+
+
+def _reuse_by_source_hash(reports: list[dict]) -> list[StyleVariant] | None:
+    """同一源文件已分析过 → 复用已有变体(返回 None 表示需新分析)。"""
+    if len(reports) != 1:
+        return None
+    digest = _source_hash(reports[0])
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT id FROM style_variants WHERE source_hash=? ORDER BY id LIMIT 1",
+            (digest,),
+        ).fetchone()
+    if row is None:
+        return None
+    variant = get_variant(row["id"])
+    return [variant] if variant else None
+
+
+def _record_source_hash(reports: list[dict], variants: list[StyleVariant]) -> None:
+    """分析完成后记录源文件 hash 到变体(幂等身份)。"""
+    if len(reports) != 1 or not variants:
+        return
+    digest = _source_hash(reports[0])
+    with connect() as conn:
+        conn.execute(
+            "UPDATE style_variants SET source_hash=? WHERE id=?",
+            (digest, variants[0].id),
+        )
 
 
 def _ensure_library() -> int:
@@ -166,9 +217,9 @@ def _build_variant(library_id: int, topic_type: str, members: list[dict]) -> Sty
             f"结尾: {member['samples']['ending'][:150]}"
         )
     try:
-        payload = model_gateway.generate_json(
+        payload = invoke(
+            "template", model_gateway.generate_json,
             _VARIANT_PROMPT.replace("{type}", topic_type)
-            .replace("{count}", str(len(members)))
             .replace("{reports}", "\n\n---\n\n".join(report_blocks)),
             system="你是机构报告风格分析师。",
         )
@@ -420,6 +471,16 @@ def get_locked_variant() -> StyleVariant | None:
 
 def set_variant_status(variant_id: int, status: str) -> None:
     with connect() as conn:
+        if status == "locked":
+            row = conn.execute(
+                "SELECT library_id FROM style_variants WHERE id=?", (variant_id,)
+            ).fetchone()
+            if row is not None:
+                conn.execute(
+                    "UPDATE style_variants SET status='confirmed' "
+                    "WHERE library_id=? AND status='locked' AND id!=?",
+                    (row["library_id"], variant_id),
+                )
         conn.execute("UPDATE style_variants SET status=? WHERE id=?", (status, variant_id))
 
 

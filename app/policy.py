@@ -91,11 +91,51 @@ def _template_policy(template_variant: Any) -> dict:
     structure = getattr(template_variant, "structure", {}) or {}
     format_spec = getattr(template_variant, "format_spec", {}) or {}
     institution_rules = getattr(template_variant, "institution_rules", {}) or {}
+    structure_type = _structure_type(format_spec, institution_rules)
     return {
-        "structure_hint": structure,
+        "structure_type": structure_type,
+        "structure_hint": structure if structure_type != "FORMAT_ONLY" else {},
         "institution_rules": institution_rules,
         "format_summary": _format_summary(format_spec),
+        "guidance": (
+            "模板只控制格式与导出呈现,不得把模板目录作为报告目录。"
+            if structure_type == "FORMAT_ONLY"
+            else "模板目录可参考,但最终结构仍由材料事实和分析结论决定。"
+            if structure_type == "SOFT_STRUCTURE"
+            else "模板目录为强制业务结构,最终报告应严格遵守。"
+        ),
     }
+
+
+def _structure_type(format_spec: dict, institution_rules: dict) -> str:
+    candidates = []
+    if isinstance(institution_rules, dict):
+        candidates.extend([
+            institution_rules.get("template_structure_type"),
+            institution_rules.get("structure_type"),
+        ])
+    if isinstance(format_spec, dict):
+        candidates.extend([
+            format_spec.get("template_structure_type"),
+            format_spec.get("structure_type"),
+        ])
+        dominant = format_spec.get("dominant")
+        if isinstance(dominant, dict):
+            candidates.extend([
+                dominant.get("template_structure_type"),
+                dominant.get("structure_type"),
+            ])
+            schema = dominant.get("template_schema")
+            if isinstance(schema, dict):
+                candidates.extend([
+                    schema.get("structure_type"),
+                    schema.get("template_structure_type"),
+                ])
+    for item in candidates:
+        value = str(item or "").upper()
+        if value in {"FORMAT_ONLY", "SOFT_STRUCTURE", "HARD_STRUCTURE"}:
+            return value
+    return "FORMAT_ONLY"
 
 
 def _format_summary(format_spec: dict) -> dict:

@@ -40,6 +40,7 @@ const LEVEL_NAMES = {
   MATERIAL_FACT: "材料事实",
   MATERIAL_INFERENCE: "分析判断",
   EXTERNAL_INFORMATION: "外部信息",
+  SUBHEADING: "小标题",
   TRANSITION: "过渡句"
 };
 let DATA = null;
@@ -98,10 +99,39 @@ function render(data) {
     tocLink.dataset.sectionAnchor = anchor;
     toc.appendChild(tocLink);
     for (const para of section.paragraphs) {
-      if ((para.sentences || []).some(s => isListItem(s.content))) {
+      const paraSentences = para.sentences || [];
+      if (paraSentences.some(s => s.source_level === "SUBHEADING")) {
+        let current = [];
+        const flushCurrent = () => {
+          if (!current.length) return;
+          const p = document.createElement("p");
+          p.className = "doc-paragraph";
+          for (const item of current) {
+            SENTENCES[item.id] = item;
+            p.appendChild(makeSentenceSpan(item));
+          }
+          main.appendChild(p);
+          current = [];
+        };
+        for (const s of paraSentences) {
+          if (s.source_level === "SUBHEADING") {
+            flushCurrent();
+            SENTENCES[s.id] = s;
+            const h3 = document.createElement("h3");
+            h3.className = "doc-subheading";
+            h3.appendChild(makeSentenceSpan(s));
+            main.appendChild(h3);
+          } else {
+            current.push(s);
+          }
+        }
+        flushCurrent();
+        continue;
+      }
+      if (paraSentences.some(s => isListItem(s.content))) {
         const list = document.createElement("div");
         list.className = "doc-list";
-        for (const s of para.sentences) {
+        for (const s of paraSentences) {
           SENTENCES[s.id] = s;
           const item = document.createElement("p");
           item.className = isListItem(s.content) ? "doc-list-item" : "doc-paragraph";
@@ -114,7 +144,7 @@ function render(data) {
       }
       const p = document.createElement("p");
       p.className = "doc-paragraph";
-      for (const s of para.sentences) {
+      for (const s of paraSentences) {
         SENTENCES[s.id] = s;
         const span = makeSentenceSpan(s);
         p.appendChild(span);

@@ -13,6 +13,7 @@ import re
 
 from app.db import connect
 from app.gateway import model_gateway
+from app.llm_scheduler import invoke
 
 _QA_SYSTEM = """你是报告质量检查员。检查报告是否存在以下问题,严格输出 JSON:
 {"issues": [{"type": "LOGIC_GAP|CITATION_MISMATCH|REDUNDANT", "section": "章节", "quote": "问题句片段", "note": "问题说明"}]}
@@ -253,7 +254,8 @@ def run_quality_check(report_id: int, plan_structure: list[str],
                 f"[{row['section']}] ({row['source_level']}) {row['content']}"
                 for row in rows[:40]
             )
-            payload = model_gateway.generate_json(
+            payload = invoke(
+                "qa", model_gateway.generate_json,
                 f"报告句子清单:\n{block}", system=_QA_SYSTEM
             )
             for item in payload.get("issues", []):

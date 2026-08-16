@@ -20,12 +20,29 @@ os.environ["IRA_QDRANT_COLLECTION_UNITS"] = "verify_ira_units"
 os.environ["IRA_QDRANT_COLLECTION_MATERIALS"] = "verify_ira_materials"
 os.environ["IRA_QDRANT_COLLECTION_FACTS"] = "verify_ira_facts"
 
+# create_task 上传接口需要真实文件(Docling 已 mock,内容仅作载体)
+_FAKE_PDF = "/tmp/t_cn.pdf"
+with open(_FAKE_PDF, "w", encoding="utf-8") as fh:
+    fh.write("某监管机构于2026年发布行业监管政策文件。")
+
 import app.agents.base as base_mod
 import app.memory.style as style_mod
-import app.parser.images as images_mod
 import app.quality as quality_mod
 import app.retrieval.embedder as embedder_mod
 from app.retrieval import vector_store
+
+# Docling 解析 mock:验证只测流程,不启动 Docling 模型
+import app.workflow.controller as controller_mod
+from app.models import Unit
+
+
+def _fake_parse_file_with_profile(path):
+    return [Unit(material_id=0, kind="text", content="某监管机构于2026年发布行业监管政策文件。", page=1)], {
+        "parser": "verify-mock", "units_count": 1,
+    }
+
+
+controller_mod.parse_file_with_profile = _fake_parse_file_with_profile
 
 CHECKS: list[str] = []
 
@@ -53,7 +70,12 @@ class FakeGateway:
                                           "word_count": "100-500", "inference_ratio": "", "data_requirements": ""}}
         if "体裁与风格特征" in system:
             return {"topic_type": "政策研究", "structure_notes": "五段式", "language_notes": "正式"}
-        if "报告规划师" in system:
+        if "分析规划师" in system:
+            # 初版规划:只定分析问题与证据提取方向,不冻结章节
+            return {"title": "T", "core_question": "监管如何变化", "dimensions": ["D1"],
+                    "required_facts": ["政策"]}
+        if "结构总规划师" in system:
+            # 终版规划:Evidence/Analysis 后冻结最终章节结构
             return {"title": "T", "core_question": "监管如何变化", "core_judgment": "监管趋严",
                     "narrative_logic": "背景→影响→风险", "dimensions": ["D1"],
                     "report_budget": {"target_words": 800, "soft_max_words": 1000,
@@ -83,6 +105,14 @@ class FakeGateway:
         if "情报分析员" in system:
             return {"inferences": [{"content": "政策将趋严", "based_fact_ids": [1],
                                     "reasoning": "r", "analysis_type": "TREND"}], "external_notes": []}
+        if "综合研判师" in system:
+            return {"inferences": [{"content": "监管趋严将推动行业规范", "based_fact_ids": [1],
+                                    "short_rationale": "r", "dimension": "全局综合", "analysis_type": "IMPACT"}],
+                    "external_notes": [],
+                    "critical_fact_ids": [1],
+                    "coverage_status": {"D1": "SUFFICIENT"},
+                    "unresolved_conflicts": [],
+                    "uncertainty": []}
         if "撰稿人" in system:
             return {"paragraphs": [
                 {"sentences": [
@@ -100,14 +130,8 @@ class FakeGateway:
             return {"text": "据称监管标准为15元。"}
         raise AssertionError(system)
 
-    def embed(self, texts):
+    def embed(self, texts, timeout=None, num_gpu=None):
         return [[0.1] * 8 for _ in texts]
-
-    def ocr(self, image_bytes):
-        return ""
-
-    def describe_image(self, image_bytes, prompt):
-        return ""
 
     def health(self):
         return {}
@@ -116,7 +140,6 @@ class FakeGateway:
 fake = FakeGateway()
 base_mod.model_gateway = fake
 style_mod.model_gateway = fake
-images_mod.model_gateway = fake
 quality_mod.model_gateway = fake
 embedder_mod.model_gateway = fake
 
@@ -406,7 +429,8 @@ check("导出兼容历史符号化条目", _export_is_list_item("• 必交: 登
 check("解析进度最终态 done==total",
       task.get("parse_progress", {}).get("done") == task.get("parse_progress", {}).get("total") == 1)
 check("证据进度最终态 done==total",
-      task.get("evidence_progress", {}).get("done") == task.get("evidence_progress", {}).get("total") == 1)
+      (lambda ep: ep.get("done") == ep.get("total") and ep.get("total", 0) >= 1)
+      (task.get("evidence_progress") or {}))
 check("LLM 调用统计记录", task.get("llm_stats", {}).get("calls", 0) >= 1)
 with connect() as conn:
     token_log_count = conn.execute("SELECT COUNT(*) c FROM llm_call_logs WHERE task_id=?", ("r3d",)).fetchone()["c"]
@@ -439,7 +463,7 @@ check("Task Cache:阶段 Artifact 写入",
 check("Task Cache:章节草稿 Artifact 写入",
       any(stage.startswith("chapter_draft:") for stage in artifact_stages))
 check("Material Cache:解析版本记录",
-      material_row is not None and material_row["parser_version"] == "parser-v1")
+      material_row is not None and material_row["parser_version"] == "verify-mock")
 
 from app.export import export_report
 out = export_report(task["report_id"])
@@ -469,7 +493,8 @@ check("materials API", r.status_code == 200 and len(r.json()) == 1)
 r = client.get("/api/materials")
 check("材料库 API 绑定所属任务", r.status_code == 200 and any(item.get("tasks") for item in r.json()))
 r = client.get("/api/tasks/r3d/analysis")
-check("analysis API:事实/推断", r.status_code == 200 and len(r.json()["facts"]) == 1 and len(r.json()["inferences"]) == 1)
+check("analysis API:事实/推断",
+      r.status_code == 200 and len(r.json()["facts"]) == 1 and len(r.json()["inferences"]) >= 1)
 r = client.get(f"/api/reports/{task['report_id']}")
 data = r.json()
 check("报告详情 API 返回所属任务", data.get("task_id") == "r3d" and data.get("status") == "draft")

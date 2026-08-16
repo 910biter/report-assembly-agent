@@ -1,0 +1,12 @@
+# 构建上下文排除(镜像瘦身 + 避免复制本地数据)
+.venv
+.git
+__pycache__
+*.pyc
+runtime
+materials
+nohup.out
+*.log
+.dockerignore
+Dockerfile
+docker-compose.yml

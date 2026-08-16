@@ -25,7 +25,10 @@ class QdrantVectorStore:
         self.units_collection = settings.qdrant_collection_units
         self.materials_collection = settings.qdrant_collection_materials
         self.facts_collection = settings.qdrant_collection_facts
-        if settings.vector_backend != "qdrant" or not settings.qdrant_url:
+        backend = (settings.vector_backend or "auto").lower()
+        if backend == "off":
+            return
+        if backend not in ("auto", "qdrant") or not settings.qdrant_url:
             return
         try:
             from qdrant_client import QdrantClient
@@ -73,23 +76,37 @@ class QdrantVectorStore:
         payload["kind"] = "unit"
         self._upsert(self.units_collection, int(unit_id), vector, payload)
 
-    def save_fact_vector(self, fact_id: int, vector: list[float]) -> None:
+    def save_fact_vector(self, fact_id: int, vector: list[float], task_id: str = "") -> None:
         self._upsert(
             self.facts_collection,
             int(fact_id),
             vector,
-            {"fact_id": int(fact_id), "kind": "fact"},
+            {"fact_id": int(fact_id), "task_id": task_id, "kind": "fact"},
         )
 
     def material_vectors(self) -> list[tuple[int, np.ndarray]]:
         """全部材料向量(供去重):[(material_id, np.ndarray)]。"""
         return self._scroll_vectors(self.materials_collection, "material_id")
 
-    def fact_vectors(self) -> list[tuple[int, np.ndarray]]:
-        """全部事实向量(供 Writer 章节检索):[(fact_id, np.ndarray)]。"""
-        return self._scroll_vectors(self.facts_collection, "fact_id")
+    def fact_vectors(self, task_id: str = "") -> list[tuple[int, np.ndarray]]:
+        """事实向量;传入 task_id 时只读取当前任务,避免全库滚动污染。"""
+        filters = {"task_id": task_id} if task_id else None
+        return self._scroll_vectors(self.facts_collection, "fact_id", filters=filters)
 
-    def _scroll_vectors(self, collection: str, id_field: str) -> list[tuple[int, np.ndarray]]:
+    def unit_vectors(self, unit_ids: set[int] | None = None) -> dict[int, np.ndarray]:
+        """单位向量(供语义相关度混合检索):{unit_id: np.ndarray}。"""
+        if not self.enabled or self.client is None:
+            return {}
+        try:
+            filters = None
+            if unit_ids:
+                filters = {"unit_id": sorted(int(i) for i in unit_ids)}
+            return {unit_id: vec for unit_id, vec in self._scroll_vectors(self.units_collection, "unit_id", filters=filters)}
+        except Exception:
+            return {}
+
+    def _scroll_vectors(self, collection: str, id_field: str,
+                        filters: dict | None = None) -> list[tuple[int, np.ndarray]]:
         if not self.enabled or self.client is None:
             return []
         try:
@@ -100,6 +117,7 @@ class QdrantVectorStore:
                     collection_name=collection,
                     limit=512,
                     offset=next_offset,
+                    scroll_filter=self._qdrant_filter(filters or {}),
                     with_payload=True,
                     with_vectors=True,
                 )

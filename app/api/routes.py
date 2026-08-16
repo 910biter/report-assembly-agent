@@ -13,6 +13,7 @@ from app.config import settings
 from app.db import connect
 from app.export import export_report
 from app.llm_queue import llm_queue_stats
+from app.llm_scheduler import invoke
 from app.memory import short_term, style
 from app.parser import parse_file
 from app.token_monitor import build_token_efficiency, list_llm_calls
@@ -82,7 +83,7 @@ def list_tasks():
         rows = conn.execute("SELECT task_id, payload FROM short_memory ORDER BY rowid DESC").fetchall()
     tasks = []
     for row in rows:
-        payload = json.loads(row["payload"])
+        payload = _task_view(json.loads(row["payload"]))
         tasks.append({
             "task_id": row["task_id"],
             "theme": payload.get("theme", ""),
@@ -111,7 +112,7 @@ def get_task(task_id: str):
     task = short_term.load_task(task_id)
     if task is None:
         return JSONResponse({"error": "TASK_NOT_FOUND"}, status_code=404)
-    return task
+    return _task_view(task)
 
 
 @router.delete("/tasks/{task_id}")
@@ -136,11 +137,26 @@ def delete_task(task_id: str):
 
 @router.get("/tasks/{task_id}/materials")
 def task_materials(task_id: str):
-    """任务材料解析状态:每份材料的内容单元数/页数/图片OCR/解析异常。"""
+    """任务材料解析状态:每份材料的内容单元数/页数/图片文本/解析异常。"""
     task = short_term.load_task(task_id)
     if task is None:
         return JSONResponse({"error": "TASK_NOT_FOUND"}, status_code=404)
-    parse_errors = {e["filename"]: e.get("error", "") for e in task.get("parse_errors", [])}
+    parse_errors: dict[str, str] = {}
+    embed_errors = {e["filename"]: e.get("error", "") for e in task.get("embed_errors", [])}
+    for item in task.get("parse_errors", []):
+        filename = item.get("filename")
+        error = str(item.get("error", ""))
+        if not filename:
+            continue
+        if error.lower().startswith("embed:"):
+            embed_errors.setdefault(filename, error)
+        else:
+            parse_errors[filename] = error
+    parse_profiles = {
+        int(item.get("material_id")): item
+        for item in task.get("parse_results", [])
+        if item.get("material_id") is not None
+    }
     material_ids = [int(i) for i in task.get("material_ids", [])]
     if not material_ids:
         return []
@@ -155,16 +171,21 @@ def task_materials(task_id: str):
         result = []
         for material in materials:
             units = conn.execute(
-                "SELECT kind, content, image_desc, page FROM units WHERE material_id=?",
+                "SELECT kind, content, image_desc, page, metadata_json FROM units WHERE material_id=?",
                 (material["id"],),
             ).fetchall()
             pages = {u["page"] for u in units if u["page"] is not None}
             images = [u for u in units if u["kind"] == "image"]
             parsed = len(units) > 0
-            if material["filename"] in parse_errors:
+            profile = parse_profiles.get(int(material["id"]), {})
+            if parsed:
+                # Units 已入库时材料正文可用。向量化或历史解析告警不应显示成
+                # “材料解析错误”,否则用户会误以为 Docling 没有解析出内容。
+                parse_status = "partial" if material["filename"] in embed_errors else "ok"
+            elif material["filename"] in parse_errors:
                 parse_status = "error"
-            elif parsed:
-                parse_status = "ok"
+            elif material["filename"] in embed_errors:
+                parse_status = "vector_error"
             else:
                 parse_status = "pending"  # 未解析(尚未轮到/中断),与材料库 unit_count 判断一致
             result.append({
@@ -176,11 +197,14 @@ def task_materials(task_id: str):
                 "parsed_count": parsed_count,
                 "duplicate_of": material["duplicate_of"],
                 "images": [{
+                    "text": u["content"],
                     "ocr_text": u["content"],
                     "image_desc": u["image_desc"],
                 } for u in images],
                 "parse_status": parse_status,
                 "parse_error": parse_errors.get(material["filename"], ""),
+                "embed_error": embed_errors.get(material["filename"], ""),
+                "parse_profile": profile,
             })
     return result
 
@@ -262,7 +286,7 @@ def list_materials():
 
 @router.get("/materials/{material_id}")
 def get_material(material_id: int):
-    """材料详情:内容单元列表(文本/表格/图片 OCR+描述)。"""
+    """材料详情:内容单元列表(文本/表格/图片文本和解析元数据)。"""
     material_tasks = _material_task_index()
     with connect() as conn:
         material = conn.execute("SELECT * FROM materials WHERE id=?", (material_id,)).fetchone()
@@ -278,6 +302,7 @@ def get_material(material_id: int):
         "units": [{
             "id": u["id"], "kind": u["kind"], "content": u["content"],
             "page": u["page"], "image_desc": u["image_desc"],
+            "metadata": json.loads(u["metadata_json"] or "{}"),
         } for u in units],
     }
 
@@ -542,7 +567,7 @@ def health():
     from app.gateway import model_gateway
 
     try:
-        status = model_gateway.health()
+        status = invoke("health", model_gateway.health)
         return {
             "version": status.get("version"),
             "models": status.get("models", {}),
@@ -689,6 +714,53 @@ def _report_task_index() -> dict[int, dict]:
     return index
 
 
+def _task_view(payload: dict) -> dict:
+    """Return UI-safe task payload without mutating historical task records."""
+    view = dict(payload or {})
+    parse_errors = []
+    embed_errors = list(view.get("embed_errors") or [])
+    seen_embed = {item.get("filename") for item in embed_errors if isinstance(item, dict)}
+    for item in view.get("parse_errors") or []:
+        if not isinstance(item, dict):
+            continue
+        error = str(item.get("error", ""))
+        if error.lower().startswith("embed:"):
+            filename = item.get("filename")
+            if filename not in seen_embed:
+                embed_errors.append(item)
+                seen_embed.add(filename)
+        else:
+            parse_errors.append(item)
+    view["parse_errors"] = parse_errors
+    view["embed_errors"] = embed_errors
+    stats = dict(view.get("parse_stats") or {})
+    if stats:
+        stats["parse_error_count"] = len(parse_errors)
+        stats["embed_error_count"] = len(embed_errors)
+        stats["failure_reasons"] = _reason_buckets_for_api(parse_errors)
+        stats["embed_failure_reasons"] = _reason_buckets_for_api(embed_errors)
+        view["parse_stats"] = stats
+    return view
+
+
+def _reason_buckets_for_api(errors: list[dict]) -> dict:
+    buckets: dict[str, int] = {}
+    for item in errors:
+        error = str(item.get("error", "")).lower()
+        if "timed out" in error or "timeout" in error:
+            key = "timeout"
+        elif "database is locked" in error:
+            key = "database_locked"
+        elif "no route to host" in error or "connection reset" in error:
+            key = "network"
+        elif "embed:" in error:
+            key = "embedding"
+        else:
+            key = "other"
+        buckets[key] = buckets.get(key, 0) + 1
+    return buckets
+
+
 def _progress_summary(payload: dict) -> dict:
     stage_timings = payload.get("stage_timings") or {}
     stage = payload.get("stage", "")
@@ -718,6 +790,10 @@ def _progress_summary(payload: dict) -> dict:
             "material_analysis_cache_hits": payload.get("material_analysis_cache_hits", 0),
             "ttfr_seconds": payload.get("ttfr_seconds"),
         },
+        # 解析/向量化错误分开透传(历史任务 embed: 前缀已由 _task_view 拆分)
+        "parse_errors": payload.get("parse_errors") or [],
+        "embed_errors": payload.get("embed_errors") or [],
+        "parse_stats": payload.get("parse_stats") or {},
         "versions": payload.get("versions") or {},
     }
     if stage_timings:

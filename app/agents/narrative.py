@@ -13,6 +13,17 @@ _SYSTEM = """你是报告章节叙事规划师。你的任务不是写正文,而
   "chapter_title": "章节标题",
   "central_message": "本章中心意思",
   "logic_order": ["话题1", "话题2", "..."],
+  "subsections": [
+    {
+      "title": "小节标题",
+      "purpose": "该小节解决什么问题",
+      "topic_ids": ["T1"],
+      "fact_ids": [1,2],
+      "inference_ids": [3],
+      "detail_level": "expand/brief/reference",
+      "completion_criteria": ["表达什么才算完成"]
+    }
+  ],
   "topics": [
     {
       "topic_id": "T1",
@@ -41,7 +52,9 @@ _SYSTEM = """你是报告章节叙事规划师。你的任务不是写正文,而
 5. 规划应服务于本章核心问题和全文主线,不是材料清单复述。
 6. 事实归属优先未在前文使用的事实(前文已用事实仅在承担新的逻辑作用时复用),
    避免各章节重复使用同一批事实导致后章无内容可写。
-7. completion_criteria 由材料内容决定(该话题在材料里能支撑什么就写什么),不按固定模板。"""
+7. completion_criteria 由材料内容决定(该话题在材料里能支撑什么就写什么),不按固定模板。
+8. 若当前章节规划包含 subsections,应优先继承并校准这些小节;若没有,只有在多个话题层次确实需要分层表达时才生成 subsections。
+9. 小节标题必须是结构标题,不能是一句带判断的正文;不得为了格式美观硬设小节。"""
 
 _QA_SYSTEM = """你是章节叙事质量评审。根据 Narrative Plan 判断本章每个 Topic 是否按计划完成。
 严格输出 JSON,不要任何解释:
@@ -226,6 +239,7 @@ def _strip_plan_for_qa(narrative_plan: dict) -> dict:
         "chapter_title": narrative_plan.get("chapter_title", ""),
         "central_message": narrative_plan.get("central_message", ""),
         "logic_order": narrative_plan.get("logic_order", []),
+        "subsections": narrative_plan.get("subsections", []),
         "topics": topics,
         "must_not_claim": narrative_plan.get("must_not_claim", []),
     }
@@ -264,10 +278,12 @@ def _sanitize_plan(payload: dict, chapter_plan: dict, fact_ids: set[int], infere
     logic_order = [str(item)[:40] for item in payload.get("logic_order") or [] if str(item).strip()]
     if not logic_order:
         logic_order = [topic["name"] for topic in topics]
+    subsections = _sanitize_subsections(payload.get("subsections"), chapter_plan, topics, fact_ids, inference_ids)
     return {
         "chapter_title": str(payload.get("chapter_title") or chapter_plan.get("title") or ""),
         "central_message": str(payload.get("central_message") or chapter_plan.get("judgment") or "")[:240],
         "logic_order": logic_order,
+        "subsections": subsections,
         "topics": topics,
         "background_fact_ids": [
             int(i) for i in payload.get("background_fact_ids") or []
@@ -276,6 +292,55 @@ def _sanitize_plan(payload: dict, chapter_plan: dict, fact_ids: set[int], infere
         "must_not_claim": [str(item)[:160] for item in payload.get("must_not_claim") or [] if str(item).strip()],
         "transition_hint": str(payload.get("transition_hint") or chapter_plan.get("next_bridge") or "")[:240],
     }
+
+
+def _sanitize_subsections(raw, chapter_plan: dict, topics: list[dict],
+                          fact_ids: set[int], inference_ids: set[int]) -> list[dict]:
+    source = raw if isinstance(raw, list) and raw else chapter_plan.get("subsections")
+    if not isinstance(source, list):
+        return []
+    topic_by_name = {_key(t.get("name")): t for t in topics}
+    result = []
+    for item in source:
+        if not isinstance(item, dict):
+            continue
+        title = _clean_subsection_title(str(item.get("title") or ""))
+        if not title:
+            continue
+        fids = [int(i) for i in item.get("fact_ids") or item.get("primary_fact_ids") or [] if str(i).isdigit() and int(i) in fact_ids]
+        iids = [int(i) for i in item.get("inference_ids") or item.get("primary_inference_ids") or [] if str(i).isdigit() and int(i) in inference_ids]
+        topic_ids = [str(i)[:16] for i in item.get("topic_ids") or [] if str(i).strip()]
+        if not fids and not iids:
+            matched = topic_by_name.get(_key(title))
+            if matched:
+                fids = list(matched.get("fact_ids") or [])
+                iids = list(matched.get("inference_ids") or [])
+                topic_ids = topic_ids or [matched.get("topic_id", "")]
+        if not fids and not iids:
+            continue
+        detail = str(item.get("detail_level") or "brief")
+        if detail not in {"expand", "brief", "reference"}:
+            detail = "brief"
+        result.append({
+            "title": title[:60],
+            "purpose": str(item.get("purpose") or "")[:180],
+            "topic_ids": [t for t in topic_ids if t],
+            "fact_ids": fids,
+            "inference_ids": iids,
+            "detail_level": detail,
+            "completion_criteria": [str(c)[:120] for c in (item.get("completion_criteria") or []) if str(c).strip()],
+        })
+    return result
+
+
+def _clean_subsection_title(text: str) -> str:
+    value = re.sub(r"^\s*(?:\d+(?:\.\d+)+|[（(][一二三四五六七八九十]+[）)]|[一二三四五六七八九十]+[、.])\s*", "", text or "").strip()
+    value = re.split(r"[。！？!?；;\n]", value, maxsplit=1)[0].strip()
+    return value
+
+
+def _key(text: str) -> str:
+    return re.sub(r"\s+", "", str(text or "").strip())
 
 
 def _fallback_topics(chapter_plan: dict, fact_ids: set[int]) -> list[dict]:

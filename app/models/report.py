@@ -17,6 +17,10 @@ class ReportPlan:
     budget: dict = field(default_factory=dict)  # ReportBudget: target_words/soft_max_words/hard_max_words/summary_budget
     chapter_plans: list[dict] = field(default_factory=list)  # [{title, questions, judgment, relation_to_prev, required_facts, required_inferences, exclude, next_bridge, target_words, importance, evidence_density}]
     user_requirements: str = ""
+    plan_stage: str = "analysis"
+    plan_version: int = 1
+    analysis_plan_json: dict = field(default_factory=dict)
+    final_plan_json: dict = field(default_factory=dict)
     id: int | None = None
 
 

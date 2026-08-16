@@ -29,7 +29,9 @@ _SYSTEM = """你是情报事实提取员。从材料中提取可溯源的陈述(
 3. fact_type 按陈述性质:事件EVENT/人物PERSON/地点LOCATION/时间TIME/数字NUMBER/一般陈述STATEMENT
 4. 只输出有原文支撑的陈述;没有支撑就少输出
 5. 禁止输出推断、评价、总结(那些属于"分析人士认为"类观点时,content 须注明是来源观点)
-6. 不要输出 file/page/完整原文,系统会根据 unit_id 回查来源"""
+6. 分析维度和优先事实类别只是检索/提取重点,不是排除边界;材料中与用户目标明显相关的高价值事实即使不在维度内也应提取
+7. 面向综述或多材料任务时,同一维度应覆盖主要机制、标准、平台、时间线、威胁模型和比较要素;不要只抽取少数摘要性陈述
+8. 不要输出 file/page/完整原文,系统会根据 unit_id 回查来源"""
 
 _CONFLICT_SYSTEM = """你是情报冲突检测员。扫描陈述(Claim)清单,识别同一主题在不同来源中的矛盾
 (如:同一数字口径不同、同一事件描述相反)。只标注冲突,不判断谁对谁错。
@@ -130,6 +132,25 @@ _CONFLICT_WORD_GROUPS = (
     ("有", "无", "包含", "不包含"),
 )
 
+_OPEN_DISCOVERY_DIMENSION = "开放发现:补充提取与用户目标相关、但未被前述维度覆盖的高价值事实"
+
+
+def _normalize_dimensions(dimensions: list[str]) -> list[str]:
+    """Keep planner dimensions as priorities while adding one open discovery pass."""
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for item in dimensions or []:
+        text = str(item).strip()
+        if not text or text in seen:
+            continue
+        cleaned.append(text)
+        seen.add(text)
+    if not cleaned:
+        cleaned.append("核心事实发现")
+    if not any("开放发现" in item for item in cleaned):
+        cleaned.append(_OPEN_DISCOVERY_DIMENSION)
+    return cleaned
+
 
 def _claim_field_chars(items: list[dict]) -> dict[str, int]:
     fields = {"content": 0, "short_quote": 0, "unit_id": 0, "fact_type": 0, "other": 0}
@@ -220,144 +241,177 @@ class EvidenceAgent(BaseAgent):
         required_facts: list[str] | None = None,
         task_id: str = "",
         progress_callback=None,
+        start_dimension: int = 0,
     ) -> list[Fact]:
         """按维度提取陈述(Claim) → quote 校验 → 提升为 Fact。
 
         Claim 全部落库:校验通过 status=promoted 并关联 fact_id,未通过 status=pending。
         有 Context Manager 时按维度检索相关材料片段(小上下文友好),否则回退全量文本。
-        insights/required_facts 用于检索引导与提取聚焦。
+        insights/required_facts 用于检索引导与提取聚焦,不是事实空间边界。
         progress_callback(done, total) 每完成一个维度调用一次。
         """
-        if not dimensions:
-            dimensions = ["全部事实"]
+        dimensions = _normalize_dimensions(dimensions)
         facts: list[Fact] = []
         total = len(dimensions)
         insight_block = self._build_insight_block(insights)
         facts_this_dim: list[Fact] = []
         for index, dimension in enumerate(dimensions, start=1):
+            if index <= start_dimension:
+                continue  # 断点续跑:已完成维度跳过
+            if progress_callback is not None:
+                progress_callback(index - 1, total)  # 开始前:进度=已确认完成的维度数(防崩溃误判)
+            material_scan: dict[int, dict] = {}
+            if cm is not None and hasattr(cm, "for_evidence_batches"):
+                # 材料全覆盖 Evidence Pass:逐批处理,不静默截断
+                batches = cm.for_evidence_batches(dimension, insights, required_facts)
+            else:
+                material_text = (
+                    cm.for_evidence(dimension, insights, required_facts)
+                    if cm is not None
+                    else self._build_material_text(units_by_material, filenames)
+                )
+                batches = [(material_text, {
+                    "dimension": dimension,
+                    "context_source": "retrieval" if cm is not None else "full_material",
+                    "scanned_material_count": len(units_by_material),
+                })]
+            for batch_index, (material_text, batch_meta) in enumerate(batches, start=1):
+                context_meta = dict(batch_meta)
+                prompt = (
+                    f'分析维度:"{dimension}"\n\n'
+                    f"优先事实类别(用于聚焦,不是排除边界):{json.dumps(required_facts or [], ensure_ascii=False)}\n"
+                    f"{insight_block}\n"
+                    f"材料文本(按来源标注):\n{material_text}\n\n"
+                    f"请优先提取该维度相关的陈述;若发现与用户目标明显相关但不属于该维度的高价值事实,也可以提取。"
+                    "如果材料片段覆盖多个平台/标准/攻击/机制,请分别抽取,不要合并成过度概括的一条。输出 JSON。"
+                )
+                prompt_parts = {
+                    "dimension": len(f'分析维度:"{dimension}"\n\n'),
+                    "required_facts": len(json.dumps(required_facts or [], ensure_ascii=False)),
+                    "insight_block": len(insight_block or ""),
+                    "material_context": len(material_text or ""),
+                    "instruction": len("请优先提取该维度相关的陈述;若发现与用户目标明显相关但不属于该维度的高价值事实,也可以提取。输出 JSON。"),
+                    "system_prompt": len(self.role or _SYSTEM),
+                }
+                try:
+                    payload = self.generate_json(prompt)
+                except Exception:
+                    continue
+                call_id = self.last_call_id
+                produced_fact_ids: list[int] = []
+                stored_chars = 0
+                # 兼容模型两种输出:新格式 claims / 旧格式 facts(小模型提示跟随不稳)
+                items = payload.get("claims") or payload.get("facts") or []
+                model_claims = len(items)
+                valid_field_claims = 0
+                quote_bound_claims = 0
+                duplicate_claims = 0
+                pending_claims = 0
+                field_chars = _claim_field_chars(items)
+                contributed_materials: set[int] = set()
+                contributed_units: set[int] = set()
+                for item in items:
+                    content = str(item.get("content", "")).strip()
+                    quote = str(item.get("short_quote") or item.get("quote") or "").strip()
+                    try:
+                        unit_id = int(item.get("unit_id")) if item.get("unit_id") is not None else None
+                    except (TypeError, ValueError):
+                        unit_id = None
+                    if not content or not quote:
+                        continue
+                    valid_field_claims += 1
+                    fact_type = str(item.get("fact_type", "STATEMENT")).upper()
+                    if fact_type not in _FACT_TYPES:
+                        fact_type = "STATEMENT"
+                    if fact_exists(content, task_id):
+                        duplicate_claims += 1
+                        continue  # 当前任务内跨维度去重,不影响其他任务
+                    evidence_list = bind_sources(quote, units_by_material, filenames, unit_id=unit_id)
+                    claim = Claim(
+                        material_id=evidence_list[0].material_id if evidence_list else 0,
+                        content=content, quote=quote,
+                        source=filenames.get(evidence_list[0].material_id, "") if evidence_list else "",
+                        fact_type=fact_type, dimension=dimension,
+                    )
+                    if not evidence_list:
+                        pending_claims += 1
+                        save_claim(claim, status="pending", origin_call_id=call_id, task_id=task_id)  # 无来源支撑:保留为待核陈述
+                        continue
+                    quote_bound_claims += 1
+                    contributed_materials.update(int(ev.material_id) for ev in evidence_list)
+                    contributed_units.update(int(ev.unit_id) for ev in evidence_list)
+                    # 校验通过:提升为 Fact 并绑定 Evidence
+                    fact = Fact(content=content, dimension=dimension, fact_type=fact_type)
+                    fact.id = save_fact_with_evidence(fact, evidence_list, task_id, origin_call_id=call_id)
+                    facts.append(fact)
+                    facts_this_dim.append(fact)
+                    produced_fact_ids.append(int(fact.id))
+                    stored_chars += len(fact.content or "") + sum(len(ev.quote or "") for ev in evidence_list)
+                    claim.fact_id = fact.id
+                    save_claim(claim, status="promoted", origin_call_id=call_id, task_id=task_id)
+                    # 材料扫描统计:该 Fact 归属材料
+                    for ev in evidence_list:
+                        scan = material_scan.setdefault(int(ev.material_id), {"scanned": True, "units_selected": 0, "fact_count": 0})
+                        scan["fact_count"] += 1
+                update_call_products(call_id, produced_fact_ids=produced_fact_ids)
+                update_call_metrics(call_id, stored_chars=stored_chars)
+                update_call_funnel(
+                    call_id,
+                    dimension=dimension,
+                    context_meta=context_meta,
+                    prompt_parts=prompt_parts,
+                    prompt_chars=len(prompt),
+                    material_context_chars=len(material_text),
+                    contributed_material_count=len(contributed_materials),
+                    contributed_unit_count=len(contributed_units),
+                    contributed_material_ids=sorted(contributed_materials),
+                    contributed_unit_ids=sorted(contributed_units)[:50],
+                    model_claims=model_claims,
+                    valid_field_claims=valid_field_claims,
+                    quote_bound_claims=quote_bound_claims,
+                    duplicate_claims=duplicate_claims,
+                    pending_claims=pending_claims,
+                    promoted_facts=len(produced_fact_ids),
+                    field_chars=field_chars,
+                    batch=batch_index,
+                    batch_count=len(batches),
+                )
+                # 材料扫描状态:batch 内每份材料记录选中 unit 数
+                for mid, unit_count in (batch_meta.get("batch_material_units") or {}).items():
+                    scan = material_scan.setdefault(int(mid), {"scanned": True, "units_selected": 0, "fact_count": 0})
+                    scan["units_selected"] = int(unit_count)
+            # 维度结束:记录材料扫描状态 + 该维度 Fact 批量 embedding 持久化
+            # 全部批次完成并落库后才更新进度(崩溃时 done=已确认完成数,resume 不丢维度)
+            self._record_material_scan(task_id, dimension, material_scan)
             if progress_callback is not None:
                 progress_callback(index, total)
-            context_meta = {
-                "dimension": dimension,
-                "retrieved_unit_count": 0,
-                "retrieved_chars": 0,
-                "context_chars": 0,
-                "truncated": False,
-                "context_source": "full_material",
-            }
-            if cm is not None:
-                if hasattr(cm, "for_evidence_with_meta"):
-                    material_text, context_meta = cm.for_evidence_with_meta(dimension, insights, required_facts)
-                    context_meta["context_source"] = "retrieval"
-                else:
-                    material_text = cm.for_evidence(dimension, insights, required_facts)
-                    context_meta["context_chars"] = len(material_text)
-            else:
-                material_text = self._build_material_text(units_by_material, filenames)
-                context_meta["context_chars"] = len(material_text)
-            prompt = (
-                f'分析维度:"{dimension}"\n\n'
-                f"{insight_block}\n"
-                f"材料文本(按来源标注):\n{material_text}\n\n"
-                f"请提取该维度相关的陈述,输出 JSON。"
-            )
-            prompt_parts = {
-                "dimension": len(f'分析维度:"{dimension}"\n\n'),
-                "insight_block": len(insight_block or ""),
-                "material_context": len(material_text or ""),
-                "instruction": len("请提取该维度相关的陈述,输出 JSON。"),
-                "system_prompt": len(self.role or _SYSTEM),
-            }
-            try:
-                payload = self.generate_json(prompt)
-            except Exception:
-                continue
-            call_id = self.last_call_id
-            produced_fact_ids: list[int] = []
-            stored_chars = 0
-            # 兼容模型两种输出:新格式 claims / 旧格式 facts(小模型提示跟随不稳)
-            items = payload.get("claims") or payload.get("facts") or []
-            model_claims = len(items)
-            valid_field_claims = 0
-            quote_bound_claims = 0
-            duplicate_claims = 0
-            pending_claims = 0
-            field_chars = _claim_field_chars(items)
-            contributed_materials: set[int] = set()
-            contributed_units: set[int] = set()
-            for item in items:
-                content = str(item.get("content", "")).strip()
-                quote = str(item.get("short_quote") or item.get("quote") or "").strip()
-                try:
-                    unit_id = int(item.get("unit_id")) if item.get("unit_id") is not None else None
-                except (TypeError, ValueError):
-                    unit_id = None
-                if not content or not quote:
-                    continue
-                valid_field_claims += 1
-                fact_type = str(item.get("fact_type", "STATEMENT")).upper()
-                if fact_type not in _FACT_TYPES:
-                    fact_type = "STATEMENT"
-                if fact_exists(content):
-                    duplicate_claims += 1
-                    continue  # 跨维度去重,同一陈述只保留一条
-                evidence_list = bind_sources(quote, units_by_material, filenames, unit_id=unit_id)
-                claim = Claim(
-                    material_id=evidence_list[0].material_id if evidence_list else 0,
-                    content=content, quote=quote,
-                    source=filenames.get(evidence_list[0].material_id, "") if evidence_list else "",
-                    fact_type=fact_type, dimension=dimension,
-                )
-                if not evidence_list:
-                    pending_claims += 1
-                    save_claim(claim, status="pending", origin_call_id=call_id)  # 无来源支撑:保留为待核陈述
-                    continue
-                quote_bound_claims += 1
-                contributed_materials.update(int(ev.material_id) for ev in evidence_list)
-                contributed_units.update(int(ev.unit_id) for ev in evidence_list)
-                # 校验通过:提升为 Fact 并绑定 Evidence
-                fact = Fact(content=content, dimension=dimension, fact_type=fact_type)
-                fact.id = save_fact_with_evidence(fact, evidence_list, task_id, origin_call_id=call_id)
-                facts.append(fact)
-                facts_this_dim.append(fact)
-                produced_fact_ids.append(int(fact.id))
-                stored_chars += len(fact.content or "") + sum(len(ev.quote or "") for ev in evidence_list)
-                claim.fact_id = fact.id
-                save_claim(claim, status="promoted", origin_call_id=call_id)
-            update_call_products(call_id, produced_fact_ids=produced_fact_ids)
-            update_call_metrics(call_id, stored_chars=stored_chars)
-            update_call_funnel(
-                call_id,
-                dimension=dimension,
-                context_meta=context_meta,
-                prompt_parts=prompt_parts,
-                prompt_chars=len(prompt),
-                material_context_chars=len(material_text),
-                contributed_material_count=len(contributed_materials),
-                contributed_unit_count=len(contributed_units),
-                contributed_material_ids=sorted(contributed_materials),
-                contributed_unit_ids=sorted(contributed_units)[:50],
-                model_claims=model_claims,
-                valid_field_claims=valid_field_claims,
-                quote_bound_claims=quote_bound_claims,
-                duplicate_claims=duplicate_claims,
-                pending_claims=pending_claims,
-                promoted_facts=len(produced_fact_ids),
-                field_chars=field_chars,
-            )
-            # 维度结束:该维度 Fact 批量计算 embedding 并持久化
-            # (永久缓存:Writer 每章检索不再对全部事实重复计算,只算查询向量)
             if facts_this_dim:
                 try:
                     vectors = embed_texts([f.content for f in facts_this_dim])
                     for fact, vector in zip(facts_this_dim, vectors):
-                        vector_store.save_fact_vector(fact.id, vector)
+                        vector_store.save_fact_vector(fact.id, vector, task_id=task_id)
                 except Exception:
                     pass  # embedding 失败不影响事实本身,检索回退关键词
                 facts_this_dim = []
         return facts
 
-    def detect_conflicts(self, claims: list[dict]) -> list[Conflict]:
+    def _record_material_scan(self, task_id: str, dimension: str, material_scan: dict) -> None:
+        """材料扫描状态落独立表(可观测性,避免大 payload 反复写任务)。"""
+        try:
+            with connect() as conn:
+                for mid, info in material_scan.items():
+                    conn.execute(
+                        "INSERT INTO material_scan(task_id, material_id, dimension, scanned, units_selected, fact_count) "
+                        "VALUES(?, ?, ?, ?, ?, ?) "
+                        "ON CONFLICT(task_id, material_id, dimension) DO UPDATE SET "
+                        "scanned=excluded.scanned, units_selected=excluded.units_selected, fact_count=excluded.fact_count",
+                        (task_id, int(mid), dimension,
+                         int(info.get("scanned", 1)), int(info.get("units_selected", 0)), int(info.get("fact_count", 0))),
+                    )
+        except Exception:
+            pass
+
+    def detect_conflicts(self, claims: list[dict], task_id: str = "") -> list[Conflict]:
         """在 Claim 层检测多源矛盾:只标注,不裁定。
 
         规则预筛:仅当存在候选冲突组(共享数字/共享文本片段)才调用 LLM,
@@ -429,7 +483,7 @@ class EvidenceAgent(BaseAgent):
                 entries=entries,
                 claim_ids=[int(i) for i in item.get("claim_ids", []) if str(i).isdigit()],
             )
-            conflict.id = save_conflict(conflict, origin_call_id=call_id)
+            conflict.id = save_conflict(conflict, origin_call_id=call_id, task_id=task_id)
             conflicts.append(conflict)
         update_call_metrics(
             call_id,
@@ -456,8 +510,12 @@ class EvidenceAgent(BaseAgent):
 
     @staticmethod
     def _build_material_text(units_by_material: dict[int, list[Unit]], filenames: dict[int, str]) -> str:
+        from app.config import settings
+
         blocks: list[str] = []
         total = 0
+        budget = max(1000, int(settings.max_context_chars or 12000))
+        omitted = 0
         for material_id, units in units_by_material.items():
             for unit in units:
                 if unit.kind == "image" and not unit.content:
@@ -466,16 +524,28 @@ class EvidenceAgent(BaseAgent):
                 if unit.page is not None:
                     label += f" 第{unit.page}页"
                 label += "]"
-                blocks.append(f"{label}\n{unit.content}")
-                total += len(unit.content) + 20
-                if total > 12000:
-                    return "\n\n".join(blocks)
+                block = f"{label}\n{unit.content}"
+                if total + len(block) > budget:
+                    omitted += 1
+                    continue
+                blocks.append(block)
+                total += len(block)
+        if omitted:
+            blocks.append(
+                f"[上下文预算提示] 另有 {omitted} 个材料单元未进入本次 LLM prompt;"
+                "原始 Unit 已完整入库,后续可通过检索再次召回。"
+            )
         return "\n\n".join(blocks)
 
 
-def fact_exists(content: str) -> bool:
+def fact_exists(content: str, task_id: str = "") -> bool:
     with connect() as conn:
-        row = conn.execute("SELECT 1 FROM facts WHERE content=?", (content,)).fetchone()
+        if task_id:
+            row = conn.execute(
+                "SELECT 1 FROM facts WHERE task_id=? AND content=?", (task_id, content)
+            ).fetchone()
+        else:
+            row = conn.execute("SELECT 1 FROM facts WHERE content=?", (content,)).fetchone()
     return row is not None
 
 
@@ -501,30 +571,35 @@ def save_fact_with_evidence(fact: Fact, evidence_list: list[Evidence], task_id: 
     return fact.id
 
 
-def save_claim(claim: Claim, status: str, origin_call_id: str = "") -> int:
+def save_claim(claim: Claim, status: str, origin_call_id: str = "", task_id: str = "") -> int:
     with connect() as conn:
         cur = conn.execute(
-            "INSERT INTO claims(fact_id, material_id, content, quote, source, fact_type, dimension, status, origin_call_id) "
-            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO claims(fact_id, material_id, content, quote, source, fact_type, dimension, status, task_id, origin_call_id) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (claim.fact_id, claim.material_id, claim.content, claim.quote,
-             claim.source, claim.fact_type, claim.dimension, status, origin_call_id),
+             claim.source, claim.fact_type, claim.dimension, status, task_id, origin_call_id),
         )
         return cur.lastrowid
 
 
-def load_claims() -> list[dict]:
+def load_claims(task_id: str = "") -> list[dict]:
     """当前任务的全部陈述(含未提升的 pending)。"""
     with connect() as conn:
-        rows = conn.execute("SELECT * FROM claims ORDER BY id").fetchall()
+        if task_id:
+            rows = conn.execute(
+                "SELECT * FROM claims WHERE task_id=? ORDER BY id", (task_id,)
+            ).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM claims ORDER BY id").fetchall()
     return [dict(row) for row in rows]
 
 
-def save_conflict(conflict: Conflict, origin_call_id: str = "") -> int:
+def save_conflict(conflict: Conflict, origin_call_id: str = "", task_id: str = "") -> int:
     with connect() as conn:
         cur = conn.execute(
-            "INSERT INTO conflicts(fact_key, entries, claim_ids, status, origin_call_id) VALUES(?, ?, ?, ?, ?)",
+            "INSERT INTO conflicts(fact_key, entries, claim_ids, status, task_id, origin_call_id) VALUES(?, ?, ?, ?, ?, ?)",
             (conflict.fact_key, json.dumps(conflict.entries, ensure_ascii=False),
-             json.dumps(conflict.claim_ids), conflict.status, origin_call_id),
+             json.dumps(conflict.claim_ids), conflict.status, task_id, origin_call_id),
         )
         return cur.lastrowid
 

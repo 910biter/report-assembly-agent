@@ -28,8 +28,8 @@ def main() -> None:
 
     task_id = "full_eval_" + datetime.now().strftime("%m%d_%H%M%S")
     short_term.save_task(task_id, {
-        "theme": "大学生暑期社会实践活动总结报告（P0/P1全量评估）",
-        "user_requirements": "按当前P0/P1修复后的业务闭环、模板学习和UI进度能力生成，并用于评估质量与速度。",
+        "theme": "低空经济发展总结报告",
+        "user_requirements": "撰写一份中文总结报告(公文风格,套用已锁定模板):系统总结低空经济发展情况,包括一、工作背景与总体情况(政策环境、产业基础与总体进展);二、主要举措与阶段成效(基础设施建设、产业培育、应用场景拓展、试点示范);三、存在问题与挑战研判(空域管理、安全监管、技术瓶颈、商业化路径);四、下一步工作计划与建议。预期篇幅约10000字,数据与判断须来自给定材料。",
         "variant_id": locked.id if locked else None,
         "material_ids": material_ids,
         "stage": "created",

@@ -29,7 +29,10 @@ ROLE_SIGNATURE = "signature"
 
 _CJK_HEADING_1 = re.compile(r"^[一二三四五六七八九十]+、\S+")
 _CJK_HEADING_2 = re.compile(r"^（[一二三四五六七八九十]+）\S+")
-_NUM_HEADING = re.compile(r"^\d+[.、]\S+")
+_NUM_HEADING_1 = re.compile(r"^\d+\s+\S+")
+_NUM_HEADING_2 = re.compile(r"^\d+\.\d+\s+\S+")
+_NUM_HEADING_3 = re.compile(r"^\d+\.\d+\.\d+\s+\S+")
+_NUM_HEADING = re.compile(r"^\d+(?:\.\d+)*[.、]?\s*\S+")
 _PLACEHOLDER = re.compile(r"(\{\{[^}]+\}\}|《[^》]+》|【[^】]+】|________+|_{4,})")
 
 
@@ -123,6 +126,7 @@ def _document_structure(doc, role_paragraphs: dict) -> dict:
     return {
         "roles_detected": sorted(k for k, v in role_paragraphs.items() if v is not None),
         "heading_patterns": headings[:20],
+        "heading_tree": _heading_tree(headings),
         "template_instructions": _template_instructions(doc),
         "metadata_fields": _metadata_fields(doc),
         "signature_fields": _signature_fields(doc),
@@ -141,29 +145,33 @@ def _detect_role_paragraphs(paragraphs: list) -> dict:
     }
     if paragraphs:
         roles[ROLE_DOCUMENT_TITLE] = paragraphs[0]
-    for para in paragraphs:
+    for para in paragraphs[1:]:
         role = _paragraph_role(para)
         if role in {ROLE_HEADING_1, ROLE_HEADING_2, ROLE_HEADING_3} and roles[role] is None:
             roles[role] = para
     for para in paragraphs[1:]:
         text = para.text.strip()
-        if roles[ROLE_BODY] is None and len(text) >= 18 and _paragraph_role(para) == ROLE_BODY:
+        if (
+            roles[ROLE_BODY] is None
+            and _paragraph_role(para) == ROLE_BODY
+            and _looks_like_body_sample(para)
+        ):
             roles[ROLE_BODY] = para
         if roles[ROLE_SIGNATURE] is None and re.search(r"(单位|日期|年\s*月\s*日|盖章|署名)", text):
             roles[ROLE_SIGNATURE] = para
     if roles[ROLE_BODY] is None and len(paragraphs) > 1:
-        roles[ROLE_BODY] = paragraphs[1]
+        roles[ROLE_BODY] = next((p for p in paragraphs[1:] if _paragraph_role(p) == ROLE_BODY), paragraphs[1])
     return roles
 
 
 def _paragraph_role(para) -> str:
     text = para.text.strip()
     style = (para.style.name or "").lower() if para.style is not None else ""
-    if _CJK_HEADING_1.match(text) or style.startswith(("heading 1", "标题 1")):
+    if _CJK_HEADING_1.match(text) or _NUM_HEADING_1.match(text) or style.startswith(("heading 1", "标题 1")) or "一级标题" in style:
         return ROLE_HEADING_1
-    if _CJK_HEADING_2.match(text) or style.startswith(("heading 2", "标题 2")):
+    if _CJK_HEADING_2.match(text) or _NUM_HEADING_2.match(text) or style.startswith(("heading 2", "标题 2")) or "二级标题" in style:
         return ROLE_HEADING_2
-    if _NUM_HEADING.match(text) or style.startswith(("heading 3", "标题 3")):
+    if _NUM_HEADING_3.match(text) or style.startswith(("heading 3", "标题 3")) or "三级标题" in style:
         return ROLE_HEADING_3
     return ROLE_BODY
 
@@ -257,8 +265,12 @@ def _numbering(doc) -> dict:
             pattern = "cjk_level_1"
         elif _CJK_HEADING_2.match(text):
             pattern = "cjk_level_2"
-        elif _NUM_HEADING.match(text):
-            pattern = "arabic"
+        elif _NUM_HEADING_3.match(text):
+            pattern = "arabic_level_3"
+        elif _NUM_HEADING_2.match(text):
+            pattern = "arabic_level_2"
+        elif _NUM_HEADING_1.match(text):
+            pattern = "arabic_level_1"
         if pattern and pattern not in [p["format"] for p in patterns]:
             patterns.append({"format": pattern, "sample": _text_pattern(text)})
     return {"patterns": patterns}
@@ -365,15 +377,65 @@ def _heading_items(text: str) -> list[dict]:
     items = []
     for line in _logical_lines(text):
         role = ""
-        if _CJK_HEADING_1.match(line):
+        if _CJK_HEADING_1.match(line) or _NUM_HEADING_1.match(line):
             role = ROLE_HEADING_1
-        elif _CJK_HEADING_2.match(line):
+        elif _CJK_HEADING_2.match(line) or _NUM_HEADING_2.match(line):
             role = ROLE_HEADING_2
-        elif _NUM_HEADING.match(line):
+        elif _NUM_HEADING_3.match(line):
             role = ROLE_HEADING_3
         if role:
-            items.append({"role": role, "text_pattern": _text_pattern(line)})
+            items.append({"role": role, "level": _heading_level(role), "text_pattern": _text_pattern(line)})
     return items
+
+
+def _heading_level(role: str) -> int:
+    return {ROLE_HEADING_1: 1, ROLE_HEADING_2: 2, ROLE_HEADING_3: 3}.get(role, 9)
+
+
+def _heading_tree(headings: list[dict]) -> list[dict]:
+    """Build a heading hierarchy for UI and export policy inspection."""
+    roots: list[dict] = []
+    stack: list[dict] = []
+    for item in headings:
+        level = int(item.get("level") or _heading_level(item.get("role", "")))
+        node = {
+            "role": item.get("role", ""),
+            "level": level,
+            "text_pattern": item.get("text_pattern", ""),
+            "children": [],
+        }
+        while stack and int(stack[-1].get("level") or 9) >= level:
+            stack.pop()
+        if stack:
+            stack[-1].setdefault("children", []).append(node)
+        else:
+            roots.append(node)
+        stack.append(node)
+    return roots[:30]
+
+
+def _looks_like_body_sample(para) -> bool:
+    text = para.text.strip()
+    style = para.style.name if para.style is not None else ""
+    if not text or _heading_items(text):
+        return False
+    if _is_template_instruction(text):
+        return "正文样式" in style
+    if any(marker in text for marker in ("摘", "关键词", "中图法分类号")) and ("[" in text or "：" in text):
+        return False
+    if len(text) < 12 and "正文" not in style:
+        return False
+    return True
+
+
+def _is_template_instruction(text: str) -> bool:
+    stripped = text.strip()
+    return bool(
+        (stripped.startswith("[") and stripped.endswith("]"))
+        or ("填写" in stripped and ("[" in stripped or "。" in stripped))
+        or "示例" in stripped
+        or "说明" in stripped
+    )
 
 
 def _template_instructions(doc) -> list[dict]:

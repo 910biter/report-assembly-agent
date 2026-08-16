@@ -4,7 +4,7 @@
 <div class="page-header">
   <div>
     <h1>材料库</h1>
-    <p class="page-subtitle">管理可复用材料，查看解析状态和所属任务。</p>
+    <p class="page-subtitle">管理已入库材料，查看解析内容、所属任务和材料状态。</p>
   </div>
 </div>
 
@@ -149,9 +149,16 @@ function groupedUnits(units) {
   });
   return [...map.entries()].map(([label, items]) => ({label, items}));
 }
-function unitLabel(u) { return u.kind === "image" ? "图片" : u.kind === "table" ? "表格" : "段落"; }
+function unitLabel(u) { return u.kind === "image" ? "图片" : u.kind === "table" ? "表格" : u.kind === "heading" ? "标题" : "段落"; }
 function tabName(t) { return ({overview:"概览", content:"解析内容", meta:"元数据"})[t]; }
 function metricCard(label, value, hint) { return `<div class="metric-card"><span>${escapeHtml(label)}</span><b>${escapeHtml(value)}</b><em>${escapeHtml(hint)}</em></div>`; }
+function formatSize(value) {
+  let n = Number(value || 0);
+  const units = ["B","KB","MB","GB"];
+  let i = 0;
+  while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+  return `${i ? n.toFixed(1) : Math.round(n)}${units[i]}`;
+}
 function escapeHtml(text) {
   const div = document.createElement("div");
   div.textContent = text == null ? "" : String(text);

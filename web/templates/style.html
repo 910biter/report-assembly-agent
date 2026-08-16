@@ -63,8 +63,11 @@ function renderDocTemplate(v) {
   const page = doc.page || spec.page_cm || {};
   const title = roleSummary(roles.document_title);
   const h1 = roleSummary(roles.heading_1);
+  const h2 = roleSummary(roles.heading_2);
+  const h3 = roleSummary(roles.heading_3);
   const body = roleSummary(roles.body);
   const quality = schema.quality || {};
+  const headingTree = (((schema.structure || {}).heading_tree) || []);
   return `<div class="profile-box">
     <div class="card-title-row">
       <h3>${escapeHtml(v.name || "未命名模板")}</h3>
@@ -74,18 +77,35 @@ function renderDocTemplate(v) {
       ${metricCard("页面设置", page.width_cm ? `${page.width_cm}×${page.height_cm}cm` : page.width ? `${page.width}×${page.height}cm` : "未识别", "纸张大小")}
       ${metricCard("主标题", title || "未识别", "字体 / 字号 / 对齐 / 边框")}
       ${metricCard("一级标题", h1 || "未识别", "语义角色 HEADING_1")}
+      ${metricCard("二级标题", h2 || "未识别", "语义角色 HEADING_2")}
+      ${metricCard("三级标题", h3 || "未识别", "语义角色 HEADING_3")}
       ${metricCard("正文", body || `${spec.font_name || "默认"} ${spec.font_size_pt || ""}pt`, "字体 / 缩进 / 行距")}
       ${metricCard("页边距", marginSummary(margins), "单位 cm")}
       ${metricCard("完整度", profile.completeness != null ? `${Math.round(profile.completeness * 100)}%` : "待评估", "建议人工复核低置信字段")}
     </div>
     <div class="template-schema-summary">
       <div class="pf-row"><b>结构组件：</b>${componentSummary(schema.components || [])}</div>
+      <div class="pf-row"><b>标题层级：</b>${renderHeadingTree(headingTree)}</div>
       <div class="pf-row"><b>学习质量：</b>${quality.completeness != null ? Math.round(quality.completeness * 100) + "%" : "待评估"}${quality.unknown_items && quality.unknown_items.length ? `，待复核：${escapeHtml(quality.unknown_items.slice(0, 5).join("、"))}` : ""}</div>
       <div class="pf-row"><b>原始模板：</b>${escapeHtml(((schema.source || {}).filename) || "未记录")} ${schema.source ? `<a href="/api/style/variants/${v.id}/template-schema" target="_blank">查看 Schema JSON</a>` : ""}</div>
     </div>
     <p class="muted">适用报告类型：${escapeHtml(v.description || "通用报告")}</p>
     <div class="profile-actions">${actions(v)}</div>
   </div>`;
+}
+
+function renderHeadingTree(nodes) {
+  if (!nodes || !nodes.length) return "未识别";
+  const lines = [];
+  const walk = (items, depth) => {
+    items.slice(0, 10).forEach(node => {
+      const prefix = depth ? "　".repeat(depth) + "└ " : "";
+      lines.push(prefix + `${node.role || "heading"}：${node.text_pattern || ""}`);
+      if (node.children && node.children.length) walk(node.children, depth + 1);
+    });
+  };
+  walk(nodes, 0);
+  return `<pre class="schema-tree">${escapeHtml(lines.join("\\n"))}</pre>`;
 }
 
 function roleSummary(role) {

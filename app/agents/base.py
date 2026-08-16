@@ -7,6 +7,7 @@ import time
 
 from app.gateway import generation_stats, last_generation_meta, model_gateway, reset_generation_stats
 from app.llm_queue import submit_llm_call
+from app.llm_scheduler import invoke
 from app.token_monitor import generation_delta, log_llm_call, new_call_id
 
 
@@ -18,13 +19,13 @@ class BaseAgent:
 
     def generate(self, prompt: str, system: str | None = None) -> str:
         return self._with_retry(
-            lambda: submit_llm_call(lambda: model_gateway.generate(prompt, system=system or self.role)),
+            lambda: submit_llm_call(lambda: invoke("agent", model_gateway.generate, prompt, system=system or self.role)),
             len(prompt),
         )
 
     def generate_json(self, prompt: str, system: str | None = None) -> dict:
         return self._with_retry(
-            lambda: submit_llm_call(lambda: model_gateway.generate_json(prompt, system=system or self.role)),
+            lambda: submit_llm_call(lambda: invoke("agent", model_gateway.generate_json, prompt, system=system or self.role)),
             len(prompt),
         )
 

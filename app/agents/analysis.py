@@ -31,6 +31,27 @@ _SYSTEM = """你是情报分析员。基于事实清单、来源冲突与历史�
 6. 不要输出长篇推理过程;short_rationale 只写必要依据链"""
 
 
+_GLOBAL_SYSTEM = """你是情报报告综合研判师。基于各维度局部推断与关键事实,形成跨维度综合判断。
+严格输出 JSON,不要任何解释:
+{
+  "inferences": [
+    {"content": "跨维度综合判断", "based_fact_ids": [1, 2], "short_rationale": "60字以内依据说明",
+     "dimension": "全局综合", "analysis_type": "TREND/IMPACT/RISK/CAUSE/PREDICTION"}
+  ],
+  "external_notes": [{"content": "模型常识/外部知识补充,与材料无关"}],
+  "critical_fact_ids": [1],
+  "coverage_status": {"维度名": "SUFFICIENT/PARTIAL/WEAK/ABSENT/CONFLICTING/MATERIAL_INSUFFICIENT"},
+  "unresolved_conflicts": ["未解决的矛盾口径"],
+  "uncertainty": ["不确定性说明"]
+}
+要求:
+1. 综合判断必须基于局部推断与给定事实,based_fact_ids 必须真实存在
+2. 不得重复局部推断的原文,综合是跨维度的新判断
+3. coverage_status 逐维度给出证据覆盖状态,证据不足的维度必须如实标注
+4. critical_fact_ids 列出支撑核心结论的关键事实
+5. 材料存在冲突时,unresolved_conflicts 必须列出,不得假装一致"""
+
+
 def _int_ids(values) -> list[int]:
     result = []
     for value in values or []:
@@ -45,20 +66,59 @@ class AnalysisAgent(BaseAgent):
     name = "analysis"
     role = _SYSTEM
 
-    def analyze(self, facts: list[dict], context_block: str = "") -> tuple[list[Inference], list[Inference]]:
-        """输入事实清单 + Context Manager 生成的上下文块(冲突/时间线/历史知识)。
-
-        context_block 为空时回退为纯事实清单(兼容直接调用)。
-        """
+    def analyze_local(self, dimension: str, facts: list[dict],
+                      context_block: str = "") -> list[Inference]:
+        """Map:单维局部分析(按维度分组的 facts),产出该维推断。"""
         if not facts:
-            return [], []
+            return []
         valid_ids = {f["id"] for f in facts}
         if not context_block:
             fact_lines = [f"{f['id']}. [{f['sources']}] {f['content']}" for f in facts]
             context_block = "事实清单(编号 + 来源):\n" + "\n".join(fact_lines)
-        prompt = f"{context_block}\n\n请基于以上事实与冲突做综合研判,输出 JSON。"
+        prompt = f"分析维度:{dimension}\n\n{context_block}\n\n请基于该维度事实做局部研判,输出 JSON。"
         payload = self.generate_json(prompt)
         call_id = self.last_call_id
+        inferences, _external = self._parse_payload(payload, valid_ids, call_id)
+        update_call_products(call_id, produced_inference_ids=[i.id for i in inferences if i.id])
+        update_call_metrics(call_id, stored_chars=sum(len(i.content or "") + len(i.reasoning_chain or "") for i in inferences))
+        return inferences
+
+    def analyze_global(self, local_inferences: list[Inference], facts: list[dict],
+                       conflicts: str = "") -> tuple[list[Inference], list[Inference], dict]:
+        """Reduce:跨维度综合分析。
+
+        输入各维局部推断 + 关键事实;输出全局推断 + 综合元数据
+        (critical_fact_ids / coverage_status / unresolved_conflicts / uncertainty)。
+        """
+        if not local_inferences:
+            return [], [], {}
+        valid_ids = {f["id"] for f in facts}
+        lines = ["各维度局部推断:"]
+        lines.extend(
+            f"- [{i.dimension or '未分类'}] {i.content} (based_fact_ids={i.based_fact_ids})"
+            for i in local_inferences
+        )
+        if conflicts:
+            lines.append(f"来源冲突:{conflicts}")
+        prompt = "\n".join(lines) + "\n\n请基于局部推断与关键事实做跨维度综合研判,输出 JSON。"
+        payload = self.generate_json(prompt, system=_GLOBAL_SYSTEM)
+        call_id = self.last_call_id
+        inferences, external = self._parse_payload(payload, valid_ids, call_id)
+        meta = {
+            "critical_fact_ids": [int(i) for i in (payload.get("critical_fact_ids") or []) if str(i).isdigit() and int(i) in valid_ids],
+            "coverage_status": {
+                str(k): str(v).upper() for k, v in (payload.get("coverage_status") or {}).items()
+                if str(v).upper() in {"SUFFICIENT", "PARTIAL", "WEAK", "ABSENT", "CONFLICTING", "MATERIAL_INSUFFICIENT"}
+            },
+            "unresolved_conflicts": [str(c)[:200] for c in (payload.get("unresolved_conflicts") or []) if str(c).strip()],
+            "uncertainty": [str(c)[:200] for c in (payload.get("uncertainty") or []) if str(c).strip()],
+        }
+        update_call_products(call_id, produced_inference_ids=[i.id for i in inferences + external if i.id])
+        update_call_metrics(call_id, stored_chars=sum(len(i.content or "") + len(i.reasoning_chain or "") for i in inferences + external))
+        return inferences, external, meta
+
+    def _parse_payload(self, payload: dict, valid_ids: set[int], call_id: str) -> tuple[list[Inference], list[Inference]]:
+        """解析推断与外部知识并保存(局部/全局共用)。"""
         inferences: list[Inference] = []
         for item in payload.get("inferences", []):
             # 兼容模型两种输出:对象 / 纯文本字符串(小模型提示跟随不稳)
@@ -94,8 +154,6 @@ class AnalysisAgent(BaseAgent):
             note = Inference(content=content, source_level="EXTERNAL_INFORMATION")
             note.id = save_inference(note, origin_call_id=call_id)
             external.append(note)
-        update_call_products(call_id, produced_inference_ids=[i.id for i in inferences + external if i.id])
-        update_call_metrics(call_id, stored_chars=sum(len(i.content or "") + len(i.reasoning_chain or "") for i in inferences + external))
         return inferences, external
 
 

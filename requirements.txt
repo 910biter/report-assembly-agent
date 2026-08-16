@@ -10,3 +10,4 @@ jinja2
 numpy
 python-multipart
 qdrant-client
+docling

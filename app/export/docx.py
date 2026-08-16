@@ -44,9 +44,7 @@ def export_report(report_id: int) -> Path:
             "SELECT * FROM report_sentences WHERE report_id=? AND selected=1 ORDER BY position",
             (report_id,),
         ).fetchall()
-    variant = get_variant(report["style_profile_id"]) if report["style_profile_id"] else None
-    if variant is None:
-        variant = get_locked_variant()
+    variant = _select_export_variant(report["style_profile_id"])
     format_spec = _dominant_format(variant)
     schema = format_spec.get("template_schema") if isinstance(format_spec.get("template_schema"), dict) else {}
 
@@ -71,6 +69,11 @@ def export_report(report_id: int) -> Path:
             _flush_paragraph(doc, paragraph_buffer)
             paragraph_buffer = []
         current_paragraph = sentence["paragraph"]
+        if sentence["source_level"] == "SUBHEADING":
+            _flush_paragraph(doc, paragraph_buffer)
+            paragraph_buffer = []
+            _add_role_paragraph(doc, sentence["user_edit"] or sentence["content"], "heading_2")
+            continue
         paragraph_buffer.append(sentence["user_edit"] or sentence["content"])
     _flush_paragraph(doc, paragraph_buffer)
 
@@ -86,6 +89,35 @@ def _dominant_format(variant) -> dict:
         return {}
     dominant = variant.format_spec.get("dominant")
     return dominant if isinstance(dominant, dict) else {}
+
+
+def _select_export_variant(style_profile_id: int | None):
+    """Use the active locked template when older reports point at stale variants."""
+    variant = get_variant(style_profile_id) if style_profile_id else None
+    locked = get_locked_variant()
+    if (
+        _variant_has_template_roles(locked)
+        and variant is not None
+        and getattr(variant, "status", "") != "locked"
+        and getattr(variant, "library_id", None) == getattr(locked, "library_id", None)
+    ):
+        return locked
+    if _variant_has_template_roles(variant):
+        return variant
+    if _variant_has_template_roles(locked):
+        return locked
+    return variant or locked
+
+
+def _variant_has_template_roles(variant) -> bool:
+    if variant is None or not isinstance(variant.format_spec, dict):
+        return False
+    dominant = variant.format_spec.get("dominant")
+    if not isinstance(dominant, dict):
+        return False
+    schema = dominant.get("template_schema")
+    roles = schema.get("style", {}).get("roles", {}) if isinstance(schema, dict) else {}
+    return isinstance(roles, dict) and bool(roles.get("body") and roles.get("document_title"))
 
 
 def _open_render_base(format_spec: dict, schema: dict):
@@ -124,10 +156,10 @@ def _install_semantic_styles(doc, schema: dict, format_spec: dict) -> None:
     roles = _schema_roles(schema)
     fallback = _legacy_roles(format_spec)
     for role, style_name in ROLE_STYLE_NAMES.items():
-        role_style = roles.get(role) or fallback.get(role) or {}
+        role_style = _enrich_role_style(doc, roles.get(role) or fallback.get(role) or {})
         _ensure_paragraph_style(doc, style_name, role_style)
     if not roles and not fallback:
-        _ensure_paragraph_style(doc, ROLE_STYLE_NAMES["body"], {})
+        _ensure_paragraph_style(doc, ROLE_STYLE_NAMES["body"], _enrich_role_style(doc, {}))
 
 
 def _ensure_paragraph_style(doc, style_name: str, role_style: dict):
@@ -135,6 +167,10 @@ def _ensure_paragraph_style(doc, style_name: str, role_style: dict):
         style = doc.styles[style_name]
     except KeyError:
         style = doc.styles.add_style(style_name, WD_STYLE_TYPE.PARAGRAPH)
+    source_style = str(role_style.get("source_style") or "") if isinstance(role_style, dict) else ""
+    try:
+        style.base_style = doc.styles[source_style] if source_style else doc.styles["Normal"]
+    except Exception:
         try:
             style.base_style = doc.styles["Normal"]
         except Exception:
@@ -160,6 +196,7 @@ def _add_role_paragraph(doc, text: str, role: str):
     _set_paragraph_borders(paragraph, _role_paragraph(role_style).get("borders"))
     run = paragraph.add_run(text)
     _apply_font(run.font, _role_run(role_style))
+    _set_run_east_asia(run, (_role_run(role_style).get("font_east_asia") or _role_run(role_style).get("font_name")))
     return paragraph
 
 
@@ -326,6 +363,22 @@ def _set_east_asia(style, font_name: str | None) -> None:
         pass
 
 
+def _set_run_east_asia(run, font_name: str | None) -> None:
+    if not font_name or font_name == "unknown":
+        return
+    try:
+        rpr = run._r.get_or_add_rPr()
+        rfonts = rpr.rFonts
+        if rfonts is None:
+            rfonts = OxmlElement("w:rFonts")
+            rpr.append(rfonts)
+        rfonts.set(qn("w:eastAsia"), font_name)
+        rfonts.set(qn("w:ascii"), font_name)
+        rfonts.set(qn("w:hAnsi"), font_name)
+    except Exception:
+        pass
+
+
 def _set_style_borders(style, borders) -> None:
     try:
         ppr = style.element.get_or_add_pPr()
@@ -370,8 +423,11 @@ def _replace_pbdr(ppr, borders) -> None:
 
 def _apply_format(doc, spec: dict, schema: dict) -> None:
     """Apply page/header/footer and expose role styles for paragraph creation."""
-    roles = _schema_roles(schema) or _legacy_roles(spec)
-    doc._ira_role_styles = roles
+    raw_roles = _schema_roles(schema) or _legacy_roles(spec)
+    doc._ira_role_styles = {
+        role: _enrich_role_style(doc, style)
+        for role, style in raw_roles.items()
+    }
     try:
         page = schema.get("document", {}).get("page", {}) if schema else {}
         margins = schema.get("document", {}).get("margins", {}) if schema else {}
@@ -405,3 +461,76 @@ def _write_conformance(out: Path, schema: dict) -> None:
     result = check_docx_conformance(out, schema)
     sidecar = out.with_suffix(".conformance.json")
     sidecar.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _enrich_role_style(doc, role_style: dict) -> dict:
+    """Fill unknown run fonts from the source style and DOCX defaults."""
+    role_style = json.loads(json.dumps(role_style or {}, ensure_ascii=False))
+    run = role_style.setdefault("run", {})
+    source_style = str(role_style.get("source_style") or "")
+    style_defaults = _style_run_defaults(doc, source_style)
+    doc_defaults = _doc_default_run(doc)
+    for key in ("font_east_asia", "font_ascii", "font_hansi", "font_cs", "font_size_pt", "bold", "italic", "underline"):
+        if _is_missing(run.get(key)):
+            if not _is_missing(style_defaults.get(key)):
+                run[key] = style_defaults[key]
+            elif not _is_missing(doc_defaults.get(key)):
+                run[key] = doc_defaults[key]
+    if _is_missing(run.get("font_name")) and not _is_missing(run.get("font_east_asia")):
+        run["font_name"] = run["font_east_asia"]
+    if _is_missing(run.get("font_color")):
+        run["font_color"] = "000000"
+    return role_style
+
+
+def _style_run_defaults(doc, source_style: str) -> dict:
+    if not source_style:
+        return {}
+    try:
+        style = doc.styles[source_style]
+    except Exception:
+        return {}
+    result = {
+        "font_size_pt": style.font.size.pt if style.font.size else None,
+        "bold": style.font.bold,
+        "italic": style.font.italic,
+        "underline": style.font.underline,
+    }
+    try:
+        rpr = style.element.rPr
+        rfonts = rpr.rFonts if rpr is not None else None
+        if rfonts is not None:
+            result.update({
+                "font_east_asia": rfonts.get(qn("w:eastAsia")),
+                "font_ascii": rfonts.get(qn("w:ascii")),
+                "font_hansi": rfonts.get(qn("w:hAnsi")),
+                "font_cs": rfonts.get(qn("w:cs")),
+            })
+    except Exception:
+        pass
+    if _is_missing(result.get("font_ascii")) and style.font.name:
+        result["font_ascii"] = style.font.name
+    return result
+
+
+def _doc_default_run(doc) -> dict:
+    result: dict = {}
+    try:
+        defaults = doc.styles.element.find(qn("w:docDefaults"))
+        rpr_default = defaults.find(qn("w:rPrDefault")) if defaults is not None else None
+        rpr = rpr_default.find(qn("w:rPr")) if rpr_default is not None else None
+        rfonts = rpr.find(qn("w:rFonts")) if rpr is not None else None
+        if rfonts is not None:
+            result.update({
+                "font_east_asia": rfonts.get(qn("w:eastAsia")),
+                "font_ascii": rfonts.get(qn("w:ascii")),
+                "font_hansi": rfonts.get(qn("w:hAnsi")),
+                "font_cs": rfonts.get(qn("w:cs")),
+            })
+    except Exception:
+        pass
+    return result
+
+
+def _is_missing(value) -> bool:
+    return value in (None, "", "unknown")

@@ -211,6 +211,29 @@ def _json_dumps(value, limit: int | None = None) -> str:
     return text[:limit] + ("…" if limit and len(text) > limit else "")
 
 
+def _text_length(text: str) -> int:
+    """Approximate Chinese report length in the same unit used by scale stats."""
+    return len(re.findall(r"[\u4e00-\u9fff]", text or "")) + len(re.findall(r"[A-Za-z0-9]+", text or ""))
+
+
+def _ids_used_in_chapter(report_id: int, chapter_title: str) -> dict[str, set[int]]:
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT source_refs FROM report_sentences WHERE report_id=? AND section=?",
+            (report_id, chapter_title),
+        ).fetchall()
+    fact_ids: set[int] = set()
+    inference_ids: set[int] = set()
+    for row in rows:
+        try:
+            refs = json.loads(row["source_refs"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        fact_ids.update(_int_ids(refs.get("fact_ids")))
+        inference_ids.update(_int_ids(refs.get("inference_ids")))
+    return {"fact_ids": fact_ids, "inference_ids": inference_ids}
+
+
 def _evidence_aware_budget(chapter_plan: dict, fact_count: int, inference_count: int,
                            authoritative: bool = False) -> dict:
     """Return Writer execution budget.
@@ -344,6 +367,121 @@ def _normalize_report_sentence(text: str) -> str:
     return value
 
 
+_SUBHEADING_PREFIX_RE = re.compile(
+    r"^\s*(?:\d+(?:\.\d+)+|[（(][一二三四五六七八九十]+[）)]|[一二三四五六七八九十]+[、.])\s*"
+)
+
+
+def _planned_subsection_titles(narrative_plan: dict) -> list[str]:
+    titles = []
+    for item in (narrative_plan or {}).get("subsections") or []:
+        title = str(item.get("title") or "").strip()
+        if title:
+            titles.append(title)
+    return titles
+
+
+def _subsection_execution_hint(titles: list[str]) -> str:
+    if not titles:
+        return (
+            "小标题策略:当前 Narrative Plan 未规划小节标题。Writer 不得自行创造 2.1/2.2 等编号小标题;"
+            "如需分层,用自然段主题句承接。"
+        )
+    lines = "\n".join(f"- {title}" for title in titles)
+    return (
+        "小节结构(规划约束):\n"
+        f"{lines}\n"
+        "如使用小标题,只能使用以上标题,并单独输出为 source_level=\"SUBHEADING\" 的 sentence;"
+        "小标题后正文另起 sentence,不得把“小标题。正文”粘在同一 text 中。"
+    )
+
+
+def _split_embedded_subheading(text: str, allowed_titles: list[str] | None = None) -> list[dict]:
+    """Split model output like '2.3 小标题。正文...' into structure + prose.
+
+    This is deterministic structure repair. It does not invent headings or
+    rewrite facts; it only prevents headings from being rendered as body text.
+    """
+    value = str(text or "").strip()
+    split = _extract_embedded_subheading(value)
+    if not split:
+        return [{"text": value}]
+    heading, body = split
+    clean_heading = _clean_generated_subheading(heading)
+    if not _heading_allowed(clean_heading, allowed_titles or []):
+        return [{"text": body}] if body else []
+    parts = [{"text": clean_heading, "source_level": "SUBHEADING"}]
+    if body:
+        parts.append({"text": body})
+    return parts
+
+
+def _planned_heading_part(text: str, allowed_titles: list[str]) -> list[dict]:
+    clean_heading = _clean_generated_subheading(text)
+    if not _heading_allowed(clean_heading, allowed_titles):
+        return []
+    return [{"text": clean_heading, "source_level": "SUBHEADING"}]
+
+
+def _clean_generated_subheading(text: str) -> str:
+    value = str(text or "").strip()
+    value = _SUBHEADING_PREFIX_RE.sub("", value)
+    value = re.split(r"[。！？!?；;\n]", value, maxsplit=1)[0].strip()
+    return value
+
+
+def _extract_embedded_subheading(text: str) -> tuple[str, str] | None:
+    if not _SUBHEADING_PREFIX_RE.match(text):
+        return None
+    for mark in ("。", "；", "！", "？"):
+        index = text.find(mark)
+        if 0 < index <= 80 and index < len(text) - 1:
+            return text[:index], text[index + 1:].strip()
+    return None
+
+
+def _heading_allowed(heading: str, allowed_titles: list[str]) -> bool:
+    if not allowed_titles:
+        return False
+    key = _structure_key(heading)
+    allowed = {_structure_key(title) for title in allowed_titles}
+    return key in allowed
+
+
+def _is_duplicate_structure_sentence(text: str, chapter_title: str, report_title: str) -> bool:
+    """Drop title/chapter echoes that the model sometimes emits as body prose."""
+    value = _structure_key(text)
+    if not value:
+        return False
+    candidates = {_structure_key(chapter_title), _structure_key(report_title)}
+    chapter_no = re.match(r"^([一二三四五六七八九十]+)[、.]\s*(.+)$", str(chapter_title or "").strip())
+    if chapter_no:
+        candidates.add(_structure_key(chapter_no.group(2)))
+        candidates.add(_structure_key(f"{_chinese_number_to_int(chapter_no.group(1))}. {chapter_no.group(2)}"))
+    return value in {item for item in candidates if item}
+
+
+def _structure_key(text: str) -> str:
+    value = str(text or "").strip()
+    value = re.sub(r"^[第]?[一二三四五六七八九十]+[章节部分、.]\s*", "", value)
+    value = re.sub(r"^\d+(?:\.\d+)*[、.)]?\s*", "", value)
+    value = re.sub(r"[。．.\s]+$", "", value)
+    return re.sub(r"\s+", "", value)
+
+
+def _chinese_number_to_int(text: str) -> int:
+    mapping = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+    value = str(text or "")
+    if value == "十":
+        return 10
+    if value.startswith("十"):
+        return 10 + mapping.get(value[-1], 0)
+    if "十" in value:
+        left, _, right = value.partition("十")
+        return mapping.get(left, 1) * 10 + mapping.get(right, 0)
+    return mapping.get(value, 0)
+
+
 def _writer_policy_only(policy: dict) -> dict:
     if not policy:
         return {}
@@ -463,6 +601,7 @@ class WriterAgent(BaseAgent):
                 if progress_callback:
                     progress_callback(chapter_index, chapter_count, chapter_title, "resumed", 0)
                 continue
+            self._discard_incomplete_chapter(report.id, chapter_title)
             if progress_callback:
                 progress_callback(chapter_index - 1, chapter_count, chapter_title, "generating", 0)
             # 1. 信息需求 → 检索 query(标题+核心问题+核心判断+所需事实,而非仅标题)
@@ -535,6 +674,8 @@ class WriterAgent(BaseAgent):
                         level = "MATERIAL_FACT"
                     elif inf_ids:
                         level = inf_levels.get(inf_ids[0], "MATERIAL_INFERENCE")
+                    elif sent.get("source_level") == "SUBHEADING":
+                        level = "SUBHEADING"
                     else:
                         level = "TRANSITION"  # 过渡句:无引用,不参与来源分级
                     source_refs = {
@@ -600,6 +741,23 @@ class WriterAgent(BaseAgent):
                             final_used_fact_ids=sorted(written_fact_ids),
                             final_used_inference_ids=sorted(written_inference_ids),
                         )
+            expansion = self._expand_underfilled_chapter(
+                report.id, chapter_title, chapter_index,
+                chapter_plan, narrative_plan,
+                chapter_facts, chapter_inferences,
+                valid_fact_ids, valid_inf_ids, inf_levels,
+                plan, report_memory,
+            )
+            if expansion:
+                written_fact_ids.update(expansion["fact_ids"])
+                written_inference_ids.update(expansion["inference_ids"])
+                chapter_text = self._chapter_texts(report.id, chapter_title)
+                update_call_products(
+                    self.last_call_id,
+                    produced_chapter_ids=[chapter_index],
+                    final_used_fact_ids=sorted(written_fact_ids),
+                    final_used_inference_ids=sorted(written_inference_ids),
+                )
             self._record_narrative_qa(chapter_title, qa_result)
             # 4. 更新 Report Memory
             report_memory["used_fact_ids"].update(written_fact_ids)
@@ -624,6 +782,160 @@ class WriterAgent(BaseAgent):
                     "status": "done",
                 })
         return report
+
+    def _expand_underfilled_chapter(self, report_id: int, chapter_title: str, chapter_index: int,
+                                    chapter_plan: dict, narrative_plan: dict,
+                                    chapter_facts: list[dict], chapter_inferences: list[dict],
+                                    valid_fact_ids: set[int], valid_inf_ids: set[int],
+                                    inf_levels: dict[int, str], plan: dict,
+                                    report_memory: dict) -> dict | None:
+        """Append evidence-backed prose when an authoritative budget was not met.
+
+        This is not a blind length filler. It only runs when the chapter has
+        enough support items and asks the Writer to expand unresolved narrative
+        topics with unused facts.
+        """
+        if (plan.get("budget") or {}).get("budget_authority") != "report_scale_plan":
+            return None
+        target = int(chapter_plan.get("target_words") or 0)
+        if target <= 0:
+            return None
+        support_count = len(chapter_facts) + len(chapter_inferences)
+        if support_count <= WRITER_CONTEXT_POLICY["limited_support_threshold"]:
+            return None
+        max_rounds = 3
+        written_fact_ids: set[int] = set()
+        written_inference_ids: set[int] = set()
+        for _round in range(max_rounds):
+            paragraphs = self._paragraph_texts(report_id, chapter_title)
+            current = _text_length("".join(paragraphs))
+            if current >= int(target * 0.78):
+                break
+            gap = target - current
+            if gap < 280:
+                break
+            used_ids = _ids_used_in_chapter(report_id, chapter_title)
+            unused_facts = [f for f in chapter_facts if int(f.get("id", -1)) not in used_ids["fact_ids"]]
+            support_facts = (unused_facts or chapter_facts)[:min(len(chapter_facts), 18)]
+            support_inferences = [
+                i for i in chapter_inferences
+                if int(i.get("id", -1)) not in used_ids["inference_ids"]
+            ] or chapter_inferences
+            support_inferences = support_inferences[:6]
+            existing_text = "\n".join(paragraphs)
+            narrative_json = json.dumps(narrative_plan, ensure_ascii=False)
+            prompt = (
+                f"报告标题:{plan.get('title','')}\n"
+                f"章节:{chapter_title}\n"
+                f"本章目标约 {target} 字,当前约 {current} 字,仍需在证据支撑下展开约 {min(gap, 1200)} 字。\n"
+                "注意:这是补充展开,不是重写全章;不得重复已有段落,不得为了字数空泛扩写。\n"
+                "优先展开 Narrative Plan 中 detail_level=expand 且正文尚未充分说明的话题; "
+                "围绕机制、流程、比较维度、限制和研究意义作解释性展开。\n\n"
+                f"已有正文:\n{_fit_block(existing_text, 2600)}\n\n"
+                f"Narrative Plan:\n{_fit_block(narrative_json, 1800)}\n\n"
+                "可继续使用的 Facts:\n"
+                + "\n".join(f"{f['id']}. {f.get('content','')}" for f in support_facts)
+                + "\n\n可继续使用的 Inferences:\n"
+                + "\n".join(f"{i['id']}. {i.get('content','')}" for i in support_inferences)
+                + "\n\n请输出 JSON: {\"sentences\":[{\"paragraph\":1,\"text\":\"补充句子\",\"fact_ids\":[1],\"inference_ids\":[]}]}。"
+                "每句必须绑定真实 fact_ids 或 inference_ids;正文不要出现来源编号。"
+            )
+            try:
+                payload = self.generate_json(prompt)
+            except Exception:
+                break
+            paragraphs_payload = _coerce_paragraphs(payload)
+            new_sentences: list[dict] = []
+            for paragraph in paragraphs_payload:
+                for sentence in paragraph.get("sentences", []):
+                    if not isinstance(sentence, dict):
+                        continue
+                    text = str(sentence.get("text", "")).strip()
+                    fact_ids = [i for i in _int_ids(sentence.get("fact_ids")) if i in valid_fact_ids]
+                    inf_ids = [i for i in _int_ids(sentence.get("inference_ids")) if i in valid_inf_ids]
+                    if not text or (not fact_ids and not inf_ids):
+                        continue
+                    new_sentences.append({"text": text, "fact_ids": fact_ids, "inference_ids": inf_ids})
+            if not new_sentences:
+                break
+            with connect() as conn:
+                max_paragraph = conn.execute(
+                    "SELECT COALESCE(MAX(paragraph), 0) p FROM report_sentences WHERE report_id=? AND section=?",
+                    (report_id, chapter_title),
+                ).fetchone()["p"]
+                existing_count = conn.execute(
+                    "SELECT COUNT(*) c FROM report_sentences WHERE report_id=? AND section=?",
+                    (report_id, chapter_title),
+                ).fetchone()["c"]
+                paragraph_no = int(max_paragraph) + 1
+                for offset, sent in enumerate(new_sentences, start=1):
+                    position = _chapter_position(chapter_index, int(existing_count) + offset)
+                    level = "MATERIAL_FACT" if sent["fact_ids"] else (
+                        inf_levels.get(sent["inference_ids"][0], "MATERIAL_INFERENCE")
+                        if sent["inference_ids"] else "TRANSITION"
+                    )
+                    cur = conn.execute(
+                        "INSERT INTO report_sentences(report_id, section, paragraph, position, "
+                        "content, source_level, source_refs, origin_call_id) VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            report_id, chapter_title, paragraph_no, position, sent["text"], level,
+                            json.dumps({"fact_ids": sent["fact_ids"], "inference_ids": sent["inference_ids"]}, ensure_ascii=False),
+                            self.last_call_id,
+                        ),
+                    )
+                    sentence_id = cur.lastrowid
+                    for fid in sent["fact_ids"]:
+                        conn.execute(
+                            "INSERT INTO report_sentence_fact(sentence_id, fact_id) VALUES(?, ?) "
+                            "ON CONFLICT(sentence_id, fact_id) DO NOTHING",
+                            (sentence_id, fid),
+                        )
+                    for iid in sent["inference_ids"]:
+                        conn.execute(
+                            "INSERT INTO report_sentence_inference(sentence_id, inference_id) VALUES(?, ?) "
+                            "ON CONFLICT(sentence_id, inference_id) DO NOTHING",
+                            (sentence_id, iid),
+                        )
+                    written_fact_ids.update(sent["fact_ids"])
+                    written_inference_ids.update(sent["inference_ids"])
+            update_call_funnel(
+                self.last_call_id,
+                scale_expansion=True,
+                expansion_sentence_count=len(new_sentences),
+                expansion_gap_before=gap,
+            )
+            update_call_metrics(
+                self.last_call_id,
+                stored_chars=sum(len(s["text"]) for s in new_sentences),
+                final_chars=sum(len(s["text"]) for s in new_sentences),
+            )
+        if not written_fact_ids and not written_inference_ids:
+            return None
+        return {"fact_ids": written_fact_ids, "inference_ids": written_inference_ids}
+
+    @staticmethod
+    def _discard_incomplete_chapter(report_id: int, chapter_title: str) -> None:
+        with connect() as conn:
+            rows = conn.execute(
+                "SELECT id FROM report_sentences WHERE report_id=? AND section=?",
+                (report_id, chapter_title),
+            ).fetchall()
+            sentence_ids = [int(r["id"]) for r in rows]
+            if not sentence_ids:
+                return
+            placeholders = ",".join("?" * len(sentence_ids))
+            conn.execute(
+                f"DELETE FROM report_sentence_fact WHERE sentence_id IN ({placeholders})",
+                sentence_ids,
+            )
+            conn.execute(
+                f"DELETE FROM report_sentence_inference WHERE sentence_id IN ({placeholders})",
+                sentence_ids,
+            )
+            conn.execute(
+                f"DELETE FROM report_sentences WHERE id IN ({placeholders})",
+                sentence_ids,
+            )
 
     def _open_or_create_report(self, plan: dict, profile_id: int | None,
                                existing_report_id: int | None = None) -> Report:
@@ -663,11 +975,24 @@ class WriterAgent(BaseAgent):
                 "WHERE report_id=? ORDER BY position",
                 (report_id,),
             ).fetchall()
+            artifact_rows = conn.execute(
+                "SELECT payload FROM task_artifacts WHERE task_id=? AND stage LIKE 'chapter_draft:%' AND status='done'",
+                (getattr(self, "_task_id", "") or "",),
+            ).fetchall()
+        completed_markers: set[str] = set()
+        for artifact in artifact_rows:
+            try:
+                payload = json.loads(artifact["payload"] or "{}")
+            except (TypeError, ValueError):
+                continue
+            if payload.get("status") == "done" and payload.get("chapter"):
+                completed_markers.add(str(payload.get("chapter")))
         completed_sections: set[str] = set()
         section_text: dict[str, list[str]] = {}
         position = 0
         for row in rows:
-            completed_sections.add(row["section"])
+            if row["section"] in completed_markers:
+                completed_sections.add(row["section"])
             section_text.setdefault(row["section"], []).append(row["content"])
             position = max(position, int(row["position"]))
             try:
@@ -739,9 +1064,9 @@ class WriterAgent(BaseAgent):
             soft_max = int(budget.get("soft_max_words") or target_words * 1.15)
             hard_max = int(budget.get("hard_max_words") or target_words * 1.3)
             budget_block = (
-                f"本章规模预算参考:目标约 {target_words} 字,软上限 {soft_max},绝对上限 {hard_max}。"
-                "规模仅供篇幅参考,完成与否由内容质量决定:按 Narrative Plan 的完成条件写充分即可,"
-                "不得为凑字数扩写、重复已有观点或堆砌事实;证据不足时允许低于预算完成,宁短勿虚构。\n"
+                f"本章规模预算:目标约 {target_words} 字,软上限 {soft_max},绝对上限 {hard_max}。"
+                "在证据支撑充分时,应把目标规模作为执行目标,围绕 Narrative Plan 的重点话题充分解释、比较和展开;"
+                "不得把预算静默缩短为摘要。若证据不足,必须宁短勿虚构,并通过事实边界表达原因。\n"
             )
             if budget.get("support_level") == "limited":
                 budget_block += "本章证据偏少:尽量围绕已有事实展开背景、流程、边界和影响,但不得重复扩写或制造新事实。\n"
@@ -759,6 +1084,8 @@ class WriterAgent(BaseAgent):
         memory_block = self._memory_block(report_memory)
         execution_hint = _execution_format_hint(chapter_title, chapter_plan, chapter_facts)
         organization_hint = _paragraph_organization_hint(chapter_title, chapter_facts)
+        planned_subsections = _planned_subsection_titles(narrative_plan)
+        subsection_hint = _subsection_execution_hint(planned_subsections)
         prompt = (
             f"报告标题:{plan.get('title', '')}\n"
             f"报告核心判断:{plan.get('core_judgment', '')}\n"
@@ -773,13 +1100,14 @@ class WriterAgent(BaseAgent):
             + (f"{policy_block}\n\n" if policy_block else "")
             + (execution_hint + "\n" if execution_hint else "")
             + (organization_hint + "\n" if organization_hint else "")
+            + (subsection_hint + "\n" if subsection_hint else "")
             + (budget_block + "\n" if budget_block else "")
             + "本章相关事实清单:\n" + "\n".join(fact_lines) + "\n\n"
             + "本章相关推断清单:\n" + "\n".join(inference_lines) + "\n\n"
             + f"{chapter_style}\n"
-            + "请严格按 Narrative Plan 和 ChapterPlan 撰写本章内容。先根据 topics/logic_order 组织段落,再写成正式、连贯、可阅读的报告正文;"
+            + "请严格按 Narrative Plan 和 ChapterPlan 撰写本章内容。先根据 subsections/topics/logic_order 组织段落,再写成正式、连贯、可阅读的报告正文;"
               "不要把 fact 清单改写成一串短句。输出必须是一个 JSON 对象,优先只包含 sentences 字段;"
-              "sentences 每项包含 paragraph/text/fact_ids/inference_ids。不要输出解释、备选文本、Markdown 代码块或额外字段。"
+              "sentences 每项包含 paragraph/text/fact_ids/inference_ids,小标题句可额外包含 source_level=\"SUBHEADING\"。不要输出解释、备选文本、Markdown 代码块或额外字段。"
         )
         try:
             payload = self.generate_json(prompt)
@@ -789,7 +1117,10 @@ class WriterAgent(BaseAgent):
         paragraphs = _coerce_paragraphs(payload)
         result: list[dict] = []
         paragraph_number = 0
-        transition_budget = WRITER_CONTEXT_POLICY["transition_sentence_budget"]
+        transition_budget = (
+            WRITER_CONTEXT_POLICY["transition_sentence_budget"]
+            if chapter_facts or chapter_inferences else 0
+        )
         model_sentences = 0
         accepted_sentences = 0
         dropped_untraced_sentences = 0
@@ -805,6 +1136,7 @@ class WriterAgent(BaseAgent):
                     continue
                 model_sentences += 1
                 text = str(sentence.get("text", "")).strip()
+                sentence_level = str(sentence.get("source_level") or "").strip()
                 fact_ids = [i for i in _int_ids(sentence.get("fact_ids")) if i in valid_fact_ids]
                 inf_ids = [i for i in _int_ids(sentence.get("inference_ids")) if i in valid_inf_ids]
                 split_items_for_sentence = _split_structured_items(text)
@@ -814,21 +1146,33 @@ class WriterAgent(BaseAgent):
                 for item_text in split_items_for_sentence:
                     if not item_text:
                         continue
-                    if not fact_ids and not inf_ids:
-                        # 无依据句:仅允许少量过渡句(连接词开头/短句),超出丢弃
-                        if (
-                            transition_budget <= 0
-                            or len(item_text) > WRITER_CONTEXT_POLICY["transition_sentence_max_chars"]
-                        ):
-                            dropped_untraced_sentences += 1
-                            continue
-                        transition_budget -= 1
-                    accepted_sentences += 1
-                    result.append({
-                        "text": item_text, "fact_ids": fact_ids, "inference_ids": inf_ids,
-                        "paragraph": paragraph_number,
-                        "trace_granularity_warning": trace_warning,
-                    })
+                    if _is_duplicate_structure_sentence(item_text, chapter_title, str(plan.get("title", ""))):
+                        continue
+                    if sentence_level == "SUBHEADING":
+                        part_candidates = _planned_heading_part(item_text, planned_subsections)
+                    else:
+                        part_candidates = _split_embedded_subheading(item_text, planned_subsections)
+                    for part in part_candidates:
+                        part_text = part["text"]
+                        is_subheading = part.get("source_level") == "SUBHEADING"
+                        part_fact_ids = [] if is_subheading else fact_ids
+                        part_inf_ids = [] if is_subheading else inf_ids
+                        if not part_fact_ids and not part_inf_ids and not is_subheading:
+                            # 无依据句:仅允许少量过渡句(连接词开头/短句),超出丢弃
+                            if (
+                                transition_budget <= 0
+                                or len(part_text) > WRITER_CONTEXT_POLICY["transition_sentence_max_chars"]
+                            ):
+                                dropped_untraced_sentences += 1
+                                continue
+                            transition_budget -= 1
+                        accepted_sentences += 1
+                        result.append({
+                            "text": part_text, "fact_ids": part_fact_ids, "inference_ids": part_inf_ids,
+                            "paragraph": paragraph_number,
+                            "source_level": part.get("source_level", ""),
+                            "trace_granularity_warning": trace_warning and not is_subheading,
+                        })
         update_call_funnel(
             call_id,
             model_sentences=model_sentences,

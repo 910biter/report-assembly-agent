@@ -1,9 +1,8 @@
-"""模型网关:业务代码访问模型的唯一入口。
+"""模型网关:业务代码访问生成/向量模型的唯一入口。
 
 当前实现为 Ollama 兼容协议客户端,指向远端模型服务
 (settings.ollama_url)。远端接口文件如有变化,只改本文件。
 """
-import base64
 import json
 import re
 import threading
@@ -32,9 +31,9 @@ class ModelGateway(Protocol):
     def generate(self, prompt: str, system: str | None = None) -> str: ...
     def generate_json(self, prompt: str, system: str | None = None) -> dict: ...
     def embed(self, texts: list[str]) -> list[list[float]]: ...
-    def ocr(self, image_bytes: bytes) -> str: ...
-    def describe_image(self, image_bytes: bytes, prompt: str) -> str: ...
     def health(self) -> dict: ...
+    def unload_model(self, model: str = "") -> bool: ...
+    def warmup_model(self, model: str = "") -> bool: ...
 
 
 class OllamaGateway:
@@ -44,12 +43,42 @@ class OllamaGateway:
     def generate(self, prompt: str, system: str | None = None) -> str:
         return self._chat(prompt, system=system, json_mode=False)
 
+    def unload_model(self, model: str = "") -> bool:
+        """卸载 Ollama 模型(keep_alive=0)。由 LLM Scheduler 按资源策略调用。"""
+        try:
+            resp = httpx.post(
+                f"{self.base_url}/api/generate",
+                json={"model": model or settings.generation_model, "keep_alive": 0},
+                timeout=30,
+            )
+            return resp.status_code == 200
+        except Exception:
+            return False
+
+    def warmup_model(self, model: str = "") -> bool:
+        """预热模型(重新加载到显存)。由 LLM Scheduler 按资源策略调用。"""
+        try:
+            resp = httpx.post(
+                f"{self.base_url}/api/generate",
+                json={"model": model or settings.generation_model, "prompt": "hi", "stream": False,
+                      "keep_alive": "5m", "options": {"num_predict": 1}},
+                timeout=settings.gateway_timeout_seconds,
+            )
+            return resp.status_code == 200
+        except Exception:
+            return False
+
     def _chat(self, prompt: str, system: str | None = None, json_mode: bool = False) -> str:
         messages = []
         if system:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
-        payload = {"model": settings.generation_model, "messages": messages, "stream": False}
+        payload = {
+            "model": settings.generation_model,
+            "messages": messages,
+            "stream": False,
+            "options": {"num_gpu": settings.gpu_layers},  # 统一放置策略:GPU 优先
+        }
         if json_mode:
             payload["format"] = "json"
         response = httpx.post(
@@ -92,13 +121,17 @@ class OllamaGateway:
         )
         return value
 
-    def embed(self, texts: list[str]) -> list[list[float]]:
+    def embed(self, texts: list[str], timeout: int | None = None, num_gpu: int | None = None) -> list[list[float]]:
         if not texts:
             return []
         response = httpx.post(
             f"{self.base_url}/api/embed",
-            json={"model": settings.embedding_model, "input": texts},
-            timeout=180,
+            json={
+                "model": settings.embedding_model,
+                "input": texts,
+                "options": {"num_gpu": settings.gpu_layers if num_gpu is None else num_gpu},  # 统一放置策略
+            },
+            timeout=timeout or 90,  # 由自适应分批按 workload 动态传入
         )
         response.raise_for_status()
         embeddings = response.json()["embeddings"]
@@ -106,49 +139,13 @@ class OllamaGateway:
             raise RuntimeError("EMBEDDING_COUNT_MISMATCH")
         return embeddings
 
-    def ocr(self, image_bytes: bytes) -> str:
-        response = httpx.post(
-            f"{self.base_url}/api/chat",
-            json={
-                "model": settings.ocr_model,
-                "messages": [{
-                    "role": "user",
-                    "content": "识别页面中的全部文字,按阅读顺序输出纯文本,不要解释。",
-                    "images": [base64.b64encode(image_bytes).decode("ascii")],
-                }],
-                "stream": False,
-                "options": {"temperature": 0, "num_gpu": 0},
-            },
-            timeout=settings.ocr_timeout_seconds,
-        )
-        response.raise_for_status()
-        return response.json()["message"]["content"].strip()
-
-    def describe_image(self, image_bytes: bytes, prompt: str) -> str:
-        response = httpx.post(
-            f"{self.base_url}/api/chat",
-            json={
-                "model": settings.generation_model,
-                "messages": [{
-                    "role": "user",
-                    "content": prompt,
-                    "images": [base64.b64encode(image_bytes).decode("ascii")],
-                }],
-                "stream": False,
-                "options": {"temperature": 0},
-            },
-            timeout=settings.describe_timeout_seconds,
-        )
-        response.raise_for_status()
-        return response.json()["message"]["content"].strip()
-
     def health(self) -> dict:
         version_response = httpx.get(f"{self.base_url}/api/version", timeout=2)
         tags_response = httpx.get(f"{self.base_url}/api/tags", timeout=5)
         version_response.raise_for_status()
         tags_response.raise_for_status()
         available = {item["name"] for item in tags_response.json().get("models", [])}
-        required = [settings.generation_model, settings.embedding_model, settings.ocr_model]
+        required = [settings.generation_model, settings.embedding_model]
         return {
             "version": version_response.json().get("version"),
             "models": {name: name in available for name in required},

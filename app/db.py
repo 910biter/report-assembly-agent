@@ -20,6 +20,59 @@ CREATE TABLE IF NOT EXISTS materials (
     duplicate_of INTEGER
 );
 
+CREATE TABLE IF NOT EXISTS file_nodes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    parent_id INTEGER REFERENCES file_nodes(id),
+    node_type TEXT NOT NULL DEFAULT 'file',
+    name TEXT NOT NULL,
+    path TEXT NOT NULL UNIQUE,
+    relative_path TEXT NOT NULL DEFAULT '',
+    file_type TEXT NOT NULL DEFAULT '',
+    file_size INTEGER NOT NULL DEFAULT 0,
+    file_hash TEXT NOT NULL DEFAULT '',
+    material_id INTEGER REFERENCES materials(id),
+    status TEXT NOT NULL DEFAULT 'indexed',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS file_parse_profiles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    node_id INTEGER NOT NULL REFERENCES file_nodes(id),
+    material_id INTEGER REFERENCES materials(id),
+    parser TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'pending',
+    page_count INTEGER NOT NULL DEFAULT 0,
+    text_count INTEGER NOT NULL DEFAULT 0,
+    table_count INTEGER NOT NULL DEFAULT 0,
+    image_count INTEGER NOT NULL DEFAULT 0,
+    markdown_chars INTEGER NOT NULL DEFAULT 0,
+    structure_json TEXT NOT NULL DEFAULT '{}',
+    error TEXT NOT NULL DEFAULT '',
+    parsed_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(node_id, parser)
+);
+
+CREATE TABLE IF NOT EXISTS node_summaries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    node_id INTEGER NOT NULL REFERENCES file_nodes(id),
+    summary_type TEXT NOT NULL DEFAULT 'folder',
+    status TEXT NOT NULL DEFAULT 'ready',
+    summary TEXT NOT NULL DEFAULT '',
+    detail_json TEXT NOT NULL DEFAULT '{}',
+    generated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(node_id, summary_type)
+);
+
+CREATE TABLE IF NOT EXISTS export_packages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    node_id INTEGER NOT NULL REFERENCES file_nodes(id),
+    package_path TEXT NOT NULL,
+    file_count INTEGER NOT NULL DEFAULT 0,
+    total_size INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS units (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     material_id INTEGER NOT NULL REFERENCES materials(id),
@@ -27,7 +80,8 @@ CREATE TABLE IF NOT EXISTS units (
     content TEXT NOT NULL,
     page INTEGER,
     paragraph INTEGER,
-    image_desc TEXT
+    image_desc TEXT,
+    metadata_json TEXT NOT NULL DEFAULT '{}'
 );
 
 CREATE TABLE IF NOT EXISTS facts (
@@ -38,7 +92,8 @@ CREATE TABLE IF NOT EXISTS facts (
     evidence_ids TEXT NOT NULL DEFAULT '[]',
     conflict_ids TEXT NOT NULL DEFAULT '[]',
     task_id TEXT NOT NULL DEFAULT '',
-    origin_call_id TEXT NOT NULL DEFAULT ''
+    origin_call_id TEXT NOT NULL DEFAULT '',
+    disposition TEXT NOT NULL DEFAULT 'UNASSIGNED'
 );
 
 CREATE TABLE IF NOT EXISTS evidence (
@@ -58,6 +113,7 @@ CREATE TABLE IF NOT EXISTS conflicts (
     fact_key TEXT NOT NULL,
     entries TEXT NOT NULL DEFAULT '[]',
     status TEXT NOT NULL DEFAULT 'unresolved',
+    task_id TEXT NOT NULL DEFAULT '',
     origin_call_id TEXT NOT NULL DEFAULT ''
 );
 
@@ -91,6 +147,7 @@ CREATE TABLE IF NOT EXISTS style_variants (
     source_reports TEXT NOT NULL DEFAULT '[]',
     confidence REAL NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'draft',
+    source_hash TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -105,6 +162,7 @@ CREATE TABLE IF NOT EXISTS claims (
     dimension TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'pending',
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    task_id TEXT NOT NULL DEFAULT '',
     origin_call_id TEXT NOT NULL DEFAULT ''
 );
 
@@ -175,6 +233,16 @@ CREATE TABLE IF NOT EXISTS llm_call_logs (
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS material_scan (
+    task_id TEXT NOT NULL,
+    material_id INTEGER NOT NULL,
+    dimension TEXT NOT NULL,
+    scanned INTEGER NOT NULL DEFAULT 1,
+    units_selected INTEGER NOT NULL DEFAULT 0,
+    fact_count INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (task_id, material_id, dimension)
+);
+
 CREATE TABLE IF NOT EXISTS material_insights (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     material_id INTEGER NOT NULL,
@@ -188,9 +256,11 @@ CREATE TABLE IF NOT EXISTS material_insights (
     key_points TEXT NOT NULL DEFAULT '[]',
     material_role TEXT NOT NULL DEFAULT '',
     claim_support TEXT NOT NULL DEFAULT 'unknown',
+    task_id TEXT NOT NULL DEFAULT '',
     allowed_usage TEXT NOT NULL DEFAULT '[]',
     forbidden_usage TEXT NOT NULL DEFAULT '[]',
-    missing_information TEXT NOT NULL DEFAULT '[]'
+    missing_information TEXT NOT NULL DEFAULT '[]',
+    analysis_version TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS report_plans (
@@ -208,6 +278,11 @@ CREATE TABLE IF NOT EXISTS report_plans (
     budget TEXT NOT NULL DEFAULT '{}',
     required_facts TEXT NOT NULL DEFAULT '[]',
     user_requirements TEXT NOT NULL DEFAULT '',
+    plan_stage TEXT NOT NULL DEFAULT 'analysis',
+    plan_version INTEGER NOT NULL DEFAULT 1,
+    analysis_plan_json TEXT NOT NULL DEFAULT '{}',
+    final_plan_json TEXT NOT NULL DEFAULT '{}',
+    finalized_at TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -249,7 +324,8 @@ CREATE TABLE IF NOT EXISTS entities (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
     type TEXT NOT NULL DEFAULT '',
-    aliases TEXT NOT NULL DEFAULT '[]'
+    aliases TEXT NOT NULL DEFAULT '[]',
+    task_id TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS events (
@@ -257,7 +333,8 @@ CREATE TABLE IF NOT EXISTS events (
     name TEXT NOT NULL,
     time TEXT NOT NULL DEFAULT '',
     entity_ids TEXT NOT NULL DEFAULT '[]',
-    fact_ids TEXT NOT NULL DEFAULT '[]'
+    fact_ids TEXT NOT NULL DEFAULT '[]',
+    task_id TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS relations (
@@ -265,7 +342,8 @@ CREATE TABLE IF NOT EXISTS relations (
     source_entity INTEGER NOT NULL,
     target_entity INTEGER NOT NULL,
     relation_type TEXT NOT NULL,
-    fact_ids TEXT NOT NULL DEFAULT '[]'
+    fact_ids TEXT NOT NULL DEFAULT '[]',
+    task_id TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS inference_fact (
@@ -295,21 +373,24 @@ CREATE INDEX IF NOT EXISTS idx_insights_material ON material_insights(material_i
 CREATE INDEX IF NOT EXISTS idx_sentences_report ON report_sentences(report_id);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS units_fts USING fts5(content, tokenize='trigram');
+DROP TRIGGER IF EXISTS units_fts_ai;
+DROP TRIGGER IF EXISTS units_fts_ad;
+DROP TRIGGER IF EXISTS units_fts_au;
 CREATE TRIGGER IF NOT EXISTS units_fts_ai AFTER INSERT ON units BEGIN
     INSERT INTO units_fts(rowid, content) VALUES (new.id, new.content);
 END;
 CREATE TRIGGER IF NOT EXISTS units_fts_ad AFTER DELETE ON units BEGIN
-    INSERT INTO units_fts(units_fts, rowid, content) VALUES ('delete', old.id, old.content);
+    DELETE FROM units_fts WHERE rowid = old.id;
 END;
 CREATE TRIGGER IF NOT EXISTS units_fts_au AFTER UPDATE OF content ON units BEGIN
-    INSERT INTO units_fts(units_fts, rowid, content) VALUES ('delete', old.id, old.content);
+    DELETE FROM units_fts WHERE rowid = old.id;
     INSERT INTO units_fts(rowid, content) VALUES (new.id, new.content);
 END;
 """
 
 
 def connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(settings.db_path)
+    conn = sqlite3.connect(settings.db_path, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
@@ -329,7 +410,16 @@ def init_db() -> None:
         # 依赖迁移列的索引(列由 _migrate 补充后建立;旧库无列时 _SCHEMA 建索引会崩)
         for index_sql in (
             "CREATE INDEX IF NOT EXISTS idx_facts_task ON facts(task_id)",
+            "CREATE INDEX IF NOT EXISTS idx_claims_task ON claims(task_id)",
+            "CREATE INDEX IF NOT EXISTS idx_conflicts_task ON conflicts(task_id)",
+            "CREATE INDEX IF NOT EXISTS idx_insights_task_material ON material_insights(task_id, material_id)",
+            "CREATE INDEX IF NOT EXISTS idx_entities_task ON entities(task_id)",
+            "CREATE INDEX IF NOT EXISTS idx_events_task ON events(task_id)",
             "CREATE INDEX IF NOT EXISTS idx_materials_hash ON materials(file_hash)",
+            "CREATE INDEX IF NOT EXISTS idx_file_nodes_parent ON file_nodes(parent_id)",
+            "CREATE INDEX IF NOT EXISTS idx_file_nodes_material ON file_nodes(material_id)",
+            "CREATE INDEX IF NOT EXISTS idx_file_parse_profiles_node ON file_parse_profiles(node_id)",
+            "CREATE INDEX IF NOT EXISTS idx_node_summaries_node ON node_summaries(node_id)",
             "CREATE INDEX IF NOT EXISTS idx_artifact_cache_stage ON artifact_cache(stage)",
             "CREATE INDEX IF NOT EXISTS idx_task_artifacts_task_stage ON task_artifacts(task_id, stage)",
             "CREATE INDEX IF NOT EXISTS idx_llm_call_logs_task ON llm_call_logs(task_id)",
@@ -349,24 +439,35 @@ def init_db() -> None:
 def _migrate(conn: sqlite3.Connection) -> None:
     """轻量迁移:为已有库补充新列(旧库 CREATE TABLE IF NOT EXISTS 不生效的列)。"""
     migrations = [
+        ("style_variants", "source_hash", "TEXT NOT NULL DEFAULT ''"),
         ("report_sentences", "paragraph", "INTEGER NOT NULL DEFAULT 1"),
         ("report_sentences", "edit_history", "TEXT NOT NULL DEFAULT '[]'"),
         ("facts", "fact_type", "TEXT NOT NULL DEFAULT 'STATEMENT'"),
         ("facts", "task_id", "TEXT NOT NULL DEFAULT ''"),
         ("facts", "origin_call_id", "TEXT NOT NULL DEFAULT ''"),
+        ("facts", "disposition", "TEXT NOT NULL DEFAULT 'UNASSIGNED'"),
         ("claims", "origin_call_id", "TEXT NOT NULL DEFAULT ''"),
+        ("claims", "task_id", "TEXT NOT NULL DEFAULT ''"),
         ("conflicts", "origin_call_id", "TEXT NOT NULL DEFAULT ''"),
+        ("conflicts", "task_id", "TEXT NOT NULL DEFAULT ''"),
         ("inferences", "origin_call_id", "TEXT NOT NULL DEFAULT ''"),
         ("report_sentences", "origin_call_id", "TEXT NOT NULL DEFAULT ''"),
         ("materials", "file_hash", "TEXT NOT NULL DEFAULT ''"),
         ("materials", "parser_version", "TEXT NOT NULL DEFAULT ''"),
         ("materials", "parsed_at", "TEXT"),
+        ("file_nodes", "parent_id", "INTEGER REFERENCES file_nodes(id)"),
+        ("file_nodes", "material_id", "INTEGER REFERENCES materials(id)"),
+        ("file_nodes", "status", "TEXT NOT NULL DEFAULT 'indexed'"),
+        ("file_parse_profiles", "markdown_chars", "INTEGER NOT NULL DEFAULT 0"),
+        ("units", "metadata_json", "TEXT NOT NULL DEFAULT '{}'"),
         ("material_insights", "key_points", "TEXT NOT NULL DEFAULT '[]'"),
         ("material_insights", "material_role", "TEXT NOT NULL DEFAULT ''"),
         ("material_insights", "claim_support", "TEXT NOT NULL DEFAULT 'unknown'"),
+        ("material_insights", "task_id", "TEXT NOT NULL DEFAULT ''"),
         ("material_insights", "allowed_usage", "TEXT NOT NULL DEFAULT '[]'"),
         ("material_insights", "forbidden_usage", "TEXT NOT NULL DEFAULT '[]'"),
         ("material_insights", "missing_information", "TEXT NOT NULL DEFAULT '[]'"),
+        ("material_insights", "analysis_version", "TEXT NOT NULL DEFAULT ''"),
         ("conflicts", "claim_ids", "TEXT NOT NULL DEFAULT '[]'"),
         ("evidence", "created_at", "TEXT NOT NULL DEFAULT (datetime('now'))"),
         ("inferences", "analysis_type", "TEXT NOT NULL DEFAULT ''"),
@@ -383,6 +484,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ("report_plans", "chapter_plans", "TEXT NOT NULL DEFAULT '[]'"),
         ("report_plans", "budget", "TEXT NOT NULL DEFAULT '{}'"),
         ("report_plans", "required_facts", "TEXT NOT NULL DEFAULT '[]'"),
+        ("report_plans", "plan_stage", "TEXT NOT NULL DEFAULT 'analysis'"),
+        ("report_plans", "plan_version", "INTEGER NOT NULL DEFAULT 1"),
+        ("report_plans", "analysis_plan_json", "TEXT NOT NULL DEFAULT '{}'"),
+        ("report_plans", "final_plan_json", "TEXT NOT NULL DEFAULT '{}'"),
+        ("report_plans", "finalized_at", "TEXT"),
         ("llm_call_logs", "returned_chars", "INTEGER NOT NULL DEFAULT 0"),
         ("llm_call_logs", "valid_json_chars", "INTEGER NOT NULL DEFAULT 0"),
         ("llm_call_logs", "stored_chars", "INTEGER NOT NULL DEFAULT 0"),
@@ -394,6 +500,9 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ("llm_call_logs", "candidate_count", "INTEGER NOT NULL DEFAULT 0"),
         ("llm_call_logs", "candidate_total", "INTEGER NOT NULL DEFAULT 0"),
         ("llm_call_logs", "funnel_json", "TEXT NOT NULL DEFAULT '{}'"),
+        ("entities", "task_id", "TEXT NOT NULL DEFAULT ''"),
+        ("events", "task_id", "TEXT NOT NULL DEFAULT ''"),
+        ("relations", "task_id", "TEXT NOT NULL DEFAULT ''"),
     ]
     for table, column, ddl in migrations:
         columns = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}

@@ -21,6 +21,7 @@ class Unit:
     page: int | None = None
     paragraph: int | None = None
     image_desc: str | None = None
+    metadata_json: str = "{}"
     id: int | None = None
 
 
