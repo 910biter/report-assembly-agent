@@ -8,10 +8,25 @@ from pathlib import Path
 
 from fastapi import APIRouter, File, Form, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
+from sqlalchemy import delete, func, insert, select, update
 
 from app.config import settings
-from app.db import connect
+from app.db import session_scope
 from app.export import export_report
+from app.infrastructure.orm import (
+    Base,
+    ORMConflict,
+    ORMEvidence,
+    ORMFact,
+    ORMInference,
+    ORMMaterial,
+    ORMPlan,
+    ORMReport,
+    ORMSentence,
+    ORMShortMemory,
+    ORMTaskArtifact,
+    ORMUnit,
+)
 from app.llm_queue import llm_queue_stats
 from app.llm_scheduler import invoke
 from app.memory import short_term, style
@@ -46,10 +61,10 @@ def create_task(
             continue
         content = upload.file.read()
         file_hash = hashlib.sha256(content).hexdigest()
-        with connect() as conn:
-            existing = conn.execute(
-                "SELECT id FROM materials WHERE file_hash=?", (file_hash,)
-            ).fetchone()
+        with session_scope() as s:
+            existing = s.execute(
+                select(ORMMaterial.c.id).where(ORMMaterial.c.file_hash == file_hash)
+            ).mappings().first()
             if existing is not None:
                 material_ids.append(existing["id"])  # 同内容文件:复用已入库材料(解析/向量/理解全缓存)
                 continue
@@ -57,11 +72,16 @@ def create_task(
             dest = settings.materials_dir / f"{task_id}_{filename}"
             with dest.open("wb") as fh:
                 fh.write(content)
-            cur = conn.execute(
-                "INSERT INTO materials(filename, file_type, path, fingerprint, file_hash) VALUES(?, ?, ?, ?, ?)",
-                (filename, dest.suffix.lower().lstrip("."), str(dest), file_hash, file_hash),
+            result = s.execute(
+                insert(ORMMaterial).values(
+                    filename=filename,
+                    file_type=dest.suffix.lower().lstrip("."),
+                    path=str(dest),
+                    fingerprint=file_hash,
+                    file_hash=file_hash,
+                )
             )
-            material_ids.append(cur.lastrowid)
+            material_ids.append(result.inserted_primary_key[0])
     material_ids = list(dict.fromkeys(material_ids))
     if not material_ids:
         return JSONResponse({"error": "NO_MATERIALS"}, status_code=400)
@@ -79,8 +99,10 @@ def create_task(
 @router.get("/tasks")
 def list_tasks():
     """历史任务列表(按创建时间倒序),含主题/状态/报告链接。"""
-    with connect() as conn:
-        rows = conn.execute("SELECT task_id, payload FROM short_memory ORDER BY rowid DESC").fetchall()
+    with session_scope() as s:
+        rows = s.execute(
+            select(ORMShortMemory.c.task_id, ORMShortMemory.c.payload)
+        ).mappings().all()
     tasks = []
     for row in rows:
         payload = _task_view(json.loads(row["payload"]))
@@ -130,8 +152,8 @@ def delete_task(task_id: str):
     ):
         return JSONResponse({"error": "TASK_BUSY"}, status_code=409)
     short_term.delete_task(task_id)
-    with connect() as conn:
-        conn.execute("DELETE FROM task_artifacts WHERE task_id=?", (task_id,))
+    with session_scope() as s:
+        s.execute(delete(ORMTaskArtifact).where(ORMTaskArtifact.c.task_id == task_id))
     return {"ok": True}
 
 
@@ -160,20 +182,22 @@ def task_materials(task_id: str):
     material_ids = [int(i) for i in task.get("material_ids", [])]
     if not material_ids:
         return []
-    placeholders = ",".join("?" * len(material_ids))
-    with connect() as conn:
-        parsed_ids = {r["material_id"] for r in conn.execute(
-            "SELECT DISTINCT material_id FROM units").fetchall()}
-        materials = conn.execute(
-            f"SELECT * FROM materials WHERE id IN ({placeholders})", material_ids
-        ).fetchall()
+    with session_scope() as s:
+        parsed_ids = {r["material_id"] for r in s.execute(
+            select(ORMUnit.c.material_id).distinct()
+        ).mappings().all()}
+        materials = s.execute(
+            select(ORMMaterial).where(ORMMaterial.c.id.in_(material_ids))
+        ).mappings().all()
         parsed_count = sum(1 for m in materials if m["id"] in parsed_ids)
         result = []
         for material in materials:
-            units = conn.execute(
-                "SELECT kind, content, image_desc, page, metadata_json FROM units WHERE material_id=?",
-                (material["id"],),
-            ).fetchall()
+            units = s.execute(
+                select(
+                    ORMUnit.c.kind, ORMUnit.c.content, ORMUnit.c.image_desc,
+                    ORMUnit.c.page, ORMUnit.c.metadata_json,
+                ).where(ORMUnit.c.material_id == material["id"])
+            ).mappings().all()
             pages = {u["page"] for u in units if u["page"] is not None}
             images = [u for u in units if u["kind"] == "image"]
             parsed = len(units) > 0
@@ -215,23 +239,29 @@ def task_analysis(task_id: str):
     task = short_term.load_task(task_id)
     if task is None:
         return JSONResponse({"error": "TASK_NOT_FOUND"}, status_code=404)
-    with connect() as conn:
+    with session_scope() as s:
         facts = []
         for fact_id in task.get("fact_ids", []):
-            row = conn.execute("SELECT * FROM facts WHERE id=?", (fact_id,)).fetchone()
+            row = s.execute(
+                select(ORMFact).where(ORMFact.c.id == fact_id)
+            ).mappings().first()
             if row is None:
                 continue
-            evidence = conn.execute(
-                "SELECT source_file, page, paragraph, quote FROM evidence WHERE fact_id=?",
-                (fact_id,),
-            ).fetchall()
+            evidence = s.execute(
+                select(
+                    ORMEvidence.c.source_file, ORMEvidence.c.page, ORMEvidence.c.paragraph,
+                    ORMEvidence.c.quote,
+                ).where(ORMEvidence.c.fact_id == fact_id)
+            ).mappings().all()
             facts.append({
                 "id": row["id"], "content": row["content"], "dimension": row["dimension"],
                 "evidence": [dict(e) for e in evidence],
             })
         inferences = []
         for inference_id in task.get("inference_ids", []) + task.get("external_ids", []):
-            row = conn.execute("SELECT * FROM inferences WHERE id=?", (inference_id,)).fetchone()
+            row = s.execute(
+                select(ORMInference).where(ORMInference.c.id == inference_id)
+            ).mappings().first()
             if row is not None:
                 inferences.append({
                     "id": row["id"], "content": row["content"],
@@ -241,7 +271,9 @@ def task_analysis(task_id: str):
                 })
         conflicts = []
         for conflict_id in task.get("conflict_ids", []):
-            row = conn.execute("SELECT * FROM conflicts WHERE id=?", (conflict_id,)).fetchone()
+            row = s.execute(
+                select(ORMConflict).where(ORMConflict.c.id == conflict_id)
+            ).mappings().first()
             if row is not None:
                 conflicts.append({
                     "id": row["id"], "fact_key": row["fact_key"],
@@ -269,13 +301,22 @@ def task_token_efficiency(task_id: str):
 def list_materials():
     """材料库:材料列表 + 解析状态(单元数/重复标记)。"""
     material_tasks = _material_task_index()
-    with connect() as conn:
-        rows = conn.execute(
-            "SELECT m.id, m.filename, m.file_type, m.is_duplicate, m.duplicate_of, "
-            "COUNT(u.id) AS unit_count "
-            "FROM materials m LEFT JOIN units u ON u.material_id = m.id "
-            "GROUP BY m.id ORDER BY m.id DESC"
-        ).fetchall()
+    with session_scope() as s:
+        rows = s.execute(
+            select(
+                ORMMaterial.c.id, ORMMaterial.c.filename, ORMMaterial.c.file_type,
+                ORMMaterial.c.is_duplicate, ORMMaterial.c.duplicate_of,
+                func.count(ORMUnit.c.id).label("unit_count"),
+            )
+            .select_from(
+                ORMMaterial.outerjoin(ORMUnit, ORMUnit.c.material_id == ORMMaterial.c.id)
+            )
+            .group_by(
+                ORMMaterial.c.id, ORMMaterial.c.filename, ORMMaterial.c.file_type,
+                ORMMaterial.c.is_duplicate, ORMMaterial.c.duplicate_of,
+            )
+            .order_by(ORMMaterial.c.id.desc())
+        ).mappings().all()
     return [{
         "id": r["id"], "filename": r["filename"], "file_type": r["file_type"],
         "unit_count": r["unit_count"], "is_duplicate": r["is_duplicate"],
@@ -288,13 +329,15 @@ def list_materials():
 def get_material(material_id: int):
     """材料详情:内容单元列表(文本/表格/图片文本和解析元数据)。"""
     material_tasks = _material_task_index()
-    with connect() as conn:
-        material = conn.execute("SELECT * FROM materials WHERE id=?", (material_id,)).fetchone()
+    with session_scope() as s:
+        material = s.execute(
+            select(ORMMaterial).where(ORMMaterial.c.id == material_id)
+        ).mappings().first()
         if material is None:
             return JSONResponse({"error": "MATERIAL_NOT_FOUND"}, status_code=404)
-        units = conn.execute(
-            "SELECT * FROM units WHERE material_id=? ORDER BY id", (material_id,)
-        ).fetchall()
+        units = s.execute(
+            select(ORMUnit).where(ORMUnit.c.material_id == material_id).order_by(ORMUnit.c.id)
+        ).mappings().all()
     return {
         "id": material["id"], "filename": material["filename"], "file_type": material["file_type"],
         "is_duplicate": material["is_duplicate"], "duplicate_of": material["duplicate_of"],
@@ -313,13 +356,20 @@ def get_material(material_id: int):
 def list_reports():
     """报告库列表(按生成时间倒序)。"""
     report_tasks = _report_task_index()
-    with connect() as conn:
-        rows = conn.execute(
-            "SELECT r.id, r.title, r.status, r.created_at, "
-            "COUNT(s.id) AS sentence_count "
-            "FROM reports r LEFT JOIN report_sentences s ON s.report_id = r.id "
-            "GROUP BY r.id ORDER BY r.id DESC"
-        ).fetchall()
+    with session_scope() as s:
+        rows = s.execute(
+            select(
+                ORMReport.c.id, ORMReport.c.title, ORMReport.c.status, ORMReport.c.created_at,
+                func.count(ORMSentence.c.id).label("sentence_count"),
+            )
+            .select_from(
+                ORMReport.outerjoin(ORMSentence, ORMSentence.c.report_id == ORMReport.c.id)
+            )
+            .group_by(
+                ORMReport.c.id, ORMReport.c.title, ORMReport.c.status, ORMReport.c.created_at,
+            )
+            .order_by(ORMReport.c.id.desc())
+        ).mappings().all()
     return [{
         "id": r["id"], "title": r["title"], "status": r["status"],
         "created_at": r["created_at"], "sentence_count": r["sentence_count"],
@@ -330,14 +380,16 @@ def list_reports():
 @router.get("/reports/{report_id}")
 def get_report(report_id: int):
     """报告数据(章节→段落→句子,句子带来源分级与溯源细节)。"""
-    with connect() as conn:
-        report = conn.execute("SELECT * FROM reports WHERE id=?", (report_id,)).fetchone()
+    with session_scope() as s:
+        report = s.execute(
+            select(ORMReport).where(ORMReport.c.id == report_id)
+        ).mappings().first()
         if report is None:
             return JSONResponse({"error": "REPORT_NOT_FOUND"}, status_code=404)
-        sentences = conn.execute(
-            "SELECT * FROM report_sentences WHERE report_id=? ORDER BY position",
-            (report_id,),
-        ).fetchall()
+        sentences = s.execute(
+            select(ORMSentence).where(ORMSentence.c.report_id == report_id)
+            .order_by(ORMSentence.c.position)
+        ).mappings().all()
     result = {
         "id": report["id"],
         "title": report["title"],
@@ -368,15 +420,19 @@ def update_report_meta(report_id: int, payload: dict):
     title = str(payload.get("title", "")).strip()
     if not title:
         return JSONResponse({"error": "TITLE_REQUIRED"}, status_code=400)
-    with connect() as conn:
-        report = conn.execute("SELECT plan_id FROM reports WHERE id=?", (report_id,)).fetchone()
+    user_memory = Base.metadata.tables["user_memory"]
+    with session_scope() as s:
+        report = s.execute(
+            select(ORMReport.c.plan_id).where(ORMReport.c.id == report_id)
+        ).mappings().first()
         if report is None:
             return JSONResponse({"error": "REPORT_NOT_FOUND"}, status_code=404)
-        conn.execute("UPDATE reports SET title=? WHERE id=?", (title, report_id))
-        conn.execute("UPDATE report_plans SET title=? WHERE id=?", (title, report["plan_id"]))
-        conn.execute(
-            "INSERT INTO user_memory(note_type, summary, content) VALUES('edit', ?, ?)",
-            ("用户修改了报告题目", title[:120]),
+        s.execute(update(ORMReport).where(ORMReport.c.id == report_id).values(title=title))
+        s.execute(update(ORMPlan).where(ORMPlan.c.id == report["plan_id"]).values(title=title))
+        s.execute(
+            insert(user_memory).values(
+                note_type="edit", summary="用户修改了报告题目", content=title[:120]
+            )
         )
     return {"ok": True, "title": title}
 
@@ -390,39 +446,40 @@ def update_report_section(report_id: int, payload: dict):
         return JSONResponse({"error": "SECTION_TITLE_REQUIRED"}, status_code=400)
     if old_title == new_title:
         return {"ok": True, "title": new_title}
-    with connect() as conn:
-        report = conn.execute("SELECT plan_id FROM reports WHERE id=?", (report_id,)).fetchone()
+    from app.infrastructure.orm import ORMSentence, ORMPlan, ORMReport, Base
+    from sqlalchemy import select, update
+    with session_scope() as s:
+        report = s.execute(select(ORMReport.c.plan_id).where(ORMReport.c.id == report_id)).first()
         if report is None:
             return JSONResponse({"error": "REPORT_NOT_FOUND"}, status_code=404)
-        count = conn.execute(
-            "UPDATE report_sentences SET section=? WHERE report_id=? AND section=?",
-            (new_title, report_id, old_title),
-        ).rowcount
-        if count == 0:
+        result = s.execute(
+            update(ORMSentence).where(
+                ORMSentence.c.report_id == report_id, ORMSentence.c.section == old_title
+            ).values(section=new_title)
+        )
+        if result.rowcount == 0:
             return JSONResponse({"error": "SECTION_NOT_FOUND"}, status_code=404)
-        plan = conn.execute(
-            "SELECT structure, chapter_plans FROM report_plans WHERE id=?",
-            (report["plan_id"],),
-        ).fetchone()
+        plan = s.execute(
+            select(ORMPlan.c.structure, ORMPlan.c.chapter_plans).where(ORMPlan.c.id == report[0])
+        ).first()
         if plan is not None:
-            structure = json.loads(plan["structure"] or "[]")
-            chapter_plans = json.loads(plan["chapter_plans"] or "[]")
+            structure = json.loads(plan[0] or "[]")
+            chapter_plans = json.loads(plan[1] or "[]")
             structure = [new_title if str(item) == old_title else item for item in structure]
             for chapter in chapter_plans:
                 if str(chapter.get("title", "")) == old_title:
                     chapter["title"] = new_title
-            conn.execute(
-                "UPDATE report_plans SET structure=?, chapter_plans=? WHERE id=?",
-                (
-                    json.dumps(structure, ensure_ascii=False),
-                    json.dumps(chapter_plans, ensure_ascii=False),
-                    report["plan_id"],
-                ),
+            s.execute(
+                update(ORMPlan).where(ORMPlan.c.id == report[0]).values(
+                    structure=json.dumps(structure, ensure_ascii=False),
+                    chapter_plans=json.dumps(chapter_plans, ensure_ascii=False),
+                )
             )
-        conn.execute(
-            "INSERT INTO user_memory(note_type, summary, content) VALUES('edit', ?, ?)",
-            ("用户修改了章节标题", f"{old_title} → {new_title}"),
-        )
+        user_memory = Base.metadata.tables["user_memory"]
+        s.execute(user_memory.insert().values(
+            note_type="edit", summary="用户修改了章节标题",
+            content=f"{old_title} → {new_title}",
+        ))
     return {"ok": True, "old_title": old_title, "title": new_title}
 
 
@@ -430,26 +487,31 @@ def update_report_section(report_id: int, payload: dict):
 def update_sentence(report_id: int, sentence_id: int, payload: dict):
     """在线编辑:勾选状态与用户修改文字(修改内容记入 edit_history + user_memory)。"""
     content = payload.get("content")
-    with connect() as conn:
-        row = conn.execute(
-            "SELECT content, user_edit, edit_history FROM report_sentences "
-            "WHERE id=? AND report_id=?",
-            (sentence_id, report_id),
-        ).fetchone()
+    from app.infrastructure.orm import ORMSentence, Base
+    from sqlalchemy import select, update
+    with session_scope() as s:
+        row = s.execute(
+            select(ORMSentence.c.content, ORMSentence.c.user_edit, ORMSentence.c.edit_history)
+            .where(ORMSentence.c.id == sentence_id, ORMSentence.c.report_id == report_id)
+        ).first()
         if row is None:
             return JSONResponse({"error": "SENTENCE_NOT_FOUND"}, status_code=404)
-        history = json.loads(row["edit_history"] or "[]")
-        if content is not None and content != (row["user_edit"] or ""):
+        history = json.loads(row[2] or "[]")
+        if content is not None and content != (row[1] or ""):
             history.append({"time": datetime.now().strftime("%m-%d %H:%M"), "editor": "user", "content": content})
-            conn.execute(
-                "INSERT INTO user_memory(note_type, summary, content) VALUES('edit', ?, ?)",
-                ("用户修改了报告句子", f"{str(row['content'] or '')[:60]} → {content[:60]}"),
+            user_memory = Base.metadata.tables["user_memory"]
+            s.execute(user_memory.insert().values(
+                note_type="edit", summary="用户修改了报告句子",
+                content=f"{str(row[0] or '')[:60]} → {content[:60]}",
+            ))
+        s.execute(
+            update(ORMSentence).where(
+                ORMSentence.c.id == sentence_id, ORMSentence.c.report_id == report_id
+            ).values(
+                selected=1 if payload.get("selected", True) else 0,
+                user_edit=content if content is not None else row[1],
+                edit_history=json.dumps(history, ensure_ascii=False),
             )
-        conn.execute(
-            "UPDATE report_sentences SET selected=?, user_edit=?, edit_history=? WHERE id=? AND report_id=?",
-            (1 if payload.get("selected", True) else 0,
-             content if content is not None else row["user_edit"],
-             json.dumps(history, ensure_ascii=False), sentence_id, report_id),
         )
     return {"ok": True}
 
@@ -599,16 +661,18 @@ def queues():
 
 def _find_task_by_report(report_id: int) -> str | None:
     """从短期记忆中反查持有该报告的任务。"""
-    with connect() as conn:
-        rows = conn.execute("SELECT task_id, payload FROM short_memory").fetchall()
+    from app.infrastructure.orm import ORMShortMemory
+    from sqlalchemy import select
+    with session_scope() as s:
+        rows = s.execute(select(ORMShortMemory.c.task_id, ORMShortMemory.c.payload)).all()
     for row in rows:
-        payload = json.loads(row["payload"])
+        payload = json.loads(row[1])
         try:
             payload_report_id = int(payload.get("report_id"))
         except (TypeError, ValueError):
             continue
         if payload_report_id == int(report_id):
-            return row["task_id"]
+            return row[0]
     return None
 
 
@@ -616,23 +680,27 @@ def _sentence_detail(row, refs: dict) -> dict:
     fact_ids = refs.get("fact_ids", [])
     inference_ids = refs.get("inference_ids", [])
     sources = []
-    with connect() as conn:
+    from app.infrastructure.orm import ORMFact, ORMEvidence
+    from sqlalchemy import select
+    with session_scope() as s:
         for fact_id in fact_ids:
-            fact = conn.execute("SELECT * FROM facts WHERE id=?", (fact_id,)).fetchone()
+            fact = s.execute(select(ORMFact).where(ORMFact.c.id == fact_id)).mappings().first()
             if fact is None:
                 continue
-            evidence = conn.execute(
-                "SELECT source_file, page, paragraph, quote FROM evidence WHERE fact_id=?",
-                (fact_id,),
-            ).fetchall()
+            evidence = s.execute(
+                select(ORMEvidence.c.source_file, ORMEvidence.c.page,
+                       ORMEvidence.c.paragraph, ORMEvidence.c.quote)
+                .where(ORMEvidence.c.fact_id == fact_id)
+            ).mappings().all()
             sources.append({
                 "fact_id": fact_id,
                 "content": fact["content"],
                 "evidence": [dict(item) for item in evidence],
             })
         inferences = []
+        from app.infrastructure.orm import ORMInference
         for inference_id in inference_ids:
-            inference = conn.execute("SELECT * FROM inferences WHERE id=?", (inference_id,)).fetchone()
+            inference = s.execute(select(ORMInference).where(ORMInference.c.id == inference_id)).mappings().first()
             if inference is not None:
                 inferences.append({
                     "inference_id": inference_id,
@@ -672,8 +740,13 @@ def variant_fields(variant) -> dict:
 
 
 def _task_rows() -> list:
-    with connect() as conn:
-        return conn.execute("SELECT task_id, payload FROM short_memory ORDER BY rowid DESC").fetchall()
+    from app.infrastructure.orm import ORMShortMemory
+    from sqlalchemy import select
+    with session_scope() as s:
+        return s.execute(
+            select(ORMShortMemory.c.task_id, ORMShortMemory.c.payload)
+            .order_by(ORMShortMemory.c.task_id.desc())
+        ).mappings().all()
 
 
 def _material_task_index() -> dict[int, list[dict]]:
@@ -774,10 +847,6 @@ def _progress_summary(payload: dict) -> dict:
         "stage_durations": payload.get("stage_durations") or {},
         "llm_stats": payload.get("llm_stats"),
         "token_efficiency": payload.get("token_efficiency") or {},
-        "business_coverage": payload.get("business_coverage"),
-        "business_qa": payload.get("business_qa"),
-        "preliminary_scale_plan": payload.get("preliminary_scale_plan") or {},
-        "report_scale_plan": payload.get("report_scale_plan") or {},
         "ttfr_seconds": payload.get("ttfr_seconds"),
         "critical_path_done": payload.get("critical_path_done", False),
         "background_jobs": payload.get("background_jobs") or {},

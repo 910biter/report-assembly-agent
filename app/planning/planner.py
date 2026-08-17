@@ -9,7 +9,9 @@ presentation unless explicitly marked as hard structure.
 import json
 
 from app.agents.base import BaseAgent
-from app.db import connect
+from app.db import session_scope
+from app.infrastructure.orm import ORMPlan
+from sqlalchemy import select, update
 from app.models import ReportPlan
 
 _SYSTEM = """你是情报报告分析规划师。根据用户主题、材料摘要与机构风格,只制定分析问题与证据提取方向,不要冻结最终报告章节。
@@ -45,7 +47,17 @@ _SYSTEM = """你是情报报告分析规划师。根据用户主题、材料摘�
 4. 初步分析假设不是最终叙事逻辑,后续 Final Planner 不需要继承,应以真实 Facts/Inferences 为准
 5. 规模预算依据:用户明确字数要求(如有)、报告类型档位
    (简要约2000-4000字/标准约5000-10000字/深度约10000-20000字)、材料信息量、章节数与重要性。
-6. 最终报告结构将在 Evidence + Analysis 后另行生成,届时由真实 Fact/Inference 和核心结论决定。"""
+6. 最终报告结构将在 Evidence + Analysis 后另行生成,届时由真实 Fact/Inference 和核心结论决定。
+7. 【证据需求拆分——最重要的要求】evidence_needs 必须对主题做穷尽式拆解(参照复杂论断验证思想):
+   - 机制原理、威胁模型、协议规范、实现细节、安全属性、对比差异、演进趋势、评估数据、监管标准
+     等关键方面,每个可查证方面都应成为一个 need(数量不限,由主题复杂度和材料信息量决定;
+     该综述类深度报告若材料覆盖多个子主题,evidence_needs 不少于 6 条)
+   - 每个 need 必须是"可被材料证实/证伪的一句话子问题",避免宽泛无法查证的表述
+   - 按对核心判断的支撑度标注 priority(支撑主线结论的为 high)
+8. 面向决策的全面性:证据检索的遗漏比松弛更危险——宁可多列可查证子问题,不要因低估主题而少列。
+9. 【视角发现按需】先判断主题复杂度:简单主题(会议通知/单一事实类)不需要多视角,直接按问题拆分;
+   复杂主题(行业趋势/体系分析/综述类)需从多个研究视角(机制/政策/产业/技术/市场/风险/监管等)
+   探索证据需求——视角是能力不是固定步骤,由主题复杂度决定是否启用。"""
 
 _FINAL_SYSTEM = """你是情报报告结构总规划师。现在 Evidence 与 Analysis 已完成,请基于真实事实、推断、用户目标和模板策略生成最终 ReportPlan。
 严格输出 JSON,不要任何解释:
@@ -202,45 +214,51 @@ def _plan_snapshot(plan: ReportPlan, stage: str) -> dict:
 
 
 def save_plan(plan: ReportPlan) -> ReportPlan:
-    with connect() as conn:
-        cur = conn.execute(
-            "INSERT INTO report_plans(title, objective, audience, report_type, core_question, "
-            "core_judgment, narrative_logic, structure, dimensions, evidence_needs, required_facts, chapter_plans, "
-            "budget, user_requirements, plan_stage, plan_version, analysis_plan_json, final_plan_json) "
-            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (plan.title, plan.objective, plan.audience, plan.report_type,
-             plan.core_question, plan.core_judgment, plan.narrative_logic,
-             json.dumps(plan.structure, ensure_ascii=False),
-             json.dumps(plan.dimensions, ensure_ascii=False),
-             json.dumps(plan.evidence_needs, ensure_ascii=False),
-             json.dumps(plan.required_facts, ensure_ascii=False),
-             json.dumps(plan.chapter_plans, ensure_ascii=False),
-             json.dumps(plan.budget, ensure_ascii=False),
-             plan.user_requirements,
-             plan.plan_stage,
-             int(plan.plan_version or 1),
-             json.dumps(plan.analysis_plan_json or _plan_snapshot(plan, "analysis"), ensure_ascii=False),
-             json.dumps(plan.final_plan_json or {}, ensure_ascii=False)),
+    with session_scope() as s:
+        result = s.execute(
+            ORMPlan.insert().values(
+                title=plan.title, objective=plan.objective, audience=plan.audience,
+                report_type=plan.report_type, core_question=plan.core_question,
+                core_judgment=plan.core_judgment, narrative_logic=plan.narrative_logic,
+                structure=json.dumps(plan.structure, ensure_ascii=False),
+                dimensions=json.dumps(plan.dimensions, ensure_ascii=False),
+                evidence_needs=json.dumps(plan.evidence_needs, ensure_ascii=False),
+                required_facts=json.dumps(plan.required_facts, ensure_ascii=False),
+                chapter_plans=json.dumps(plan.chapter_plans, ensure_ascii=False),
+                budget=json.dumps(plan.budget, ensure_ascii=False),
+                user_requirements=plan.user_requirements,
+                plan_stage=plan.plan_stage,
+                plan_version=int(plan.plan_version or 1),
+                analysis_plan_json=json.dumps(plan.analysis_plan_json or _plan_snapshot(plan, "analysis"), ensure_ascii=False),
+                final_plan_json=json.dumps(plan.final_plan_json or {}, ensure_ascii=False),
+            )
         )
-        plan.id = cur.lastrowid
+        plan.id = int(result.inserted_primary_key[0])
     return plan
 
 
 def update_plan(plan: ReportPlan) -> ReportPlan:
-    with connect() as conn:
-        conn.execute(
-            "UPDATE report_plans SET title=?, objective=?, audience=?, report_type=?, core_question=?, "
-            "core_judgment=?, narrative_logic=?, structure=?, chapter_plans=?, budget=?, "
-            "plan_stage='final', plan_version=plan_version + 1, final_plan_json=?, finalized_at=datetime('now') "
-            "WHERE id=?",
-            (
-                plan.title, plan.objective, plan.audience, plan.report_type,
-                plan.core_question, plan.core_judgment, plan.narrative_logic,
-                json.dumps(plan.structure, ensure_ascii=False),
-                json.dumps(plan.chapter_plans, ensure_ascii=False),
-                json.dumps(plan.budget, ensure_ascii=False),
-                json.dumps(plan.final_plan_json or _plan_snapshot(plan, "final"), ensure_ascii=False),
-                plan.id,
-            ),
+    import time as _time
+    with session_scope() as s:
+        # plan_version 自增 + finalized_at(原 SQL 语义)
+        row = s.execute(select(ORMPlan.c.plan_version).where(ORMPlan.c.id == plan.id)).first()
+        next_version = int(row[0] or 1) + 1 if row else 1
+        s.execute(
+            update(ORMPlan)
+            .where(ORMPlan.c.id == plan.id)
+            .values(
+                title=plan.title, objective=plan.objective, audience=plan.audience,
+                report_type=plan.report_type, core_question=plan.core_question,
+                core_judgment=plan.core_judgment, narrative_logic=plan.narrative_logic,
+                structure=json.dumps(plan.structure, ensure_ascii=False),
+                chapter_plans=json.dumps(plan.chapter_plans, ensure_ascii=False),
+                budget=json.dumps(plan.budget, ensure_ascii=False),
+                plan_stage="final",
+                plan_version=next_version,
+                final_plan_json=json.dumps(plan.final_plan_json or _plan_snapshot(plan, "final"), ensure_ascii=False),
+                finalized_at=_time.strftime("%Y-%m-%d %H:%M:%S"),
+            )
         )
     return plan
+
+__all__ = ['PlannerAgent', 'save_plan', 'update_plan']

@@ -11,7 +11,10 @@ _SYSTEM = """你是报告章节叙事规划师。你的任务不是写正文,而
 严格输出 JSON,不要任何解释:
 {
   "chapter_title": "章节标题",
+  "core_question": "本章要回答的核心问题(一句话,可被材料证实/证伪)",
+  "core_message": "本章核心信息/主线判断(一句话)",
   "central_message": "本章中心意思",
+  "dependencies": ["本章依赖的前置章节标题(无则空列表)"],
   "logic_order": ["话题1", "话题2", "..."],
   "subsections": [
     {
@@ -29,6 +32,7 @@ _SYSTEM = """你是报告章节叙事规划师。你的任务不是写正文,而
       "topic_id": "T1",
       "name": "话题名称",
       "purpose": "这个话题解决什么问题",
+      "core_question": "这个话题要回答的问题",
       "core_message": "这个话题要传达的核心意思(一句话)",
       "fact_ids": [1,2],
       "supporting_fact_ids": [1,2],
@@ -37,6 +41,13 @@ _SYSTEM = """你是报告章节叙事规划师。你的任务不是写正文,而
       "expected_content": "这个话题预期写出的内容要点",
       "completion_criteria": ["表达什么才算完成,如:说明入口", "说明操作主体", "说明关键步骤"],
       "relation_to_previous": "与上一个话题的逻辑关系",
+      "discourse_flow": [
+        {"role": "background", "facts": [1]},
+        {"role": "current_status", "facts": [2, 3]},
+        {"role": "evidence", "facts": [4]},
+        {"role": "analysis", "facts": []},
+        {"role": "limitation", "facts": [5]}
+      ],
       "writing_hint": "如何展开,避免事实罗列"
     }
   ],
@@ -54,7 +65,15 @@ _SYSTEM = """你是报告章节叙事规划师。你的任务不是写正文,而
    避免各章节重复使用同一批事实导致后章无内容可写。
 7. completion_criteria 由材料内容决定(该话题在材料里能支撑什么就写什么),不按固定模板。
 8. 若当前章节规划包含 subsections,应优先继承并校准这些小节;若没有,只有在多个话题层次确实需要分层表达时才生成 subsections。
-9. 小节标题必须是结构标题,不能是一句带判断的正文;不得为了格式美观硬设小节。"""
+9. 小节标题必须是结构标题,不能是一句带判断的正文;不得为了格式美观硬设小节。
+10. 【Discourse Plan——最重要的要求】每个 topic 的 discourse_flow 定义"这段按什么逻辑组织",role 取值:
+    background(背景/定义)/ current_status(当前状态/进展)/ evidence(支撑证据/数据)/
+    analysis(分析/因果/对比)/ limitation(限制/风险/未解决)/ judgment(判断/结论)。
+    flow 按逻辑顺序排列(背景→状态→证据→分析→限制→判断),每项 facts 列承担该角色的
+    fact_ids(可为空表示该角色靠推断/衔接);Writer 严格按 flow 顺序写,一段一个角色,
+    禁止把 flow 打散或按 fact 编号罗列。
+11. dependencies 列出本章写作前必须先完成的前置章节(如"机制概述"是"威胁分析"的前置),
+    用于 Writer 只注入依赖章节的记忆,防止上下文膨胀。"""
 
 _QA_SYSTEM = """你是章节叙事质量评审。根据 Narrative Plan 判断本章每个 Topic 是否按计划完成。
 严格输出 JSON,不要任何解释:
@@ -262,7 +281,7 @@ def _sanitize_plan(payload: dict, chapter_plan: dict, fact_ids: set[int], infere
         topics.append({
             "topic_id": str(item.get("topic_id") or f"T{len(topics) + 1}")[:16],
             "name": str(item.get("name") or "相关事实")[:40],
-            "purpose": str(item.get("purpose") or "")[:160],
+            "purpose": str(item.get("purpose") or ""),
             "core_message": str(item.get("core_message") or "")[:240],
             "fact_ids": fids,
             "supporting_fact_ids": fids,
@@ -270,7 +289,7 @@ def _sanitize_plan(payload: dict, chapter_plan: dict, fact_ids: set[int], infere
             "detail_level": detail,
             "expected_content": str(item.get("expected_content") or "")[:240],
             "completion_criteria": [str(c)[:120] for c in (item.get("completion_criteria") or []) if str(c).strip()],
-            "relation_to_previous": str(item.get("relation_to_previous") or "")[:160],
+            "relation_to_previous": str(item.get("relation_to_previous") or ""),
             "writing_hint": str(item.get("writing_hint") or "")[:220],
         })
     if not topics and fact_ids:
@@ -289,7 +308,7 @@ def _sanitize_plan(payload: dict, chapter_plan: dict, fact_ids: set[int], infere
             int(i) for i in payload.get("background_fact_ids") or []
             if str(i).isdigit() and int(i) in fact_ids
         ],
-        "must_not_claim": [str(item)[:160] for item in payload.get("must_not_claim") or [] if str(item).strip()],
+        "must_not_claim": [str(item) for item in payload.get("must_not_claim") or [] if str(item).strip()],
         "transition_hint": str(payload.get("transition_hint") or chapter_plan.get("next_bridge") or "")[:240],
     }
 
@@ -347,7 +366,7 @@ def _fallback_topics(chapter_plan: dict, fact_ids: set[int]) -> list[dict]:
     title = str(chapter_plan.get("title") or "本章")
     return [{
         "name": _clean_title(title),
-        "purpose": str(chapter_plan.get("judgment") or "围绕本章核心问题组织事实。")[:160],
+        "purpose": str(chapter_plan.get("judgment") or "围绕本章核心问题组织事实。"),
         "fact_ids": sorted(fact_ids),
         "inference_ids": [],
         "detail_level": "expand",
@@ -368,3 +387,5 @@ def _serializable_memory(memory: dict) -> dict:
 
 
 narrative_agent = NarrativeAgent()
+
+__all__ = ['NarrativeAgent', 'narrative_agent']

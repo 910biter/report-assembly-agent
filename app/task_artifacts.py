@@ -10,7 +10,9 @@ import json
 from typing import Any
 
 from app.cache import stable_hash
-from app.db import connect
+from app.db import session_scope
+from app.infrastructure.orm import ORMTaskArtifact
+from sqlalchemy import select
 
 TASK_ARTIFACT_SCHEMA_VERSION = "task-artifact-1"
 
@@ -27,31 +29,37 @@ def save_task_artifact(task_id: str, stage: str, effective_inputs: Any,
                        payload: Any, status: str = "done") -> str:
     """Persist a stage artifact and return its dependency hash."""
     input_hash = artifact_input_hash(stage, effective_inputs)
-    with connect() as conn:
-        conn.execute(
-            "INSERT INTO task_artifacts(task_id, stage, input_hash, status, payload) "
-            "VALUES(?, ?, ?, ?, ?) "
-            "ON CONFLICT(task_id, stage, input_hash) DO UPDATE SET "
-            "status=excluded.status, payload=excluded.payload, updated_at=datetime('now')",
-            (
-                task_id,
-                stage,
-                input_hash,
-                status,
-                json.dumps(payload, ensure_ascii=False),
-            ),
-        )
+    with session_scope() as s:
+        exists = s.execute(
+            select(ORMTaskArtifact.c.id).where(
+                ORMTaskArtifact.c.task_id == task_id,
+                ORMTaskArtifact.c.stage == stage,
+                ORMTaskArtifact.c.input_hash == input_hash,
+            )
+        ).first()
+        values = dict(task_id=task_id, stage=stage, input_hash=input_hash,
+                      status=status, payload=json.dumps(payload, ensure_ascii=False))
+        if exists:
+            s.execute(
+                ORMTaskArtifact.update()
+                .where(ORMTaskArtifact.c.task_id == task_id,
+                       ORMTaskArtifact.c.stage == stage,
+                       ORMTaskArtifact.c.input_hash == input_hash)
+                .values(status=status, payload=values["payload"])
+            )
+        else:
+            s.execute(ORMTaskArtifact.insert().values(**values))
     return input_hash
 
 
 def latest_task_artifact(task_id: str, stage: str) -> dict | None:
     """Return the latest artifact for a task stage, if present."""
-    with connect() as conn:
-        row = conn.execute(
-            "SELECT * FROM task_artifacts WHERE task_id=? AND stage=? "
-            "ORDER BY updated_at DESC, id DESC LIMIT 1",
-            (task_id, stage),
-        ).fetchone()
+    with session_scope() as s:
+        row = s.execute(
+            select(ORMTaskArtifact).where(
+                ORMTaskArtifact.c.task_id == task_id, ORMTaskArtifact.c.stage == stage
+            ).order_by(ORMTaskArtifact.c.updated_at.desc(), ORMTaskArtifact.c.id.desc()).limit(1)
+        ).mappings().first()
     if row is None:
         return None
     try:
@@ -71,10 +79,12 @@ def latest_task_artifact(task_id: str, stage: str) -> dict | None:
 
 
 def list_task_artifacts(task_id: str) -> list[dict]:
-    with connect() as conn:
-        rows = conn.execute(
-            "SELECT stage, input_hash, status, payload, updated_at "
-            "FROM task_artifacts WHERE task_id=? ORDER BY id",
+    with session_scope() as s:
+        rows = s.execute(
+            select(ORMTaskArtifact.c.stage, ORMTaskArtifact.c.input_hash,
+                   ORMTaskArtifact.c.status, ORMTaskArtifact.c.payload,
+                   ORMTaskArtifact.c.updated_at)
+            .where(ORMTaskArtifact.c.task_id == task_id).order_by(ORMTaskArtifact.c.id)
             (task_id,),
         ).fetchall()
     artifacts: list[dict] = []

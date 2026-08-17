@@ -8,7 +8,9 @@ import time
 import uuid
 from typing import Any
 
-from app.db import connect
+from app.db import session_scope
+from app.infrastructure.orm import ORMLLMCall, ORMFact, ORMInference, ORMSentence
+from sqlalchemy import select, update
 
 _task_id: contextvars.ContextVar[str] = contextvars.ContextVar("token_task_id", default="")
 _stage: contextvars.ContextVar[str] = contextvars.ContextVar("token_stage", default="")
@@ -66,38 +68,33 @@ def log_llm_call(call_id: str, agent: str, input_chars: int, stats_delta: dict,
     }
     timing["prompt_tokens_per_second"] = round(prompt_tokens / timing["prompt_eval_seconds"], 2) if timing["prompt_eval_seconds"] else 0
     timing["output_tokens_per_second"] = round(output_tokens / timing["output_eval_seconds"], 2) if timing["output_eval_seconds"] else 0
-    with connect() as conn:
-        conn.execute(
-            "INSERT INTO llm_call_logs(call_id, task_id, agent, stage, report_mode, "
-            "input_chars, input_tokens, output_tokens, context_tokens, latency_ms, "
-            "retry_count, success, error, material_count, returned_chars, valid_json_chars, "
-            "returned_tokens, parsed_tokens, created_at) "
-            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                call_id,
-                ctx.get("task_id", ""),
-                agent or "base",
-                ctx.get("stage", ""),
-                ctx.get("report_mode", ""),
-                int(input_chars),
-                prompt_tokens,
-                output_tokens,
-                context_tokens,
-                int(latency_seconds * 1000),
-                int(retry_count),
-                1 if success else 0,
-                str(error or "")[:500],
-                int(ctx.get("material_count") or 0),
-                int(returned_chars or 0),
-                int(valid_json_chars or 0),
-                returned_tokens,
-                parsed_tokens,
-                time.strftime("%Y-%m-%d %H:%M:%S"),
-            ),
+    with session_scope() as s:
+        s.execute(
+            ORMLLMCall.insert().values(
+                call_id=call_id,
+                task_id=ctx.get("task_id", ""),
+                agent=agent or "base",
+                stage=ctx.get("stage", ""),
+                report_mode=ctx.get("report_mode", ""),
+                input_chars=int(input_chars),
+                input_tokens=prompt_tokens,
+                output_tokens=output_tokens,
+                context_tokens=context_tokens,
+                latency_ms=int(latency_seconds * 1000),
+                retry_count=int(retry_count),
+                success=1 if success else 0,
+                error=str(error or "")[:500],
+                material_count=int(ctx.get("material_count") or 0),
+                returned_chars=int(returned_chars or 0),
+                valid_json_chars=int(valid_json_chars or 0),
+                returned_tokens=returned_tokens,
+                parsed_tokens=parsed_tokens,
+                created_at=time.strftime("%Y-%m-%d %H:%M:%S"),
+            )
         )
-        conn.execute(
-            "UPDATE llm_call_logs SET funnel_json=? WHERE call_id=?",
-            (json.dumps({"model_timing": timing}, ensure_ascii=False), call_id),
+        s.execute(
+            update(ORMLLMCall).where(ORMLLMCall.c.call_id == call_id)
+            .values(funnel_json=json.dumps({"model_timing": timing}, ensure_ascii=False))
         )
 
 
@@ -110,21 +107,19 @@ def log_pipeline_event(agent: str, **funnel: Any) -> str:
     """
     call_id = "evt_" + new_call_id()
     ctx = current_context()
-    with connect() as conn:
-        conn.execute(
-            "INSERT INTO llm_call_logs(call_id, task_id, agent, stage, report_mode, "
-            "success, material_count, funnel_json, created_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                call_id,
-                ctx.get("task_id", ""),
-                agent or "pipeline",
-                ctx.get("stage", ""),
-                ctx.get("report_mode", ""),
-                1,
-                int(ctx.get("material_count") or 0),
-                json.dumps(_json_safe(funnel), ensure_ascii=False),
-                time.strftime("%Y-%m-%d %H:%M:%S"),
-            ),
+    with session_scope() as s:
+        s.execute(
+            ORMLLMCall.insert().values(
+                call_id=call_id,
+                task_id=ctx.get("task_id", ""),
+                agent=agent or "pipeline",
+                stage=ctx.get("stage", ""),
+                report_mode=ctx.get("report_mode", ""),
+                success=1,
+                material_count=int(ctx.get("material_count") or 0),
+                funnel_json=json.dumps(_json_safe(funnel), ensure_ascii=False),
+                created_at=time.strftime("%Y-%m-%d %H:%M:%S"),
+            )
         )
     return call_id
 
@@ -145,18 +140,15 @@ def update_call_products(call_id: str, **products: list[int]) -> None:
         "final_used_fact_ids",
         "final_used_inference_ids",
     }
-    sets = []
-    params: list[Any] = []
+    values = {}
     for key, value in products.items():
         if key not in allowed:
             continue
-        sets.append(f"{key}=?")
-        params.append(json.dumps([int(v) for v in value or [] if str(v).isdigit()], ensure_ascii=False))
-    if not sets:
+        values[key] = json.dumps([int(v) for v in value or [] if str(v).isdigit()], ensure_ascii=False)
+    if not values:
         return
-    params.append(call_id)
-    with connect() as conn:
-        conn.execute(f"UPDATE llm_call_logs SET {', '.join(sets)} WHERE call_id=?", params)
+    with session_scope() as s:
+        s.execute(update(ORMLLMCall).where(ORMLLMCall.c.call_id == call_id).values(**values))
 
 
 def update_call_metrics(call_id: str, **metrics: int) -> None:
@@ -165,11 +157,11 @@ def update_call_metrics(call_id: str, **metrics: int) -> None:
         "returned_tokens", "parsed_tokens", "persisted_tokens", "final_tokens",
         "candidate_count", "candidate_total",
     }
-    with connect() as conn:
-        row = conn.execute(
-            "SELECT returned_chars, returned_tokens, output_tokens FROM llm_call_logs WHERE call_id=?",
-            (call_id,),
-        ).fetchone()
+    with session_scope() as s:
+        row = s.execute(
+            select(ORMLLMCall.c.returned_chars, ORMLLMCall.c.returned_tokens, ORMLLMCall.c.output_tokens)
+            .where(ORMLLMCall.c.call_id == call_id)
+        ).mappings().first()
     returned_chars = int(row["returned_chars"] or 0) if row else 0
     returned_tokens = int(row["returned_tokens"] or row["output_tokens"] or 0) if row else 0
     if "stored_chars" in metrics and "persisted_tokens" not in metrics:
@@ -177,18 +169,15 @@ def update_call_metrics(call_id: str, **metrics: int) -> None:
     if "final_chars" in metrics and "final_tokens" not in metrics:
         metrics["final_tokens"] = _estimate_sub_tokens(int(metrics.get("final_chars") or 0), returned_chars, returned_tokens)
 
-    sets = []
-    params: list[Any] = []
+    values = {}
     for key, value in metrics.items():
         if key not in allowed:
             continue
-        sets.append(f"{key}=?")
-        params.append(int(value or 0))
-    if not sets:
+        values[key] = int(value or 0)
+    if not values:
         return
-    params.append(call_id)
-    with connect() as conn:
-        conn.execute(f"UPDATE llm_call_logs SET {', '.join(sets)} WHERE call_id=?", params)
+    with session_scope() as s:
+        s.execute(update(ORMLLMCall).where(ORMLLMCall.c.call_id == call_id).values(**values))
 
 
 def update_call_funnel(call_id: str, **funnel: Any) -> None:
@@ -200,16 +189,18 @@ def update_call_funnel(call_id: str, **funnel: Any) -> None:
     """
     if not call_id or not funnel:
         return
-    with connect() as conn:
-        row = conn.execute("SELECT funnel_json FROM llm_call_logs WHERE call_id=?", (call_id,)).fetchone()
+    with session_scope() as s:
+        row = s.execute(
+            select(ORMLLMCall.c.funnel_json).where(ORMLLMCall.c.call_id == call_id)
+        ).mappings().first()
         try:
             current = json.loads(row["funnel_json"] or "{}") if row else {}
         except (TypeError, ValueError):
             current = {}
         current.update(_json_safe(funnel))
-        conn.execute(
-            "UPDATE llm_call_logs SET funnel_json=? WHERE call_id=?",
-            (json.dumps(current, ensure_ascii=False), call_id),
+        s.execute(
+            update(ORMLLMCall).where(ORMLLMCall.c.call_id == call_id)
+            .values(funnel_json=json.dumps(current, ensure_ascii=False))
         )
 
 
@@ -230,23 +221,27 @@ def generation_delta(before: dict, after: dict) -> dict:
 
 def build_token_efficiency(task_id: str, report_id: int | None = None) -> dict:
     """Compute post-run token utilization metrics from call logs and lineage tables."""
-    with connect() as conn:
-        calls = conn.execute("SELECT * FROM llm_call_logs WHERE task_id=?", (task_id,)).fetchall()
+    with session_scope() as s:
+        calls = s.execute(
+            select(ORMLLMCall).where(ORMLLMCall.c.task_id == task_id)
+        ).mappings().all()
         call_ids = [c["call_id"] for c in calls]
-        facts = conn.execute("SELECT id, origin_call_id FROM facts WHERE task_id=?", (task_id,)).fetchall()
+        facts = s.execute(
+            select(ORMFact.c.id, ORMFact.c.origin_call_id).where(ORMFact.c.task_id == task_id)
+        ).mappings().all()
         inferences = []
         if call_ids:
-            placeholders = ",".join("?" * len(call_ids))
-            inferences = conn.execute(
-                f"SELECT id, origin_call_id FROM inferences WHERE origin_call_id IN ({placeholders})",
-                call_ids,
-            ).fetchall()
+            inferences = s.execute(
+                select(ORMInference.c.id, ORMInference.c.origin_call_id)
+                .where(ORMInference.c.origin_call_id.in_(call_ids))
+            ).mappings().all()
         sentence_rows = []
         if report_id is not None:
-            sentence_rows = conn.execute(
-                "SELECT id, content, source_refs, origin_call_id, selected FROM report_sentences WHERE report_id=?",
-                (int(report_id),),
-            ).fetchall()
+            sentence_rows = s.execute(
+                select(ORMSentence.c.id, ORMSentence.c.content, ORMSentence.c.source_refs,
+                       ORMSentence.c.origin_call_id, ORMSentence.c.selected)
+                .where(ORMSentence.c.report_id == int(report_id))
+            ).mappings().all()
 
     total_output = sum(int(c["output_tokens"] or 0) for c in calls)
     total_input = sum(int(c["input_tokens"] or 0) for c in calls)
@@ -690,11 +685,10 @@ def _aggregate_funnel(calls: list, final_text: str = "") -> dict:
 
 
 def list_llm_calls(task_id: str) -> list[dict]:
-    with connect() as conn:
-        rows = conn.execute(
-            "SELECT * FROM llm_call_logs WHERE task_id=? ORDER BY id",
-            (task_id,),
-        ).fetchall()
+    with session_scope() as s:
+        rows = s.execute(
+            select(ORMLLMCall).where(ORMLLMCall.c.task_id == task_id).order_by(ORMLLMCall.c.id)
+        ).mappings().all()
     result = []
     for row in rows:
         item = dict(row)

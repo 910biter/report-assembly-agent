@@ -51,6 +51,7 @@ class Claim:
     source: str = ""
     fact_type: str = "STATEMENT"  # EVENT / PERSON / LOCATION / TIME / NUMBER / STATEMENT
     dimension: str = ""
+    need_id: int = 0  # EvidenceNeed 归属(0=开放发现)
     status: str = "pending"  # pending / promoted / rejected
     fact_id: int | None = None
     id: int | None = None

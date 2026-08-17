@@ -18,7 +18,9 @@ from docx.oxml.ns import qn
 from docx.shared import Cm, Pt, RGBColor
 
 from app.config import settings
-from app.db import connect
+from app.db import session_scope
+from app.infrastructure.orm import ORMReport, ORMSentence
+from sqlalchemy import select
 from app.memory.style import get_locked_variant, get_variant
 from app.template_engine import check_docx_conformance
 
@@ -36,14 +38,15 @@ ROLE_STYLE_NAMES = {
 
 def export_report(report_id: int) -> Path:
     """Export selected report sentences to DOCX and write a conformance sidecar."""
-    with connect() as conn:
-        report = conn.execute("SELECT * FROM reports WHERE id=?", (report_id,)).fetchone()
+    with session_scope() as s:
+        report = s.execute(select(ORMReport).where(ORMReport.c.id == report_id)).mappings().first()
         if report is None:
             raise ValueError("REPORT_NOT_FOUND")
-        sentences = conn.execute(
-            "SELECT * FROM report_sentences WHERE report_id=? AND selected=1 ORDER BY position",
-            (report_id,),
-        ).fetchall()
+        sentences = s.execute(
+            select(ORMSentence).where(
+                ORMSentence.c.report_id == report_id, ORMSentence.c.selected == 1
+            ).order_by(ORMSentence.c.position)
+        ).mappings().all()
     variant = _select_export_variant(report["style_profile_id"])
     format_spec = _dominant_format(variant)
     schema = format_spec.get("template_schema") if isinstance(format_spec.get("template_schema"), dict) else {}

@@ -132,19 +132,6 @@ class QdrantVectorStore:
         except Exception:
             return []
 
-    def dedup_materials(self, threshold: float = 0.88) -> list[tuple[int, int]]:
-        """返回 [(附属_id, 主条目_id)]:相似度 >= threshold 判为重复,id 较小者为主条目。"""
-        vectors = self.material_vectors()
-        result: list[tuple[int, int]] = []
-        for i in range(len(vectors)):
-            for j in range(i + 1, len(vectors)):
-                mid_i, vec_i = vectors[i]
-                mid_j, vec_j = vectors[j]
-                if cosine(vec_i, vec_j) >= threshold:
-                    main_id, dup_id = (mid_i, mid_j) if mid_i < mid_j else (mid_j, mid_i)
-                    result.append((dup_id, main_id))
-        return result
-
     def search_units(self, query_vector: list[float] | np.ndarray, top_k: int = 10,
                      query_text: str = "", filters: dict | None = None) -> list[tuple[int, float]]:
         """Qdrant 向量检索;query_text 仅作兼容参数(关键词候选由 rag 层内存补充)。"""
@@ -180,14 +167,17 @@ class QdrantVectorStore:
             pass  # 单点写入失败跳过,不中断任务;检索层自动回退关键词
 
     def _unit_payload(self, unit_id: int) -> dict:
-        from app.db import connect
+        from app.db import session_scope
+        from app.infrastructure.orm import ORMUnit, ORMMaterial
+        from sqlalchemy import select
 
-        with connect() as conn:
-            row = conn.execute(
-                "SELECT u.id, u.material_id, u.kind, u.page, u.paragraph, m.filename, m.file_type "
-                "FROM units u JOIN materials m ON m.id=u.material_id WHERE u.id=?",
-                (int(unit_id),),
-            ).fetchone()
+        with session_scope() as s:
+            row = s.execute(
+                select(ORMUnit.c.id, ORMUnit.c.material_id, ORMUnit.c.kind, ORMUnit.c.page,
+                       ORMUnit.c.paragraph, ORMMaterial.c.filename, ORMMaterial.c.file_type)
+                .join(ORMMaterial, ORMMaterial.c.id == ORMUnit.c.material_id)
+                .where(ORMUnit.c.id == int(unit_id))
+            ).mappings().first()
         if row is None:
             return {"unit_id": int(unit_id)}
         return {

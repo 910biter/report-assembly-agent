@@ -11,3 +11,4 @@ numpy
 python-multipart
 qdrant-client
 docling
+psycopg[binary]

@@ -11,7 +11,7 @@ LLM 检查:逻辑跳跃、引用与内容一致性。结果统一为 qa_notes �
 import json
 import re
 
-from app.db import connect
+from app.db import session_scope
 from app.gateway import model_gateway
 from app.llm_scheduler import invoke
 
@@ -53,12 +53,15 @@ def run_quality_check(report_id: int, plan_structure: list[str],
     """
     qa_policy = qa_policy or {}
     allow_symbolic_lists = bool(qa_policy.get("allow_symbolic_lists"))
-    with connect() as conn:
-        rows = conn.execute(
-            "SELECT id, section, paragraph, content, source_level, source_refs "
-            "FROM report_sentences WHERE report_id=? AND selected=1 ORDER BY position",
-            (report_id,),
-        ).fetchall()
+    from app.infrastructure.orm import ORMSentence
+    from sqlalchemy import select
+    with session_scope() as s:
+        rows = s.execute(
+            select(ORMSentence.c.id, ORMSentence.c.section, ORMSentence.c.paragraph,
+                   ORMSentence.c.content, ORMSentence.c.source_level, ORMSentence.c.source_refs)
+            .where(ORMSentence.c.report_id == report_id, ORMSentence.c.selected == 1)
+            .order_by(ORMSentence.c.position)
+        ).mappings().all()
     issues: list[dict] = []
 
     # 1. 重复内容:同段或近段内句子高相似
@@ -142,9 +145,10 @@ def run_quality_check(report_id: int, plan_structure: list[str],
 
     # 4. 数字一致性:句子中的数字应在其引用事实(含原文片段)中出现(防模型改述出错)
     _digit_re = re.compile(r"\d+(?:\.\d+)?")
-    with connect() as conn:
-        fact_rows = conn.execute("SELECT id, content FROM facts").fetchall()
-        ev_rows = conn.execute("SELECT fact_id, quote FROM evidence").fetchall()
+    from app.infrastructure.orm import ORMFact, ORMEvidence
+    with session_scope() as s:
+        fact_rows = s.execute(select(ORMFact.c.id, ORMFact.c.content)).mappings().all()
+        ev_rows = s.execute(select(ORMEvidence.c.fact_id, ORMEvidence.c.quote)).mappings().all()
     fact_by_id = {r["id"]: r["content"] for r in fact_rows}
     quote_by_fact: dict[int, list[str]] = {}
     for ev in ev_rows:
@@ -171,6 +175,35 @@ def run_quality_check(report_id: int, plan_structure: list[str],
                 "type": "CITATION_MISMATCH", "section": row["section"],
                 "quote": row["content"][:60],
                 "note": f"句子数字 {sorted(missing)} 未在引用事实中出现,请核对",
+            })
+
+    # 4.4 逐句归因支持门控(AFtG"选择即引用"的运行时兜底):
+    # 句子绑定 fact_ids 却与证据文本几乎零词面重叠 → 疑似裸结论/无依据扩展。
+    # 模型语义判断为主;此处仅抓极低重叠的明显异常,避免误报。
+    for row in rows:
+        try:
+            refs = json.loads(row["source_refs"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        fact_ids = refs.get("fact_ids") or []
+        if not fact_ids:
+            continue
+        content = row["content"] or ""
+        if len(content) < 20:
+            continue  # 短句/过渡句不判
+        evidence_text = ""
+        for fid in fact_ids:
+            evidence_text += fact_by_id.get(int(fid), "") + " "
+            for quote in quote_by_fact.get(int(fid), []):
+                evidence_text += quote + " "
+        if not evidence_text.strip():
+            continue
+        sim = _cosine_similarity(content, evidence_text)
+        if sim < 0.1:  # 字符二元组重叠极低(程序兜底;语义判断由模型承担)
+            issues.append({
+                "type": "ATTRIBUTION_WEAK", "section": row["section"],
+                "quote": content[:60],
+                "note": "句子与所引用证据词面重叠极低,疑似无依据扩展/裸结论,请核对或补充引用",
             })
 
     # 4.5 具体化检查:引用事实/证据已有明确日期、文件名、材料名时,正文不应泛化。
@@ -228,10 +261,13 @@ def run_quality_check(report_id: int, plan_structure: list[str],
             })
 
     # 5. 信息密度:无事实/推断依据的句子占比过高 → 内容空洞(规则,零成本)
-    with connect() as conn:
-        all_rows = conn.execute(
-            "SELECT source_refs FROM report_sentences WHERE report_id=? AND selected=1", (report_id,)
-        ).fetchall()
+    from app.infrastructure.orm import ORMSentence
+    from sqlalchemy import select
+    with session_scope() as s:
+        all_rows = s.execute(
+            select(ORMSentence.c.source_refs)
+            .where(ORMSentence.c.report_id == report_id, ORMSentence.c.selected == 1)
+        ).mappings().all()
     referenced = 0
     for r in all_rows:
         try:

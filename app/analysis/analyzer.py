@@ -5,7 +5,9 @@
 import json
 
 from app.agents.base import BaseAgent
-from app.db import connect
+from app.db import session_scope
+from app.infrastructure.orm import ORMInference, Base
+from sqlalchemy import select
 from app.models import Inference
 from app.token_monitor import update_call_metrics, update_call_products
 
@@ -158,22 +160,32 @@ class AnalysisAgent(BaseAgent):
 
 
 def save_inference(inference: Inference, origin_call_id: str = "") -> int:
-    with connect() as conn:
-        cur = conn.execute(
-            "INSERT INTO inferences(content, source_level, based_fact_ids, reasoning_chain, "
-            "dimension, analysis_type, origin_call_id) VALUES(?, ?, ?, ?, ?, ?, ?)",
-            (inference.content, inference.source_level,
-             json.dumps(inference.based_fact_ids), inference.reasoning_chain,
-             inference.dimension, inference.analysis_type, origin_call_id),
+    with session_scope() as s:
+        result = s.execute(
+            ORMInference.insert().values(
+                content=inference.content, source_level=inference.source_level,
+                based_fact_ids=json.dumps(inference.based_fact_ids),
+                reasoning_chain=inference.reasoning_chain,
+                dimension=inference.dimension, analysis_type=inference.analysis_type,
+                origin_call_id=origin_call_id,
+            )
         )
+        inference_id = int(result.inserted_primary_key[0])
         # 数据血缘:推断 → 依据事实(关联表,支持"事实被哪些推断使用"查询)
+        inference_fact = Base.metadata.tables["inference_fact"]
         for fact_id in inference.based_fact_ids:
             try:
-                conn.execute(
-                    "INSERT INTO inference_fact(inference_id, fact_id) VALUES(?, ?) "
-                    "ON CONFLICT(inference_id, fact_id) DO NOTHING",
-                    (cur.lastrowid, int(fact_id)),
-                )
+                exists = s.execute(
+                    select(inference_fact.c.inference_id).where(
+                        inference_fact.c.inference_id == inference_id,
+                        inference_fact.c.fact_id == int(fact_id),
+                    )
+                ).first()
+                if exists is None:
+                    s.execute(inference_fact.insert().values(
+                        inference_id=inference_id, fact_id=int(fact_id)))
             except Exception:
                 continue  # 依据事实不存在(幻觉 id/旧数据)时跳过血缘,不影响推断本身
-        return cur.lastrowid
+        return inference_id
+
+__all__ = ['AnalysisAgent', 'save_inference']

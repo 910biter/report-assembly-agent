@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     torch_compile: bool = False  # torch.compile 编译(IRA_TORCH_COMPILE):缺 python3-dev 时编译必败,默认禁用走 eager
     gpu_memory_tight: bool = False  # 显存紧张模式(IRA_GPU_MEMORY_TIGHT):重资源阶段(解析)自动卸载推理模型
     gpu_layers: int = -1  # Ollama num_gpu(IRA_GPU_LAYERS):-1=auto, 0=CPU, >0=显式 GPU 层数(统一模型放置策略)
+    db_url: str = ""  # PG 连接串(IRA_DB_URL, postgresql+psycopg://...);空 = 默认本地 PG(ira/ira@127.0.0.1:5432/ira)
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -56,12 +57,6 @@ class Settings(BaseSettings):
     qdrant_collection_units: str = "ira_units"
     qdrant_collection_materials: str = "ira_materials"
     qdrant_collection_facts: str = "ira_facts"
-    max_embedded_images: int = 0  # 0 = process every meaningful embedded image
-    xlsx_chunk_rows: int = 40
-
-    @property
-    def db_path(self) -> Path:
-        return self.runtime_root / "report.db"
 
     @property
     def materials_dir(self) -> Path:

@@ -11,7 +11,9 @@ import shutil
 from pathlib import Path
 
 from app.config import settings
-from app.db import connect
+from app.db import session_scope
+from app.infrastructure.orm import ORMVariant, Base
+from sqlalchemy import select
 from app.gateway import model_gateway
 from app.llm_scheduler import invoke
 from app.models import StyleVariant
@@ -140,11 +142,11 @@ def _reuse_by_source_hash(reports: list[dict]) -> list[StyleVariant] | None:
     if len(reports) != 1:
         return None
     digest = _source_hash(reports[0])
-    with connect() as conn:
-        row = conn.execute(
-            "SELECT id FROM style_variants WHERE source_hash=? ORDER BY id LIMIT 1",
-            (digest,),
-        ).fetchone()
+    with session_scope() as s:
+        row = s.execute(
+            select(ORMVariant.c.id).where(ORMVariant.c.source_hash == digest)
+            .order_by(ORMVariant.c.id).limit(1)
+        ).mappings().first()
     if row is None:
         return None
     variant = get_variant(row["id"])
@@ -156,20 +158,20 @@ def _record_source_hash(reports: list[dict], variants: list[StyleVariant]) -> No
     if len(reports) != 1 or not variants:
         return
     digest = _source_hash(reports[0])
-    with connect() as conn:
-        conn.execute(
-            "UPDATE style_variants SET source_hash=? WHERE id=?",
-            (digest, variants[0].id),
+    with session_scope() as s:
+        s.execute(
+            ORMVariant.update().where(ORMVariant.c.id == variants[0].id).values(source_hash=digest)
         )
 
 
 def _ensure_library() -> int:
-    with connect() as conn:
-        row = conn.execute("SELECT id FROM style_library ORDER BY id LIMIT 1").fetchone()
+    library_table = Base.metadata.tables["style_library"]
+    with session_scope() as s:
+        row = s.execute(select(library_table.c.id).order_by(library_table.c.id).limit(1)).first()
         if row:
-            return row["id"]
-        cur = conn.execute("INSERT INTO style_library(institution) VALUES('')")
-        return cur.lastrowid
+            return int(row[0])
+        result = s.execute(library_table.insert().values(institution=""))
+        return int(result.inserted_primary_key[0])
 
 
 def _extract_headings(text: str, path=None) -> list[str]:
@@ -423,80 +425,78 @@ def _write_template_schema_file(schema: dict) -> None:
 
 
 def save_variant(variant: StyleVariant) -> StyleVariant:
-    with connect() as conn:
-        cur = conn.execute(
-            "INSERT INTO style_variants(library_id, name, description, structure_json, "
-            "writing_style_json, terminology_json, format_spec_json, writing_patterns_json, "
-            "style_samples_json, chapter_styles_json, reasoning_profile_json, institution_rules_json, "
-            "source_reports, confidence, status) "
-            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (variant.library_id, variant.name, variant.description,
-             json.dumps(variant.structure, ensure_ascii=False),
-             json.dumps(variant.writing_style, ensure_ascii=False),
-             json.dumps(variant.terminology, ensure_ascii=False),
-             json.dumps(variant.format_spec, ensure_ascii=False),
-             json.dumps(variant.writing_patterns, ensure_ascii=False),
-             json.dumps(variant.style_samples, ensure_ascii=False),
-             json.dumps(variant.chapter_styles, ensure_ascii=False),
-             json.dumps(variant.reasoning_profile, ensure_ascii=False),
-             json.dumps(variant.institution_rules, ensure_ascii=False),
-             json.dumps(variant.source_reports, ensure_ascii=False),
-             0.0, variant.status),
+    with session_scope() as s:
+        result = s.execute(
+            ORMVariant.insert().values(
+                library_id=variant.library_id, name=variant.name,
+                description=variant.description,
+                structure_json=json.dumps(variant.structure, ensure_ascii=False),
+                writing_style_json=json.dumps(variant.writing_style, ensure_ascii=False),
+                terminology_json=json.dumps(variant.terminology, ensure_ascii=False),
+                format_spec_json=json.dumps(variant.format_spec, ensure_ascii=False),
+                writing_patterns_json=json.dumps(variant.writing_patterns, ensure_ascii=False),
+                style_samples_json=json.dumps(variant.style_samples, ensure_ascii=False),
+                chapter_styles_json=json.dumps(variant.chapter_styles, ensure_ascii=False),
+                reasoning_profile_json=json.dumps(variant.reasoning_profile, ensure_ascii=False),
+                institution_rules_json=json.dumps(variant.institution_rules, ensure_ascii=False),
+                source_reports=json.dumps(variant.source_reports, ensure_ascii=False),
+                confidence=0.0, status=variant.status,
+            )
         )
-        variant.id = cur.lastrowid
+        variant.id = int(result.inserted_primary_key[0])
     return variant
 
 
 def get_variant(variant_id: int) -> StyleVariant | None:
-    with connect() as conn:
-        row = conn.execute("SELECT * FROM style_variants WHERE id=?", (variant_id,)).fetchone()
-    return _row_to_variant(row) if row else None
+    with session_scope() as s:
+        row = s.execute(select(ORMVariant).where(ORMVariant.c.id == variant_id)).mappings().first()
+    return _row_to_variant(dict(row)) if row else None
 
 
 def list_variants() -> list[StyleVariant]:
-    with connect() as conn:
-        rows = conn.execute(
-            "SELECT * FROM style_variants WHERE status!='deleted' ORDER BY id DESC"
-        ).fetchall()
-    return [_row_to_variant(row) for row in rows]
+    with session_scope() as s:
+        rows = s.execute(
+            select(ORMVariant).where(ORMVariant.c.status != "deleted")
+            .order_by(ORMVariant.c.id.desc())
+        ).mappings().all()
+    return [_row_to_variant(dict(row)) for row in rows]
 
 
 def get_locked_variant() -> StyleVariant | None:
-    with connect() as conn:
-        row = conn.execute(
-            "SELECT * FROM style_variants WHERE status='locked' ORDER BY id DESC LIMIT 1"
-        ).fetchone()
-    return _row_to_variant(row) if row else None
+    with session_scope() as s:
+        row = s.execute(
+            select(ORMVariant).where(ORMVariant.c.status == "locked")
+            .order_by(ORMVariant.c.id.desc()).limit(1)
+        ).mappings().first()
+    return _row_to_variant(dict(row)) if row else None
 
 
 def set_variant_status(variant_id: int, status: str) -> None:
-    with connect() as conn:
+    with session_scope() as s:
         if status == "locked":
-            row = conn.execute(
-                "SELECT library_id FROM style_variants WHERE id=?", (variant_id,)
-            ).fetchone()
+            row = s.execute(
+                select(ORMVariant.c.library_id).where(ORMVariant.c.id == variant_id)
+            ).first()
             if row is not None:
-                conn.execute(
-                    "UPDATE style_variants SET status='confirmed' "
-                    "WHERE library_id=? AND status='locked' AND id!=?",
-                    (row["library_id"], variant_id),
+                s.execute(
+                    ORMVariant.update()
+                    .where(ORMVariant.c.library_id == row[0],
+                           ORMVariant.c.status == "locked",
+                           ORMVariant.c.id != variant_id)
+                    .values(status="confirmed")
                 )
-        conn.execute("UPDATE style_variants SET status=? WHERE id=?", (status, variant_id))
+        s.execute(ORMVariant.update().where(ORMVariant.c.id == variant_id).values(status=status))
 
 
 def update_variant(variant_id: int, name: str | None = None, description: str | None = None) -> None:
-    sets: list[str] = []
-    params: list = []
+    values: dict = {}
     if name is not None:
-        sets.append("name=?")
-        params.append(name)
+        values["name"] = name
     if description is not None:
-        sets.append("description=?")
-        params.append(description)
-    if sets:
-        params.append(variant_id)
-        with connect() as conn:
-            conn.execute(f"UPDATE style_variants SET {', '.join(sets)} WHERE id=?", params)
+        values["description"] = description
+    if values:
+        with session_scope() as s:
+            s.execute(ORMVariant.update().where(ORMVariant.c.id == variant_id).values(**values))
 
 
 def delete_variant(variant_id: int) -> bool:
@@ -507,8 +507,8 @@ def delete_variant(variant_id: int) -> bool:
     """
     if get_variant(variant_id) is None:
         return False
-    with connect() as conn:
-        conn.execute("UPDATE style_variants SET status='deleted' WHERE id=?", (variant_id,))
+    with session_scope() as s:
+        s.execute(ORMVariant.update().where(ORMVariant.c.id == variant_id).values(status="deleted"))
     return True
 
 

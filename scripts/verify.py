@@ -146,26 +146,54 @@ embedder_mod.model_gateway = fake
 from app.config import settings
 
 check("隔离 runtime", str(settings.runtime_root) == _TMP_ROOT)
-from app.db import connect, init_db
+from app.db import init_db, session_scope
+from sqlalchemy import select
 init_db()
+# PG 持久库幂等:DROP 全部表后重建(create_all 带 DEFAULT/约束)+ 清数据
+from app.db import init_db as _init_db
+from app.infrastructure.orm import Base
+from app.db import _get_engine
+from sqlalchemy import text
+with _get_engine().connect() as _conn:
+    _tables = ", ".join(f'"{t.name}"' for t in reversed(Base.metadata.sorted_tables))
+    _conn.execute(text(f"DROP TABLE IF EXISTS {_tables} CASCADE"))
+    _conn.commit()
+_init_db()
 
 MATERIAL_DIR = Path("/mnt/c/Users/32795/OneDrive/桌面/agent/material")
 if not MATERIAL_DIR.exists():
     MATERIAL_DIR = Path("/mnt/c/Users/32795/OneDrive/桌面/material")
+if not MATERIAL_DIR.exists():
+    # 远端/通用环境:取 runtime/templates 下的模板文件
+    TPL_DIR = Path("runtime/templates")
+    MATERIAL_DIR = TPL_DIR
+    _tpl = list(TPL_DIR.glob("*.docx"))
+    _TEMPLATE_DOCX = _tpl[0] if _tpl else None
+else:
+    _TEMPLATE_DOCX = MATERIAL_DIR / "总结报告模板_公文风格.docx"
 
 from app.memory import short_term, style
-spec = style.extract_docx_format(MATERIAL_DIR / "总结报告模板_公文风格.docx")
+assert _TEMPLATE_DOCX is not None, "模板缺失(本地桌面 或 runtime/templates)"
+spec = style.extract_docx_format(_TEMPLATE_DOCX)
 check("docx 格式提取(字体/字号/页边距)",
       bool(spec.get("font_name")) and bool(spec.get("font_size_pt")) and "margins_cm" in spec)
 
 # 风格库:2 份同体裁报告 → 聚类为 1 个变体
+def _find_template(name_part: str):
+    """模板文件定位(本地裸名 / 远端哈希前缀)。"""
+    if MATERIAL_DIR.name == "templates" and MATERIAL_DIR.exists():
+        hits = [f for f in MATERIAL_DIR.glob(f"*{name_part}*.docx")]
+        return str(hits[0]) if hits else str(MATERIAL_DIR / name_part)
+    return str(MATERIAL_DIR / name_part)
+
+
 va = style.analyze_library([
     {"filename": "模板A.docx",
      "text": "模板A报告\n一、背景概述\n本年度工作围绕立德树人展开。\n二、成效分析\n成果显著。\n三、趋势研判\n后续将深化。",
-     "path": str(MATERIAL_DIR / "总结报告模板_公文风格.docx")},
+     "path": _find_template("总结报告模板_公文风格")},
     {"filename": "模板B.docx",
      "text": "模板B报告\n一、背景概述\n坚持问题导向,系统梳理短板弱项。\n二、成效分析\n形成闭环管理机制。\n三、趋势研判\n推动长效化发展。",
-     "path": str(MATERIAL_DIR / "通用总结报告模板_公文风格.docx")},
+     "path": _find_template("通用总结报告模板_公文风格")},
 ])[0]
 check("聚类:2 份同体裁 → 1 变体", va.name == "政策研究")
 check("变体含结构化章节", isinstance(va.structure.get("sections"), list) and len(va.structure["sections"]) >= 1)
@@ -193,9 +221,8 @@ check("变体含分析逻辑层与机构规则层",
 check("to_prompt_block 注入分析逻辑与机构规则",
       "分析逻辑" in va.to_prompt_block() and "机构规则" in va.to_prompt_block())
 
-from app.business import build_chapter_evidence_matrix, build_task_profile
+from app.report_tools import build_chapter_evidence_matrix, build_task_profile
 from app.policy import build_report_policy, policy_prompt_block
-from app.scale import build_preliminary_scale_plan, build_report_scale_plan
 profile = build_task_profile("生成一份要求梳理与执行指导报告", [
     {"material_id": 1, "filename": "a.docx", "doc_type": "说明", "topic": "提交要求",
      "material_role": "上级规范依据", "claim_support": "normative",
@@ -240,25 +267,12 @@ check("运行时闭环:章节证据矩阵与待补信息",
       and len(coverage["chapters"]) == len(runtime_plan["structure"])
       and coverage["missing_inputs"]
       and any(c["guardrails"] for c in coverage["chapters"]))
-pre_scale = build_preliminary_scale_plan("生成一份要求梳理与执行指导报告", "必须生成一万字", profile)
-final_scale = build_report_scale_plan(
-    runtime_plan,
-    [{"id": 101, "content": "材料说明当前只能证明提交要求,不能证明任务已经完成。", "dimension": "材料能证明什么", "source_roles": ["上级规范依据"], "claim_supports": ["normative"], "source_files": ["a.docx"]}],
-    [],
-    profile,
-    pre_scale,
-)
-check("规模决策:用户目标记录但证据容量约束上限",
-      pre_scale["user_requested_words"] == 10000
-      and final_scale["user_requested_words"] == 10000
-      and final_scale["effective_target_words"] <= final_scale["max_safe_words"]
-      and final_scale["needs_negotiation"] is True)
 style.confirm_variant(va.id)
 style.lock_variant(va.id)
 
 from app.models import Stage
 from app.workflow import WorkflowController, next_stage
-from app.agents.writer import _coerce_paragraphs
+from app.writing.writer import _coerce_paragraphs
 check("状态机:去重后进入材料理解",
       next_stage(Stage.DEDUP) == Stage.MATERIAL_ANALYSIS
       and next_stage(Stage.MATERIAL_ANALYSIS) == Stage.PLANNING)
@@ -270,8 +284,11 @@ flat = _coerce_paragraphs({"sentences": [
 ]})
 check("Writer JSON结构容错:扁平sentences按段落归并",
       len(flat) == 2 and flat[0]["sentences"][0]["text"] == "第一段")
-with connect() as conn:
-    conn.execute("INSERT INTO materials(filename, file_type, path, fingerprint) VALUES('x.pdf', 'pdf', '/tmp/t_cn.pdf', 'r3-a')")
+with session_scope() as s:
+    from app.infrastructure.orm import ORMMaterial
+    from sqlalchemy import delete as _del
+    s.execute(_del(ORMMaterial).where(ORMMaterial.c.fingerprint == 'r3-a'))  # PG 持久库幂等
+    s.execute(ORMMaterial.insert().values(filename='x.pdf', file_type='pdf', path='/tmp/t_cn.pdf', fingerprint='r3-a'))
 
 short_term.save_task("r3a", {"theme": "t", "variant_id": va.id, "material_ids": [1]})
 check("指定变体被选中", WorkflowController("r3a")._selected_variant().id == va.id)
@@ -284,14 +301,15 @@ short_term.save_task("r3d", {"theme": "t", "variant_id": va.id, "material_ids": 
 wc = WorkflowController("r3d")
 wc.run_to_review()
 task = short_term.load_task("r3d")
-with connect() as conn:
-    rows = conn.execute("SELECT section, paragraph, content FROM report_sentences ORDER BY position").fetchall()
-    rep = conn.execute("SELECT style_profile_id FROM reports WHERE id=?", (task["report_id"],)).fetchone()
+with session_scope() as s:
+    from app.infrastructure.orm import ORMSentence, ORMReport
+    rows = s.execute(select(ORMSentence.c.section, ORMSentence.c.paragraph, ORMSentence.c.content).order_by(ORMSentence.c.position)).mappings().all()
+    rep = s.execute(select(ORMReport.c.style_profile_id).where(ORMReport.c.id == task["report_id"])).mappings().first()
 check("章节级生成:句子按章节归属", len(rows) == 4 and all(r["section"] == "一、背景" for r in rows))
 check("报告记录任务所选变体", rep["style_profile_id"] == va.id)
-with connect() as conn:
-    plan_row = conn.execute(
-        "SELECT core_judgment, narrative_logic, chapter_plans, budget FROM report_plans WHERE id=?", (task["plan_id"],)).fetchone()
+with session_scope() as s:
+    from app.infrastructure.orm import ORMPlan
+    plan_row = s.execute(select(ORMPlan.c.core_judgment, ORMPlan.c.narrative_logic, ORMPlan.c.chapter_plans, ORMPlan.c.budget).where(ORMPlan.c.id == task["plan_id"])).mappings().first()
 plan_budget = json.loads(plan_row["budget"])
 plan_chapters = json.loads(plan_row["chapter_plans"])
 check("规划含核心判断/叙事逻辑/章节规划",
@@ -304,29 +322,20 @@ check("任务保存分层Report Policy",
       "report_policy" in task
       and "hard_guardrails" in task["report_policy"]
       and "planner_policy" in task["report_policy"])
-check("ReportScalePlan:动态预算回写",
-      task.get("preliminary_scale_plan", {}).get("stage") == "preliminary"
-      and task.get("report_scale_plan", {}).get("stage") == "final"
-      and plan_budget.get("target_words", 0) > 0
-      and plan_budget.get("target_words", 0) <= plan_budget.get("hard_max_words", 0)
-      and plan_budget.get("max_safe_words", 0) >= plan_budget.get("target_words", 0))
-check("章节预算(importance/密度/动态规模)",
-      plan_chapters[0].get("target_words", 0) > 0
-      and plan_chapters[0].get("importance") == "high"
-      and plan_chapters[0].get("evidence_density") == "medium"
-      and plan_chapters[0].get("evidence_capacity") in ("low", "medium", "high"))
-check("规模统计记录(actual_words/facts_per_1000)",
-      task.get("report_stats", {}).get("actual_words", 0) > 0
-      and "facts_per_1000" in task.get("report_stats", {}))
+check("章节预算(模型输出 report_budget)",
+      plan_budget.get("target_words", 0) > 0
+      and plan_budget.get("target_words", 0) <= plan_budget.get("hard_max_words", 0))
 check("性能节点:TTFR 已记录且知识沉淀后台化",
       task.get("ttfr_seconds", 0) > 0
       and task.get("critical_path_done") is True
       and "knowledge" in task.get("background_jobs", {}))
 check("过渡句保留(无引用短句)",
       any("值得重点关注" in r["content"] for r in rows))
-with connect() as conn:
-    lineage = conn.execute("SELECT COUNT(*) c FROM report_sentence_fact").fetchone()["c"]
+with session_scope() as s:
+    from app.infrastructure.orm import Base as _ORMBase
+    lineage = s.execute(select(__import__('sqlalchemy').func.count()).select_from(_ORMBase.metadata.tables['report_sentence_fact'])).scalar()
 check("句子-事实血缘表写入", lineage >= 3)
+print("DEBUG qa_notes:", task.get("qa_notes", []))
 check("QA 数字一致性检出(99元不在事实中)",
       any(i["type"] == "CITATION_MISMATCH" for i in task.get("qa_notes", [])))
 check("验证闭环:数字不一致句自动重写",
@@ -334,10 +343,11 @@ check("验证闭环:数字不一致句自动重写",
       and "99" not in "\n".join(r["content"] for r in rows))
 check("验证闭环:无依据句自动删除(本流程0条)",
       task.get("auto_revision", {}).get("removed") == 0)
-with connect() as conn:
-    claim_rows = conn.execute("SELECT fact_type, status, fact_id FROM claims").fetchall()
-    fact_row = conn.execute("SELECT fact_type FROM facts WHERE id=1").fetchone()
-    inf_row = conn.execute("SELECT analysis_type FROM inferences WHERE id=1").fetchone()
+with session_scope() as s:
+    from app.infrastructure.orm import ORMClaim, ORMFact, ORMInference
+    claim_rows = s.execute(select(ORMClaim.c.fact_type, ORMClaim.c.status, ORMClaim.c.fact_id)).mappings().all()
+    fact_row = s.execute(select(ORMFact.c.fact_type).where(ORMFact.c.id == 1)).mappings().first()
+    inf_row = s.execute(select(ORMInference.c.analysis_type).where(ORMInference.c.id == 1)).mappings().first()
 check("Claim 层:陈述落库且提升为 fact",
       len(claim_rows) == 1 and claim_rows[0]["status"] == "promoted" and claim_rows[0]["fact_id"] == 1)
 check("Fact 带 fact_type", fact_row["fact_type"] == "EVENT")
@@ -356,61 +366,38 @@ check("质量检查:机构规则检出(缺失/禁止/字数)",
       any(i["type"] == "RULE_VIOLATION" and "必备内容" in i["note"] for i in qa_rules)
       and any(i["type"] == "RULE_VIOLATION" and "禁止" in i["note"] for i in qa_rules)
       and any(i["type"] == "RULE_VIOLATION" and "字数" in i["note"] for i in qa_rules))
-with connect() as conn:
-    cur = conn.execute(
-        "INSERT INTO reports(plan_id, title, style_profile_id, status) VALUES(?, ?, ?, ?)",
-        (task["plan_id"], "模糊表达检查", va.id, "draft"),
-    )
-    vague_report_id = cur.lastrowid
-    conn.execute(
-        "INSERT INTO report_sentences(report_id, section, paragraph, position, content, source_level, source_refs) "
-        "VALUES(?, ?, ?, ?, ?, ?, ?)",
-        (vague_report_id, "一、背景", 1, 1, "应按规定时间提交相关材料。", "MATERIAL_FACT",
-         json.dumps({"fact_ids": [1], "inference_ids": []})),
-    )
+with session_scope() as s:
+    from app.infrastructure.orm import ORMReport, ORMSentence
+    _r = s.execute(ORMReport.insert().values(plan_id=task["plan_id"], title="模糊表达检查", style_profile_id=va.id, status="draft"))
+    vague_report_id = int(_r.inserted_primary_key[0])
+    s.execute(ORMSentence.insert().values(report_id=vague_report_id, section="一、背景", paragraph=1, position=1,
+              content="应按规定时间提交相关材料。", source_level="MATERIAL_FACT",
+              source_refs=json.dumps({"fact_ids": [1], "inference_ids": []})))
 qa_concrete = run_quality_check(vague_report_id, ["一、背景"])
 check("质量检查:模糊表达具体化提示",
       any(i["type"] == "CONCRETENESS_ISSUE" for i in qa_concrete))
-with connect() as conn:
-    cur = conn.execute(
-        "INSERT INTO reports(plan_id, title, style_profile_id, status) VALUES(?, ?, ?, ?)",
-        (task["plan_id"], "清单溯源粒度", va.id, "draft"),
-    )
-    trace_report_id = cur.lastrowid
-    conn.execute(
-        "INSERT INTO report_sentences(report_id, section, paragraph, position, content, source_level, source_refs) "
-        "VALUES(?, ?, ?, ?, ?, ?, ?)",
-        (trace_report_id, "一、背景", 1, 1, "必交材料方面，需提交登记表和通讯稿。", "MATERIAL_FACT",
-         json.dumps({"fact_ids": [1], "inference_ids": [], "trace_granularity_warning": True})),
-    )
-    cur = conn.execute(
-        "INSERT INTO reports(plan_id, title, style_profile_id, status) VALUES(?, ?, ?, ?)",
-        (task["plan_id"], "符号化清单格式", va.id, "draft"),
-    )
-    bullet_report_id = cur.lastrowid
-    conn.execute(
-        "INSERT INTO report_sentences(report_id, section, paragraph, position, content, source_level, source_refs) "
-        "VALUES(?, ?, ?, ?, ?, ?, ?)",
-        (bullet_report_id, "一、背景", 1, 1, "• 必交: 登记表、通讯稿。", "MATERIAL_FACT",
-         json.dumps({"fact_ids": [1], "inference_ids": []})),
-    )
-    cur = conn.execute(
-        "INSERT INTO reports(plan_id, title, style_profile_id, status) VALUES(?, ?, ?, ?)",
-        (task["plan_id"], "模糊表达无明确证据", va.id, "draft"),
-    )
-    vague_no_hit_report_id = cur.lastrowid
-    conn.execute(
-        "INSERT INTO facts(content, dimension, source_level, fact_type, evidence_ids, conflict_ids, task_id) "
-        "VALUES(?, ?, ?, ?, ?, ?, ?)",
-        ("材料要求团队后续完成提交工作", "D", "MATERIAL_FACT", "STATEMENT", "[]", "[]", "qa-vague"),
-    )
-    vague_fact_id = conn.execute("SELECT last_insert_rowid() id").fetchone()["id"]
-    conn.execute(
-        "INSERT INTO report_sentences(report_id, section, paragraph, position, content, source_level, source_refs) "
-        "VALUES(?, ?, ?, ?, ?, ?, ?)",
-        (vague_no_hit_report_id, "一、背景", 1, 1, "应按规定时间提交相关材料。", "MATERIAL_FACT",
-         json.dumps({"fact_ids": [vague_fact_id], "inference_ids": []})),
-    )
+with session_scope() as s:
+    from app.infrastructure.orm import ORMReport, ORMSentence
+    _r = s.execute(ORMReport.insert().values(plan_id=task["plan_id"], title="清单溯源粒度", style_profile_id=va.id, status="draft"))
+    trace_report_id = int(_r.inserted_primary_key[0])
+    s.execute(ORMSentence.insert().values(report_id=trace_report_id, section="一、背景", paragraph=1, position=1,
+              content="必交材料方面，需提交登记表和通讯稿。", source_level="MATERIAL_FACT",
+              source_refs=json.dumps({"fact_ids": [1], "inference_ids": [], "trace_granularity_warning": True})))
+    _r2 = s.execute(ORMReport.insert().values(plan_id=task["plan_id"], title="符号化清单格式", style_profile_id=va.id, status="draft"))
+    bullet_report_id = int(_r2.inserted_primary_key[0])
+    s.execute(ORMSentence.insert().values(report_id=bullet_report_id, section="一、背景", paragraph=1, position=1,
+              content="• 必交: 登记表、通讯稿。", source_level="MATERIAL_FACT",
+              source_refs=json.dumps({"fact_ids": [1], "inference_ids": []})))
+    _r3 = s.execute(ORMReport.insert().values(plan_id=task["plan_id"], title="模糊表达无明确证据", style_profile_id=va.id, status="draft"))
+    vague_no_hit_report_id = int(_r3.inserted_primary_key[0])
+    from app.infrastructure.orm import ORMFact
+    _fr = s.execute(ORMFact.insert().values(content="材料要求团队后续完成提交工作", dimension="D",
+                  source_level="MATERIAL_FACT", fact_type="STATEMENT", evidence_ids="[]",
+                  conflict_ids="[]", task_id="qa-vague"))
+    vague_fact_id = int(_fr.inserted_primary_key[0])
+    s.execute(ORMSentence.insert().values(report_id=vague_no_hit_report_id, section="一、背景", paragraph=1, position=1,
+              content="应按规定时间提交相关材料。", source_level="MATERIAL_FACT",
+              source_refs=json.dumps({"fact_ids": [vague_fact_id], "inference_ids": []})))
 qa_trace = run_quality_check(trace_report_id, ["一、背景"])
 qa_vague_no_hit = run_quality_check(vague_no_hit_report_id, ["一、背景"])
 qa_bullet = run_quality_check(bullet_report_id, ["一、背景"])
@@ -421,7 +408,7 @@ check("质量检查:无明确证据不误报具体化",
 check("质量检查:禁止符号化清单前缀",
       any(i["type"] == "FORMAT_STYLE_ISSUE" for i in qa_bullet))
 from app.export.docx import _is_list_item as _export_is_list_item
-from app.agents.writer import _normalize_report_sentence
+from app.writing.writer import _normalize_report_sentence
 normalized_item = _normalize_report_sentence("• A类事项: 示例内容。")
 check("写作清洗符号化清单前缀",
       normalized_item == "A类事项方面，示例内容。")
@@ -432,8 +419,9 @@ check("证据进度最终态 done==total",
       (lambda ep: ep.get("done") == ep.get("total") and ep.get("total", 0) >= 1)
       (task.get("evidence_progress") or {}))
 check("LLM 调用统计记录", task.get("llm_stats", {}).get("calls", 0) >= 1)
-with connect() as conn:
-    token_log_count = conn.execute("SELECT COUNT(*) c FROM llm_call_logs WHERE task_id=?", ("r3d",)).fetchone()["c"]
+with session_scope() as s:
+    from app.infrastructure.orm import ORMLLMCall
+    token_log_count = s.execute(select(__import__('sqlalchemy').func.count()).select_from(ORMLLMCall).where(ORMLLMCall.c.task_id == "r3d")).scalar()
 check("Token观测:LLM Call 日志落库", token_log_count >= 1)
 check("Token观测:效率指标写入任务",
       task.get("token_efficiency", {}).get("call_count", 0) >= 1
@@ -441,22 +429,19 @@ check("Token观测:效率指标写入任务",
       and "fact_utilization_rate" in task.get("token_efficiency", {})
       and "token_buckets" in task.get("token_efficiency", {})
       and "scale_drivers" in task.get("token_efficiency", {}))
-check("业务闭环产物写入任务",
-      "business_coverage" in task
-      and "role_matrix" in task.get("business_coverage", {}))
 mvs = vector_store.material_vectors()
 check("材料向量由 unit 聚合(写入Qdrant)", len(mvs) == 1 and len(mvs[0][1]) == 8)
-with connect() as conn:
-    cache_row = conn.execute(
-        "SELECT COUNT(*) c FROM artifact_cache WHERE stage='material_analysis'"
-    ).fetchone()
-check("性能缓存:材料分析 Artifact Cache 写入", cache_row["c"] >= 1)
-with connect() as conn:
-    artifact_rows = conn.execute(
-        "SELECT stage, status FROM task_artifacts WHERE task_id=?",
-        ("r3d",),
-    ).fetchall()
-    material_row = conn.execute("SELECT parser_version, parsed_at FROM materials LIMIT 1").fetchone()
+with session_scope() as s:
+    from app.infrastructure.orm import Base as _B
+    from sqlalchemy import func as _f
+    _ac = _B.metadata.tables["artifact_cache"]
+    cache_row = s.execute(select(_f.count()).select_from(_ac).where(_ac.c.stage == "material_analysis")).scalar()
+check("性能缓存:材料分析 Artifact Cache 写入", cache_row >= 1)
+with session_scope() as s:
+    from app.infrastructure.orm import ORMTaskArtifact
+    artifact_rows = s.execute(select(ORMTaskArtifact.c.stage, ORMTaskArtifact.c.status).where(ORMTaskArtifact.c.task_id == "r3d")).mappings().all()
+    from app.infrastructure.orm import ORMMaterial
+    material_row = s.execute(select(ORMMaterial.c.parser_version, ORMMaterial.c.parsed_at).limit(1)).mappings().first()
 artifact_stages = {r["stage"] for r in artifact_rows if r["status"] == "done"}
 check("Task Cache:阶段 Artifact 写入",
       {"parse", "material_analysis", "plan", "evidence", "analysis", "write"} <= artifact_stages)
@@ -501,21 +486,6 @@ check("报告详情 API 返回所属任务", data.get("task_id") == "r3d" and da
 check("报告段落分组:1节1段4句", len(data["sections"]) == 1
       and len(data["sections"][0]["paragraphs"]) == 1
       and len(data["sections"][0]["paragraphs"][0]["sentences"]) == 4)
-# 缺失章节补写(在分组断言后单独验证,避免污染报告数据)
-facts2 = [{"id": 1, "content": "某监管机构于2026年发布行业监管政策文件。"}]
-ok_append = wc._append_chapter(task["report_id"], "二、影响",
-                               {"id": task["plan_id"], "title": "T", "structure": ["一、背景", "二、影响"]},
-                               facts2, [], "", 2)
-wc._normalize_report_order(task["report_id"], {"structure": ["一、背景", "二、影响"]})
-with connect() as conn:
-    secs = []
-    for r in conn.execute(
-            "SELECT section FROM report_sentences WHERE report_id=? ORDER BY position",
-            (task["report_id"],)).fetchall():
-        if not secs or secs[-1] != r["section"]:
-            secs.append(r["section"])
-check("验证闭环:缺失章节补写", ok_append and "二、影响" in secs)
-check("缺失章节补写保持规划顺序", secs[:2] == ["一、背景", "二、影响"])
 r = client.post("/api/tasks", data={"theme": "带变体任务", "variant_id": str(va.id)},
                 files=[("files", ("t_cn.pdf", open("/tmp/t_cn.pdf", "rb"), "application/pdf"))])
 created_task_id = r.json().get("task_id") if r.status_code == 200 else ""

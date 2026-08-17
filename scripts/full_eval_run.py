@@ -50,7 +50,6 @@ def main() -> None:
     print("LLM_STATS=" + json.dumps(task.get("llm_stats", {}), ensure_ascii=False), flush=True)
     print("TOKEN_EFFICIENCY=" + json.dumps(task.get("token_efficiency", {}), ensure_ascii=False), flush=True)
     print("REPORT_STATS=" + json.dumps(task.get("report_stats", {}), ensure_ascii=False), flush=True)
-    print("BUSINESS_QA=" + json.dumps(task.get("business_qa", {}), ensure_ascii=False), flush=True)
     print("QA_NOTES=" + json.dumps(task.get("qa_notes", []), ensure_ascii=False), flush=True)
     with connect() as conn:
         report_id = task.get("report_id")

@@ -388,10 +388,12 @@ def _pdf_pipeline_options(do_ocr: bool):
         options.do_table_structure = True
         return options
     engine = (settings.docling_ocr_engine or "auto").strip().lower()
+    # RapidOCR(onnxruntime)语言码为 'ch'/'chinese_cht';EasyOCR 为 'ch_sim';
+    # 两者混用时按后端分别给定,避免 onnxruntime 后端报不支持语言码
     if engine == "auto":
-        options.ocr_options = OcrAutoOptions(lang=["ch_sim", "en"])
+        options.ocr_options = OcrAutoOptions(lang=["ch", "en"])
     elif engine == "rapidocr":
-        options.ocr_options = RapidOcrOptions(lang=["ch_sim", "en"])
+        options.ocr_options = RapidOcrOptions(lang=["ch", "en"])
     elif engine == "easyocr":
         options.ocr_options = EasyOcrOptions(lang=["ch_sim", "en"])
     elif engine == "tesseract":

@@ -9,8 +9,6 @@ from __future__ import annotations
 import json
 import re
 
-from app.db import connect
-
 ACTUAL_SUPPORT = {"actual"}
 NON_ACTUAL_SUPPORT = {"normative", "template", "reference", "unknown"}
 
@@ -151,78 +149,6 @@ def build_chapter_evidence_matrix(plan: dict, profile: dict, facts: list[dict],
         "hard_rules": list(profile.get("business_guardrails") or []),
         "role_matrix": profile.get("role_matrix") or build_role_matrix(profile.get("enriched_insights") or []),
     }
-
-
-def build_business_qa(report_id: int, plan: dict, profile: dict, facts: list[dict],
-                      inferences: list[dict] | None = None) -> dict:
-    matrix = build_chapter_evidence_matrix(plan, profile, facts, inferences)
-    issues = append_business_issues(report_id, profile, facts)
-    with connect() as conn:
-        rows = conn.execute(
-            "SELECT section, content, source_refs, source_level FROM report_sentences WHERE report_id=? ORDER BY position",
-            (report_id,),
-        ).fetchall()
-    unsupported = 0
-    factual = 0
-    for row in rows:
-        if row["source_level"] == "TRANSITION":
-            continue
-        factual += 1
-        try:
-            refs = json.loads(row["source_refs"] or "{}")
-        except (TypeError, ValueError):
-            refs = {}
-        if not refs.get("fact_ids") and not refs.get("inference_ids"):
-            unsupported += 1
-    if unsupported:
-        issues.append({
-            "type": "BUSINESS_MISMATCH",
-            "section": "",
-            "quote": "",
-            "note": f"存在 {unsupported} 个事实/判断句缺少句级证据引用。",
-        })
-    return {
-        "coverage": matrix,
-        "issues": _dedup_issues(issues),
-        "sentence_support": {
-            "factual_sentence_count": factual,
-            "unsupported_sentence_count": unsupported,
-            "support_rate": round((factual - unsupported) / max(factual, 1), 2),
-        },
-        "verdict": "pass" if not issues and matrix.get("status") != "needs_materials" else "needs_review",
-    }
-
-
-def append_business_issues(report_id: int, profile: dict, facts: list[dict]) -> list[dict]:
-    if not profile:
-        return []
-    issues: list[dict] = []
-    fact_support = {int(f.get("id")): _fact_support(f) for f in facts if f.get("id") is not None}
-    with connect() as conn:
-        rows = conn.execute(
-            "SELECT section, content, source_refs, source_level FROM report_sentences WHERE report_id=? ORDER BY position",
-            (report_id,),
-        ).fetchall()
-    if not profile.get("has_actual_evidence"):
-        for row in rows:
-            try:
-                refs = json.loads(row["source_refs"] or "{}")
-            except (TypeError, ValueError):
-                refs = {}
-            supports = set()
-            for fact_id in refs.get("fact_ids") or []:
-                try:
-                    supports.add(fact_support.get(int(fact_id), "unknown"))
-                except (TypeError, ValueError):
-                    continue
-            if _looks_like_result_claim(row["content"]) and "actual" not in supports:
-                issues.append({
-                    "type": "BUSINESS_MISMATCH",
-                    "section": row["section"],
-                    "quote": row["content"][:60],
-                    "note": "当前材料未提供可证明该结果性表述的实际证据。",
-                })
-    return _dedup_issues(issues)
 
 
 def looks_like_template_meta(text: str) -> bool:

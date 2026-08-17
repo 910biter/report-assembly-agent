@@ -1,8 +1,4 @@
-"""Agent 层:四个角色 Agent,共用同一模型服务。"""
-from app.agents.analysis import AnalysisAgent
+"""Agent 基类(各角色 Agent 已迁移至 planning/evidence/analysis/writing,直接 import 具体模块)。"""
 from app.agents.base import BaseAgent
-from app.agents.evidence import EvidenceAgent
-from app.agents.planner import PlannerAgent
-from app.agents.writer import WriterAgent
 
-__all__ = ["BaseAgent", "PlannerAgent", "EvidenceAgent", "AnalysisAgent", "WriterAgent"]
+__all__ = ["BaseAgent"]

@@ -99,7 +99,7 @@ async function poll() {
   renderTask(TASK);
   const versions = TASK.versions || {};
   const materialVersion = String(versions.materials || JSON.stringify([TASK.stage, TASK.material_ids, TASK.parse_progress, TASK.material_analysis_progress, TASK.task_profile]));
-  const analysisVersion = String(versions.analysis || JSON.stringify([TASK.fact_ids, TASK.inference_ids, TASK.conflict_ids, TASK.business_qa, TASK.qa_notes]));
+  const analysisVersion = String(versions.analysis || JSON.stringify([TASK.fact_ids, TASK.inference_ids, TASK.conflict_ids, TASK.qa_notes]));
   if (document.getElementById("tab-materials").classList.contains("active") && materialVersion !== lastMaterialVersion) {
     lastMaterialVersion = materialVersion;
     loadMaterials();
@@ -141,20 +141,13 @@ function renderUserProgress(stage, task) {
 }
 
 function renderOverview(task) {
-  const issues = [...(task.qa_notes || []), ...(((task.business_qa || {}).issues) || [])];
-  const coverage = task.business_coverage || {};
-  const scale = task.report_scale_plan || task.preliminary_scale_plan || {};
+  const issues = [...(task.qa_notes || [])];
   const facts = (task.fact_ids || []).length;
   const reportReady = isReportReviewable(task);
   const partialReport = !!task.report_id && !reportReady;
-  const scaleWarning = scale.needs_negotiation
-    ? `<div class="notice warning">用户目标与证据承载能力冲突：${escapeHtml(scale.reason || "系统已按质量红线压到安全规模。")}</div>`
-    : "";
   document.getElementById("overview-alerts").innerHTML = task.error
     ? `<div class="notice danger">任务失败：${escapeHtml(task.error)}</div>`
     : issues.length ? `<div class="notice warning">发现 ${issues.length} 个待核验问题，建议进入“分析”查看质量检查。</div>`
-    : scaleWarning
-      ? scaleWarning
     : reportReady ? `<div class="notice success">报告已生成，可以进入“报告”审核。</div>`
     : partialReport ? `<div class="notice">报告草稿正在生成，当前阶段：${stageName(task.stage)}。</div>`
     : task.stage === "created" ? `<div class="notice">任务已创建，点击“开始运行”后进入队列。</div>`
@@ -162,8 +155,6 @@ function renderOverview(task) {
   document.getElementById("next-actions").innerHTML = [
     metricCard("材料数量", `${(task.material_ids || []).length} 份`, "进入“材料”查看解析状态"),
     metricCard("事实数量", `${facts} 条`, "进入“分析”查看事实与依据"),
-    metricCard("证据覆盖", coverage.coverage != null ? `${Math.round(coverage.coverage * 100)}%` : "待生成", "覆盖不足时会列出待补材料"),
-    metricCard("目标规模", scale.effective_target_words ? `${scale.effective_target_words} 字` : scale.target_words ? `${scale.target_words} 字` : "自动", scale.user_requested_words ? `用户目标 ${scale.user_requested_words} 字` : "按材料自动估算"),
     metricCard("报告状态", reportReady ? (task.stage === "done" ? "已完成" : "待审核") : partialReport ? "生成中" : "未生成", nextActionText(task)),
   ].join("");
 }
@@ -184,8 +175,6 @@ function renderProgressDetail(task) {
   if (task.evidence_progress) rows.push(["事实提取", progressPair(task.evidence_progress)]);
   if (task.write_progress) rows.push(["章节写作", progressPair(task.write_progress) + (task.write_progress.chapter ? ` · ${task.write_progress.chapter}` : "")]);
   if (task.queue_status && task.queue_status.status) rows.push(["任务队列", queueText(task) || task.queue_status.status]);
-  const scale = task.report_scale_plan || task.preliminary_scale_plan || {};
-  if (scale.stage) rows.push(["规模计划", scaleSummary(scale)]);
   if (Object.keys(durations).length) rows.push(["步骤耗时", Object.entries(durations).map(([k, v]) => `${k}: ${v}s`).join(" / ")]);
   if (Object.keys(timings).length) rows.push(["阶段耗时", Object.entries(timings).map(([k, v]) => `${k}: ${v}s`).join(" / ")]);
   if (llm.calls) rows.push(["模型调用", `${llm.calls} 次 · 输入约 ${llm.chars || 0} 字符 · 重试 ${llm.retries || 0} 次`]);
@@ -286,13 +275,11 @@ async function loadAnalysis() {
 }
 
 function renderQualityOverview() {
-  const qa = (TASK || {}).business_qa || {};
-  const coverage = (TASK || {}).business_coverage || {};
+  const qa = { issues: [...((TASK || {}).qa_notes || [])] };
   document.getElementById("quality-overview").innerHTML = `<div class="overview-grid">
     ${metricCard("事实", `${(ANALYSIS.facts || []).length} 条`, "带材料来源")}
     ${metricCard("分析判断", `${(ANALYSIS.inferences || []).filter(i => i.source_level === "MATERIAL_INFERENCE").length} 条`, "基于事实推理")}
     ${metricCard("待核验", `${((ANALYSIS.conflicts || []).length) + ((qa.issues || []).length)} 项`, "冲突与质量问题")}
-    ${metricCard("证据覆盖", coverage.coverage != null ? `${Math.round(coverage.coverage * 100)}%` : "待生成", coverage.status || "—")}
   </div>`;
 }
 
@@ -316,7 +303,7 @@ function renderAnalysis() {
       ${(c.entries || []).map(e => `<p class="muted">${escapeHtml(e.file)}：${escapeHtml(e.statement)}</p>`).join("")}
     </div>`).join("") : '<div class="empty">暂无冲突</div>';
   } else {
-    const issues = [...((TASK || {}).qa_notes || []), ...((((TASK || {}).business_qa || {}).issues) || [])];
+    const issues = [...((TASK || {}).qa_notes || [])];
     box.innerHTML = issues.length ? issues.map(i => `<div class="analysis-card warning-card">
       <b>${escapeHtml(i.type || "质量问题")}</b>
       <p>${escapeHtml(i.note || i.quote || "")}</p>

@@ -11,7 +11,9 @@ import re
 
 
 from app.agents.base import BaseAgent
-from app.db import connect
+from app.db import session_scope
+from app.infrastructure.orm import ORMFact, ORMEvidence, ORMClaim
+from sqlalchemy import select, update
 from app.models import Claim, Conflict, Evidence, Fact, Unit
 from app.retrieval import vector_store
 from app.retrieval.embedder import embed_texts
@@ -309,18 +311,25 @@ class EvidenceAgent(BaseAgent):
 
         # Coverage Audit + Iterative Retrieval:缺口补检,足够即停
         gaps = self._coverage_audit(facts, needs, task_id)
-        for round_index in range(2):
-            if not gaps:
-                break
+        # FIRE 式迭代:缺什么补什么,足够即停。
+        # 停止条件:①无缺口 ②本轮未产出新事实(材料已无新证据)→ information_gap 接受
+        # 安全 cap = 资源保护(工程限制,非业务规则),防止异常死循环
+        round_index = 0
+        while gaps and round_index < 3:
+            round_index += 1
+            before_count = len(facts)
+            known_contents = {f.content for f in facts if f.content}
             if cm is not None and hasattr(cm, "for_gap_retrieval"):
-                gap_batches = cm.for_gap_retrieval(gaps, insights)
+                gap_batches = cm.for_gap_retrieval(gaps, insights, known_contents=known_contents)
             else:
                 gap_batches = []
             for batch_index, (material_text, batch_meta) in enumerate(gap_batches, start=1):
                 facts.extend(self._process_batch(
                     gaps, material_text, batch_meta, units_by_material, filenames,
-                    task_id, batch_index, len(gap_batches), round_tag=round_index + 1,
+                    task_id, batch_index, len(gap_batches), round_tag=round_index,
                 ))
+            if len(facts) == before_count:
+                break  # 无新证据:接受 information_gap,不再空转
             gaps = self._coverage_audit(facts, needs, task_id)
         report_phase(3)
         return facts
@@ -397,7 +406,7 @@ class EvidenceAgent(BaseAgent):
                 material_id=evidence_list[0].material_id if evidence_list else 0,
                 content=content, quote=quote,
                 source=filenames.get(evidence_list[0].material_id, "") if evidence_list else "",
-                fact_type=fact_type, dimension=dimension,
+                fact_type=fact_type, dimension=dimension, need_id=need_idx,
             )
             if not evidence_list:
                 pending_claims += 1
@@ -406,7 +415,7 @@ class EvidenceAgent(BaseAgent):
             quote_bound_claims += 1
             contributed_materials.update(int(ev.material_id) for ev in evidence_list)
             contributed_units.update(int(ev.unit_id) for ev in evidence_list)
-            fact = Fact(content=content, dimension=dimension, fact_type=fact_type)
+            fact = Fact(content=content, dimension=dimension, fact_type=fact_type, need_id=need_idx)
             fact.id = save_fact_with_evidence(fact, evidence_list, task_id, origin_call_id=call_id)
             facts.append(fact)
             produced_fact_ids.append(int(fact.id))
@@ -470,10 +479,10 @@ class EvidenceAgent(BaseAgent):
             return []
         need_facts: dict[int, list[str]] = {}
         for need_index, need in enumerate(needs, start=1):
-            dim = need.get("dimension", "")
-            matched = [f.content for f in facts
-                       if (f.dimension or "") == dim or (f.dimension or "") == need.get("need", "")]
-            need_facts[need_index] = matched[:6]
+            # 真实关系匹配:fact.need_id 由模型标注(非 dimension 猜测)
+            matched = [f.content for f in facts if int(getattr(f, "need_id", 0) or 0) == need_index]
+            # 无标注的开放发现(need_id=0)不自动归属任何 need(避免误判支持)
+            need_facts[need_index] = matched
         need_lines = []
         for index, need in enumerate(needs, start=1):
             facts_text = "\n".join(f"  - {c}" for c in need_facts[index]) or "  (无)"
@@ -495,16 +504,34 @@ class EvidenceAgent(BaseAgent):
     def _record_material_scan(self, task_id: str, dimension: str, material_scan: dict) -> None:
         """材料扫描状态落独立表(可观测性,避免大 payload 反复写任务)。"""
         try:
-            with connect() as conn:
+            from app.infrastructure.orm import ORMMaterialScan
+            from sqlalchemy import select as _select
+            with session_scope() as s:
                 for mid, info in material_scan.items():
-                    conn.execute(
-                        "INSERT INTO material_scan(task_id, material_id, dimension, scanned, units_selected, fact_count) "
-                        "VALUES(?, ?, ?, ?, ?, ?) "
-                        "ON CONFLICT(task_id, material_id, dimension) DO UPDATE SET "
-                        "scanned=excluded.scanned, units_selected=excluded.units_selected, fact_count=excluded.fact_count",
-                        (task_id, int(mid), dimension,
-                         int(info.get("scanned", 1)), int(info.get("units_selected", 0)), int(info.get("fact_count", 0))),
+                    values = dict(
+                        task_id=task_id, material_id=int(mid), dimension=dimension,
+                        scanned=int(info.get("scanned", 1)),
+                        units_selected=int(info.get("units_selected", 0)),
+                        fact_count=int(info.get("fact_count", 0)),
                     )
+                    exists = s.execute(
+                        _select(ORMMaterialScan.c.task_id).where(
+                            ORMMaterialScan.c.task_id == task_id,
+                            ORMMaterialScan.c.material_id == int(mid),
+                            ORMMaterialScan.c.dimension == dimension,
+                        )
+                    ).first()
+                    if exists:
+                        s.execute(
+                            ORMMaterialScan.update().where(
+                                ORMMaterialScan.c.task_id == task_id,
+                                ORMMaterialScan.c.material_id == int(mid),
+                                ORMMaterialScan.c.dimension == dimension,
+                            ).values(scanned=values["scanned"], units_selected=values["units_selected"],
+                                     fact_count=values["fact_count"])
+                        )
+                    else:
+                        s.execute(ORMMaterialScan.insert().values(**values))
         except Exception:
             pass
 
@@ -636,74 +663,80 @@ class EvidenceAgent(BaseAgent):
 
 
 def fact_exists(content: str, task_id: str = "") -> bool:
-    with connect() as conn:
+    with session_scope() as s:
+        query = select(ORMFact.c.id).where(ORMFact.c.content == content)
         if task_id:
-            row = conn.execute(
-                "SELECT 1 FROM facts WHERE task_id=? AND content=?", (task_id, content)
-            ).fetchone()
-        else:
-            row = conn.execute("SELECT 1 FROM facts WHERE content=?", (content,)).fetchone()
-    return row is not None
+            query = query.where(ORMFact.c.task_id == task_id)
+        return s.execute(query).first() is not None
 
 
 def save_fact_with_evidence(fact: Fact, evidence_list: list[Evidence], task_id: str = "",
                             origin_call_id: str = "") -> int:
-    with connect() as conn:
-        cur = conn.execute(
-            "INSERT INTO facts(content, dimension, source_level, fact_type, evidence_ids, conflict_ids, task_id, origin_call_id) "
-            "VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
-            (fact.content, fact.dimension, fact.source_level, fact.fact_type, "[]", "[]", task_id, origin_call_id),
+    with session_scope() as s:
+        result = s.execute(
+            ORMFact.insert().values(
+                content=fact.content, dimension=fact.dimension, source_level=fact.source_level,
+                fact_type=fact.fact_type, need_id=fact.need_id,
+                evidence_ids="[]", conflict_ids="[]", task_id=task_id, origin_call_id=origin_call_id,
+            )
         )
-        fact.id = cur.lastrowid
+        fact.id = int(result.inserted_primary_key[0])
         evidence_ids = []
         for ev in evidence_list:
             ev.fact_id = fact.id
-            cur2 = conn.execute(
-                "INSERT INTO evidence(fact_id, material_id, unit_id, source_file, page, paragraph, quote) "
-                "VALUES(?, ?, ?, ?, ?, ?, ?)",
-                (ev.fact_id, ev.material_id, ev.unit_id, ev.source_file, ev.page, ev.paragraph, ev.quote),
+            r2 = s.execute(
+                ORMEvidence.insert().values(
+                    fact_id=ev.fact_id, material_id=ev.material_id, unit_id=ev.unit_id,
+                    source_file=ev.source_file, page=ev.page, paragraph=ev.paragraph, quote=ev.quote,
+                )
             )
-            evidence_ids.append(cur2.lastrowid)
-        conn.execute("UPDATE facts SET evidence_ids=? WHERE id=?", (json.dumps(evidence_ids), fact.id))
+            evidence_ids.append(int(r2.inserted_primary_key[0]))
+        s.execute(update(ORMFact).where(ORMFact.c.id == fact.id).values(evidence_ids=json.dumps(evidence_ids)))
     return fact.id
 
 
 def save_claim(claim: Claim, status: str, origin_call_id: str = "", task_id: str = "") -> int:
-    with connect() as conn:
-        cur = conn.execute(
-            "INSERT INTO claims(fact_id, material_id, content, quote, source, fact_type, dimension, status, task_id, origin_call_id) "
-            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (claim.fact_id, claim.material_id, claim.content, claim.quote,
-             claim.source, claim.fact_type, claim.dimension, status, task_id, origin_call_id),
+    with session_scope() as s:
+        result = s.execute(
+            ORMClaim.insert().values(
+                fact_id=claim.fact_id or 0, material_id=claim.material_id,
+                content=claim.content, quote=claim.quote, source=claim.source,
+                fact_type=claim.fact_type, dimension=claim.dimension, need_id=claim.need_id,
+                status=status, task_id=task_id, origin_call_id=origin_call_id,
+            )
         )
-        return cur.lastrowid
+        return int(result.inserted_primary_key[0])
 
 
 def load_claims(task_id: str = "") -> list[dict]:
     """当前任务的全部陈述(含未提升的 pending)。"""
-    with connect() as conn:
+    with session_scope() as s:
+        query = select(ORMClaim)
         if task_id:
-            rows = conn.execute(
-                "SELECT * FROM claims WHERE task_id=? ORDER BY id", (task_id,)
-            ).fetchall()
-        else:
-            rows = conn.execute("SELECT * FROM claims ORDER BY id").fetchall()
+            query = query.where(ORMClaim.c.task_id == task_id)
+        rows = s.execute(query.order_by(ORMClaim.c.id)).mappings().all()
     return [dict(row) for row in rows]
 
 
 def save_conflict(conflict: Conflict, origin_call_id: str = "", task_id: str = "") -> int:
-    with connect() as conn:
-        cur = conn.execute(
-            "INSERT INTO conflicts(fact_key, entries, claim_ids, status, task_id, origin_call_id) VALUES(?, ?, ?, ?, ?, ?)",
-            (conflict.fact_key, json.dumps(conflict.entries, ensure_ascii=False),
-             json.dumps(conflict.claim_ids), conflict.status, task_id, origin_call_id),
+    from app.infrastructure.orm import ORMConflict
+    with session_scope() as s:
+        result = s.execute(
+            ORMConflict.insert().values(
+                fact_key=conflict.fact_key,
+                entries=json.dumps(conflict.entries, ensure_ascii=False),
+                claim_ids=json.dumps(conflict.claim_ids),
+                status=conflict.status, task_id=task_id, origin_call_id=origin_call_id,
+            )
         )
-        return cur.lastrowid
+        return int(result.inserted_primary_key[0])
 
 
 def load_evidence_quotes(fact_id: int) -> str:
-    with connect() as conn:
-        rows = conn.execute(
-            "SELECT source_file FROM evidence WHERE fact_id=?", (fact_id,)
-        ).fetchall()
-    return ", ".join(row["source_file"] for row in rows)
+    with session_scope() as s:
+        rows = s.execute(
+            select(ORMEvidence.c.source_file).where(ORMEvidence.c.fact_id == fact_id)
+        ).all()
+    return ", ".join(str(row[0]) for row in rows)
+
+__all__ = ['bind_sources', 'EvidenceAgent', 'fact_exists', 'save_fact_with_evidence', 'save_claim', 'load_claims', 'save_conflict', 'load_evidence_quotes']

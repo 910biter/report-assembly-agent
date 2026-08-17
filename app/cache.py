@@ -5,7 +5,9 @@ import hashlib
 import json
 from typing import Any
 
-from app.db import connect
+from app.db import session_scope
+from app.infrastructure.orm import Base
+from sqlalchemy import select
 
 CACHE_SCHEMA_VERSION = "artifact-cache-1"
 
@@ -39,11 +41,12 @@ def cache_key(stage: str, effective_inputs: Any, model_version: str = "",
 def get_cached(stage: str, effective_inputs: Any, model_version: str = "",
                prompt_version: str = "", config_version: str = "") -> Any | None:
     key, _input_hash = cache_key(stage, effective_inputs, model_version, prompt_version, config_version)
-    with connect() as conn:
-        row = conn.execute("SELECT payload FROM artifact_cache WHERE cache_key=?", (key,)).fetchone()
+    cache_table = Base.metadata.tables["artifact_cache"]
+    with session_scope() as s:
+        row = s.execute(select(cache_table.c.payload).where(cache_table.c.cache_key == key)).first()
         if row is None:
             return None
-        conn.execute("UPDATE artifact_cache SET last_hit_at=datetime('now') WHERE cache_key=?", (key,))
+        s.execute(cache_table.update().where(cache_table.c.cache_key == key).values(last_hit_at=__import__("datetime").datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
     try:
         return json.loads(row["payload"])
     except (TypeError, ValueError):
@@ -53,13 +56,13 @@ def get_cached(stage: str, effective_inputs: Any, model_version: str = "",
 def set_cached(stage: str, effective_inputs: Any, payload: Any, model_version: str = "",
                prompt_version: str = "", config_version: str = "") -> None:
     key, input_hash = cache_key(stage, effective_inputs, model_version, prompt_version, config_version)
-    with connect() as conn:
-        conn.execute(
-            "INSERT INTO artifact_cache(cache_key, stage, model_version, prompt_version, "
-            "config_version, input_hash, payload) VALUES(?, ?, ?, ?, ?, ?, ?) "
-            "ON CONFLICT(cache_key) DO UPDATE SET payload=excluded.payload",
-            (
-                key, stage, model_version, prompt_version, config_version, input_hash,
-                json.dumps(payload, ensure_ascii=False),
-            ),
-        )
+    cache_table = Base.metadata.tables["artifact_cache"]
+    with session_scope() as s:
+        exists = s.execute(select(cache_table.c.cache_key).where(cache_table.c.cache_key == key)).first()
+        values = dict(cache_key=key, stage=stage, model_version=model_version,
+                      prompt_version=prompt_version, config_version=config_version,
+                      input_hash=input_hash, payload=json.dumps(payload, ensure_ascii=False))
+        if exists:
+            s.execute(cache_table.update().where(cache_table.c.cache_key == key).values(payload=values["payload"]))
+        else:
+            s.execute(cache_table.insert().values(**values))

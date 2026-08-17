@@ -3,7 +3,14 @@
 不做图谱推理、不做本体学习;支撑历史报告关联、实体/事件关联与增量分析。
 """
 from app.agents.base import BaseAgent
-from app.db import connect
+from app.db import session_scope
+from app.infrastructure.orm import Base
+from sqlalchemy import select
+
+
+EntityTable = Base.metadata.tables["entities"]
+EventTable = Base.metadata.tables["events"]
+RelationTable = Base.metadata.tables["relations"]
 
 _SYSTEM = """你是知识抽取员。从情报材料中抽取实体、事件与关系。
 严格输出 JSON,不要任何解释:
@@ -49,62 +56,74 @@ class KnowledgeAgent(BaseAgent):
 
 
 def save_entity(name: str, type_: str = "", task_id: str = "") -> int:
-    with connect() as conn:
-        row = conn.execute(
-            "SELECT id FROM entities WHERE name=? AND task_id=?", (name, task_id)
-        ).fetchone()
+    with session_scope() as s:
+        row = s.execute(
+            select(EntityTable.c.id).where(
+                EntityTable.c.name == name, EntityTable.c.task_id == task_id
+            )
+        ).mappings().first()
         if row:
             return row["id"]
-        cur = conn.execute(
-            "INSERT INTO entities(name, type, task_id) VALUES(?, ?, ?)",
-            (name, type_, task_id),
+        result = s.execute(
+            EntityTable.insert().values(name=name, type=type_, task_id=task_id)
         )
-        return cur.lastrowid
+        return int(result.inserted_primary_key[0])
 
 
 def save_event(name: str, time: str = "", task_id: str = "") -> int:
-    with connect() as conn:
-        row = conn.execute(
-            "SELECT id FROM events WHERE name=? AND task_id=?", (name, task_id)
-        ).fetchone()
+    with session_scope() as s:
+        row = s.execute(
+            select(EventTable.c.id).where(
+                EventTable.c.name == name, EventTable.c.task_id == task_id
+            )
+        ).mappings().first()
         if row:
             return row["id"]
-        cur = conn.execute(
-            "INSERT INTO events(name, time, task_id) VALUES(?, ?, ?)",
-            (name, time, task_id),
+        result = s.execute(
+            EventTable.insert().values(name=name, time=time, task_id=task_id)
         )
-        return cur.lastrowid
+        return int(result.inserted_primary_key[0])
 
 
 def save_relation(source: str, target: str, relation_type: str, task_id: str = "") -> int:
     source_id = save_entity(source, task_id=task_id)
     target_id = save_entity(target, task_id=task_id)
-    with connect() as conn:
-        row = conn.execute(
-            "SELECT id FROM relations WHERE source_entity=? AND target_entity=? AND relation_type=? AND task_id=?",
-            (source_id, target_id, relation_type, task_id),
-        ).fetchone()
+    with session_scope() as s:
+        row = s.execute(
+            select(RelationTable.c.id).where(
+                RelationTable.c.source_entity == source_id,
+                RelationTable.c.target_entity == target_id,
+                RelationTable.c.relation_type == relation_type,
+                RelationTable.c.task_id == task_id,
+            )
+        ).mappings().first()
         if row:
             return row["id"]
-        cur = conn.execute(
-            "INSERT INTO relations(source_entity, target_entity, relation_type, task_id) VALUES(?, ?, ?, ?)",
-            (source_id, target_id, relation_type, task_id),
+        result = s.execute(
+            RelationTable.insert().values(
+                source_entity=source_id, target_entity=target_id,
+                relation_type=relation_type, task_id=task_id,
+            )
         )
-        return cur.lastrowid
+        return int(result.inserted_primary_key[0])
 
 
 def load_entity_names(task_id: str = "") -> list[str]:
-    with connect() as conn:
-        rows = conn.execute(
-            "SELECT name FROM entities WHERE task_id=? ORDER BY id", (task_id,)
-        ).fetchall()
+    with session_scope() as s:
+        rows = s.execute(
+            select(EntityTable.c.name)
+            .where(EntityTable.c.task_id == task_id)
+            .order_by(EntityTable.c.id)
+        ).mappings().all()
     return [r["name"] for r in rows]
 
 
 def load_events(task_id: str = "") -> list[dict]:
     """全部已沉淀事件(含时间),供时间线组织。"""
-    with connect() as conn:
-        rows = conn.execute(
-            "SELECT * FROM events WHERE task_id=? ORDER BY id", (task_id,)
-        ).fetchall()
+    with session_scope() as s:
+        rows = s.execute(
+            select(EventTable)
+            .where(EventTable.c.task_id == task_id)
+            .order_by(EventTable.c.id)
+        ).mappings().all()
     return [dict(row) for row in rows]

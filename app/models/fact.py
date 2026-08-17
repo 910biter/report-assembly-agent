@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 class Fact:
     content: str
     dimension: str = ""
+    need_id: int = 0  # EvidenceNeed 归属(0=开放发现)
     source_level: str = "MATERIAL_FACT"
     fact_type: str = "STATEMENT"  # EVENT / PERSON / LOCATION / TIME / NUMBER / STATEMENT
     evidence_ids: list[int] = field(default_factory=list)

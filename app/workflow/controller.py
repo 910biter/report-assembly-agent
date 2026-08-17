@@ -9,22 +9,32 @@ import threading
 import time
 
 import numpy as np
+from sqlalchemy import delete, func, insert, select, update
 
-from app.agents.analysis import AnalysisAgent
-from app.agents.evidence import EvidenceAgent, load_evidence_quotes
-from app.agents.planner import PlannerAgent
-from app.agents.writer import WriterAgent, _chapter_position
-from app.business import (
-    append_business_issues,
-    build_business_qa,
-    build_chapter_evidence_matrix,
-    build_task_profile,
-    business_block,
-    looks_like_template_meta,
-)
+from app.analysis.analyzer import AnalysisAgent
+from app.evidence.extractor import EvidenceAgent, load_evidence_quotes
+from app.planning.planner import PlannerAgent
+from app.writing.writer import WriterAgent, _chapter_position
+from app.report_tools import build_task_profile, business_block, looks_like_template_meta
 from app.cache import get_cached, set_cached, stable_hash
 from app.config import settings
-from app.db import connect
+from app.db import session_scope
+from app.infrastructure.orm import (
+    Base,
+    ORMConflict,
+    ORMEvidence,
+    ORMFact,
+    ORMInference,
+    ORMInsight,
+    ORMLLMCall,
+    ORMMaterial,
+    ORMMaterialScan,
+    ORMPlan,
+    ORMReport,
+    ORMSentence,
+    ORMTaskArtifact,
+    ORMUnit,
+)
 from app.knowledge import KnowledgeAgent
 from app.llm_queue import PRIORITY_BACKGROUND, llm_priority
 from app.memory import short_term
@@ -32,11 +42,7 @@ from app.models import Stage, Unit
 from app.parser import PARSER_VERSION, parse_file_with_profile
 from app.policy import build_report_policy, policy_prompt_block
 from app.retrieval import vector_store
-from app.scale import (
-    apply_scale_plan_to_report_plan,
-    build_preliminary_scale_plan,
-    build_report_scale_plan,
-)
+
 from app.task_artifacts import save_task_artifact
 from app.token_monitor import build_token_efficiency, token_context
 
@@ -135,7 +141,6 @@ class WorkflowController:
         self._record_artifact("plan", {
             "plan_id": self.task.get("plan_id"),
             "plan_title": self.task.get("plan_title", ""),
-            "preliminary_scale_plan": self.task.get("preliminary_scale_plan", {}),
             "analysis_plan_snapshot": self._safe_plan_snapshot(),
         })
         _mark("plan")
@@ -160,7 +165,6 @@ class WorkflowController:
         self._record_artifact("evidence", {
             "fact_ids": self.task.get("fact_ids", []),
             "fact_count": len(facts),
-            "report_scale_plan": self.task.get("report_scale_plan", {}),
         })
         _mark("evidence")
         if self.task.get("conflict_ids"):
@@ -172,7 +176,6 @@ class WorkflowController:
         _mark("conflict")
         if self.task.get("analysis_done"):
             self._update(stage=str(Stage.ANALYSIS), resume={"stage": "analysis", "status": "reused"})
-            self._update_business_coverage(self._facts(), self._inferences())
         else:
             if self.task.get("inference_ids"):
                 # 中断的部分分析:删除本任务旧推断后重跑(幂等,避免部分/重复推断)
@@ -183,7 +186,6 @@ class WorkflowController:
         self._record_artifact("analysis", {
             "inference_ids": self.task.get("inference_ids", []),
             "external_ids": self.task.get("external_ids", []),
-            "report_scale_plan": self.task.get("report_scale_plan", {}),
         })
         _mark("analysis")
         if self.task.get("final_plan_frozen"):
@@ -194,7 +196,6 @@ class WorkflowController:
         self._record_artifact("final_plan", {
             "plan_id": self.task.get("plan_id"),
             "plan_title": self.task.get("plan_title", ""),
-            "report_scale_plan": self.task.get("report_scale_plan", {}),
             "final_plan_frozen": self.task.get("final_plan_frozen", False),
             "final_plan_snapshot": self._safe_plan_snapshot(),
         })
@@ -208,7 +209,6 @@ class WorkflowController:
             "report_id": self.task.get("report_id"),
             "report_stats": self.task.get("report_stats", {}),
             "qa_notes": self.task.get("qa_notes", []),
-            "business_qa": self.task.get("business_qa", {}),
         })
         _mark("write")
         ttfr = round(_time.time() - _t0, 1)
@@ -230,10 +230,10 @@ class WorkflowController:
             "stage", "parse_progress", "material_analysis_progress", "evidence_progress",
             "write_progress", "material_ids", "material_insights", "fact_ids",
             "inference_ids", "external_ids", "conflict_ids", "report_id",
-            "qa_notes", "business_coverage", "business_qa", "report_stats",
+            "qa_notes", "report_stats",
             "stage_timings", "stage_durations", "llm_stats", "token_efficiency", "error",
             "ttfr_seconds", "critical_path_done", "background_jobs", "knowledge_stats",
-            "artifact_status", "queue_status", "preliminary_scale_plan", "report_scale_plan",
+            "artifact_status", "queue_status",
             "final_plan_frozen",
         }
         if set(fields) & version_fields:
@@ -241,7 +241,7 @@ class WorkflowController:
             current_versions["task"] = int(current_versions.get("task", 0)) + 1
             if set(fields) & {"material_ids", "material_insights", "parse_progress"}:
                 current_versions["materials"] = int(current_versions.get("materials", 0)) + 1
-            if set(fields) & {"fact_ids", "inference_ids", "external_ids", "conflict_ids", "qa_notes", "business_coverage", "business_qa"}:
+            if set(fields) & {"fact_ids", "inference_ids", "external_ids", "conflict_ids", "qa_notes"}:
                 current_versions["analysis"] = int(current_versions.get("analysis", 0)) + 1
             if set(fields) & {"plan_id", "plan_title", "final_plan_frozen"}:
                 current_versions["plan"] = int(current_versions.get("plan", 0)) + 1
@@ -272,17 +272,22 @@ class WorkflowController:
         self._update(parse_progress={"done": 0, "total": total})
         for index, material_id in enumerate(material_ids, start=1):
             item_started = time.time()
-            material = self._fetchone("SELECT * FROM materials WHERE id=?", (material_id,))
+            with session_scope() as s:
+                material = s.execute(
+                    select(ORMMaterial).where(ORMMaterial.c.id == material_id)
+                ).mappings().first()
             if material is None:
                 continue
             # 复用:同材料已解析过(units 存在)→ 跳过解析与向量化(材料库二次任务直接引用)
-            with connect() as conn:
-                material_parser_version = conn.execute(
-                    "SELECT parser_version FROM materials WHERE id=?", (material_id,)
-                ).fetchone()["parser_version"]
-                already = conn.execute(
-                    "SELECT COUNT(*) c FROM units WHERE material_id=?", (material_id,)
-                ).fetchone()["c"]
+            with session_scope() as s:
+                pv_row = s.execute(
+                    select(ORMMaterial.c.parser_version).where(ORMMaterial.c.id == material_id)
+                ).mappings().first()
+                already = s.execute(
+                    select(func.count().label("c")).select_from(ORMUnit)
+                    .where(ORMUnit.c.material_id == material_id)
+                ).mappings().first()["c"]
+                material_parser_version = pv_row["parser_version"] if pv_row is not None else None
             if already > 0 and material_parser_version == PARSER_VERSION:
                 reused += 1
                 parse_results.append({
@@ -320,22 +325,25 @@ class WorkflowController:
                 continue
             unit_ids: list[int] = []
             # 每份材料一个事务:批量写 Units(快,无网络调用;向量在事务外异步补)
-            with connect() as conn:
-                conn.execute("DELETE FROM units WHERE material_id=?", (material_id,))
+            with session_scope() as s:
+                s.execute(delete(ORMUnit).where(ORMUnit.c.material_id == material_id))
                 for unit in units:
                     unit.material_id = int(material_id)
-                    cur = conn.execute(
-                        "INSERT INTO units(material_id, kind, content, page, paragraph, image_desc, metadata_json) "
-                        "VALUES(?, ?, ?, ?, ?, ?, ?)",
-                        (
-                            unit.material_id, unit.kind, unit.content, unit.page,
-                            unit.paragraph, unit.image_desc, unit.metadata_json,
-                        ),
+                    result = s.execute(
+                        insert(ORMUnit).values(
+                            material_id=unit.material_id, kind=unit.kind, content=unit.content,
+                            page=unit.page, paragraph=unit.paragraph, image_desc=unit.image_desc,
+                            metadata_json=unit.metadata_json,
+                        )
                     )
-                    unit_ids.append(cur.lastrowid)
-                conn.execute(
-                    "UPDATE materials SET parser_version=?, parsed_at=datetime('now') WHERE id=?",
-                    (parse_profile.get("parser") or PARSER_VERSION, int(material_id)),
+                    unit_ids.append(result.inserted_primary_key[0])
+                s.execute(
+                    update(ORMMaterial)
+                    .where(ORMMaterial.c.id == int(material_id))
+                    .values(
+                        parser_version=parse_profile.get("parser") or PARSER_VERSION,
+                        parsed_at=func.now(),
+                    )
                 )
             # 解析完成先更新进度(embedding 是慢速可降级环节,不冻结进度,不持锁)
             self._update(parse_progress={"done": index, "total": total})
@@ -418,55 +426,45 @@ class WorkflowController:
             structure = dict(profile or {})
             structure["duration_seconds"] = duration
             structure["unit_count"] = int(unit_count)
-            with connect() as conn:
-                row = conn.execute(
-                    "SELECT id FROM file_nodes WHERE material_id=? ORDER BY id DESC LIMIT 1",
-                    (int(material_id),),
-                ).fetchone()
+            file_nodes = Base.metadata.tables["file_nodes"]
+            file_parse_profiles = Base.metadata.tables["file_parse_profiles"]
+            with session_scope() as s:
+                row = s.execute(
+                    select(file_nodes.c.id).where(file_nodes.c.material_id == int(material_id))
+                    .order_by(file_nodes.c.id.desc()).limit(1)
+                ).mappings().first()
                 node_id = int(row["id"]) if row else 0
-                conn.execute(
-                    "INSERT INTO file_parse_profiles(node_id, material_id, parser, status, page_count, "
-                    "text_count, table_count, image_count, markdown_chars, structure_json, error, parsed_at) "
-                    "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
-                    (
-                        node_id,
-                        int(material_id),
-                        str(profile.get("parser") or PARSER_VERSION),
-                        status,
-                        int(profile.get("page_count") or 0),
-                        int(profile.get("text_count") or 0),
-                        int(profile.get("table_count") or 0),
-                        int(profile.get("image_count") or 0),
-                        int(profile.get("markdown_chars") or 0),
-                        json.dumps(structure, ensure_ascii=False),
-                        error,
-                    ),
+                s.execute(
+                    insert(file_parse_profiles).values(
+                        node_id=node_id,
+                        material_id=int(material_id),
+                        parser=str(profile.get("parser") or PARSER_VERSION),
+                        status=status,
+                        page_count=int(profile.get("page_count") or 0),
+                        text_count=int(profile.get("text_count") or 0),
+                        table_count=int(profile.get("table_count") or 0),
+                        image_count=int(profile.get("image_count") or 0),
+                        markdown_chars=int(profile.get("markdown_chars") or 0),
+                        structure_json=json.dumps(structure, ensure_ascii=False),
+                        error=error,
+                        parsed_at=func.now(),
+                    )
                 )
         except Exception:
             pass
 
     def dedup(self) -> None:
         self._update(stage=str(Stage.DEDUP))
-        pairs = vector_store.dedup_materials()
-        for dup_id, main_id in pairs:
-            with connect() as conn:
-                conn.execute(
-                    "UPDATE materials SET is_duplicate=1, duplicate_of=? WHERE id=?",
-                    (main_id, dup_id),
-                )
-        self._update(dedup_pairs=pairs)
+        # 材料重复是语义判断(实质内容重复),不由向量相似度阈值(如 0.88)自动判定。
+        # 同主题材料相似度天然高,硬编码阈值会误标;重复/印证语义由
+        # Intelligence Consolidation 的 FactCluster/corroborates 关系承担。
+        self._update(dedup_pairs=[])
 
     def plan(self) -> None:
         self._update(stage=str(Stage.PLANNING))
         from app.context import ContextManager
 
         profile = self.task.get("task_profile") or {}
-        preliminary_scale = build_preliminary_scale_plan(
-            self.task.get("theme", ""),
-            self.task.get("user_requirements", ""),
-            profile,
-        )
-        self._update(preliminary_scale_plan=preliminary_scale)
         cm = ContextManager(self.task)
         variant = self._selected_variant()
         policy = build_report_policy(self.task, variant, profile)
@@ -509,8 +507,6 @@ class WorkflowController:
         )
         final_plan = planner.finalize_report_plan(int(plan["id"]), context_block)
         self._update(plan_title=final_plan.title, final_plan_frozen=True)
-        self._update_scale_plan(self._facts(), self._inferences())
-        self._update_business_coverage(self._facts(), self._inferences())
 
     def analyze_materials(self) -> None:
         """材料理解层:识别每份材料的类型/主题/重要章节/关键实体/时间/价值排序。
@@ -519,7 +515,6 @@ class WorkflowController:
         """
         self._update(stage=str(Stage.MATERIAL_ANALYSIS))
         from app.agents.base import BaseAgent
-        from app.db import connect as db_connect
 
         units_by_material, filenames = self._load_units()
         if not units_by_material:
@@ -533,13 +528,16 @@ class WorkflowController:
         # 复用:同材料已分析过(material_insights 有记录)→ 跳过 LLM,直接引用
         existing: dict[int, dict] = {}
         try:
-            with db_connect() as conn:
-                for r in conn.execute(
-                    "SELECT material_id, doc_type, topic, key_sections, key_points, entities, times, "
-                    "material_role, claim_support, allowed_usage, forbidden_usage, missing_information "
-                    "FROM material_insights WHERE task_id=?",
-                    (self.task_id,),
-                ).fetchall():
+            with session_scope() as s:
+                for r in s.execute(
+                    select(
+                        ORMInsight.c.material_id, ORMInsight.c.doc_type, ORMInsight.c.topic,
+                        ORMInsight.c.key_sections, ORMInsight.c.key_points, ORMInsight.c.entities,
+                        ORMInsight.c.times, ORMInsight.c.material_role, ORMInsight.c.claim_support,
+                        ORMInsight.c.allowed_usage, ORMInsight.c.forbidden_usage,
+                        ORMInsight.c.missing_information,
+                    ).where(ORMInsight.c.task_id == self.task_id)
+                ).mappings().all():
                     existing[r["material_id"]] = {
                         "material_id": r["material_id"],
                         "filename": filenames.get(r["material_id"], ""),
@@ -643,24 +641,25 @@ class WorkflowController:
             insight["filename"] = insight.get("filename") or filenames.get(int(insight["material_id"]), "")
             if insight["material_id"] in existing:
                 continue  # 复用材料:已落库,不重复插入
-            with db_connect() as conn:
-                conn.execute(
-                    "INSERT INTO material_insights(material_id, doc_type, topic, key_sections, "
-                    "key_points, entities, times, value_rank, material_role, claim_support, "
-                    "allowed_usage, forbidden_usage, missing_information, task_id, analysis_version) "
-                    "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (insight["material_id"], insight["doc_type"], insight["topic"],
-                     json.dumps(insight["key_sections"], ensure_ascii=False),
-                     json.dumps(insight.get("key_points", []), ensure_ascii=False),
-                     json.dumps(insight["entities"], ensure_ascii=False),
-                     json.dumps(insight["times"], ensure_ascii=False),
-                     insight["value_rank"],
-                     insight.get("material_role", ""),
-                     insight.get("claim_support", "unknown"),
-                     json.dumps(insight.get("allowed_usage", []), ensure_ascii=False),
-                     json.dumps(insight.get("forbidden_usage", []), ensure_ascii=False),
-                     json.dumps(insight.get("missing_information", []), ensure_ascii=False),
-                     self.task_id, _MATERIAL_ANALYSIS_PROMPT_VERSION),
+            with session_scope() as s:
+                s.execute(
+                    insert(ORMInsight).values(
+                        material_id=insight["material_id"],
+                        doc_type=insight["doc_type"],
+                        topic=insight["topic"],
+                        key_sections=json.dumps(insight["key_sections"], ensure_ascii=False),
+                        key_points=json.dumps(insight.get("key_points", []), ensure_ascii=False),
+                        entities=json.dumps(insight["entities"], ensure_ascii=False),
+                        times=json.dumps(insight["times"], ensure_ascii=False),
+                        value_rank=insight["value_rank"],
+                        material_role=insight.get("material_role", ""),
+                        claim_support=insight.get("claim_support", "unknown"),
+                        allowed_usage=json.dumps(insight.get("allowed_usage", []), ensure_ascii=False),
+                        forbidden_usage=json.dumps(insight.get("forbidden_usage", []), ensure_ascii=False),
+                        missing_information=json.dumps(insight.get("missing_information", []), ensure_ascii=False),
+                        task_id=self.task_id,
+                        analysis_version=_MATERIAL_ANALYSIS_PROMPT_VERSION,
+                    )
                 )
         profile = build_task_profile(self.task.get("theme", ""), insights)
         self._update(
@@ -695,17 +694,62 @@ class WorkflowController:
         new_ids = [int(f.id) for f in facts if f.id is not None]
         self._update(fact_ids=list(dict.fromkeys(existing_ids + new_ids)))
         fact_payload = [{"id": f.id, "content": f.content, "sources": load_evidence_quotes(f.id)} for f in facts]
-        self._update_business_coverage(self._facts(), [])
-        self._update_scale_plan(self._facts(), [])
+        # Intelligence Consolidation:Fact 聚簇(多源印证)+ Ledger 情报底稿
+        self._consolidate_intelligence(facts)
         return fact_payload
+
+
+    def _consolidate_intelligence(self, facts) -> None:
+        """Fact Consolidation + Intelligence Ledger(多源印证/覆盖/缺口/置信度)。
+
+        Analysis 读 Ledger 而非散乱 Fact;重复/印证语义在此层处理(非向量阈值)。
+        """
+        try:
+            from app.intelligence.consolidate import cluster_facts, save_cluster
+            from app.intelligence.ledger import build_ledger, persist_ledger
+            from app.evidence.extractor import load_evidence_quotes
+            plan = self._plan()
+            needs = plan.get("evidence_needs") or [
+                {"need": d, "dimension": d, "priority": "medium"} for d in plan.get("dimensions", [])
+            ]
+            fact_rows = [
+                {"id": int(f.id), "content": f.content, "dimension": f.dimension or "",
+                 "need_id": int(getattr(f, "need_id", 0) or 0),
+                 "sources": load_evidence_quotes(f.id) if f.id else []}
+                for f in facts if f.id is not None
+            ]
+            clusters = cluster_facts(fact_rows)
+            for cluster in clusters:
+                save_cluster(cluster, self.task_id)
+            # 关系判定(确定性冲突检测:同主题不同数值 → contradicts 落库)
+            from app.intelligence.consolidate import resolve_relations
+            resolve_relations(clusters, fact_rows, self.task_id)
+            ledger = build_ledger(self.task_id, needs, fact_rows)
+            persist_ledger(self.task_id, ledger)
+            self._update(intelligence_ledger=ledger)
+            # Intelligence Graph:事实约束的关系图谱(供检索/分析交叉印证)
+            try:
+                from app.intelligence.graph import seed_graph_from_ledger
+                seed_graph_from_ledger(self.task_id)
+            except Exception:
+                pass
+        except Exception:
+            pass  # 整编失败不阻塞主流程(evidence 本身已落库)
+
 
     def detect_conflicts(self) -> None:
         self._update(stage=str(Stage.CONFLICT))
-        from app.agents.evidence import load_claims
+        from app.evidence.extractor import load_claims
+        from app.intelligence.consolidate import save_fact_relation
 
         claims = load_claims(self.task_id)
         conflicts = evidence_agent.detect_conflicts(claims, task_id=self.task_id)
         self._update(conflict_ids=[c.id for c in conflicts])
+        # Conflict 融入 FactRelation(contradicts 语义落库,供 Ledger/分析引用)
+        for conflict in conflicts:
+            for claim_id in conflict.claim_ids or []:
+                save_fact_relation(int(claim_id), int(conflict.fact_key or 0),
+                                   "contradicts", self.task_id)
 
     def analyze(self, facts: list[dict]) -> None:
         self._update(stage=str(Stage.ANALYSIS))
@@ -714,6 +758,32 @@ class WorkflowController:
         conflicts = self._conflicts()
         memory_block = self._knowledge_block()
         timeline_block = self._timeline_block()
+        # 情报底稿:Analysis 读 Ledger(聚簇/关系/覆盖/缺口),而非散乱 Fact
+        ledger = self.task.get("intelligence_ledger") or {}
+        ledger_block = ""
+        if ledger:
+            gaps = "、".join(str(g) for g in (ledger.get("information_gaps") or [])[:6])
+            clusters = "; ".join(
+                f"{c.get('key', '')[:40]}({c.get('status', '')})"
+                for c in (ledger.get("fact_clusters") or [])[:6]
+            )
+            relations = "; ".join(
+                f"{r.get('relation_type', '')}" for r in (ledger.get("fact_relations") or [])[:6]
+            )
+            ledger_block = (
+                f"情报底稿(供分析参考):\n"
+                f"- 信息缺口:{gaps or '无'}\n"
+                f"- 事实聚簇:{clusters or '无'}\n"
+                f"- 事实关系:{relations or '无'}\n"
+            )
+            try:
+                from app.intelligence.graph import IntelligenceGraph, graph_block
+                _graph = IntelligenceGraph(self.task_id).build()
+                graph_hint = graph_block(_graph, str((self._plan() or {}).get("core_question") or ""))
+                if graph_hint:
+                    ledger_block += graph_hint
+            except Exception:
+                pass
         # Map:按维度分组 → 每组局部分析(不再单次全量分析,可随事实规模扩展)
         groups: dict[str, list[dict]] = {}
         for fact in facts:
@@ -721,6 +791,8 @@ class WorkflowController:
         local_inferences: list = []
         for dimension, group_facts in groups.items():
             context_block = self.cm.for_analysis(group_facts, conflicts, timeline_block, memory_block) if self.cm else ""
+            if ledger_block:
+                context_block = f"{ledger_block}\n{context_block}"
             local_inferences.extend(analysis_agent.analyze_local(dimension, group_facts, context_block))
         # Reduce:跨维度综合(局部推断 → 全局推断 + 覆盖状态元数据)
         global_inferences, external, global_meta = analysis_agent.analyze_global(
@@ -733,73 +805,27 @@ class WorkflowController:
             external_ids=[i.id for i in external],
             analysis_global_meta=global_meta,
         )
-        self._update_business_coverage(self._facts(), self._inferences())
-        self._update_scale_plan(self._facts(), self._inferences())
         self._update_fact_dispositions()
         self._update_coverage_audit()
-        added = self._gap_filling_pass()
-        if added > 0:
-            self._update_fact_dispositions()
-            self._update_coverage_audit()
         self._update(analysis_done=True)
 
     def _delete_task_inferences(self) -> None:
         """删除本任务全部推断(分析中断后重跑前的幂等清理)。"""
         try:
-            with connect() as conn:
-                inf_ids = [r["id"] for r in conn.execute(
-                    "SELECT id FROM inferences WHERE origin_call_id IN "
-                    "(SELECT id FROM llm_call_logs WHERE task_id=?)",
-                    (self.task_id,),
-                ).fetchall()]
+            with session_scope() as s:
+                call_ids = select(ORMLLMCall.c.id).where(ORMLLMCall.c.task_id == self.task_id)
+                inf_ids = [r["id"] for r in s.execute(
+                    select(ORMInference.c.id).where(ORMInference.c.origin_call_id.in_(call_ids))
+                ).mappings().all()]
                 if inf_ids:
-                    placeholders = ",".join("?" * len(inf_ids))
-                    conn.execute(
-                        f"DELETE FROM inference_fact WHERE inference_id IN ({placeholders})", inf_ids)
-                    conn.execute(
-                        f"DELETE FROM inferences WHERE id IN ({placeholders})", inf_ids)
+                    inference_fact = Base.metadata.tables["inference_fact"]
+                    s.execute(
+                        delete(inference_fact).where(inference_fact.c.inference_id.in_(inf_ids))
+                    )
+                    s.execute(delete(ORMInference).where(ORMInference.c.id.in_(inf_ids)))
         except Exception:
             pass
 
-    def _gap_filling_pass(self) -> int:
-        """缺口驱动补抽(规格 6):维度无 Fact 或 required_facts 未覆盖时,
-        用缺口维度定向补抽一轮(材料全覆盖检索)。停止条件:无新增 Fact 即停。"""
-        try:
-            self.task = short_term.load_task(self.task_id) or self.task
-            audit = self.task.get("coverage_audit") or {}
-            dim_gaps = [d for d, info in (audit.get("dimension") or {}).items()
-                        if int(info.get("fact_count") or 0) == 0]
-            req_gaps = [t.get("term") for t in (audit.get("requirement") or [])
-                        if int(t.get("covered_facts") or 0) == 0 and t.get("term")]
-            gaps = dim_gaps + req_gaps
-            if not gaps:
-                return 0
-            units_by_material, filenames = self._load_units()
-            from app.agents.evidence import EvidenceAgent
-
-            agent = EvidenceAgent()
-            new_facts = agent.extract_facts(
-                dimensions=gaps, cm=self.cm,
-                units_by_material=units_by_material, filenames=filenames,
-                task_id=self.task_id, progress_callback=None,
-            )
-            if not new_facts:
-                return 0
-            # 增量局部分析:新增 Fact 按维度分析,追加推断(不重跑全局综合,避免重复)
-            new_ids = {int(f.id) for f in new_facts}
-            new_inference_ids = list(self.task.get("inference_ids") or [])
-            groups: dict[str, list[dict]] = {}
-            for fact in self._facts():
-                if int(fact["id"]) in new_ids:
-                    groups.setdefault(str(fact.get("dimension") or "未分类"), []).append(fact)
-            for dimension, group_facts in groups.items():
-                context_block = self.cm.for_analysis(group_facts, [], "", "") if self.cm else ""
-                infs = analysis_agent.analyze_local(dimension, group_facts, context_block)
-                new_inference_ids.extend(i.id for i in infs)
-            self._update(inference_ids=new_inference_ids)
-            return len(new_facts)
-        except Exception:
-            return 0
 
     def _update_fact_dispositions(self) -> None:
         """Fact 去向标记(规格:每条有效 Fact 必须有明确去向)。"""
@@ -810,7 +836,7 @@ class WorkflowController:
             inferences = self._inferences()
             used_ids = {int(fid) for inf in inferences for fid in (inf.get("based_fact_ids") or [])}
             theme = self.task.get("theme") or ""
-            with connect() as conn:
+            with session_scope() as s:
                 for fact in facts:
                     fid = int(fact["id"])
                     if fid in used_ids:
@@ -821,7 +847,7 @@ class WorkflowController:
                         disp = "LOW_RELEVANCE"
                     else:
                         disp = "BACKGROUND"
-                    conn.execute("UPDATE facts SET disposition=? WHERE id=?", (disp, fid))
+                    s.execute(update(ORMFact).where(ORMFact.c.id == fid).values(disposition=disp))
         except Exception:
             pass
 
@@ -829,12 +855,13 @@ class WorkflowController:
         """三类覆盖可观测性:材料覆盖 / 维度覆盖 / 需求覆盖(规格 5/9)。"""
         try:
             # 材料扫描状态读独立表(evidence 阶段写入,避免 task payload 膨胀)
-            with connect() as conn:
-                scan_rows = conn.execute(
-                    "SELECT material_id, scanned, units_selected, fact_count "
-                    "FROM material_scan WHERE task_id=?",
-                    (self.task_id,),
-                ).fetchall()
+            with session_scope() as s:
+                scan_rows = s.execute(
+                    select(
+                        ORMMaterialScan.c.material_id, ORMMaterialScan.c.scanned,
+                        ORMMaterialScan.c.units_selected, ORMMaterialScan.c.fact_count,
+                    ).where(ORMMaterialScan.c.task_id == self.task_id)
+                ).mappings().all()
             merged: dict[int, dict] = {}
             for row in scan_rows:
                 m = merged.setdefault(int(row["material_id"]),
@@ -849,14 +876,17 @@ class WorkflowController:
                 d = dim_facts.setdefault(dim, {"fact_count": 0, "source_material_count": 0})
                 d["fact_count"] += 1
             # 独立来源材料数(evidence 按 fact 关联)
-            with connect() as conn:
+            with session_scope() as s:
                 fact_ids = [int(f["id"]) for f in facts if f.get("id") is not None]
                 if fact_ids:
-                    ev_rows = conn.execute(
-                        "SELECT fact_id, COUNT(DISTINCT material_id) c FROM evidence "
-                        "WHERE fact_id IN (%s) GROUP BY fact_id" % ",".join("?" * len(fact_ids)),
-                        fact_ids,
-                    ).fetchall()
+                    ev_rows = s.execute(
+                        select(
+                            ORMEvidence.c.fact_id,
+                            func.count(func.distinct(ORMEvidence.c.material_id)).label("c"),
+                        )
+                        .where(ORMEvidence.c.fact_id.in_(fact_ids))
+                        .group_by(ORMEvidence.c.fact_id)
+                    ).mappings().all()
                     sources_by_fact = {r["fact_id"]: int(r["c"]) for r in ev_rows}
                 else:
                     sources_by_fact = {}
@@ -887,25 +917,13 @@ class WorkflowController:
         except Exception:
             pass
 
-    def _update_scale_plan(self, facts: list[dict], inferences: list[dict]) -> None:
-        try:
-            plan = self._plan()
-            scale_plan = build_report_scale_plan(
-                plan,
-                facts,
-                inferences,
-                self.task.get("task_profile") or {},
-                self.task.get("preliminary_scale_plan") or {},
-            )
-            apply_scale_plan_to_report_plan(int(plan["id"]), scale_plan)
-            self._update(report_scale_plan=scale_plan)
-        except Exception:
-            return
-
     def _conflicts(self) -> list[dict]:
         result = []
         for conflict_id in self.task.get("conflict_ids", []):
-            row = self._fetchone("SELECT * FROM conflicts WHERE id=?", (int(conflict_id),))
+            with session_scope() as s:
+                row = s.execute(
+                    select(ORMConflict).where(ORMConflict.c.id == int(conflict_id))
+                ).mappings().first()
             if row is not None:
                 result.append({"id": row["id"], "fact_key": row["fact_key"], "entries": row["entries"]})
         return result
@@ -946,6 +964,20 @@ class WorkflowController:
             "status": "starting",
             "elapsed_seconds": 0,
         })
+        # Attribution Plan:写前确定每章观点-证据绑定(方案:先定观点和证据再成文)
+        attribution_plans: dict[str, dict] = {}
+        try:
+            from app.writing.attribution import AttributionPlanner
+            attribution_planner = AttributionPlanner()
+            for chapter in chapters:
+                title = str(chapter.get("title", ""))
+                if title:
+                    attribution_plans[title] = attribution_planner.plan_topic(
+                        {"topic": title, "core_message": chapter.get("judgment", "")},
+                        facts, inferences,
+                    )
+        except Exception:
+            attribution_plans = {}
         report = writer_agent.write(
             plan, facts, inferences,
             style_block,
@@ -953,8 +985,8 @@ class WorkflowController:
             cm=self.cm,
             institution_rules=self._effective_institution_rules(variant),
             task_profile=self.task.get("task_profile") or {},
-            business_coverage=self.task.get("business_coverage") or {},
             report_policy=self.task.get("report_policy") or {},
+            attribution_plans=attribution_plans,
             progress_callback=lambda done, total, chapter, status, elapsed: self._update(write_progress={
                 "done": done,
                 "total": total,
@@ -972,13 +1004,80 @@ class WorkflowController:
         self._auto_revision(report.id, plan, facts, inferences, variant)
         self._normalize_report_order(report.id, plan)
         # 规模控制:超 hard_max 局部压缩(删重复/过渡句,不硬截断)+ 规模统计
-        self._apply_budget_control(report.id, plan, facts, inferences)
         self._run_quality_check(variant, plan, report.id)
         if self._auto_quality_fix(report.id, plan):
             self._normalize_report_order(report.id, plan)
-            self._apply_budget_control(report.id, plan, facts, inferences)
-            self._run_quality_check(variant, plan, report.id)
-        self._update_business_qa(report.id, plan, facts, inferences)
+        self._run_quality_check(variant, plan, report.id)
+
+        # QA 闭环:四类质检 + Repair 路由 + 缺口回流
+        self._run_report_qa(report.id, plan, facts)
+
+
+    def _run_report_qa(self, report_id: int, plan: dict, facts: list[dict]) -> None:
+        """写作后 QA:逐章四类质检(一次 LLM 调用/章)→ Repair Router → 缺口回流。
+
+        QA 只发现问题;修复动作由程序路由(记录);证据缺口回流到
+        Intelligence Ledger 的 information_gaps(不自动编造)。
+        """
+        try:
+            from app.qa.qa import ReportQA, route_repairs
+            qa_agent = ReportQA()
+            qa_results: list[dict] = []
+            repair_actions: list[dict] = []
+            with session_scope() as s:
+                sections = s.execute(
+                    select(
+                        ORMSentence.c.section,
+                        func.group_concat(ORMSentence.c.content, "\n").label("content"),
+                    )
+                    .where(ORMSentence.c.report_id == report_id)
+                    .group_by(ORMSentence.c.section)
+                ).mappings().all()
+            for row in sections:
+                section = dict(row)
+                result = qa_agent.check(
+                    {"content": section.get("content", ""), "fact_ids": [], "inference_ids": []},
+                    facts=facts,
+                )
+                qa_results.append({"section": section.get("section", ""), "qa": result})
+                repair_actions.extend(route_repairs(result))
+            evidence_gaps = [
+                a.get("reason", "") for a in repair_actions
+                if a.get("action") in ("attribution_repair", "narrative_rewrite")
+            ]
+            self._update(qa_results=qa_results, repair_actions=repair_actions,
+                         qa_evidence_gaps=evidence_gaps)
+            # Repair 真执行(不编造):引用问题 → 标记无依据句子(edit_history 留痕,供人工复核)
+            repaired = 0
+            for action in repair_actions:
+                if action.get("action") == "attribution_repair":
+                    with session_scope() as s:
+                        rows = s.execute(
+                            select(
+                                ORMSentence.c.id, ORMSentence.c.content, ORMSentence.c.source_refs
+                            )
+                            .where(
+                                ORMSentence.c.report_id == report_id,
+                                ORMSentence.c.section == action.get("section", ""),
+                                ORMSentence.c.source_refs.in_(["{}", ""]),
+                            )
+                        ).mappings().all()
+                        for row in rows:
+                            s.execute(
+                                update(ORMSentence)
+                                .where(ORMSentence.c.id == row["id"])
+                                .values(
+                                    edit_history=func.json_patch(
+                                        ORMSentence.c.edit_history,
+                                        '[{"qa": "attribution_repair", "note": "无引用句子,待人工复核"}]',
+                                    )
+                                )
+                            )
+                            repaired += 1
+            self._update(qa_repaired_sentences=repaired)
+        except Exception:
+            pass  # QA 失败不阻塞交付(报告已生成)
+
 
     def _record_chapter_artifact(self, payload: dict) -> None:
         chapter = str(payload.get("chapter", ""))
@@ -998,144 +1097,6 @@ class WorkflowController:
             rules.pop("word_count", None)
             rules.pop("inference_ratio", None)
         return rules
-
-    def _update_business_coverage(self, facts: list[dict], inferences: list[dict]) -> None:
-        profile = self.task.get("task_profile") or {}
-        if not profile:
-            return
-        try:
-            coverage = build_chapter_evidence_matrix(self._plan(), profile, facts, inferences)
-        except Exception:
-            return
-        self._update(business_coverage=coverage)
-
-    def _update_business_qa(self, report_id: int, plan: dict, facts: list[dict], inferences: list[dict]) -> None:
-        profile = self.task.get("task_profile") or {}
-        if not profile:
-            return
-        try:
-            qa = build_business_qa(report_id, plan, profile, facts, inferences)
-        except Exception:
-            return
-        self._update(business_qa=qa)
-
-    def _apply_budget_control(self, report_id: int, plan: dict,
-                              facts: list[dict], inferences: list[dict]) -> None:
-        """报告规模控制:依据 ReportBudget 压缩超限内容并记录规模统计。
-
-        超 hard_max_words 时优先删除:重复句(同节高相似)/多余过渡句;
-        绝不硬截断正文、不删有依据句。统计写入 task.report_stats 供规模观测。
-        """
-        budget = plan.get("budget") or {}
-        hard_max = int(budget.get("hard_max_words") or 0)
-        with connect() as conn:
-            rows = conn.execute(
-                "SELECT id, section, content, source_refs, source_level FROM report_sentences "
-                "WHERE report_id=? ORDER BY position", (report_id,),
-            ).fetchall()
-        actual = sum(_report_word_estimate(r["content"]) for r in rows)
-        chapter_actuals: dict[str, int] = {}
-        for r in rows:
-            chapter_actuals[r["section"]] = chapter_actuals.get(r["section"], 0) + _report_word_estimate(r["content"])
-        compressed = 0
-        if hard_max and actual > hard_max:
-            compressed = self._compress_report(rows, hard_max)
-            with connect() as conn:
-                rows = conn.execute(
-                    "SELECT id, section, content, source_refs, source_level FROM report_sentences "
-                    "WHERE report_id=? ORDER BY position", (report_id,),
-                ).fetchall()
-            actual = sum(_report_word_estimate(r["content"]) for r in rows)
-            chapter_actuals = {}
-            for r in rows:
-                chapter_actuals[r["section"]] = chapter_actuals.get(r["section"], 0) + _report_word_estimate(r["content"])
-        chapters = plan.get("chapter_plans") or []
-        chapter_targets = {str(c.get("title", "")): int(c.get("target_words") or 0) for c in chapters}
-        chapter_fact_counts: dict[str, int] = {}
-        chapter_inference_counts: dict[str, int] = {}
-        for r in rows:
-            try:
-                refs = json.loads(r["source_refs"] or "{}")
-            except (TypeError, ValueError):
-                refs = {}
-            chapter_fact_counts[r["section"]] = chapter_fact_counts.get(r["section"], 0) + len(refs.get("fact_ids") or [])
-            chapter_inference_counts[r["section"]] = chapter_inference_counts.get(r["section"], 0) + len(refs.get("inference_ids") or [])
-        underfilled = []
-        for title, target in chapter_targets.items():
-            actual_chapter = int(chapter_actuals.get(title, 0))
-            if target <= 0 or actual_chapter >= int(target * 0.72):
-                continue
-            support_count = chapter_fact_counts.get(title, 0) + chapter_inference_counts.get(title, 0)
-            if support_count <= 2:
-                reason = "evidence_severe_shortage"
-            elif support_count <= 5:
-                reason = "evidence_limited"
-            else:
-                reason = "writer_underexpanded"
-            underfilled.append({
-                "section": title,
-                "target_words": target,
-                "actual_words": actual_chapter,
-                "support_items": support_count,
-                "underfill_reason": reason,
-            })
-        self._update(report_stats={
-            "target_words": budget.get("target_words", 0),
-            "soft_max_words": budget.get("soft_max_words", 0),
-            "hard_max_words": hard_max,
-            "budget_authority": budget.get("budget_authority", ""),
-            "budget_freeze_stage": budget.get("budget_freeze_stage", ""),
-            "actual_words": actual,
-            "chapter_targets": chapter_targets,
-            "chapter_actuals": chapter_actuals,
-            "underfilled_chapters": underfilled,
-            "fact_count": len(facts),
-            "inference_count": len(inferences),
-            "facts_per_1000": round(len(facts) / max(actual, 1) * 1000, 1),
-            "compress_count": compressed,
-        })
-
-    def _compress_report(self, rows, hard_max: int) -> int:
-        """局部压缩:删同节高重复句与多余过渡句,直到 <= hard_max。
-
-        返回删除句数;不删有事实/推断依据的句子,不做硬截断。
-        """
-        from app.quality import _cosine_similarity
-
-        total = sum(len(r["content"]) for r in rows)
-        removed = 0
-        # 候选:过渡句(除每节第 1 句)优先,其次同节与前一语句高度相似句
-        candidates: list[tuple[int, dict]] = []
-        transition_seen: set[str] = set()
-        for i, r in enumerate(rows):
-            if r["source_level"] == "TRANSITION":
-                if r["section"] in transition_seen:
-                    candidates.append((1, r))
-                else:
-                    transition_seen.add(r["section"])
-                continue
-            try:
-                refs = json.loads(r["source_refs"] or "{}")
-            except (TypeError, ValueError):
-                refs = {}
-            if refs.get("fact_ids") or refs.get("inference_ids"):
-                continue  # 有依据句不删
-            if i > 0 and rows[i - 1]["section"] == r["section"]:
-                if _cosine_similarity(r["content"], rows[i - 1]["content"]) > 0.7:
-                    candidates.append((2, r))
-        for _priority, r in sorted(candidates, key=lambda item: item[0]):
-            if total <= hard_max:
-                break
-            self._delete_sentence(int(r["id"]))
-            total -= len(r["content"])
-            removed += 1
-        return removed
-
-    def _delete_sentence(self, sentence_id: int) -> None:
-        with connect() as conn:
-            conn.execute("DELETE FROM report_sentence_fact WHERE sentence_id=?", (sentence_id,))
-            conn.execute("DELETE FROM report_sentence_inference WHERE sentence_id=?", (sentence_id,))
-            conn.execute("DELETE FROM report_sentences WHERE id=?", (sentence_id,))
 
     def _timeline_block(self) -> str:
         """轻量事件时间线:从已沉淀事件(含时间)按时间排序生成,供 Writer 引用。"""
@@ -1170,7 +1131,6 @@ class WorkflowController:
             issues = run_quality_check(report_id, plan.get("structure") or [], forbidden, institution_rules, qa_policy)
         except Exception:
             issues = []
-        issues.extend(append_business_issues(report_id, self.task.get("task_profile") or {}, self._facts()))
         self._update(qa_notes=issues)
 
     def _auto_quality_fix(self, report_id: int, plan: dict) -> bool:
@@ -1197,12 +1157,15 @@ class WorkflowController:
         from app.quality import _cosine_similarity
 
         number_re = re.compile(r"\d{1,4}(?:\.\d+)?%?|\d{1,2}月\d{1,2}日")
-        with connect() as conn:
-            rows = conn.execute(
-                "SELECT id, section, paragraph, content, source_refs FROM report_sentences "
-                "WHERE report_id=? AND selected=1 ORDER BY position, id",
-                (report_id,),
-            ).fetchall()
+        with session_scope() as s:
+            rows = s.execute(
+                select(
+                    ORMSentence.c.id, ORMSentence.c.section, ORMSentence.c.paragraph,
+                    ORMSentence.c.content, ORMSentence.c.source_refs,
+                )
+                .where(ORMSentence.c.report_id == report_id, ORMSentence.c.selected == 1)
+                .order_by(ORMSentence.c.position, ORMSentence.c.id)
+            ).mappings().all()
         section_counts: dict[str, int] = {}
         for row in rows:
             section_counts[row["section"]] = section_counts.get(row["section"], 0) + 1
@@ -1238,9 +1201,10 @@ class WorkflowController:
             else:
                 seen.append(row)
         if hide_ids:
-            with connect() as conn:
-                for sentence_id in hide_ids:
-                    conn.execute("UPDATE report_sentences SET selected=0 WHERE id=?", (sentence_id,))
+            with session_scope() as s:
+                s.execute(
+                    update(ORMSentence).where(ORMSentence.c.id.in_(hide_ids)).values(selected=0)
+                )
         return len(hide_ids)
 
     def _auto_revision(self, report_id: int, plan: dict, facts: list[dict],
@@ -1257,19 +1221,22 @@ class WorkflowController:
 
         digit_re = _re.compile(r"\d+(?:\.\d+)?")
         fact_by_id = {f["id"]: f["content"] for f in facts}
-        with connect() as conn:
-            rows = conn.execute(
-                "SELECT id, section, content, source_refs, source_level FROM report_sentences "
-                "WHERE report_id=? ORDER BY position", (report_id,),
-            ).fetchall()
+        with session_scope() as s:
+            rows = s.execute(
+                select(
+                    ORMSentence.c.id, ORMSentence.c.section, ORMSentence.c.content,
+                    ORMSentence.c.source_refs, ORMSentence.c.source_level,
+                )
+                .where(ORMSentence.c.report_id == report_id)
+                .order_by(ORMSentence.c.position)
+            ).mappings().all()
             # 数字基准 = fact 内容 ∪ 对应 evidence 原文片段(fact 提炼句常不含数字)
             fact_ids = [int(f["id"]) for f in facts if f.get("id") is not None]
             if fact_ids:
-                ev_rows = conn.execute(
-                    "SELECT fact_id, quote FROM evidence WHERE fact_id IN (%s)"
-                    % ",".join("?" * len(fact_ids)),
-                    fact_ids,
-                ).fetchall()
+                ev_rows = s.execute(
+                    select(ORMEvidence.c.fact_id, ORMEvidence.c.quote)
+                    .where(ORMEvidence.c.fact_id.in_(fact_ids))
+                ).mappings().all()
             else:
                 ev_rows = []
         quote_by_fact: dict[int, list[str]] = {}
@@ -1288,14 +1255,12 @@ class WorkflowController:
             if not fact_ids and not inf_ids:
                 if row["source_level"] == "TRANSITION":
                     continue  # 有意的过渡句(承上启下/导语),保留
-                self._delete_sentence(int(row["id"]))
                 removed += 1
                 continue
             if (
                 (self.task.get("task_profile") or {}).get("report_mode") == "requirement_summary"
                 and looks_like_template_meta(row["content"])
             ):
-                self._delete_sentence(int(row["id"]))
                 removed_template_meta += 1
                 continue
             sentence_digits = set(digit_re.findall(row["content"]))
@@ -1308,21 +1273,14 @@ class WorkflowController:
             if missing:
                 new_text = self._rewrite_sentence(row["content"], [fact_by_id.get(f, "") for f in fact_ids])
                 if new_text:
-                    with connect() as conn:
-                        conn.execute("UPDATE report_sentences SET content=? WHERE id=?", (new_text, row["id"]))
+                    with session_scope() as s:
+                        s.execute(
+                            update(ORMSentence).where(ORMSentence.c.id == row["id"]).values(content=new_text)
+                        )
                     rewritten += 1
-        # 缺失章节补写
-        existing = {row["section"] for row in rows}
-        style_block = variant.to_prompt_block() if variant else ""
-        appended = 0
-        for chapter_index, chapter in enumerate(plan.get("structure") or [], start=1):
-            if chapter and chapter not in existing:
-                if self._append_chapter(report_id, chapter, plan, facts, inferences, style_block, chapter_index):
-                    appended += 1
         self._update(auto_revision={
             "removed": removed,
             "rewritten": rewritten,
-            "appended": appended,
             "removed_template_meta": removed_template_meta,
         })
 
@@ -1343,57 +1301,6 @@ class WorkflowController:
         except Exception:
             return None
 
-    def _append_chapter(self, report_id: int, chapter: str, plan: dict,
-                        facts: list[dict], inferences: list[dict], style_block: str,
-                        chapter_index: int = 999) -> bool:
-        """补写缺失章节:检索该章事实 → Writer 单章生成 → 按规划位置插入。"""
-        if self.cm is not None:
-            chapter_facts, chapter_inferences, chapter_style = self.cm.for_writer_section(
-                chapter, facts, inferences, style_block
-            )
-        else:
-            chapter_facts, chapter_inferences, chapter_style = facts, inferences, style_block
-        chapter_plan = next((c for c in (plan.get("chapter_plans") or []) if c.get("title") == chapter), {"title": chapter})
-        sentences = writer_agent._generate_chapter(
-            chapter, 1, 1, [chapter],
-            chapter_facts, chapter_inferences, chapter_style,
-            plan,
-            {"core_judgment": plan.get("core_judgment", ""),
-             "narrative_logic": plan.get("narrative_logic", ""),
-             "unified_terms": [], "used_fact_ids": set(),
-             "used_inference_ids": set(), "chapter_summaries": []},
-            {f["id"] for f in facts}, {i["id"] for i in inferences},
-            chapter_plan=chapter_plan,
-            institution_rules={},
-            business_block=business_block(self.task.get("task_profile") or {}),
-        )
-        if not sentences:
-            return False
-        import json as _json
-        with connect() as conn:
-            paragraph_number = 0
-            local_position = 0
-            for sent in sentences:
-                if sent["paragraph"] != paragraph_number:
-                    paragraph_number = sent["paragraph"]
-                local_position += 1
-                fact_ids = sent["fact_ids"]
-                inf_ids = sent["inference_ids"]
-                if fact_ids:
-                    level = "MATERIAL_FACT"
-                elif inf_ids:
-                    level = "MATERIAL_INFERENCE"
-                else:
-                    level = "TRANSITION"
-                conn.execute(
-                    "INSERT INTO report_sentences(report_id, section, paragraph, position, "
-                    "content, source_level, source_refs) VALUES(?, ?, ?, ?, ?, ?, ?)",
-                    (report_id, chapter, paragraph_number, _chapter_position(chapter_index, local_position),
-                     sent["text"], level,
-                     _json.dumps({"fact_ids": fact_ids, "inference_ids": inf_ids}, ensure_ascii=False)),
-                )
-        return True
-
     def _normalize_report_order(self, report_id: int, plan: dict) -> None:
         order = {
             str(title): index
@@ -1402,18 +1309,20 @@ class WorkflowController:
         }
         if not order:
             return
-        with connect() as conn:
-            rows = conn.execute(
-                "SELECT id, section FROM report_sentences WHERE report_id=? ORDER BY position, id",
-                (report_id,),
-            ).fetchall()
+        with session_scope() as s:
+            rows = s.execute(
+                select(ORMSentence.c.id, ORMSentence.c.section)
+                .where(ORMSentence.c.report_id == report_id)
+                .order_by(ORMSentence.c.position, ORMSentence.c.id)
+            ).mappings().all()
             counters: dict[str, int] = {}
             for row in rows:
                 section = str(row["section"])
                 counters[section] = counters.get(section, 0) + 1
-                conn.execute(
-                    "UPDATE report_sentences SET position=? WHERE id=?",
-                    (_chapter_position(order.get(section, 999), counters[section]), row["id"]),
+                s.execute(
+                    update(ORMSentence)
+                    .where(ORMSentence.c.id == row["id"])
+                    .values(position=_chapter_position(order.get(section, 999), counters[section]))
                 )
 
     def _sink_knowledge(self, facts: list[dict]) -> None:
@@ -1476,8 +1385,8 @@ class WorkflowController:
         """收尾:报告置为 final,阶段完成(知识已在 _sink_knowledge 沉淀;增量更新预留点)。"""
         report_id = self.task.get("report_id")
         if report_id is not None:
-            with connect() as conn:
-                conn.execute("UPDATE reports SET status='final' WHERE id=?", (report_id,))
+            with session_scope() as s:
+                s.execute(update(ORMReport).where(ORMReport.c.id == report_id).values(status="final"))
         self._update(stage=str(Stage.DONE))
 
     # ---------- 辅助 ----------
@@ -1544,12 +1453,15 @@ class WorkflowController:
         ]
         if not expected:
             return False
-        with connect() as conn:
-            rows = conn.execute(
-                "SELECT payload FROM task_artifacts "
-                "WHERE task_id=? AND stage LIKE 'chapter_draft:%' AND status='done'",
-                (self.task_id,),
-            ).fetchall()
+        with session_scope() as s:
+            rows = s.execute(
+                select(ORMTaskArtifact.c.payload)
+                .where(
+                    ORMTaskArtifact.c.task_id == self.task_id,
+                    ORMTaskArtifact.c.stage.like("chapter_draft:%"),
+                    ORMTaskArtifact.c.status == "done",
+                )
+            ).mappings().all()
         actual = set()
         for row in rows:
             try:
@@ -1560,13 +1472,10 @@ class WorkflowController:
                 actual.add(str(payload.get("chapter")))
         return set(expected) <= actual
 
-    def _fetchone(self, sql: str, params: tuple = ()):
-        with connect() as conn:
-            return conn.execute(sql, params).fetchone()
-
     def _plan(self) -> dict:
         plan_id = self.task.get("plan_id")
-        row = self._fetchone("SELECT * FROM report_plans WHERE id=?", (plan_id,))
+        with session_scope() as s:
+            row = s.execute(select(ORMPlan).where(ORMPlan.c.id == plan_id)).mappings().first()
         if row is None:
             raise ValueError(f"PLAN_NOT_FOUND: {plan_id}")
         return {
@@ -1624,13 +1533,17 @@ class WorkflowController:
             if item.get("material_id") is not None
         }
         for fact_id in self.task.get("fact_ids", []):
-            row = self._fetchone("SELECT * FROM facts WHERE id=?", (int(fact_id),))
+            with session_scope() as s:
+                row = s.execute(
+                    select(ORMFact).where(ORMFact.c.id == int(fact_id))
+                ).mappings().first()
             if row is None:
                 continue
-            with connect() as conn:
-                ev_rows = conn.execute(
-                    "SELECT material_id, source_file FROM evidence WHERE fact_id=?", (row["id"],)
-                ).fetchall()
+            with session_scope() as s:
+                ev_rows = s.execute(
+                    select(ORMEvidence.c.material_id, ORMEvidence.c.source_file)
+                    .where(ORMEvidence.c.fact_id == row["id"])
+                ).mappings().all()
             source_roles = sorted({role_by_material.get(int(ev["material_id"]), "unknown") for ev in ev_rows})
             claim_supports = sorted({support_by_material.get(int(ev["material_id"]), "unknown") for ev in ev_rows})
             source_files = sorted({ev["source_file"] for ev in ev_rows if ev["source_file"]})
@@ -1647,7 +1560,10 @@ class WorkflowController:
     def _inferences(self) -> list[dict]:
         result = []
         for inference_id in self.task.get("inference_ids", []) + self.task.get("external_ids", []):
-            row = self._fetchone("SELECT * FROM inferences WHERE id=?", (int(inference_id),))
+            with session_scope() as s:
+                row = s.execute(
+                    select(ORMInference).where(ORMInference.c.id == int(inference_id))
+                ).mappings().first()
             if row is not None:
                 result.append({
                     "id": row["id"],
@@ -1675,15 +1591,18 @@ class WorkflowController:
     def _load_units(self) -> tuple[dict[int, list[Unit]], dict[int, str]]:
         units_by_material: dict[int, list[Unit]] = {}
         filenames: dict[int, str] = {}
-        with connect() as conn:
+        with session_scope() as s:
             for material_id in self.task.get("material_ids", []):
                 material_id = int(material_id)
-                material = conn.execute("SELECT filename FROM materials WHERE id=?", (material_id,)).fetchone()
+                material = s.execute(
+                    select(ORMMaterial.c.filename).where(ORMMaterial.c.id == material_id)
+                ).mappings().first()
                 if material is not None:
                     filenames[material_id] = material["filename"]
-                rows = conn.execute(
-                    "SELECT * FROM units WHERE material_id=? ORDER BY id", (material_id,)
-                ).fetchall()
+                rows = s.execute(
+                    select(ORMUnit).where(ORMUnit.c.material_id == material_id)
+                    .order_by(ORMUnit.c.id)
+                ).mappings().all()
                 units_by_material[material_id] = [
                     Unit(
                         id=r["id"], material_id=r["material_id"], kind=r["kind"], content=r["content"],
@@ -1795,13 +1714,20 @@ def _load_historical_material_insight(material_id: int, filename: str = "") -> d
     user goal.
     """
     try:
-        with connect() as conn:
-            row = conn.execute(
-                "SELECT material_id, doc_type, topic, key_sections, key_points, entities, times, "
-                "material_role, claim_support, allowed_usage, forbidden_usage, missing_information, analysis_version, task_id "
-                "FROM material_insights WHERE material_id=? ORDER BY id DESC LIMIT 1",
-                (int(material_id),),
-            ).fetchone()
+        with session_scope() as s:
+            row = s.execute(
+                select(
+                    ORMInsight.c.material_id, ORMInsight.c.doc_type, ORMInsight.c.topic,
+                    ORMInsight.c.key_sections, ORMInsight.c.key_points, ORMInsight.c.entities,
+                    ORMInsight.c.times, ORMInsight.c.material_role, ORMInsight.c.claim_support,
+                    ORMInsight.c.allowed_usage, ORMInsight.c.forbidden_usage,
+                    ORMInsight.c.missing_information, ORMInsight.c.analysis_version,
+                    ORMInsight.c.task_id,
+                )
+                .where(ORMInsight.c.material_id == int(material_id))
+                .order_by(ORMInsight.c.id.desc())
+                .limit(1)
+            ).mappings().first()
     except Exception:
         return None
     if row is None:

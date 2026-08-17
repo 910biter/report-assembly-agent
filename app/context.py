@@ -1,6 +1,7 @@
 """Context Manager: build minimal context by workflow stage with hybrid retrieval."""
 
 from app.models import Unit
+from app.retrieval.query_compiler import QueryCompiler, RetrievalQuery
 from app.retrieval import embed_texts, vector_store
 from app.retrieval.rag import hybrid_retrieve_units
 
@@ -102,6 +103,7 @@ class ContextManager:
         self.task = task
         self.units_by_material = units_by_material or {}
         self.filenames = filenames or {}
+        self._query_compiler = QueryCompiler(task_id=str(task.get("id") or ""))
         self._unit_index: dict[int, tuple[int, Unit]] = {}
         for material_id, units in self.units_by_material.items():
             for unit in units:
@@ -156,9 +158,10 @@ class ContextManager:
         return blocks, meta
 
     def _label(self, material_id: int, unit: Unit) -> str:
-        label = f"[{self.filenames.get(material_id, '?')}"
+        uid = f"U{unit.id}" if unit.id is not None else "U?"
+        label = f"[{uid} | {self.filenames.get(material_id, '?')}"
         if unit.page is not None:
-            label += f" 第{unit.page}页"
+            label += f" | 第{unit.page}页"
         label += f"]\n{unit.content}"
         return label
 
@@ -261,16 +264,24 @@ class ContextManager:
             return []
         return self._build_batches(queries, insights, needs or [], pass_name="first_pass")
 
-    def for_gap_retrieval(self, gaps: list[dict], insights: list[dict]) -> list[tuple[str, dict]]:
+    def for_gap_retrieval(self, gaps: list[dict], insights: list[dict],
+                          known_contents: set[str] | None = None) -> list[tuple[str, dict]]:
         """Iterative Retrieval:仅针对缺口 Needs 检索(缺什么补什么)。"""
         queries = [str(n.get("need", "")).strip() for n in (gaps or []) if str(n.get("need", "")).strip()]
         if not queries:
             return []
-        return self._build_batches(queries, insights, gaps or [], pass_name="iterative")
+        return self._build_batches(queries, insights, gaps or [], pass_name="iterative",
+                                   known_contents=known_contents)
 
     def _build_batches(self, queries: list[str], insights: list[dict],
-                       needs: list[dict], pass_name: str) -> list[tuple[str, dict]]:
-        """按 token 预算装箱:queries 的候选并集 → 批次(候选不删减,只拆批)。"""
+                       needs: list[dict], pass_name: str,
+                       known_contents: set[str] | None = None) -> list[tuple[str, dict]]:
+        """按 token 预算装箱:queries 的候选并集 → utility 重排 → 批次。
+
+        known_contents:已提取事实(迭代轮次 feedback)——信息增益重排依据。
+        """
+        from app.retrieval.reranker import rerank
+
         per_batch_tokens = _evidence_batch_budget()
         keywords: list[str] = []
         for insight in insights or []:
@@ -289,26 +300,43 @@ class ContextManager:
         except Exception:
             unit_vectors = {}
 
+        need_text = " ".join(queries)
+        # 检索候选:Qdrant 粗召回(查询相关)→ rerank;Qdrant 不可用时回退 Python 打分
         per_material: list[tuple[int, list]] = []
         for material_id, units in self.units_by_material.items():
             candidates: dict[int, object] = {}
             for query in queries:
-                query_vector = None
+                query_vector = self._query_compiler.query_vector(RetrievalQuery(query))
+                hit_ids: set[int] = set()
                 try:
-                    from app.retrieval.embedder import embed_texts
-                    query_vector = embed_texts([query])[0]
+                    from app.retrieval import vector_store
+                    if getattr(vector_store, "enabled", False) and query_vector:
+                        hits = vector_store.search_units(query_vector, top_k=_recall_budget(), query_text=query)
+                        hit_ids = {int(h[0]) for h in hits}
                 except Exception:
-                    query_vector = None
-                scored = sorted(
-                    [(_unit_relevance(unit, query, keywords, query_vector, unit_vectors), unit)
-                     for unit in units if (unit.content or "").strip()],
-                    key=lambda pair: pair[0], reverse=True,
-                )
-                cutoff = _dynamic_cutoff([score for score, _unit in scored])
-                for _score, unit in scored[:cutoff]:
-                    candidates.setdefault(id(unit), unit)
+                    hit_ids = set()
+                for unit in units:
+                    if unit.id is not None and unit.id in hit_ids:
+                        candidates.setdefault(id(unit), unit)
+                if not hit_ids:
+                    # 回退:全库 Python 打分(离线/无 Qdrant 场景)
+                    scored = sorted(
+                        [(_unit_relevance(unit, query, keywords, query_vector, unit_vectors), unit)
+                         for unit in units if (unit.content or "").strip()],
+                        key=lambda pair: pair[0], reverse=True,
+                    )
+                    cutoff = _dynamic_cutoff([score for score, _unit in scored])
+                    for _score, unit in scored[:cutoff]:
+                        candidates.setdefault(id(unit), unit)
             if candidates:
-                per_material.append((material_id, list(candidates.values())))
+                # Utility 重排:相关 + 新信息(已提取事实 feedback 降权重复)
+                ranked = rerank(
+                    [(0.5, u) for u in candidates.values()],
+                    need_text,
+                    unit_vectors=unit_vectors,
+                    known_contents=known_contents,
+                )
+                per_material.append((material_id, [unit for _u, unit in ranked]))
 
         blocks_by_material: list[tuple[int, list]] = []
         for material_id, selected in per_material:
@@ -330,9 +358,7 @@ class ContextManager:
         current_tokens = 0
         current_units: dict[int, int] = {}
         for material_id, selected in blocks_by_material:
-            block = self._label(material_id, selected[0]) + "\n".join(
-                (u.content or "") for u in selected[1:]
-            )
+            block = "\n\n".join(self._label(material_id, u) for u in selected)
             block_tokens = _estimate_tokens(block)
             if current_tokens + block_tokens > per_batch_tokens and current_blocks:
                 batches.append((current_blocks, current_materials, current_tokens, current_units))
@@ -435,9 +461,7 @@ class ContextManager:
         current_units: dict[int, int] = {}
         for material_id, selected in blocks_by_material:
             # _label 已含首个 unit 的 content,后续 units 追加正文
-            block = self._label(material_id, selected[0]) + "\n".join(
-                (u.content or "") for u in selected[1:]
-            )
+            block = "\n\n".join(self._label(material_id, u) for u in selected)
             block_tokens = _estimate_tokens(block)
             if current_tokens + block_tokens > per_batch_tokens and current_blocks:
                 batches.append((current_blocks, current_materials, current_tokens, current_units))
@@ -599,3 +623,15 @@ def cosine(a: list[float], b: list[float]) -> float:
 def json_dumps(value) -> str:
     import json
     return json.dumps(value, ensure_ascii=False)
+
+
+def _recall_budget() -> int:
+    """Qdrant 粗召回量:按 token 预算 ÷ 平均 unit 规模推导(动态)。
+
+    预算 = 单批 token 上限的 3 倍(召回池需覆盖多批),除以平均单位规模
+    得到召回条数;随材料规模自适应,无固定 Top-K。
+    """
+    budget = _evidence_batch_budget() * 3
+    avg = 120  # 中文 unit 平均约 120 token(规模估算,非决策阈值)
+    return max(200, int(budget / avg))
+

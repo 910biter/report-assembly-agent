@@ -5,7 +5,9 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from fastapi.templating import Jinja2Templates
 
-from app.db import connect
+from app.db import session_scope
+from app.infrastructure.orm import ORMReport
+from sqlalchemy import select
 
 _WEB_DIR = Path(__file__).resolve().parent.parent.parent / "web"
 templates = Jinja2Templates(directory=str(_WEB_DIR / "templates"))
@@ -64,8 +66,8 @@ def reports_page(request: Request):
 
 @web_router.get("/reports/{report_id}")
 def report_page(request: Request, report_id: int):
-    with connect() as conn:
-        report = conn.execute("SELECT * FROM reports WHERE id=?", (report_id,)).fetchone()
+    with session_scope() as s:
+        report = s.execute(select(ORMReport).where(ORMReport.c.id == report_id)).mappings().first()
     if report is None:
         return JSONResponse({"error": "REPORT_NOT_FOUND"}, status_code=404)
     return templates.TemplateResponse(request, "report.html", {
