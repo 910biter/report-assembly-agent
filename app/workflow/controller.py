@@ -87,6 +87,13 @@ class WorkflowController:
 
     # ---------- 对外入口 ----------
 
+    def _control_boundary(self) -> None:
+        """Pause only between workflow stages; never interrupt an LLM call."""
+        task = short_term.load_task(self.task_id) or self.task
+        if (task.get("control_request") if task else "") == "pause":
+            self._update(stage="paused", queue_status={"status": "paused"}, control_request="")
+            raise RuntimeError("TASK_PAUSED")
+
     def run_to_review(self) -> None:
         """跑完 解析→去重→规划→事实→冲突→分析→写作,停在评审阶段等待用户。
 
@@ -112,6 +119,7 @@ class WorkflowController:
 
         with self._token_context("parse"):
             self.parse_materials()
+        self._control_boundary()
         self._record_artifact("parse", {
             "material_ids": self.task.get("material_ids", []),
             "parser_version": PARSER_VERSION,
@@ -123,10 +131,12 @@ class WorkflowController:
         _mark("parse")
         with self._token_context("dedup"):
             self.dedup()
+        self._control_boundary()
         self._record_artifact("dedup", {"dedup_pairs": self.task.get("dedup_pairs", [])})
         _mark("dedup")
         with self._token_context("material_analysis"):
             self.analyze_materials()
+        self._control_boundary()
         self._record_artifact("material_analysis", {
             "material_insights": self.task.get("material_insights", []),
             "reused": self.task.get("material_analysis_reused", 0),
@@ -144,6 +154,7 @@ class WorkflowController:
             "analysis_plan_snapshot": self._safe_plan_snapshot(),
         })
         _mark("plan")
+        self._control_boundary()
         if self.task.get("fact_ids"):
             # 断点续跑(维度级):evidence_progress.done 记录已完成维度数
             ep = self.task.get("evidence_progress") or {}
@@ -162,6 +173,7 @@ class WorkflowController:
         else:
             with self._token_context("evidence"):
                 facts = self.extract_evidence()
+        self._control_boundary()
         self._record_artifact("evidence", {
             "fact_ids": self.task.get("fact_ids", []),
             "fact_count": len(facts),
@@ -183,6 +195,7 @@ class WorkflowController:
                 self._update(inference_ids=[], external_ids=[], analysis_global_meta={})
             with self._token_context("analysis"):
                 self.analyze(facts)
+        self._control_boundary()
         self._record_artifact("analysis", {
             "inference_ids": self.task.get("inference_ids", []),
             "external_ids": self.task.get("external_ids", []),
@@ -193,6 +206,7 @@ class WorkflowController:
         else:
             with self._token_context("final_planning"):
                 self.finalize_report_structure()
+        self._control_boundary()
         self._record_artifact("final_plan", {
             "plan_id": self.task.get("plan_id"),
             "plan_title": self.task.get("plan_title", ""),
@@ -205,6 +219,7 @@ class WorkflowController:
         else:
             with self._token_context("writing"):
                 self.write()
+        self._control_boundary()
         self._record_artifact("write", {
             "report_id": self.task.get("report_id"),
             "report_stats": self.task.get("report_stats", {}),
@@ -698,6 +713,31 @@ class WorkflowController:
         self._consolidate_intelligence(facts)
         return fact_payload
 
+    def reflow_evidence_gaps(self) -> list[dict]:
+        """Explicit WriteHERE boundary: retrieve open writing gaps, then refresh ledger.
+
+        This is intentionally bounded to the gap contract and does not restart
+        parsing or planner stages. A caller may invoke it after QA and then
+        request a local chapter rewrite.
+        """
+        task = self.task or {}
+        gaps = task.get("qa_evidence_gaps") or []
+        if not gaps:
+            return []
+        from app.context import ContextManager
+        from app.evidence.extractor import EvidenceAgent
+        units_by_material, filenames = self._load_units()
+        cm = ContextManager(task, units_by_material, filenames)
+        needs = [{"need": str(g), "dimension": "writing_evidence_gap", "priority": "high"} for g in gaps if str(g).strip()]
+        facts = EvidenceAgent().extract_facts(
+            needs, units_by_material, filenames, cm=cm,
+            insights=task.get("material_insights", []),
+            task_id=self.task_id,
+        )
+        self._update(evidence_gap_contract={"status": "retrieved", "gaps": gaps,
+                                            "new_fact_ids": [int(f.id) for f in facts if f.id is not None]})
+        return [{"id": f.id, "content": f.content} for f in facts]
+
 
     def _consolidate_intelligence(self, facts) -> None:
         """Fact Consolidation + Intelligence Ledger(多源印证/覆盖/缺口/置信度)。
@@ -1025,28 +1065,44 @@ class WorkflowController:
             qa_results: list[dict] = []
             repair_actions: list[dict] = []
             with session_scope() as s:
-                sections = s.execute(
-                    select(
-                        ORMSentence.c.section,
-                        func.group_concat(ORMSentence.c.content, "\n").label("content"),
-                    )
+                sentence_rows = s.execute(
+                    select(ORMSentence.c.section, ORMSentence.c.content, ORMSentence.c.source_refs)
                     .where(ORMSentence.c.report_id == report_id)
-                    .group_by(ORMSentence.c.section)
+                    .order_by(ORMSentence.c.position, ORMSentence.c.id)
                 ).mappings().all()
-            for row in sections:
-                section = dict(row)
+            sections: dict[str, dict] = {}
+            for row in sentence_rows:
+                section = sections.setdefault(str(row["section"] or ""), {
+                    "section": str(row["section"] or ""), "texts": [], "fact_ids": set(), "inference_ids": set(),
+                })
+                section["texts"].append(str(row["content"] or ""))
+                try:
+                    refs = json.loads(row["source_refs"] or "{}")
+                except (TypeError, ValueError):
+                    refs = {}
+                section["fact_ids"].update(int(x) for x in refs.get("fact_ids", []) if str(x).isdigit())
+                section["inference_ids"].update(int(x) for x in refs.get("inference_ids", []) if str(x).isdigit())
+            for section in sections.values():
                 result = qa_agent.check(
-                    {"content": section.get("content", ""), "fact_ids": [], "inference_ids": []},
+                    {"content": "\n".join(section["texts"]),
+                     "fact_ids": sorted(section["fact_ids"]),
+                     "inference_ids": sorted(section["inference_ids"])},
                     facts=facts,
                 )
-                qa_results.append({"section": section.get("section", ""), "qa": result})
-                repair_actions.extend(route_repairs(result))
+                qa_results.append({"section": section["section"], "qa": result})
+                for action in route_repairs(result):
+                    action["section"] = section["section"]
+                    repair_actions.append(action)
             evidence_gaps = [
                 a.get("reason", "") for a in repair_actions
                 if a.get("action") in ("attribution_repair", "narrative_rewrite")
             ]
+            from app.planning.structure import evidence_gap_contract, evaluation_contract
+            gap_contract = evidence_gap_contract(evidence_gaps)
             self._update(qa_results=qa_results, repair_actions=repair_actions,
-                         qa_evidence_gaps=evidence_gaps)
+                         qa_evidence_gaps=evidence_gaps,
+                         evidence_gap_contract=gap_contract,
+                         evaluation_contract=evaluation_contract())
             # Repair 真执行(不编造):引用问题 → 标记无依据句子(edit_history 留痕,供人工复核)
             repaired = 0
             for action in repair_actions:

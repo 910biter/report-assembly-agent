@@ -10,8 +10,6 @@
     </div>
     <div class="actions-row">
       <button id="run-task-btn" class="button" style="display:none">开始运行</button>
-      <a id="report-top-link" class="button secondary" href="#" style="display:none">查看报告</a>
-      <button id="finalize-top-btn" style="display:none">完成审核</button>
     </div>
   </section>
 
@@ -73,6 +71,10 @@ let ANALYSIS = null;
 let activeAnalysis = "facts";
 let lastMaterialVersion = "";
 let lastAnalysisVersion = "";
+let pollInFlight = false;
+let materialsInFlight = false;
+let analysisInFlight = false;
+let lastRefreshAt = 0;
 
 document.querySelectorAll(".tab").forEach(btn => {
   btn.addEventListener("click", () => {
@@ -94,21 +96,33 @@ document.querySelectorAll(".mini-tab").forEach(btn => {
 });
 
 async function poll() {
-  const res = await fetch("/api/tasks/{{ task_id }}");
-  TASK = await res.json();
-  renderTask(TASK);
-  const versions = TASK.versions || {};
-  const materialVersion = String(versions.materials || JSON.stringify([TASK.stage, TASK.material_ids, TASK.parse_progress, TASK.material_analysis_progress, TASK.task_profile]));
-  const analysisVersion = String(versions.analysis || JSON.stringify([TASK.fact_ids, TASK.inference_ids, TASK.conflict_ids, TASK.qa_notes]));
-  if (document.getElementById("tab-materials").classList.contains("active") && materialVersion !== lastMaterialVersion) {
-    lastMaterialVersion = materialVersion;
-    loadMaterials();
+  if (pollInFlight) return;
+  pollInFlight = true;
+  try {
+    const res = await fetch("/api/tasks/{{ task_id }}", { cache: "no-store" });
+    if (!res.ok) throw new Error(`任务状态请求失败(${res.status})`);
+    TASK = await res.json();
+    lastRefreshAt = Date.now();
+    renderTask(TASK);
+  } catch (err) {
+    renderTransientError(err);
+  } finally {
+    pollInFlight = false;
   }
-  if (document.getElementById("tab-analysis").classList.contains("active") && analysisVersion !== lastAnalysisVersion) {
-    lastAnalysisVersion = analysisVersion;
-    loadAnalysis();
+  if (!TASK || !["review", "done", "failed"].includes(TASK.stage)) setTimeout(poll, 4000);
+  if (TASK) {
+    const versions = TASK.versions || {};
+    const materialVersion = String(versions.materials || JSON.stringify([TASK.stage, TASK.parse_progress, TASK.material_analysis_progress]));
+    const analysisVersion = String(versions.analysis || JSON.stringify([TASK.fact_ids, TASK.inference_ids, TASK.conflict_ids, TASK.qa_notes]));
+    if (document.getElementById("tab-materials").classList.contains("active") && materialVersion !== lastMaterialVersion) {
+      lastMaterialVersion = materialVersion;
+      loadMaterials();
+    }
+    if (document.getElementById("tab-analysis").classList.contains("active") && analysisVersion !== lastAnalysisVersion) {
+      lastAnalysisVersion = analysisVersion;
+      loadAnalysis();
+    }
   }
-  if (!["review", "done", "failed"].includes(TASK.stage)) setTimeout(poll, 4000);
 }
 
 function renderTask(task) {
@@ -126,6 +140,7 @@ function renderTask(task) {
   renderOverview(task);
   renderProgressDetail(task);
   renderReportEntry(task);
+  renderRefreshState();
 }
 
 function renderUserProgress(stage, task) {
@@ -145,6 +160,12 @@ function renderOverview(task) {
   const facts = (task.fact_ids || []).length;
   const reportReady = isReportReviewable(task);
   const partialReport = !!task.report_id && !reportReady;
+  const queueStatus = (task.queue_status || {}).status;
+  const control = queueStatus === "running"
+    ? `<button class="secondary" onclick="controlTask('pause')">暂停任务</button>`
+    : queueStatus === "paused"
+      ? `<button class="secondary" onclick="controlTask('resume')">恢复任务</button>`
+      : task.stage === "failed" ? `<button class="secondary" onclick="controlTask('restart')">重新启动</button>` : "";
   document.getElementById("overview-alerts").innerHTML = task.error
     ? `<div class="notice danger">任务失败：${escapeHtml(task.error)}</div>`
     : issues.length ? `<div class="notice warning">发现 ${issues.length} 个待核验问题，建议进入“分析”查看质量检查。</div>`
@@ -155,17 +176,14 @@ function renderOverview(task) {
   document.getElementById("next-actions").innerHTML = [
     metricCard("材料数量", `${(task.material_ids || []).length} 份`, "进入“材料”查看解析状态"),
     metricCard("事实数量", `${facts} 条`, "进入“分析”查看事实与依据"),
-    metricCard("报告状态", reportReady ? (task.stage === "done" ? "已完成" : "待审核") : partialReport ? "生成中" : "未生成", nextActionText(task)),
+    metricCard("下一步", nextActionText(task), "按当前状态执行"),
+    control ? `<div class="metric-card action-card">${control}</div>` : "",
   ].join("");
 }
 
 function renderProgressDetail(task) {
   const timings = task.stage_timings || {};
   const durations = task.stage_durations || {};
-  const llm = task.llm_stats || {};
-  const token = task.token_efficiency || {};
-  const buckets = token.token_buckets || {};
-  const drivers = token.scale_drivers || {};
   const parseStats = task.parse_stats || {};
   const rows = [];
   if (task.parse_progress) rows.push(["材料解析", progressPair(task.parse_progress)]);
@@ -177,12 +195,6 @@ function renderProgressDetail(task) {
   if (task.queue_status && task.queue_status.status) rows.push(["任务队列", queueText(task) || task.queue_status.status]);
   if (Object.keys(durations).length) rows.push(["步骤耗时", Object.entries(durations).map(([k, v]) => `${k}: ${v}s`).join(" / ")]);
   if (Object.keys(timings).length) rows.push(["阶段耗时", Object.entries(timings).map(([k, v]) => `${k}: ${v}s`).join(" / ")]);
-  if (llm.calls) rows.push(["模型调用", `${llm.calls} 次 · 输入约 ${llm.chars || 0} 字符 · 重试 ${llm.retries || 0} 次`]);
-  if (token.total_output_tokens) rows.push(["Token效率", `输出 ${token.total_output_tokens} · 最终正文约 ${token.final_report_tokens_est || 0} · 正文效率 ${percent(token.final_token_efficiency)}`]);
-  if (buckets.necessary_proxy_tokens) rows.push(["中间信息", `必要性代理 ${percent(buckets.necessary_proxy_share)} · 可压缩代理 ${percent(buckets.compressible_proxy_share)} · 重试浪费 ${percent(token.retry_waste_rate)}`]);
-  if (buckets.returned_tokens) rows.push(["Token漏斗", `返回→解析 ${percent(buckets.returned_to_parsed_share)} · 解析→入库 ${percent(buckets.parsed_to_persisted_share)} · 入库→最终 ${percent(buckets.persisted_to_final_share)}`]);
-  if (buckets.candidate_total) rows.push(["冲突候选", `送检 ${buckets.candidate_count}/${buckets.candidate_total} · 压缩后保留 ${percent(buckets.candidate_compression_share)}`]);
-  if (drivers.writer_output_tokens_per_final_token) rows.push(["效率驱动", `写作膨胀 ${drivers.writer_output_tokens_per_final_token}x · 事实利用 ${percent(token.fact_utilization_rate)} · 推断利用 ${percent(token.inference_utilization_rate)}`]);
   document.getElementById("progress-detail").innerHTML = rows.length
     ? rows.map(([k, v]) => `<div class="progress-row"><b>${escapeHtml(k)}</b><span>${escapeHtml(v)}</span></div>`).join("")
     : '<p class="muted">暂无运行详情。</p>';
@@ -215,20 +227,12 @@ function renderRunButton(task) {
 }
 
 function renderReportEntry(task) {
-  const topLink = document.getElementById("report-top-link");
-  const topBtn = document.getElementById("finalize-top-btn");
   const box = document.getElementById("report-entry");
   if (!task.report_id) {
-    topLink.style.display = "none";
-    topBtn.style.display = "none";
     box.innerHTML = '<div class="empty">报告尚未生成。</div>';
     return;
   }
   const reportReady = isReportReviewable(task);
-  topLink.style.display = "inline-block";
-  topLink.href = "/reports/" + task.report_id;
-  topBtn.style.display = task.stage === "review" ? "inline-block" : "none";
-  topBtn.onclick = () => finalize(task.report_id, topBtn);
   box.innerHTML = `<div class="report-actions-card">
     <p>${reportReady ? (task.stage === "done" ? "报告已完成审核。" : "报告已生成，建议先进入报告编辑器完成审核。") : "报告草稿正在生成中，当前仅用于断点续写，暂不建议审核或导出。"}</p>
     <div class="actions-row">
@@ -240,8 +244,12 @@ function renderReportEntry(task) {
 }
 
 async function loadMaterials() {
-  const res = await fetch("/api/tasks/{{ task_id }}/materials");
-  MATERIALS = await res.json();
+  if (materialsInFlight) return;
+  materialsInFlight = true;
+  try {
+    const res = await fetch("/api/tasks/{{ task_id }}/materials", { cache: "no-store" });
+    if (!res.ok) throw new Error(`材料请求失败(${res.status})`);
+    MATERIALS = await res.json();
   const roles = ((TASK || {}).task_profile || {}).role_matrix || [];
   const roleByName = new Map(roles.map(r => [r.filename, r]));
   const parsedCount = MATERIALS.length ? MATERIALS[0].parsed_count : 0;
@@ -265,13 +273,21 @@ async function loadMaterials() {
       </div>
     </div>`;
   }).join("") : '<div class="empty">暂无材料</div>');
+  } catch (err) { renderTransientError(err); }
+  finally { materialsInFlight = false; }
 }
 
 async function loadAnalysis() {
-  const res = await fetch("/api/tasks/{{ task_id }}/analysis");
-  ANALYSIS = await res.json();
-  renderQualityOverview();
-  renderAnalysis();
+  if (analysisInFlight) return;
+  analysisInFlight = true;
+  try {
+    const res = await fetch("/api/tasks/{{ task_id }}/analysis", { cache: "no-store" });
+    if (!res.ok) throw new Error(`分析请求失败(${res.status})`);
+    ANALYSIS = await res.json();
+    renderQualityOverview();
+    renderAnalysis();
+  } catch (err) { renderTransientError(err); }
+  finally { analysisInFlight = false; }
 }
 
 function renderQualityOverview() {
@@ -309,6 +325,19 @@ function renderAnalysis() {
       <p>${escapeHtml(i.note || i.quote || "")}</p>
     </div>`).join("") : '<div class="empty">暂无质量问题</div>';
   }
+}
+
+async function controlTask(action) {
+  const labels = {pause: "正在请求暂停…", resume: "正在恢复…", restart: "正在重新启动…"};
+  const res = await fetch(`/api/tasks/{{ task_id }}/control/${action}`, {method: "POST"});
+  const data = await res.json();
+  if (!res.ok) {
+    renderTransientError(new Error(data.status || data.error || `HTTP ${res.status}`));
+    return;
+  }
+  const box = document.getElementById("overview-alerts");
+  if (box) box.insertAdjacentHTML("beforeend", `<span class="muted">${labels[action] || "操作已提交"}</span>`);
+  await poll();
 }
 
 async function finalize(reportId, btn) {
@@ -373,6 +402,18 @@ function nextActionText(task) {
 }
 function isReportReviewable(task) {
   return !!task.report_id && (task.critical_path_done === true || ["review", "done"].includes(task.stage));
+}
+function renderRefreshState() {
+  const el = document.getElementById("overview-alerts");
+  if (!el || !lastRefreshAt) return;
+  const stamp = new Date(lastRefreshAt).toLocaleTimeString();
+  const current = el.querySelector(".refresh-state");
+  if (current) current.textContent = `状态已刷新：${stamp}`;
+  else el.insertAdjacentHTML("beforeend", `<span class="muted refresh-state">状态已刷新：${stamp}</span>`);
+}
+function renderTransientError(err) {
+  const el = document.getElementById("overview-alerts");
+  if (el) el.insertAdjacentHTML("beforeend", `<div class="notice warning">暂时无法刷新，系统将自动重试：${escapeHtml(err.message || err)}</div>`);
 }
 function metricCard(label, value, hint) {
   return `<div class="metric-card"><span>${escapeHtml(label)}</span><b>${escapeHtml(value)}</b><em>${escapeHtml(hint || "")}</em></div>`;

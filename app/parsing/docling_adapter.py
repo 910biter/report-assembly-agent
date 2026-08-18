@@ -252,6 +252,9 @@ def _get_ocr_engine():
         _OCR_ENGINE = RapidOCR(params={
             "Det.model_type": mt,
             "Rec.model_type": mt,
+            # RapidOCR 3.x: ONNX Runtime provider 由 EngineConfig 控制。
+            # 开启 CUDA 时优先 CUDA,不可用时 provider_config 自动回退 CPU。
+            "EngineConfig.onnxruntime.use_cuda": bool(settings.docling_ocr_cuda and (settings.docling_device or "").lower().startswith("cuda")),
         })
     return _OCR_ENGINE
 
@@ -351,7 +354,7 @@ def _build_converter(ext: str, do_ocr: bool = False):
 
 
 def _asr_pipeline_options(ext: str):
-    """ASR 管线配置:whisper 档位(默认 small,可配)+ 显式语言(中文材料避免自动检测失败)。"""
+    """ASR 管线配置:当前与 OCR 一样使用 CPU,预留独立设备开关。"""
     from docling.datamodel.asr_model_specs import (
         WHISPER_BASE,
         WHISPER_LARGE,
@@ -359,6 +362,7 @@ def _asr_pipeline_options(ext: str):
         WHISPER_SMALL,
         WHISPER_TINY,
     )
+    from docling.datamodel.accelerator_options import AcceleratorOptions
     from docling.datamodel.pipeline_options import AsrPipelineOptions, VideoPipelineOptions
 
     _SPECS = {
@@ -368,9 +372,16 @@ def _asr_pipeline_options(ext: str):
     base = _SPECS.get((settings.asr_model or "small").strip().lower(), WHISPER_SMALL)
     lang = (settings.asr_language or "").strip()
     asr_options = base.model_copy(update={"language": lang}) if lang else base
+    device = (settings.asr_device or "cpu").strip().lower()
     if ext in _AUDIO_EXTS:
-        return AsrPipelineOptions(asr_options=asr_options)
-    return VideoPipelineOptions(asr_options=asr_options)
+        return AsrPipelineOptions(
+            accelerator_options=AcceleratorOptions(device=device),
+            asr_options=asr_options,
+        )
+    return VideoPipelineOptions(
+        accelerator_options=AcceleratorOptions(device=device),
+        asr_options=asr_options,
+    )
 
 
 def _pdf_pipeline_options(do_ocr: bool):
@@ -384,8 +395,27 @@ def _pdf_pipeline_options(do_ocr: bool):
 
     options = PdfPipelineOptions()
     options.do_ocr = bool(do_ocr)
-    if not do_ocr:
+    # 解析阶段调度:Layout/Table 使用 GPU;OCR 由 RapidOCR ONNX 保持 CPU;
+    # torch.compile 关闭,避免 RT-DETR 在该环境出现 CUDA invalid argument。
+    # 纯文本 PDF 仍走 FAST_NATIVE 零模型路径。
+    _accelerator = getattr(options, "accelerator_options", None)
+    if _accelerator is not None:
+        _accelerator.device = (settings.docling_device or "cpu").strip().lower()
+    _engine = None
+    try:
+        _engine = options.layout_options.engine_options
+    except AttributeError:
+        _engine = getattr(options, "layout_options", None)
+    if _engine is not None:
+        try:
+            _engine.compile_model = False
+        except AttributeError:
+            pass
+    try:
         options.do_table_structure = True
+    except AttributeError:
+        pass
+    if not do_ocr:
         return options
     engine = (settings.docling_ocr_engine or "auto").strip().lower()
     # RapidOCR(onnxruntime)语言码为 'ch'/'chinese_cht';EasyOCR 为 'ch_sim';

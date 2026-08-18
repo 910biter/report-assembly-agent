@@ -20,6 +20,7 @@ _lock = threading.RLock()
 # LLM 阶段 agent 常驻 → True → embedding 让位走 CPU(显存 24.8G > 24.5G 不能共存)。
 _agent_active = True
 _agent_state_lock = threading.Lock()
+_heavy_active = False
 
 
 def set_agent_active(active: bool) -> None:
@@ -29,7 +30,7 @@ def set_agent_active(active: bool) -> None:
 
 
 def embedding_num_gpu() -> int:
-    """embedding 动态放置:agent 活跃时 CPU,否则 GPU(按 settings.gpu_layers)。"""
+    """embedding 动态放置:解析重阶段让位给 Docling GPU。"""
     with _agent_state_lock:
         if _agent_active:
             return 0
@@ -53,10 +54,15 @@ def heavy_stage(model: str = ""):
     tight = settings.gpu_memory_tight
     if tight:
         model_gateway.unload_model(model)
-        set_agent_active(False)
+        global _heavy_active, _agent_active
+        with _agent_state_lock:
+            _heavy_active = True
+            _agent_active = False
     try:
         yield
     finally:
         if tight:
             model_gateway.warmup_model(model)
-            set_agent_active(True)
+            with _agent_state_lock:
+                _heavy_active = False
+                _agent_active = True

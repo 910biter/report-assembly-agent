@@ -84,15 +84,37 @@ const selectedMaterials = new Set();
 document.getElementById("task-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   const form = e.target;
-  document.getElementById("existing-material-ids").value = [...selectedMaterials].join(",");
-  const res = await fetch("/api/tasks", { method: "POST", body: new FormData(form) });
-  const data = await res.json();
-  if (data.task_id) {
-    document.getElementById("task-result").textContent = "任务已创建，正在跳转……";
-    location.href = "/tasks/" + data.task_id;
-  } else {
-    document.getElementById("task-result").textContent = "创建失败：" + (data.error || JSON.stringify(data));
+  const button = form.querySelector("button[type=submit]");
+  const result = document.getElementById("task-result");
+  const files = form.querySelector("input[type=file]").files;
+  if (!files.length && !selectedMaterials.size) {
+    result.textContent = "请先选择至少一个材料文件，或从材料库勾选已有材料。";
+    return;
   }
+  document.getElementById("existing-material-ids").value = [...selectedMaterials].join(",");
+  button.disabled = true;
+  button.textContent = `正在上传 ${files.length || selectedMaterials.size} 个材料…`;
+  result.textContent = "上传中：0%（文件较多时请耐心等待）";
+  const xhr = new XMLHttpRequest();
+  xhr.open("POST", "/api/tasks");
+  xhr.upload.onprogress = (event) => {
+    if (event.lengthComputable) result.textContent = `正在上传：${Math.round(event.loaded / event.total * 100)}%`;
+  };
+  xhr.onload = () => {
+    let data = {};
+    try { data = JSON.parse(xhr.responseText || "{}"); } catch (_) { data = {error: xhr.statusText}; }
+    if (xhr.status >= 200 && xhr.status < 300 && data.task_id) {
+      result.textContent = "材料已上传，正在打开任务…";
+      location.href = "/tasks/" + data.task_id;
+    } else {
+      button.disabled = false;
+      button.textContent = "创建并开始";
+      const detail = data.filename ? `（文件：${data.filename}）` : "";
+      result.textContent = `创建失败：${data.error || `HTTP ${xhr.status}`} ${detail}`;
+    }
+  };
+  xhr.onerror = () => { button.disabled = false; button.textContent = "创建并开始"; result.textContent = "上传失败：网络连接中断，请重试。"; };
+  xhr.send(new FormData(form));
 });
 
 async function loadDashboard() {

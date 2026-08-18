@@ -20,6 +20,9 @@ from app.infrastructure.orm import Base, ORMReport, ORMSentence, ORMTaskArtifact
 from sqlalchemy import select, update, delete
 from app.models import Report
 from app.policy import policy_prompt_block
+from app.planning.structure import serializable_memory
+from app.planning.structure import order_chapters
+from app.task_artifacts import latest_task_artifact, save_task_artifact
 from app.token_monitor import update_call_funnel, update_call_metrics, update_call_products
 
 
@@ -512,6 +515,7 @@ class WriterAgent(BaseAgent):
         """
         self._task_id = task_id
         chapters = plan.get("chapter_plans") or [{"title": t} for t in (plan.get("structure") or [])]
+        chapters = order_chapters(chapters)
         valid_fact_ids = {f["id"] for f in facts}
         valid_inf_ids = {i["id"] for i in inferences}
         inf_levels = {i["id"]: i["source_level"] for i in inferences}
@@ -531,6 +535,15 @@ class WriterAgent(BaseAgent):
             "used_inference_ids": set(),
             "chapter_summaries": [],       # {chapter, summary, core_message, dependencies}
         }
+        # 持久化记忆优先:断点恢复时保留术语、判断、未解决问题和 Fact 角色。
+        if task_id:
+            stored = latest_task_artifact(task_id, "report_memory")
+            saved = (stored or {}).get("payload", {}).get("memory", {}) if stored else {}
+            for key in ("unified_terms", "expressed_points", "formed_judgments", "unresolved_issues", "chapter_summaries"):
+                report_memory[key] = list(saved.get(key) or [])
+            report_memory["fact_roles"] = dict(saved.get("fact_roles") or {})
+            report_memory["used_fact_ids"] = {int(x) for x in saved.get("used_fact_ids", [])}
+            report_memory["used_inference_ids"] = {int(x) for x in saved.get("used_inference_ids", [])}
 
         report = self._open_or_create_report(plan, profile_id, existing_report_id)
         if report_callback:
@@ -702,6 +715,10 @@ class WriterAgent(BaseAgent):
                 "core_message": narrative_plan.get("core_message") or narrative_plan.get("central_message", ""),
                 "dependencies": narrative_plan.get("dependencies") or [],
             })
+            try:
+                save_task_artifact(task_id, "report_memory", {"report_id": report.id}, {"memory": serializable_memory(report_memory)})
+            except Exception:
+                pass
             if progress_callback:
                 progress_callback(chapter_index, chapter_count, chapter_title, "done", round(time.time() - chapter_start, 1))
             if chapter_callback:
@@ -721,7 +738,6 @@ class WriterAgent(BaseAgent):
         gaps = report_memory.get("unresolved_issues") or []
         if gaps:
             try:
-                from app.task_artifacts import save_task_artifact
                 save_task_artifact(task_id, "evidence_gaps", {"source": "writer"}, {"gaps": gaps})
             except Exception:
                 pass

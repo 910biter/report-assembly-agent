@@ -84,9 +84,9 @@ def list_task_artifacts(task_id: str) -> list[dict]:
             select(ORMTaskArtifact.c.stage, ORMTaskArtifact.c.input_hash,
                    ORMTaskArtifact.c.status, ORMTaskArtifact.c.payload,
                    ORMTaskArtifact.c.updated_at)
-            .where(ORMTaskArtifact.c.task_id == task_id).order_by(ORMTaskArtifact.c.id)
-            (task_id,),
-        ).fetchall()
+            .where(ORMTaskArtifact.c.task_id == task_id)
+            .order_by(ORMTaskArtifact.c.id)
+        ).mappings().all()
     artifacts: list[dict] = []
     for row in rows:
         try:

@@ -13,6 +13,7 @@ from app.db import session_scope
 from app.infrastructure.orm import ORMPlan
 from sqlalchemy import select, update
 from app.models import ReportPlan
+from app.planning.structure import normalize_contract
 
 _SYSTEM = """你是情报报告分析规划师。根据用户主题、材料摘要与机构风格,只制定分析问题与证据提取方向,不要冻结最终报告章节。
 严格输出 JSON,不要任何解释:
@@ -72,6 +73,9 @@ _FINAL_SYSTEM = """你是情报报告结构总规划师。现在 Evidence 与 An
   "chapters": [
     {
       "title": "章节标题",
+      "core_question": "本章要回答的问题",
+      "core_message": "本章核心信息",
+      "dependencies": ["前置章节标题"],
       "questions": ["本章要回答的问题"],
       "judgment": "本章核心判断/写作目的",
       "relation_to_prev": "与上一章关系",
@@ -91,6 +95,8 @@ _FINAL_SYSTEM = """你是情报报告结构总规划师。现在 Evidence 与 An
       ],
       "exclude": ["避免重复展开的内容"],
       "next_bridge": "承接下一章的逻辑",
+      "evidence_requirements": ["本章必须有证据支撑的内容"],
+      "completion_criteria": ["完成条件"],
       "target_words": 章节目标字数,
       "importance": "high/medium/low",
       "evidence_density": "high/medium/low"
@@ -189,6 +195,9 @@ class PlannerAgent(BaseAgent):
             user_requirements="",
             plan_stage="final",
         )
+        normalized = normalize_contract({"chapter_plans": chapters})
+        plan.chapter_plans = normalized["chapter_plans"]
+        plan.structure = [c.get("title", "") for c in plan.chapter_plans]
         plan.final_plan_json = _plan_snapshot(plan, "final")
         return update_plan(plan)
 
@@ -214,6 +223,9 @@ def _plan_snapshot(plan: ReportPlan, stage: str) -> dict:
 
 
 def save_plan(plan: ReportPlan) -> ReportPlan:
+    normalized = normalize_contract({"chapter_plans": plan.chapter_plans})
+    plan.chapter_plans = normalized["chapter_plans"]
+    plan.structure = [c.get("title", "") for c in plan.chapter_plans]
     with session_scope() as s:
         result = s.execute(
             ORMPlan.insert().values(
@@ -239,6 +251,9 @@ def save_plan(plan: ReportPlan) -> ReportPlan:
 
 def update_plan(plan: ReportPlan) -> ReportPlan:
     import time as _time
+    normalized = normalize_contract({"chapter_plans": plan.chapter_plans})
+    plan.chapter_plans = normalized["chapter_plans"]
+    plan.structure = [c.get("title", "") for c in plan.chapter_plans]
     with session_scope() as s:
         # plan_version 自增 + finalized_at(原 SQL 语义)
         row = s.execute(select(ORMPlan.c.plan_version).where(ORMPlan.c.id == plan.id)).first()

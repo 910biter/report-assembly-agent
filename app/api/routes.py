@@ -1,7 +1,9 @@
 """REST API:任务、材料、报告、模板。"""
 import hashlib
 import json
+import os
 import shutil
+import subprocess
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -9,6 +11,7 @@ from pathlib import Path
 from fastapi import APIRouter, File, Form, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from sqlalchemy import delete, func, insert, select, update
+from sqlalchemy.exc import IntegrityError
 
 from app.config import settings
 from app.db import session_scope
@@ -33,7 +36,7 @@ from app.memory import short_term, style
 from app.parser import parse_file
 from app.token_monitor import build_token_efficiency, list_llm_calls
 from app.workflow import WorkflowController
-from app.workflow.queue import enqueue_task, task_queue_status
+from app.workflow.queue import enqueue_task, request_control, task_queue_status
 
 router = APIRouter(prefix="/api")
 
@@ -72,16 +75,27 @@ def create_task(
             dest = settings.materials_dir / f"{task_id}_{filename}"
             with dest.open("wb") as fh:
                 fh.write(content)
-            result = s.execute(
-                insert(ORMMaterial).values(
-                    filename=filename,
-                    file_type=dest.suffix.lower().lstrip("."),
-                    path=str(dest),
-                    fingerprint=file_hash,
-                    file_hash=file_hash,
+            try:
+                result = s.execute(
+                    insert(ORMMaterial).values(
+                        filename=filename,
+                        file_type=dest.suffix.lower().lstrip("."),
+                        path=str(dest),
+                        fingerprint=file_hash,
+                        file_hash=file_hash,
+                    )
                 )
-            )
-            material_ids.append(result.inserted_primary_key[0])
+                material_ids.append(result.inserted_primary_key[0])
+            except IntegrityError:
+                # Concurrent/重复上传:唯一约束是最终裁判,回滚本次 INSERT 后复用已有材料。
+                s.rollback()
+                existing = s.execute(
+                    select(ORMMaterial.c.id).where(ORMMaterial.c.file_hash == file_hash)
+                ).mappings().first()
+                dest.unlink(missing_ok=True)
+                if existing is None:
+                    return JSONResponse({"error": "MATERIAL_SAVE_FAILED", "filename": filename}, status_code=409)
+                material_ids.append(existing["id"])  # 幂等复用解析/向量/理解缓存
     material_ids = list(dict.fromkeys(material_ids))
     if not material_ids:
         return JSONResponse({"error": "NO_MATERIALS"}, status_code=400)
@@ -129,12 +143,36 @@ def run_task(task_id: str):
     return result
 
 
+@router.post("/tasks/{task_id}/control/{action}")
+def control_task(task_id: str, action: str):
+    """Request cooperative pause/resume at a safe workflow boundary."""
+    result = request_control(task_id, action)
+    if result.get("status") == "not_found":
+        return JSONResponse({"error": "TASK_NOT_FOUND"}, status_code=404)
+    if result.get("status") in {"not_running", "not_paused", "unsupported", "already_running"}:
+        return JSONResponse(result, status_code=409)
+    return result
+
+
 @router.get("/tasks/{task_id}")
 def get_task(task_id: str):
     task = short_term.load_task(task_id)
     if task is None:
         return JSONResponse({"error": "TASK_NOT_FOUND"}, status_code=404)
     return _task_view(task)
+
+
+@router.post("/tasks/{task_id}/evidence-gaps/retrieve")
+def retrieve_evidence_gaps(task_id: str):
+    """Bounded WriteHERE hook: retrieve QA-declared evidence gaps only."""
+    if short_term.load_task(task_id) is None:
+        return JSONResponse({"error": "TASK_NOT_FOUND"}, status_code=404)
+    from app.workflow.controller import WorkflowController
+    try:
+        facts = WorkflowController(task_id).reflow_evidence_gaps()
+    except Exception as exc:
+        return JSONResponse({"error": "EVIDENCE_GAP_RETRIEVAL_FAILED", "detail": str(exc)[:200]}, status_code=500)
+    return {"status": "retrieved", "fact_count": len(facts), "facts": facts}
 
 
 @router.delete("/tasks/{task_id}")
@@ -655,6 +693,69 @@ def queues():
         "tasks": task_queue_status(),
         "llm": llm_queue_stats(),
     }
+
+
+@router.get("/system/resources")
+def system_resources():
+    """主机资源快照:GPU/CPU/内存(系统设置页 15s 轮询)。只读,不触发模型调度。"""
+    return _resource_snapshot()
+
+
+def _resource_snapshot() -> dict:
+    import psutil
+    payload: dict = {
+        "gpu": {"available": False, "processes": []},
+        "cpu": {"load_avg": [], "cores": 0, "percent": 0.0},
+        "memory": {"total_mb": 0, "used_mb": 0, "available_mb": 0, "percent": 0.0},
+        "collected_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    try:
+        cpu = psutil.cpu_percent(interval=0.15)
+        payload["cpu"] = {
+            "load_avg": [round(x, 2) for x in os.getloadavg()],
+            "cores": psutil.cpu_count(logical=True) or 0,
+            "percent": round(float(cpu), 1),
+        }
+    except Exception:
+        pass
+    try:
+        mem = psutil.virtual_memory()
+        payload["memory"] = {
+            "total_mb": int(mem.total / 1024 / 1024),
+            "used_mb": int(mem.used / 1024 / 1024),
+            "available_mb": int(mem.available / 1024 / 1024),
+            "percent": round(float(mem.percent), 1),
+        }
+    except Exception:
+        pass
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-compute-apps=pid,process_name,used_memory", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=3,
+        )
+        processes = []
+        for line in out.stdout.strip().splitlines():
+            parts = [p.strip() for p in line.split(",") if p.strip()]
+            if len(parts) < 3:
+                continue
+            processes.append({"pid": parts[0], "name": parts[1], "used_mb": int(float(parts[2]))})
+        gpu_out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total,memory.free",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=3,
+        )
+        first = [p.strip() for p in gpu_out.stdout.strip().splitlines()[0].split(",")] if gpu_out.stdout.strip() else []
+        payload["gpu"] = {
+            "available": bool(first),
+            "utilization": int(first[0]) if len(first) > 0 else 0,
+            "used_mb": int(first[1]) if len(first) > 1 else 0,
+            "total_mb": int(first[2]) if len(first) > 2 else 0,
+            "free_mb": int(first[3]) if len(first) > 3 else 0,
+            "processes": processes,
+        }
+    except Exception:
+        payload["gpu"] = {"available": False, "processes": []}
+    return payload
 
 
 # ---------- 辅助 ----------

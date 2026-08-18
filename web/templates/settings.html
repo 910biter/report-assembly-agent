@@ -11,6 +11,13 @@
     <h2>解析与运行信息</h2>
     <div id="runtime"></div>
   </section>
+  <section class="card card-wide">
+    <div class="card-title-row">
+      <h2>主机资源</h2>
+      <span id="resource-refresh" class="muted small">每 15 秒自动刷新</span>
+    </div>
+    <div id="resources" class="muted">正在读取资源状态……</div>
+  </section>
 </div>
 {% endblock %}
 
@@ -35,10 +42,59 @@ async function load() {
     <div class="panel-value"><b>文档解析:</b> Docling 统一处理 PDF、Office、网页、文本、图片等材料</div>
     <div class="panel-value"><b>服务说明:</b> 生成/向量模型走远端；材料解析、存储和导出全本地</div>`;
 }
+
+function fmtMb(mb) {
+  if (mb == null) return "-";
+  return mb >= 1024 ? `${(mb / 1024).toFixed(1)} GB` : `${mb} MB`;
+}
+
+function bar(percent, color) {
+  const p = Math.max(0, Math.min(100, Number(percent) || 0));
+  return `<div class="meter"><div class="meter-fill" style="width:${p}%;background:${color}"></div></div>`;
+}
+
+async function loadResources() {
+  let r;
+  try {
+    const res = await fetch("/api/system/resources", {cache: "no-store"});
+    r = await res.json();
+  } catch (e) {
+    document.getElementById("resources").innerHTML = `<div class="error">资源信息读取失败：${escapeHtml(e.message)}</div>`;
+    return;
+  }
+  const box = document.getElementById("resources");
+  const cpu = r.cpu || {};
+  const mem = r.memory || {};
+  const gpu = r.gpu || {};
+  const loadText = (cpu.load_avg || []).map(v => v.toFixed(2)).join(" / ");
+  let gpuHtml;
+  if (gpu.available) {
+    const usedPct = gpu.total_mb ? Math.round(gpu.used_mb / gpu.total_mb * 100) : 0;
+    const procs = (gpu.processes || []).map(p =>
+      `<div class="panel-value small">PID ${escapeHtml(p.pid)} · ${escapeHtml(p.name)} · ${fmtMb(p.used_mb)}</div>`).join("");
+    gpuHtml = `
+      <div class="panel-value"><b>GPU 显存:</b> ${fmtMb(gpu.used_mb)} / ${fmtMb(gpu.total_mb)}（剩余 ${fmtMb(gpu.free_mb)}）${bar(usedPct, "#e06c00")}</div>
+      <div class="panel-value"><b>GPU 利用率:</b> ${gpu.utilization} %${bar(gpu.utilization, "#4a9eff")}</div>
+      ${procs ? `<div class="panel-value" style="margin-top:6px"><b>占用进程:</b></div>${procs}` : ""}`;
+  } else {
+    gpuHtml = `<div class="panel-value"><b>GPU:</b> 不可用或未检测到</div>`;
+  }
+  box.innerHTML = `
+    <div class="panel-value"><b>CPU 使用率:</b> ${cpu.percent != null ? cpu.percent + " %" : "-"} ${bar(cpu.percent, "#2e9e5b")}</div>
+    <div class="panel-value"><b>负载均值:</b> ${loadText}（${cpu.cores || "-"} 核）</div>
+    <div class="panel-value"><b>内存:</b> ${fmtMb(mem.used_mb)} / ${fmtMb(mem.total_mb)}（可用 ${fmtMb(mem.available_mb)}）${bar(mem.percent, "#b85c3c")}</div>
+    <div style="margin:10px 0;border-top:1px solid var(--border, #e5e5e5)"></div>
+    ${gpuHtml}
+    <div class="panel-value small muted" style="margin-top:8px">采集时间: ${escapeHtml(r.collected_at || "")}</div>`;
+}
+
 function escapeHtml(text) {
   const div = document.createElement("div");
-  div.textContent = text;
+  div.textContent = text == null ? "" : String(text);
   return div.innerHTML;
 }
+
 load();
+loadResources();
+setInterval(loadResources, 15000);
 {% endblock %}

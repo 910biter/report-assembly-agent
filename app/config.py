@@ -26,6 +26,16 @@ class Settings(BaseSettings):
         if self.hf_offline:
             os.environ.setdefault("HF_HUB_OFFLINE", "1")
             os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+        # HF_HOME 非 IRA_ 前缀,pydantic 不读;手动从 .env 读取并注入 os.environ,
+        # 供 docling/transformers 定位离线模型缓存(否则落到默认路径 → LocalEntryNotFoundError)。
+        env_file = _PROJECT_ROOT / ".env"
+        if os.environ.get("HF_HOME") is None and env_file.exists():
+            for line in env_file.read_text(encoding="utf-8").splitlines():
+                if line.strip().startswith("HF_HOME="):
+                    val = line.split("=", 1)[1].strip().strip("'\"")
+                    if val:
+                        os.environ["HF_HOME"] = val
+                    break
         # torch.compile 依赖系统 python3-dev(gcc 编译 Python.h);缺失时 InductorError 反复重试卡死
         if not self.torch_compile:
             os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
@@ -41,6 +51,9 @@ class Settings(BaseSettings):
     # maintains a separate OCR/ASR/Vision provider path.
     docling_ocr_engine: str = "rapidocr"  # rapidocr(PP-OCRv6,满血)/ auto / easyocr / tesseract
     docling_ocr_model: str = "medium"  # rapidocr 模型档位: tiny/small/medium(满血默认 medium)
+    docling_device: str = "cpu"  # Docling layout/table/OCR/ASR device: cuda / cpu
+    docling_ocr_cuda: bool = False  # OCR 使用 CPU，避免依赖 CUDAExecutionProvider
+    asr_device: str = "cpu"  # ASR device: cuda / cpu; 当前与 OCR 一样保持 CPU
     asr_model: str = "medium"  # ASR whisper 档位: tiny/base/small/medium/large(默认 medium:中文质量高且 CPU 可跑)
     asr_language: str = "zh"  # ASR 转写语言(默认中文;空=whisper 自动检测)
     gateway_timeout_seconds: int = 900

@@ -81,12 +81,12 @@ function renderDocTemplate(v) {
       ${metricCard("三级标题", h3 || "未识别", "语义角色 HEADING_3")}
       ${metricCard("正文", body || `${spec.font_name || "默认"} ${spec.font_size_pt || ""}pt`, "字体 / 缩进 / 行距")}
       ${metricCard("页边距", marginSummary(margins), "单位 cm")}
-      ${metricCard("完整度", profile.completeness != null ? `${Math.round(profile.completeness * 100)}%` : "待评估", "建议人工复核低置信字段")}
+
     </div>
     <div class="template-schema-summary">
       <div class="pf-row"><b>结构组件：</b>${componentSummary(schema.components || [])}</div>
       <div class="pf-row"><b>标题层级：</b>${renderHeadingTree(headingTree)}</div>
-      <div class="pf-row"><b>学习质量：</b>${quality.completeness != null ? Math.round(quality.completeness * 100) + "%" : "待评估"}${quality.unknown_items && quality.unknown_items.length ? `，待复核：${escapeHtml(quality.unknown_items.slice(0, 5).join("、"))}` : ""}</div>
+      ${quality.unknown_items && quality.unknown_items.length ? `<div class="pf-row"><b>需要处理：</b>${escapeHtml(quality.unknown_items.slice(0, 5).join("、"))}</div>` : ""}
       <div class="pf-row"><b>原始模板：</b>${escapeHtml(((schema.source || {}).filename) || "未记录")} ${schema.source ? `<a href="/api/style/variants/${v.id}/template-schema" target="_blank">查看 Schema JSON</a>` : ""}</div>
     </div>
     <p class="muted">适用报告类型：${escapeHtml(v.description || "通用报告")}</p>

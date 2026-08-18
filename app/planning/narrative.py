@@ -5,6 +5,7 @@ import json
 import re
 
 from app.agents.base import BaseAgent
+from app.planning.structure import normalize_topic, serializable_memory
 from app.task_artifacts import save_task_artifact
 
 _SYSTEM = """你是报告章节叙事规划师。你的任务不是写正文,而是在 Writer 写作前组织事实。
@@ -124,7 +125,7 @@ class NarrativeAgent(BaseAgent):
             f"全文核心判断:{report_plan.get('core_judgment','')}\n"
             f"全文叙事逻辑:{report_plan.get('narrative_logic','')}\n"
             f"当前章节规划:{json.dumps(chapter_plan, ensure_ascii=False)}\n"
-            f"前文记忆:{json.dumps(_serializable_memory(report_memory or {}), ensure_ascii=False)}\n"
+            f"前文记忆:{json.dumps(serializable_memory(report_memory or {}), ensure_ascii=False)}\n"
             + (f"业务/证据边界:\n{business_block}\n" if business_block else "")
             + "可用 Facts:\n"
             + "\n".join(f"{f['id']}. {f.get('content','')}" for f in facts)
@@ -248,11 +249,14 @@ def _strip_plan_for_qa(narrative_plan: dict) -> dict:
             "topic_id": topic.get("topic_id", ""),
             "name": topic.get("name", ""),
             "purpose": topic.get("purpose", ""),
+            "core_question": topic.get("core_question", ""),
             "core_message": topic.get("core_message", ""),
             "detail_level": topic.get("detail_level", ""),
             "completion_criteria": topic.get("completion_criteria", []),
             "expected_content": topic.get("expected_content", ""),
             "fact_ids": topic.get("fact_ids", []),
+            "inference_ids": topic.get("inference_ids", []),
+            "discourse_flow": topic.get("discourse_flow", []),
         })
     return {
         "chapter_title": narrative_plan.get("chapter_title", ""),
@@ -261,6 +265,10 @@ def _strip_plan_for_qa(narrative_plan: dict) -> dict:
         "subsections": narrative_plan.get("subsections", []),
         "topics": topics,
         "must_not_claim": narrative_plan.get("must_not_claim", []),
+        "core_question": narrative_plan.get("core_question", ""),
+        "core_message": narrative_plan.get("core_message", ""),
+        "dependencies": narrative_plan.get("dependencies", []),
+        "transition_hint": narrative_plan.get("transition_hint", ""),
     }
 
 
@@ -278,20 +286,18 @@ def _sanitize_plan(payload: dict, chapter_plan: dict, fact_ids: set[int], infere
         detail = str(item.get("detail_level") or "brief")
         if detail not in {"expand", "brief", "reference"}:
             detail = "brief"
-        topics.append({
+        normalized = normalize_topic(item, fact_ids, inference_ids)
+        normalized.update({
             "topic_id": str(item.get("topic_id") or f"T{len(topics) + 1}")[:16],
             "name": str(item.get("name") or "相关事实")[:40],
             "purpose": str(item.get("purpose") or ""),
-            "core_message": str(item.get("core_message") or "")[:240],
-            "fact_ids": fids,
-            "supporting_fact_ids": fids,
-            "inference_ids": iids,
             "detail_level": detail,
             "expected_content": str(item.get("expected_content") or "")[:240],
             "completion_criteria": [str(c)[:120] for c in (item.get("completion_criteria") or []) if str(c).strip()],
             "relation_to_previous": str(item.get("relation_to_previous") or ""),
             "writing_hint": str(item.get("writing_hint") or "")[:220],
         })
+        topics.append(normalized)
     if not topics and fact_ids:
         topics = _fallback_topics(chapter_plan, fact_ids)
     logic_order = [str(item)[:40] for item in payload.get("logic_order") or [] if str(item).strip()]

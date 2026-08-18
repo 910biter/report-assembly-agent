@@ -62,6 +62,32 @@ def enqueue_task(task_id: str, priority: int = TASK_PRIORITY_NORMAL) -> dict:
     return {"status": "queued", "queue_position": position}
 
 
+def request_control(task_id: str, action: str) -> dict:
+    task = short_term.load_task(task_id)
+    if task is None:
+        return {"status": "not_found"}
+    state = task.get("queue_status") or {}
+    if action == "pause":
+        if state.get("status") != "running":
+            return {"status": "not_running"}
+        short_term.update_task(task_id, control_request="pause", control_requested_at=round(time.time(), 1))
+        return {"status": "pause_requested"}
+    if action == "resume":
+        if task.get("stage") != "paused":
+            return {"status": "not_paused"}
+        short_term.update_task(task_id, control_request="resume", control_requested_at=round(time.time(), 1))
+        return enqueue_task(task_id)
+    if action == "restart":
+        if state.get("status") in {"running", "queued"}:
+            return {"status": "already_running"}
+        short_term.update_task(
+            task_id, stage="created", control_request="restart",
+            control_requested_at=round(time.time(), 1), error="",
+        )
+        return enqueue_task(task_id)
+    return {"status": "unsupported"}
+
+
 def task_queue_status() -> dict:
     with _LOCK:
         stats = dict(_STATS)
@@ -108,6 +134,12 @@ def _worker_loop() -> None:
             "queue_wait_seconds": round(wait, 1),
             "started_at": round(time.time(), 1),
         })
+        heartbeat_stop = threading.Event()
+        heartbeat = threading.Thread(
+            target=_heartbeat_loop, args=(item.task_id, heartbeat_stop),
+            daemon=True, name=f"heartbeat-{item.task_id}",
+        )
+        heartbeat.start()
         try:
             WorkflowController(item.task_id).run_to_review()
             with _LOCK:
@@ -120,17 +152,30 @@ def _worker_loop() -> None:
         except Exception as exc:
             with _LOCK:
                 _STATS["failed"] += 1
-            short_term.update_task(item.task_id, stage="failed", error=str(exc), queue_status={
-                "status": "failed",
+            paused = str(exc) == "TASK_PAUSED"
+            short_term.update_task(item.task_id, stage="paused" if paused else "failed", error="" if paused else str(exc), queue_status={
+                "status": "paused" if paused else "failed",
                 "queue_wait_seconds": round(wait, 1),
                 "finished_at": round(time.time(), 1),
-                "error": str(exc),
+                "error": "" if paused else str(exc),
             })
         finally:
+            heartbeat_stop.set()
             with _LOCK:
                 if _RUNNING_TASK_ID == item.task_id:
                     _RUNNING_TASK_ID = None
             _QUEUE.task_done()
+
+
+def _heartbeat_loop(task_id: str, stop: threading.Event) -> None:
+    while not stop.wait(10):
+        task = short_term.load_task(task_id) or {}
+        short_term.update_task(
+            task_id,
+            last_progress_at=round(time.time(), 1),
+            heartbeat_stage=task.get("stage", ""),
+            heartbeat_status="alive",
+        )
 
 
 def _queue_position(task_id: str) -> int | None:

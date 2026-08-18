@@ -1,14 +1,26 @@
+# 显式依赖(核心):省略号外的由 docling 等自动携带
 fastapi
 uvicorn
 httpx
 pydantic-settings
+sqlalchemy>=2.0
+python-multipart
+
+# 模型/Ollama 网关
+qdrant-client
+
+# 解析(Docling 统一)
+docling
 pymupdf
+onnxruntime
+
+# 文档导出
 python-docx
 python-pptx
 openpyxl
-jinja2
+
+# 数值/检索
 numpy
-python-multipart
-qdrant-client
-docling
+
+# 数据库
 psycopg[binary]
