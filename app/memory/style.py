@@ -144,7 +144,10 @@ def _reuse_by_source_hash(reports: list[dict]) -> list[StyleVariant] | None:
     digest = _source_hash(reports[0])
     with session_scope() as s:
         row = s.execute(
-            select(ORMVariant.c.id).where(ORMVariant.c.source_hash == digest)
+            select(ORMVariant.c.id).where(
+                ORMVariant.c.source_hash == digest,
+                ORMVariant.c.status != "deleted",  # 已被删除的旧变体不复用,重新学习应能重建
+            )
             .order_by(ORMVariant.c.id).limit(1)
         ).mappings().first()
     if row is None:
