@@ -63,21 +63,24 @@ def _ngram_similarity(left: str, right: str, n: int = 2) -> float:
 
 
 def _estimate_tokens(text: str) -> int:
-    """中文保守 token 估算(约 2 字符/token,偏保守→更安全)。"""
-    return max(1, len(text or "") // 2)
+    """token 估算:中文按 1 字符≈1 token(纠正此前 2 字符/token 的严重低估——
+    那会导致装箱以为批次不大、实际却塞满窗口、把模型输出区挤没,提取出不了 JSON)。
+    保守偏安全,让装箱后实际批次留在模型窗口内。"""
+    return max(1, len(text or ""))
 
 
 def _evidence_batch_budget() -> int:
-    """单批可用 tokens = 模型窗口 - 输出预留 - 固定 prompt 开销 - 安全余量。"""
+    """单批可用 tokens = 模型窗口 - 输出预留 - 固定 prompt 开销 - 安全余量。
+    额外再留 20% 余量(A 辅):防 token 估算偏差与输出抖动,确保模型有空间收尾输出完整 JSON。"""
     from app.config import settings
 
-    return max(
-        1024,
+    usable = (
         settings.model_context_window_tokens
         - settings.generation_reserve_tokens
         - settings.prompt_overhead_tokens
-        - settings.safety_margin_tokens,
+        - settings.safety_margin_tokens
     )
+    return max(1024, int(usable * 0.8))
 
 
 def _dynamic_cutoff(scores: list[float]) -> int:
