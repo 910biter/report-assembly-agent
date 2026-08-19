@@ -177,26 +177,46 @@ def _ensure_library() -> int:
         return int(result.inserted_primary_key[0])
 
 
-def _extract_headings(text: str, path=None) -> list[str]:
-    """提取标题序列:docx 优先用标题样式,否则按编号正则。"""
-    headings: list[str] = []
+def _extract_headings(text: str, path=None) -> list[dict]:
+    """提取标题序列(带层级 level)。docx 优先用标题样式,否则按增强编号正则。
+    返回 [{"text": str, "level": int}],保留层级供结构学习。"""
+    headings: list[dict] = []
     if path and str(path).lower().endswith(".docx"):
         try:
             from docx import Document
 
             doc = Document(path)
             for para in doc.paragraphs:
+                if not para.text.strip():
+                    continue
                 style = (para.style.name or "").lower()
-                if para.text.strip() and (style.startswith("heading") or style.startswith("标题")):
-                    headings.append(para.text.strip())
+                if style.startswith(("heading", "标题")):
+                    headings.append({"text": para.text.strip(), "level": _heading_level_of_text(para.text.strip())})
         except Exception:
             headings = []
     if not headings:
         for line in text.splitlines():
             line = line.strip()
-            if _HEADING_RE.match(line) and len(line) <= 40:
-                headings.append(line)
+            if not line:
+                continue
+            level = _heading_level_of_text(line)
+            if level:
+                headings.append({"text": line, "level": level})
     return headings[:30]
+
+
+def _heading_level_of_text(line: str) -> int:
+    """按增强编号正则推断标题层级(1/2/3),非标题返回 0。
+    与 compiler 的正则口径一致,并用负向前瞻避免把 "1.1"/"1.1.1" 误判为低层级。"""
+    if re.match(r"^(?:[一二三四五六七八九十]+[、.]|第[一二三四五六七八九十\d]+[章节部分])\s*\S+", line) or \
+       re.match(r"^\d+(?:\.(?!\d)|[、\s])\s*\S+", line):
+        return 1
+    if re.match(r"^[（(][一二三四五六七八九十\d]+[)）]\s*\S+", line) or \
+       re.match(r"^\d+\.\d+(?:\.(?!\d)|[、\s])\s*\S+", line):
+        return 2
+    if re.match(r"^\d+\.\d+\.\d+[、\s]?\s*\S+", line):
+        return 3
+    return 0
 
 
 def _sample_report(text: str) -> dict:
@@ -214,7 +234,18 @@ def _build_variant(library_id: int, topic_type: str, members: list[dict]) -> Sty
     """提炼一个变体:LLM 结构/语言/术语 + 规则格式(dominant/alternatives)+ 分类型范例。"""
     report_blocks = []
     for member in members:
-        headings = " / ".join(member["headings"][:6]) or "(未识别标题)"
+        heading_lines = []
+        for _h in (member.get("headings") or []):
+            _lv = 1
+            _txt = str(_h)
+            if isinstance(_h, dict):
+                try:
+                    _lv = int(_h.get("level", 1))
+                except Exception:
+                    _lv = 1
+                _txt = _h.get("text") or ""
+            heading_lines.append("  " * max(0, _lv - 1) + "- " + _txt)
+        headings = "\n".join(heading_lines) or "(未识别标题)"
         report_blocks.append(
             f"[{member['filename']}]\n章节结构: {headings}\n"
             f"开篇: {member['samples']['opening'][:150]}\n"
@@ -322,6 +353,17 @@ def _collect_format(members: list[dict]) -> dict:
     }
 
 
+def _strip_merge_noise(value):
+    """投票前剥离非格式动态元数据(compiled_at / source.*),避免多数投票因每次编译时间戳
+    不同而从不相等、投票退化成不稳定 tie-break。只影响判别,不影响保留的完整值。"""
+    if isinstance(value, dict):
+        v = dict(value)
+        v.pop("compiled_at", None)
+        v.pop("source", None)
+        return v
+    return value
+
+
 def _merge_format_specs(specs: list[dict]) -> tuple[dict, dict]:
     dominant: dict = {}
     conflicts: dict = {}
@@ -334,7 +376,7 @@ def _merge_format_specs(specs: list[dict]) -> tuple[dict, dict]:
         best_value = values[0]
         best_score = (0, 0)
         for value in values:
-            frozen = _freeze_value(value)
+            frozen = _freeze_value(_strip_merge_noise(value))
             counts[frozen] = counts.get(frozen, 0) + 1
             score = (counts[frozen], _value_completeness(value))
             if score > best_score:
@@ -343,7 +385,8 @@ def _merge_format_specs(specs: list[dict]) -> tuple[dict, dict]:
         dominant[key] = best_value
         unique_values = []
         for value in values:
-            if all(_freeze_value(value) != _freeze_value(other) for other in unique_values):
+            if all(_freeze_value(_strip_merge_noise(value)) != _freeze_value(_strip_merge_noise(other))
+                   for other in unique_values):
                 unique_values.append(value)
         if len(unique_values) > 1:
             conflicts[key] = unique_values[:4]
@@ -647,8 +690,25 @@ def extract_docx_format(path) -> dict:
 
     def _style_snapshot(style_name: str) -> dict:
         snapshot: dict = {}
+        # 兼容中文/自定义标题样式名:同为标题,但命名来源不同——内置中文本地化("标题 1")、
+        # 模板自定义("一级标题")、英文("Heading 1")等,逐个尝试。
+        _ALIASES = {
+            "Heading 1": ["Heading 1", "标题 1", "一级标题", "标题一"],
+            "Heading 2": ["Heading 2", "标题 2", "二级标题", "标题二"],
+            "Heading 3": ["Heading 3", "标题 3", "三级标题", "标题三"],
+            "Title": ["Title", "标题", "文档标题", "主标题"],
+            "Normal": ["Normal", "正文"],
+        }
+        style = None
+        for _name in _ALIASES.get(style_name, [style_name]):
+            try:
+                style = doc.styles[_name]
+                break
+            except Exception:
+                style = None
+        if style is None:
+            return snapshot
         try:
-            style = doc.styles[style_name]
             font = style.font
             pf = style.paragraph_format
             if _font_name(font, style):

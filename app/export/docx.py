@@ -184,6 +184,19 @@ def _ensure_paragraph_style(doc, style_name: str, role_style: dict):
     _set_east_asia(style, run_spec.get("font_east_asia") or run_spec.get("font_name"))
     _apply_paragraph_format(style.paragraph_format, paragraph_spec)
     _set_style_borders(style, paragraph_spec.get("borders"))
+
+    # 修正:由 role 定值写出大纲级别(outlineLvl),使 Word 导航窗格/目录可识别
+    _outline_val = {"IRA_Heading1": "0", "IRA_Heading2": "1", "IRA_Heading3": "2", "IRA_DocumentTitle": "0"}
+    if style_name in _outline_val:
+        try:
+            pPr = style.element.get_or_add_pPr()
+            outlineLvl = pPr.find(qn("w:outlineLvl"))
+            if outlineLvl is None:
+                outlineLvl = OxmlElement("w:outlineLvl")
+                pPr.append(outlineLvl)
+            outlineLvl.set(qn("w:val"), _outline_val[style_name])
+        except Exception:
+            pass
     return style
 
 
@@ -310,15 +323,21 @@ def _apply_paragraph_format(paragraph_format, spec: dict) -> None:
     if not isinstance(spec, dict):
         return
     line_spacing = spec.get("line_spacing")
+    line_applied = False
     if isinstance(line_spacing, dict):
-        if line_spacing.get("type") == "exact_pt" and line_spacing.get("value") not in (None, "unknown"):
-            paragraph_format.line_spacing = Pt(float(line_spacing["value"]))
-        elif line_spacing.get("type") == "multiple" and line_spacing.get("value") not in (None, "unknown"):
-            paragraph_format.line_spacing = float(line_spacing["value"])
-    elif spec.get("line_spacing_pt") not in (None, "", "unknown"):
-        paragraph_format.line_spacing = Pt(float(spec["line_spacing_pt"]))
-    elif spec.get("line_spacing") not in (None, "", "unknown"):
-        paragraph_format.line_spacing = float(spec["line_spacing"])
+        _t, _v = line_spacing.get("type"), line_spacing.get("value")
+        if _t == "exact_pt" and _v not in (None, "", "unknown"):
+            paragraph_format.line_spacing = Pt(float(_v))
+            line_applied = True
+        elif _t == "multiple" and _v not in (None, "", "unknown"):
+            paragraph_format.line_spacing = float(_v)
+            line_applied = True
+        # raw/未知类型:不当成已应用,继续走标量 fallback,避免行距丢失
+    if not line_applied:
+        if spec.get("line_spacing_pt") not in (None, "", "unknown"):
+            paragraph_format.line_spacing = Pt(float(spec["line_spacing_pt"]))
+        elif spec.get("line_spacing") not in (None, "", "unknown") and not isinstance(spec.get("line_spacing"), dict):
+            paragraph_format.line_spacing = float(spec["line_spacing"])
     if spec.get("first_line_indent_cm") not in (None, "", "unknown"):
         paragraph_format.first_line_indent = Cm(float(spec["first_line_indent_cm"]))
     if spec.get("space_before_pt") not in (None, "", "unknown"):

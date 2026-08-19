@@ -27,11 +27,11 @@ ROLE_METADATA_LABEL = "metadata_label"
 ROLE_METADATA_VALUE = "metadata_value"
 ROLE_SIGNATURE = "signature"
 
-_CJK_HEADING_1 = re.compile(r"^[一二三四五六七八九十]+、\S+")
-_CJK_HEADING_2 = re.compile(r"^（[一二三四五六七八九十]+）\S+")
-_NUM_HEADING_1 = re.compile(r"^\d+\s+\S+")
-_NUM_HEADING_2 = re.compile(r"^\d+\.\d+\s+\S+")
-_NUM_HEADING_3 = re.compile(r"^\d+\.\d+\.\d+\s+\S+")
+_CJK_HEADING_1 = re.compile(r"^(?:[一二三四五六七八九十]+[、.]|第[一二三四五六七八九十\d]+[章节部分])\s*\S+")
+_CJK_HEADING_2 = re.compile(r"^[（(][一二三四五六七八九十\d]+[)）]\s*\S+")
+_NUM_HEADING_1 = re.compile(r"^\d+(?:\.(?!\d)|[、\s])\s*\S+")
+_NUM_HEADING_2 = re.compile(r"^\d+\.\d+(?:\.(?!\d)|[、\s])\s*\S+")
+_NUM_HEADING_3 = re.compile(r"^\d+\.\d+\.\d+[、\s]?\s*\S+")
 _NUM_HEADING = re.compile(r"^\d+(?:\.\d+)*[.、]?\s*\S+")
 _PLACEHOLDER = re.compile(r"(\{\{[^}]+\}\}|《[^》]+》|【[^】]+】|________+|_{4,})")
 
@@ -121,7 +121,7 @@ def _document_layout(doc) -> dict:
 def _document_structure(doc, role_paragraphs: dict) -> dict:
     headings = []
     for para in doc.paragraphs:
-        for item in _heading_items(para.text):
+        for item in _heading_items(para):
             headings.append(item)
     return {
         "roles_detected": sorted(k for k, v in role_paragraphs.items() if v is not None),
@@ -373,18 +373,37 @@ def _quality(schema: dict) -> dict:
     }
 
 
-def _heading_items(text: str) -> list[dict]:
+def _heading_items(para_or_text) -> list[dict]:
+    """识别标题项:优先用 Word 样式(中英文兼容),否则用增强正则兜底。
+    兼容传 para 或纯文本两种调用。"""
     items = []
-    for line in _logical_lines(text):
-        role = ""
-        if _CJK_HEADING_1.match(line) or _NUM_HEADING_1.match(line):
+    if hasattr(para_or_text, "text"):
+        para = para_or_text
+        text = para.text or ""
+        style_name = ((para.style.name or "").lower() if para.style is not None else "")
+    else:
+        para = None
+        text = para_or_text or ""
+        style_name = ""
+    role = ""
+    if para is not None:
+        if style_name.startswith(("heading 1", "标题 1")) or "一级标题" in style_name:
             role = ROLE_HEADING_1
-        elif _CJK_HEADING_2.match(line) or _NUM_HEADING_2.match(line):
+        elif style_name.startswith(("heading 2", "标题 2")) or "二级标题" in style_name:
             role = ROLE_HEADING_2
-        elif _NUM_HEADING_3.match(line):
+        elif style_name.startswith(("heading 3", "标题 3")) or "三级标题" in style_name:
             role = ROLE_HEADING_3
-        if role:
-            items.append({"role": role, "level": _heading_level(role), "text_pattern": _text_pattern(line)})
+    for line in _logical_lines(text):
+        r = role
+        if not r:
+            if _CJK_HEADING_1.match(line) or _NUM_HEADING_1.match(line):
+                r = ROLE_HEADING_1
+            elif _CJK_HEADING_2.match(line) or _NUM_HEADING_2.match(line):
+                r = ROLE_HEADING_2
+            elif _NUM_HEADING_3.match(line):
+                r = ROLE_HEADING_3
+        if r:
+            items.append({"role": r, "level": _heading_level(r), "text_pattern": _text_pattern(line)})
     return items
 
 
