@@ -216,12 +216,13 @@ def _run_style(doc, para, run) -> dict:
     style_font = para.style.font if para.style is not None else None
     normal_font = doc.styles["Normal"].font
     font = run.font if run is not None else None
+    xmlfont = _rpr_font_values(para.style)
     return {
-        "font_east_asia": _font_name(font, style_font, normal_font, "eastAsia"),
-        "font_ascii": _font_name(font, style_font, normal_font, "ascii"),
-        "font_hansi": _font_name(font, style_font, normal_font, "hAnsi"),
-        "font_cs": _font_name(font, style_font, normal_font, "cs"),
-        "font_size_pt": _font_size(font, style_font, normal_font),
+        "font_east_asia": _font_name(font, style_font, normal_font, "eastAsia", xmlfont),
+        "font_ascii": _font_name(font, style_font, normal_font, "ascii", xmlfont),
+        "font_hansi": _font_name(font, style_font, normal_font, "hAnsi", xmlfont),
+        "font_cs": _font_name(font, style_font, normal_font, "cs", xmlfont),
+        "font_size_pt": _font_size(font, style_font, normal_font, xmlfont),
         "bold": _bool_value(getattr(font, "bold", None), getattr(style_font, "bold", None), getattr(normal_font, "bold", None)),
         "italic": _bool_value(getattr(font, "italic", None), getattr(style_font, "italic", None), getattr(normal_font, "italic", None)),
         "underline": _bool_value(getattr(font, "underline", None), getattr(style_font, "underline", None), getattr(normal_font, "underline", None)),
@@ -768,13 +769,20 @@ def _run_language(run) -> str:
         return "unknown"
 
 
-def _font_name(font, style_font, normal_font, key: str) -> str:
+def _font_name(font, style_font, normal_font, key: str, xmlfont=None) -> str:
     for candidate in (font, style_font, normal_font):
+        if candidate is None:
+            continue
         value = _rfont(candidate, key)
         if value:
             return value
         if key in {"ascii", "hAnsi"} and getattr(candidate, "name", None):
             return candidate.name
+    # 兜底:python-docx 缓存读不到时,从样式 XML rPr 的 rFonts 解析(如 Normal 的宋体)
+    if xmlfont:
+        v = xmlfont.get(key) or xmlfont.get("eastAsia")
+        if v:
+            return v
     return "unknown"
 
 
@@ -789,12 +797,41 @@ def _rfont(font, key: str) -> str:
         return ""
 
 
-def _font_size(font, style_font, normal_font):
+def _font_size(font, style_font, normal_font, xmlfont=None):
     for candidate in (font, style_font, normal_font):
+        if candidate is None:
+            continue
         size = getattr(candidate, "size", None)
         if size is not None:
             return round(size.pt, 1)
+    if xmlfont and xmlfont.get("size_pt"):
+        return xmlfont["size_pt"]
     return "unknown"
+
+
+def _rpr_font_values(style):
+    """从样式 XML rPr 解析实际字体(rFonts/sz)。python-docx 的 .font 缓存常读不到
+    rPr 里的 rFonts/sz(如 Normal 样式定义的宋体/12pt),这里兜底,实现"忠实记录模板呈现"。"""
+    if style is None:
+        return None
+    try:
+        rPr = style.element.find(qn("w:rPr"))
+        if rPr is None:
+            return None
+        rf = rPr.find(qn("w:rFonts"))
+        out = {"ascii": None, "hAnsi": None, "eastAsia": None, "cs": None, "size_pt": None}
+        if rf is not None:
+            for k in ("ascii", "hAnsi", "eastAsia", "cs"):
+                out[k] = rf.get(qn("w:" + k))
+        sz = rPr.find(qn("w:sz"))
+        if sz is not None:
+            try:
+                out["size_pt"] = round(int(sz.get(qn("w:val")) or 0) / 2, 1)
+            except Exception:
+                pass
+        return out
+    except Exception:
+        return None
 
 
 def _font_color(font, style_font, normal_font) -> str:
