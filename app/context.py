@@ -539,11 +539,65 @@ class ContextManager:
                     f"- {item.get('filename','')}: {item.get('doc_type','')} / {item.get('topic','')} / "
                     f"角色:{item.get('material_role','')} / 边界:{item.get('claim_support','unknown')}"
                 )
-        lines.append("已抽取事实:")
-        for fact in facts[:80]:
-            lines.append(f"- fact_id={fact.get('id')}: {fact.get('content')}")
-        if len(facts) > 80:
-            lines.append(f"[提示] 事实总数 {len(facts)} 条,这里只展示前 80 条;最终结构应围绕核心事实分组。")
+        analysis_meta = plan.get("analysis_global_meta") or {}
+        if analysis_meta:
+            lines.append("综合分析摘要:")
+            lines.append(json_dumps({
+                "critical_fact_ids": analysis_meta.get("critical_fact_ids") or [],
+                "coverage_status": analysis_meta.get("coverage_status") or {},
+                "unresolved_conflicts": analysis_meta.get("unresolved_conflicts") or [],
+                "uncertainty": analysis_meta.get("uncertainty") or [],
+            }))
+
+        # Final structure must see a coverage-driven sample rather than the
+        # first rows in database order. Critical facts are mandatory; the rest
+        # are retrieved across user intent, analysis dimensions and evidence needs.
+        fact_by_id = {int(f.get("id")): f for f in facts if f.get("id") is not None}
+        selected_facts: list[dict] = []
+        selected_ids: set[int] = set()
+
+        def add_fact(fact: dict) -> None:
+            fact_id = int(fact.get("id") or 0)
+            if fact_id and fact_id not in selected_ids:
+                selected_ids.add(fact_id)
+                selected_facts.append(fact)
+
+        for fact_id in analysis_meta.get("critical_fact_ids") or []:
+            if str(fact_id).isdigit() and int(fact_id) in fact_by_id:
+                add_fact(fact_by_id[int(fact_id)])
+        queries = [theme, user_requirements, plan.get("core_question", ""), plan.get("core_judgment", "")]
+        queries.extend(str(key) for key in (analysis_meta.get("coverage_status") or {}).keys())
+        queries.extend(
+            str(item.get("need") or "")
+            for item in plan.get("evidence_needs") or []
+            if isinstance(item, dict)
+        )
+        queries = list(dict.fromkeys(str(query).strip() for query in queries if str(query).strip()))
+        average_fact_chars = max(1, sum(len(str(f.get("content") or "")) for f in facts) // max(len(facts), 1))
+        fact_char_budget = max(1000, int(self.budget_chars() * 0.55))
+        estimated_capacity = max(1, fact_char_budget // average_fact_chars)
+        per_query = max(1, estimated_capacity // max(len(queries), 1))
+        for query in queries:
+            for fact in self._retrieve_facts(query, facts, per_query, used_fact_ids=set()):
+                add_fact(fact)
+        if not selected_facts:
+            selected_facts = list(facts)
+
+        lines.append("已抽取事实(关键事实 + 多查询覆盖召回):")
+        used_fact_chars = 0
+        included_fact_count = 0
+        for fact in selected_facts:
+            fact_line = f"- fact_id={fact.get('id')}: {fact.get('content')}"
+            if used_fact_chars + len(fact_line) > fact_char_budget and included_fact_count:
+                break
+            lines.append(fact_line)
+            used_fact_chars += len(fact_line)
+            included_fact_count += 1
+        if len(facts) > included_fact_count:
+            lines.append(
+                f"[覆盖说明] Facts 共 {len(facts)} 条,本次按关键事实和多查询覆盖召回 {included_fact_count} 条用于结构规划;"
+                "完整事实由后续章节检索继续使用。"
+            )
         lines.append("已形成分析判断:")
         for inf in inferences[:40]:
             lines.append(
@@ -560,19 +614,49 @@ class ContextManager:
 
     def for_writer_section(self, chapter: str, facts: list[dict],
                            inferences: list[dict], style_block: str,
-                           top_facts: int = 10,
+                           top_facts: int | None = None,
                            required_fact_ids: set[int] | None = None,
-                           used_fact_ids: set[int] | None = None) -> tuple[list[dict], list[dict], str]:
+                           used_fact_ids: set[int] | None = None,
+                           coverage_queries: list[str] | None = None) -> tuple[list[dict], list[dict], str]:
         required_fact_ids = required_fact_ids or set()
         used_fact_ids = used_fact_ids or set()
-        top_facts = max(top_facts, len(required_fact_ids))
-        related_facts = self._retrieve_facts(chapter, facts, top_facts,
-                                             used_fact_ids=used_fact_ids - required_fact_ids)
-        if required_fact_ids:
-            by_id = {int(f.get("id")): f for f in facts if f.get("id") is not None}
-            seen = {int(f.get("id")) for f in related_facts if f.get("id") is not None}
-            required = [by_id[fid] for fid in required_fact_ids if fid in by_id and fid not in seen]
-            related_facts = required + related_facts
+        by_id = {int(f.get("id")): f for f in facts if f.get("id") is not None}
+        queries = list(dict.fromkeys(
+            str(value).strip()
+            for value in [chapter, *(coverage_queries or [])]
+            if str(value or "").strip()
+        ))
+        fact_budget = max(1000, int(self.budget_chars() * 0.65))
+        average_fact_size = max(
+            1,
+            sum(len(str(fact.get("content") or "")) + 24 for fact in facts) // max(len(facts), 1),
+        )
+        capacity = max(len(required_fact_ids), fact_budget // average_fact_size)
+        if top_facts is not None:
+            capacity = max(capacity, int(top_facts), len(required_fact_ids))
+        per_query = max(1, (capacity + max(len(queries), 1) - 1) // max(len(queries), 1))
+
+        # Required evidence is retained first. Remaining capacity is filled by
+        # independent topic queries, so one dominant topic cannot consume the
+        # whole context and long chapters are not constrained by a fixed Top-K.
+        candidates = [by_id[fid] for fid in required_fact_ids if fid in by_id]
+        for query in queries:
+            candidates.extend(self._retrieve_facts(
+                query, facts, per_query, used_fact_ids=used_fact_ids - required_fact_ids,
+            ))
+        related_facts = []
+        seen: set[int] = set()
+        used_chars = 0
+        for fact in candidates:
+            fact_id = int(fact.get("id") or 0)
+            if not fact_id or fact_id in seen:
+                continue
+            size = len(str(fact.get("content") or "")) + 24
+            if fact_id not in required_fact_ids and related_facts and used_chars + size > fact_budget:
+                continue
+            related_facts.append(fact)
+            seen.add(fact_id)
+            used_chars += size
         related_ids = {fact["id"] for fact in related_facts}
         related_inferences = [
             inference for inference in inferences
@@ -637,4 +721,3 @@ def _recall_budget() -> int:
     budget = _evidence_batch_budget() * 3
     avg = 120  # 中文 unit 平均约 120 token(规模估算,非决策阈值)
     return max(200, int(budget / avg))
-

@@ -13,6 +13,7 @@ from app.db import session_scope
 from app.infrastructure.orm import ORMPlan
 from sqlalchemy import select, update
 from app.models import ReportPlan
+from app.planning.scale import normalize_chapter_budgets, reconcile_scale_budget
 from app.planning.structure import normalize_contract
 
 _SYSTEM = """你是情报报告分析规划师。根据用户主题、材料摘要与机构风格,只制定分析问题与证据提取方向,不要冻结最终报告章节。
@@ -49,16 +50,14 @@ _SYSTEM = """你是情报报告分析规划师。根据用户主题、材料摘�
 5. 规模预算依据:用户明确字数要求(如有)、报告类型档位
    (简要约2000-4000字/标准约5000-10000字/深度约10000-20000字)、材料信息量、章节数与重要性。
 6. 最终报告结构将在 Evidence + Analysis 后另行生成,届时由真实 Fact/Inference 和核心结论决定。
-7. 【证据需求拆分——最重要的要求】evidence_needs 必须对主题做穷尽式拆解(参照复杂论断验证思想):
-   - 机制原理、威胁模型、协议规范、实现细节、安全属性、对比差异、演进趋势、评估数据、监管标准
-     等关键方面,每个可查证方面都应成为一个 need(数量不限,由主题复杂度和材料信息量决定;
-     该综述类深度报告若材料覆盖多个子主题,evidence_needs 不少于 6 条)
+7. 【证据需求拆分——最重要的要求】evidence_needs 应覆盖完成用户目标所需的可查证问题:
+   - 根据当前主题和材料实时识别关键方面,每个独立且可查证的方面形成一个 need；
+     数量由任务复杂度和材料信息量决定,不使用固定下限或领域维度清单
    - 每个 need 必须是"可被材料证实/证伪的一句话子问题",避免宽泛无法查证的表述
    - 按对核心判断的支撑度标注 priority(支撑主线结论的为 high)
 8. 面向决策的全面性:证据检索的遗漏比松弛更危险——宁可多列可查证子问题,不要因低估主题而少列。
-9. 【视角发现按需】先判断主题复杂度:简单主题(会议通知/单一事实类)不需要多视角,直接按问题拆分;
-   复杂主题(行业趋势/体系分析/综述类)需从多个研究视角(机制/政策/产业/技术/市场/风险/监管等)
-   探索证据需求——视角是能力不是固定步骤,由主题复杂度决定是否启用。"""
+9. 【视角发现按需】先判断主题复杂度；简单任务直接按问题拆分，复杂任务从材料呈现出的多个有效视角
+   探索证据需求。视角是运行时发现结果,不是预置领域分类。"""
 
 _FINAL_SYSTEM = """你是情报报告结构总规划师。现在 Evidence 与 Analysis 已完成,请基于真实事实、推断、用户目标和模板策略生成最终 ReportPlan。
 严格输出 JSON,不要任何解释:
@@ -70,12 +69,18 @@ _FINAL_SYSTEM = """你是情报报告结构总规划师。现在 Evidence 与 An
   "core_question": "报告要回答的核心问题",
   "core_judgment": "报告核心判断/主线结论",
   "narrative_logic": "最终叙事逻辑:章节如何递进",
+  "report_budget": {
+    "target_words": 全文最终目标字数,
+    "min_words": 证据充分时可接受的最低字数,
+    "max_words": 禁止重复扩写前提下的安全上限,
+    "evidence_status": "sufficient/limited/insufficient",
+    "underfill_reason": "证据不足时允许低于目标的原因,否则为空"
+  },
   "chapters": [
     {
       "title": "章节标题",
       "core_question": "本章要回答的问题",
       "core_message": "本章核心信息",
-      "dependencies": ["前置章节标题"],
       "questions": ["本章要回答的问题"],
       "judgment": "本章核心判断/写作目的",
       "relation_to_prev": "与上一章关系",
@@ -110,11 +115,13 @@ _FINAL_SYSTEM = """你是情报报告结构总规划师。现在 Evidence 与 An
    SOFT_STRUCTURE: 目录只作参考,可借鉴但不得压过材料逻辑
    HARD_STRUCTURE: 只有用户或模板明确要求时才严格遵守
 3. 除 HARD_STRUCTURE 外,不要把模板示例目录当成最终目录;模板主要决定呈现,不决定内容逻辑
-4. 章节应形成递进关系,不是事实清单分类;常规报告通常 2-6 章,但由证据容量和用户要求决定
+4. 章节应形成递进关系,不是事实清单分类;章节数量完全由用户目标、证据容量和叙事逻辑决定
 5. 小标题也必须由内容需要决定:只有当本章内部确实存在多个相对独立的话题层次时才规划 subsections;小标题不是装饰,不得把一句正文改成标题
 6. 初步分析主线只是假设与关注方向;如果 Facts/Inferences 指向不同逻辑,必须调整,不得为继承早期规划而牺牲内容合理性
 7. 每个重要事实原则上只在最合适章节完整展开一次,其他章节只做必要承接
-8. 证据不足的主题不得硬设独立章节或小节凑结构,应合并为边界、风险或待补充说明。"""
+8. 证据不足的主题不得硬设独立章节或小节凑结构,应合并为边界、风险或待补充说明。
+9. report_budget 是 Analysis 后冻结的全文唯一规模预算。它应综合用户目标、Facts、Inferences 与章节结构;
+   下游不得再次静默缩减。证据不足时允许 underfill,但必须给出 underfill_reason,禁止为写满而重复或虚构。"""
 
 
 def _normalize_needs(raw) -> list[dict]:
@@ -164,7 +171,11 @@ class PlannerAgent(BaseAgent):
             dimensions=[str(item) for item in payload.get("dimensions", [])],
             evidence_needs=_normalize_needs(payload.get("evidence_needs")),
             required_facts=[str(item) for item in payload.get("required_facts", [])],
-            budget=payload.get("report_budget") if isinstance(payload.get("report_budget"), dict) else {},
+            budget=reconcile_scale_budget(
+                user_requirements,
+                payload.get("report_budget") if isinstance(payload.get("report_budget"), dict) else {},
+                {},
+            ),
             chapter_plans=[],
             user_requirements=user_requirements or "",
             plan_stage="analysis",
@@ -174,10 +185,23 @@ class PlannerAgent(BaseAgent):
 
     def finalize_report_plan(self, plan_id: int, context_block: str) -> ReportPlan:
         """Freeze the final report structure after Evidence + Analysis."""
+        with session_scope() as s:
+            existing = s.execute(
+                select(ORMPlan.c.budget, ORMPlan.c.user_requirements)
+                .where(ORMPlan.c.id == plan_id)
+            ).mappings().first()
+        previous_budget = json.loads(existing["budget"] or "{}") if existing else {}
+        previous_requirements = str(existing["user_requirements"] or "") if existing else ""
         payload = self.generate_json(f"{context_block}\n\n请输出最终报告结构 JSON。", system=_FINAL_SYSTEM)
         chapters = payload.get("chapters") if isinstance(payload.get("chapters"), list) else []
         if not chapters:
             chapters = [{"title": "综合分析", "questions": [], "judgment": payload.get("core_judgment", "")}]
+        final_budget = reconcile_scale_budget(
+            previous_requirements,
+            previous_budget,
+            payload.get("report_budget") if isinstance(payload.get("report_budget"), dict) else {},
+        )
+        chapters = normalize_chapter_budgets(chapters, int(final_budget.get("target_words") or 0))
         plan = ReportPlan(
             id=plan_id,
             title=str(payload.get("title", "")),
@@ -190,9 +214,11 @@ class PlannerAgent(BaseAgent):
             structure=[str(c.get("title", "")) for c in chapters if c.get("title")],
             dimensions=[],
             required_facts=[],
-            budget=payload.get("report_budget") if isinstance(payload.get("report_budget"), dict) else {},
+            # A malformed Final Planner response must not erase the user target
+            # already captured by the preliminary AnalysisPlan.
+            budget=final_budget,
             chapter_plans=chapters,
-            user_requirements="",
+            user_requirements=previous_requirements,
             plan_stage="final",
         )
         normalized = normalize_contract({"chapter_plans": chapters})

@@ -13,6 +13,11 @@
     </div>
   </section>
 
+  <section class="card run-summary-card">
+    <div class="section-kicker">当前运行</div>
+    <div id="run-summary"></div>
+  </section>
+
   <section class="card">
     <div id="user-progress" class="user-progress"></div>
     <div id="overview-alerts"></div>
@@ -54,6 +59,7 @@
   <section class="card tab-panel" id="tab-report">
     <h2>报告</h2>
     <div id="report-entry" class="empty">报告生成后可在这里审核、编辑和导出。</div>
+    <div id="report-versions" class="report-versions-block"></div>
   </section>
 </div>
 {% endblock %}
@@ -84,6 +90,7 @@ document.querySelectorAll(".tab").forEach(btn => {
     document.getElementById("tab-" + btn.dataset.tab).classList.add("active");
     if (btn.dataset.tab === "materials") loadMaterials();
     if (btn.dataset.tab === "analysis") loadAnalysis();
+    if (btn.dataset.tab === "report") loadReportVersions();
   });
 });
 document.querySelectorAll(".mini-tab").forEach(btn => {
@@ -136,6 +143,7 @@ function renderTask(task) {
     `模板：${task.template_id ? "#" + task.template_id : "默认"}`
   ].filter(Boolean).join(" · ");
   renderRunButton(task);
+  renderRunSummary(task);
   renderUserProgress(stage, task);
   renderOverview(task);
   renderProgressDetail(task);
@@ -155,13 +163,32 @@ function renderUserProgress(stage, task) {
   }).join("");
 }
 
+function runModeText(task) {
+  return task.incremental_update || task.run_mode === "incremental"
+    ? `增量更新 #${task.run_revision || 1}` : `初始运行 #${task.run_revision || 1}`;
+}
+function renderRunSummary(task) {
+  const box = document.getElementById("run-summary");
+  if (!box) return;
+  const q = task.queue_status || {};
+  const added = task.incremental_added_material_count || 0;
+  const reused = task.evidence_progress && task.evidence_progress.status === "reused";
+  const reason = task.update_reason || "";
+  const history = task.run_history || [];
+  box.innerHTML = `<div class="run-summary-grid">
+    <div><b>${escapeHtml(runModeText(task))}</b><span>${escapeHtml(queueText(task) || stageName(task.stage))}</span></div>
+    <div><b>${added ? `新增材料 ${added} 份` : "无新增材料"}</b><span>${reused ? "复用历史事实" : `材料基线 ${(task.material_ids || []).length} 份`}</span></div>
+    <div><b>${history.length ? `已有 ${history.length} 次历史运行` : "首次运行"}</b><span>${q.status === "pause_requested" ? "暂停请求已提交" : ""}</span></div>
+  </div>${reason ? `<p class="muted run-reason">更新说明：${escapeHtml(reason)}</p>` : ""}`;
+}
+
 function renderOverview(task) {
   const issues = [...(task.qa_notes || [])];
   const facts = (task.fact_ids || []).length;
   const reportReady = isReportReviewable(task);
   const partialReport = !!task.report_id && !reportReady;
   const queueStatus = (task.queue_status || {}).status;
-  const control = queueStatus === "running"
+  const control = queueStatus === "running" || queueStatus === "pause_requested"
     ? `<button class="secondary" onclick="controlTask('pause')">暂停任务</button>`
     : queueStatus === "paused"
       ? `<button class="secondary" onclick="controlTask('resume')">恢复任务</button>`
@@ -185,6 +212,7 @@ function renderProgressDetail(task) {
   const timings = task.stage_timings || {};
   const durations = task.stage_durations || {};
   const parseStats = task.parse_stats || {};
+  const workload = task.workload_profile || {};
   const rows = [];
   if (task.parse_progress) rows.push(["材料解析", progressPair(task.parse_progress)]);
   if (parseStats.total_files) rows.push(["解析结果", `成功 ${parseStats.success_files || 0} · 部分成功 ${parseStats.partial_files || 0} · 失败 ${parseStats.failed_files || 0} · Units ${parseStats.total_units || 0}`]);
@@ -195,6 +223,15 @@ function renderProgressDetail(task) {
   if (task.queue_status && task.queue_status.status) rows.push(["任务队列", queueText(task) || task.queue_status.status]);
   if (Object.keys(durations).length) rows.push(["步骤耗时", Object.entries(durations).map(([k, v]) => `${k}: ${v}s`).join(" / ")]);
   if (Object.keys(timings).length) rows.push(["阶段耗时", Object.entries(timings).map(([k, v]) => `${k}: ${v}s`).join(" / ")]);
+  if (workload.totals && workload.totals.calls) {
+    rows.push(["推理负载", `${workload.totals.calls} 次调用 · 输入 ${workload.totals.input_tokens || 0} token · 输出 ${workload.totals.output_tokens || 0} token`]);
+    const top = Object.entries(workload.by_workload || {}).sort((a, b) => (b[1].output_tokens || 0) - (a[1].output_tokens || 0))[0];
+    if (top) rows.push(["主要输出负载", `${workloadName(top[0])} · ${top[1].output_tokens || 0} token · ${Math.round((top[1].output_share || 0) * 1000) / 10}%`]);
+  }
+  if ((parseStats.slowest_files || []).length) {
+    const slow = parseStats.slowest_files[0];
+    rows.push(["最慢解析文件", `${slow.filename || "—"} · ${slow.duration_seconds || 0}s · ${slow.unit_count || 0} Units`]);
+  }
   document.getElementById("progress-detail").innerHTML = rows.length
     ? rows.map(([k, v]) => `<div class="progress-row"><b>${escapeHtml(k)}</b><span>${escapeHtml(v)}</span></div>`).join("")
     : '<p class="muted">暂无运行详情。</p>';
@@ -241,6 +278,41 @@ function renderReportEntry(task) {
       ${reportReady ? `<a class="button secondary" href="/api/reports/${task.report_id}/export">导出 Word</a>` : ""}
     </div>
   </div>`;
+  loadReportVersions();
+}
+
+let reportVersionsInFlight = false;
+async function loadReportVersions() {
+  const task = TASK;
+  const reportId = task && task.report_id;
+  const box = document.getElementById("report-versions");
+  if (!reportId || !box || reportVersionsInFlight) return;
+  reportVersionsInFlight = true;
+  try {
+    const res = await fetch(`/api/reports/${reportId}/versions`, { cache: "no-store" });
+    if (!res.ok) { box.innerHTML = ""; return; }
+    const data = await res.json();
+    const versions = data.versions || [];
+    if (!versions.length) { box.innerHTML = ""; return; }
+    box.innerHTML = `<div class="report-version-title">版本记录（${versions.length}）</div>` +
+      versions.map(v => `<div class="data-row">
+        <div>
+          <b>v${escapeHtml(v.version_label ?? v.version_no)}</b>
+          <p class="muted">${escapeHtml(versionStatusText(v))} · ${escapeHtml(v.created_at || "—")}</p>
+        </div>
+        <div class="actions-row">
+          <a class="link" href="/reports/${reportId}">审阅</a>
+          ${(v.change_summary || "").trim() ? `<span class="muted">${escapeHtml(v.change_summary.trim())}</span>` : ""}
+        </div>
+      </div>`).join("");
+  } catch (_) {
+    box.innerHTML = "";
+  } finally {
+    reportVersionsInFlight = false;
+  }
+}
+function versionStatusText(v) {
+  return ({ snapshot: "快照", applied: "已应用", draft: "草稿" })[v.status] || escapeHtml(v.status) || "快照";
 }
 
 async function loadMaterials() {
@@ -311,7 +383,11 @@ function renderAnalysis() {
     const items = (ANALYSIS.inferences || []).filter(i => i.source_level === "MATERIAL_INFERENCE");
     box.innerHTML = items.length ? items.map(i => `<div class="analysis-card">
       <b>${escapeHtml(i.content)}</b>
-      <p class="muted">依据事实：${(i.based_fact_ids || []).join("、") || "无"} · 可信度：需人工复核</p>
+      <p class="muted">类型：${analysisTypeName(i.analysis_type)} · 置信度：${confidenceLabel(i)}</p>
+      <p class="muted">依据事实：${(i.based_fact_ids || []).join("、") || "无"}</p>
+      ${i.reasoning_chain ? `<div class="panel-quote">依据说明：${escapeHtml(i.reasoning_chain)}</div>` : ""}
+      ${i.confidence_reason ? `<div class="panel-quote">置信理由：${escapeHtml(i.confidence_reason)}</div>` : ""}
+      ${i.uncertainty ? `<div class="panel-quote">不确定性：${escapeHtml(i.uncertainty)}</div>` : ""}
     </div>`).join("") : '<div class="empty">暂无分析判断</div>';
   } else if (activeAnalysis === "conflicts") {
     box.innerHTML = (ANALYSIS.conflicts || []).length ? ANALYSIS.conflicts.map(c => `<div class="analysis-card warning-card">
@@ -357,11 +433,15 @@ function userStageIndex(stage) {
   return 0;
 }
 function stageProgressText(stage, task) {
+  if (stage === "review") return "待审核";
+  if (stage === "done") return "已完成";
+  if (stage === "paused") return "已暂停";
+  if (stage === "failed") return "失败";
   if ((task.queue_status || {}).status === "queued") return "排队中";
   if (stage === "parsing" && task.parse_progress) return progressPair(task.parse_progress);
   if (stage === "evidence" && task.evidence_progress) return progressPair(task.evidence_progress);
   if (stage === "writing" && task.write_progress) return progressPair(task.write_progress);
-  return stage === "done" ? "已完成" : "正在进行";
+  return "正在进行";
 }
 function queueText(task) {
   const q = task.queue_status || {};
@@ -392,6 +472,31 @@ function scaleRiskText(value) {
 }
 function stageName(stage) {
   return ({created:"已创建", parsing:"材料准备", dedup:"材料整理", material_analysis:"材料理解", planning:"分析规划", evidence:"事实提取", conflict:"冲突核验", analysis:"综合分析", writing:"报告生成", review:"待审核", done:"已完成", failed:"失败"})[stage] || stage || "未知";
+}
+
+function workloadName(name) {
+  return ({
+    document_understanding: "文档理解",
+    evidence_extraction: "事实提取",
+    reasoning_planning: "规划分析",
+    document_generation: "文档生成",
+    quality_guardrail: "质量护栏",
+    post_review_quality_or_memory: "后台沉淀",
+    other: "其他"
+  })[name] || name || "未知";
+}
+function confidenceLabel(item) {
+  const level = String((item && item.confidence_level) || "").toLowerCase();
+  const hasAssessment = !!String((item && (item.confidence_reason || item.uncertainty || item.analysis_type)) || "").trim();
+  if (!level || (level === "medium" && !hasAssessment)) return "需人工复核";
+  return ({ high: "高", medium: "中", low: "低", "高": "高", "中": "中", "低": "低" })[level] || "需人工复核";
+}
+function analysisTypeName(type) {
+  return ({
+    OBSERVATION: "观察", CAUSE: "原因", IMPACT: "影响", RISK: "风险",
+    TREND: "趋势", PREDICTION: "预测", COMPARISON: "比较",
+    CONSTRAINT: "约束", UNCERTAINTY: "不确定性", SYNTHESIS: "综合"
+  })[String(type || "").toUpperCase()] || "综合";
 }
 function nextActionText(task) {
   if (task.stage === "review") return "下一步：完成审核";

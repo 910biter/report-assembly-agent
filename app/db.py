@@ -51,9 +51,53 @@ def create_all_tables() -> None:
     Base.metadata.create_all(_get_engine())
 
 
+def _migrate_columns() -> None:
+    """Apply additive column migrations for existing PostgreSQL tables."""
+    from sqlalchemy import inspect, text
+    from app.infrastructure.orm import _MIGRATED_COLUMNS
+
+    engine = _get_engine()
+    inspector = inspect(engine)
+    existing_tables = set(inspector.get_table_names())
+    by_table: dict[str, set[str]] = {}
+    for table in existing_tables:
+        by_table[table] = {column["name"] for column in inspector.get_columns(table)}
+    with engine.begin() as conn:
+        for table, column, ddl in _MIGRATED_COLUMNS:
+            if table not in existing_tables or column in by_table.get(table, set()):
+                continue
+            conn.execute(text(f'ALTER TABLE "{table}" ADD COLUMN "{column}" {ddl}'))
+
+
+def _migrate_integrity() -> None:
+    """Backfill stable identities and enforce critical PG uniqueness indexes."""
+    from sqlalchemy import text
+
+    engine = _get_engine()
+    with engine.begin() as conn:
+        conn.execute(text(
+            "UPDATE report_sentences SET lineage_id = 'legacy-' || id::text "
+            "WHERE lineage_id IS NULL OR lineage_id = ''"
+        ))
+        conn.execute(text(
+            "UPDATE report_versions SET version_major = version_no "
+            "WHERE version_minor = 0 AND version_major = 1 AND version_no > 1"
+        ))
+        conn.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_report_versions_report_sequence "
+            "ON report_versions(report_id, version_no)"
+        ))
+        conn.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_task_runs_task_revision "
+            "ON task_runs(task_id, revision)"
+        ))
+
+
 def init_db() -> None:
     settings.ensure_dirs()
     create_all_tables()  # PG:ORM 统一建表(含迁移列)
+    _migrate_columns()
+    _migrate_integrity()
 
 
 def check_connection() -> bool:

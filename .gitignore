@@ -4,3 +4,7 @@ __pycache__/
 runtime/
 *.log
 .DS_Store
+node_modules/
+*.tsbuildinfo
+*.zip
+*.map

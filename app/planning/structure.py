@@ -1,58 +1,25 @@
-"""Narrative structure contracts: chapter DAG and evidence-backed writing objects."""
+"""Narrative structure contracts and evidence-backed writing objects."""
 from __future__ import annotations
 
-from collections import defaultdict
 from typing import Any
 
 
 class StructureError(ValueError):
-    """Invalid chapter dependency graph."""
+    """Invalid chapter structure."""
 
 
 def order_chapters(chapters: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Validate dependencies and return a stable topological order.
+    """Validate chapter titles and keep the planner's narrative order.
 
-    Dependencies are chapter titles. Unknown dependencies are rejected rather
-    than silently ignored; this prevents a plausible but incorrectly ordered
-    report. Original order breaks ties for deterministic output.
+    Chapter ordering is a narrative planning decision. The system no longer
+    maintains a separate chapter graph because title-based cross references
+    from LLM output are brittle and can block otherwise valid reports.
     """
     items = [c for c in chapters if isinstance(c, dict)]
     titles = [str(c.get("title", "")).strip() for c in items]
     if len(set(titles)) != len(titles) or any(not t for t in titles):
         raise StructureError("chapter titles must be non-empty and unique")
-    index = {title: i for i, title in enumerate(titles)}
-    edges: dict[str, set[str]] = defaultdict(set)
-    indegree = {title: 0 for title in titles}
-    for chapter, title in zip(items, titles):
-        deps = chapter.get("dependencies") or chapter.get("depends_on") or []
-        if isinstance(deps, str):
-            deps = [deps]
-        for dep in deps:
-            dep = str(dep).strip()
-            if not dep:
-                continue
-            if dep not in index:
-                raise StructureError(f"unknown chapter dependency: {title} -> {dep}")
-            if dep == title:
-                raise StructureError(f"chapter cannot depend on itself: {title}")
-            if title not in edges[dep]:
-                edges[dep].add(title)
-                indegree[title] += 1
-    ready = [title for title in titles if indegree[title] == 0]
-    ready.sort(key=lambda title: index[title])
-    result: list[str] = []
-    while ready:
-        title = ready.pop(0)
-        result.append(title)
-        for child in sorted(edges[title], key=index.get):
-            indegree[child] -= 1
-            if indegree[child] == 0:
-                ready.append(child)
-                ready.sort(key=lambda title: index[title])
-    if len(result) != len(titles):
-        raise StructureError("chapter dependency graph contains a cycle")
-    by_title = {str(c["title"]): c for c in items}
-    return [by_title[title] for title in result]
+    return items
 
 
 def normalize_contract(plan: dict[str, Any]) -> dict[str, Any]:
@@ -65,7 +32,8 @@ def normalize_contract(plan: dict[str, Any]) -> dict[str, Any]:
         c["title"] = str(c.get("title") or "").strip()
         c["core_question"] = str(c.get("core_question") or (c.get("questions") or [""])[0])
         c["core_message"] = str(c.get("core_message") or c.get("judgment") or "")
-        c["dependencies"] = list(c.get("dependencies") or c.get("depends_on") or [])
+        c.pop("dependencies", None)
+        c.pop("depends_on", None)
         c["evidence_requirements"] = list(c.get("evidence_requirements") or c.get("required_facts") or [])
         c["expected_content"] = str(c.get("expected_content") or c.get("judgment") or "")
         c["completion_criteria"] = list(c.get("completion_criteria") or [])

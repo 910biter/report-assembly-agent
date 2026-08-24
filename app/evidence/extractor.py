@@ -11,15 +11,31 @@ import re
 
 
 from app.agents.base import BaseAgent
+from app.cache import stable_hash
 from app.db import session_scope
 from app.infrastructure.orm import ORMFact, ORMEvidence, ORMClaim
 from sqlalchemy import select, update
 from app.models import Claim, Conflict, Evidence, Fact, Unit
 from app.retrieval import vector_store
 from app.retrieval.embedder import embed_texts
-from app.token_monitor import log_pipeline_event, update_call_funnel, update_call_metrics, update_call_products
+from app.token_monitor import current_context, log_pipeline_event, update_call_funnel, update_call_metrics, update_call_products
 
 _FACT_TYPES = ("EVENT", "PERSON", "LOCATION", "TIME", "NUMBER", "STATEMENT")
+
+
+def _assert_not_paused(task_id: str) -> None:
+    """批/调用之间检查暂停零件:读到 control_request=='pause' 抛 TASK_PAUSED。
+
+    在单批 LLM 调用之前检查(即上一批刚结束的边界),绝不打断正在运行的单次调用。
+    queue worker 以 str(exc)=='TASK_PAUSED' 统一置 stage=paused,故此处不须改状态,
+    只需冒泡该异常,自然走暂停而非失败。
+    """
+    if not task_id:
+        return
+    from app.memory import short_term
+    task = short_term.load_task(task_id)
+    if task and task.get("control_request") == "pause":
+        raise RuntimeError("TASK_PAUSED")
 
 _SYSTEM = """你是情报事实提取员。从材料中提取可溯源的陈述(Claim),严格区分事实与推断。
 严格输出 JSON,不要任何解释:
@@ -294,19 +310,40 @@ class EvidenceAgent(BaseAgent):
                 progress_callback(phase, total_phases)
 
         report_phase(1)
+        first_pass_facts = 0
         if cm is not None and hasattr(cm, "for_first_pass"):
             batches = cm.for_first_pass(needs, insights)
             for batch_index, (material_text, batch_meta) in enumerate(batches, start=1):
-                facts.extend(self._process_batch(
+                produced = self._process_batch(
                     needs, material_text, batch_meta, units_by_material, filenames,
                     task_id, batch_index, len(batches),
-                ))
+                )
+                first_pass_facts += len(produced)
+                facts.extend(produced)
         else:  # 无 Context Manager:全量文本直接处理
             material_text = self._build_material_text(units_by_material, filenames)
-            facts.extend(self._process_batch(
+            produced = self._process_batch(
                 needs, material_text, {"pass": "full_material"}, units_by_material,
                 filenames, task_id, 1, 1,
-            ))
+            )
+            first_pass_facts += len(produced)
+            facts.extend(produced)
+        if first_pass_facts == 0 and _has_text_units(units_by_material):
+            # Low-yield recovery is a quality guardrail: when a successful stage
+            # produces no facts, retry with smaller material-sweep batches rather
+            # than letting later stages write from an empty evidence base.
+            recovery_batches = self._material_sweep_batches(units_by_material, filenames)
+            log_pipeline_event(
+                "evidence",
+                recovery_reason="first_pass_zero_facts",
+                recovery_batch_count=len(recovery_batches),
+                total_materials=len(units_by_material),
+            )
+            for batch_index, (material_text, batch_meta) in enumerate(recovery_batches, start=1):
+                facts.extend(self._process_batch(
+                    needs, material_text, batch_meta, units_by_material, filenames,
+                    task_id, batch_index, len(recovery_batches), round_tag=-1,
+                ))
         report_phase(2)
 
         # Coverage Audit + Iterative Retrieval:缺口补检,足够即停
@@ -328,6 +365,19 @@ class EvidenceAgent(BaseAgent):
                     gaps, material_text, batch_meta, units_by_material, filenames,
                     task_id, batch_index, len(gap_batches), round_tag=round_index,
                 ))
+            if len(facts) == before_count and _has_text_units(units_by_material):
+                recovery_batches = self._gap_sweep_batches(gaps, units_by_material, filenames, known_contents)
+                log_pipeline_event(
+                    "evidence",
+                    recovery_reason=f"gap_round_{round_index}_zero_new_facts",
+                    recovery_batch_count=len(recovery_batches),
+                    uncovered_need_count=len(gaps),
+                )
+                for batch_index, (material_text, batch_meta) in enumerate(recovery_batches, start=1):
+                    facts.extend(self._process_batch(
+                        gaps, material_text, batch_meta, units_by_material, filenames,
+                        task_id, batch_index, len(recovery_batches), round_tag=round_index + 10,
+                    ))
             if len(facts) == before_count:
                 break  # 无新证据:接受 information_gap,不再空转
             gaps = self._coverage_audit(facts, needs, task_id)
@@ -343,6 +393,7 @@ class EvidenceAgent(BaseAgent):
         输出格式:claims 每条带 need_id/need(模型标注归属),无标注则按相关性回退到首个 need。
         """
         needs_list = needs if isinstance(needs, list) else [needs]
+        _assert_not_paused(task_id)
         need_block = self._build_need_block(needs_list)
         insight_block = self._build_insight_block([])
         prompt = (
@@ -361,7 +412,21 @@ class EvidenceAgent(BaseAgent):
         context_meta = dict(batch_meta)
         try:
             payload = self.generate_json(prompt)
-        except Exception:
+        except Exception as exc:
+            call_id = self.last_call_id
+            update_call_funnel(
+                call_id,
+                dimension="first_pass" if not round_tag else f"iterative_r{round_tag}",
+                context_meta=context_meta,
+                prompt_parts=prompt_parts,
+                prompt_chars=len(prompt),
+                material_context_chars=len(material_text),
+                model_claims=0,
+                valid_field_claims=0,
+                quote_bound_claims=0,
+                promoted_facts=0,
+                extraction_error=str(exc)[:300],
+            )
             return []
         call_id = self.last_call_id
         produced_fact_ids: list[int] = []
@@ -462,6 +527,23 @@ class EvidenceAgent(BaseAgent):
             except Exception:
                 pass
         return facts
+
+    def _material_sweep_batches(self, units_by_material: dict[int, list[Unit]],
+                                filenames: dict[int, str]) -> list[tuple[str, dict]]:
+        """Generic recovery batches that scan source units without domain rules."""
+        return _build_unit_batches(units_by_material, filenames, pass_name="recovery_material_sweep")
+
+    def _gap_sweep_batches(self, gaps: list[dict], units_by_material: dict[int, list[Unit]],
+                           filenames: dict[int, str], known_contents: set[str]) -> list[tuple[str, dict]]:
+        batches = _build_unit_batches(
+            units_by_material,
+            filenames,
+            pass_name="recovery_gap_sweep",
+            known_contents=known_contents,
+        )
+        for _text, meta in batches:
+            meta["needs"] = gaps
+        return batches
 
     def _build_need_block(self, needs: list[dict]) -> str:
         """Evidence Needs 清单(合并读取的多维提取引导)。"""
@@ -662,6 +744,69 @@ class EvidenceAgent(BaseAgent):
         return "\n\n".join(blocks)
 
 
+
+
+def _has_text_units(units_by_material: dict[int, list[Unit]]) -> bool:
+    return any((unit.content or "").strip() for units in units_by_material.values() for unit in units)
+
+
+def _build_unit_batches(
+    units_by_material: dict[int, list[Unit]],
+    filenames: dict[int, str],
+    pass_name: str,
+    known_contents: set[str] | None = None,
+) -> list[tuple[str, dict]]:
+    from app.config import settings
+
+    budget = max(2000, int(settings.max_context_chars or 12000))
+    batches: list[tuple[str, dict]] = []
+    current: list[str] = []
+    current_chars = 0
+    current_materials: list[int] = []
+    current_units: dict[int, int] = {}
+    known = sorted(known_contents or set())[:20]
+    prefix = ""
+    if known:
+        prefix = "已知事实摘要(用于避免重复,不是排除边界):\n" + "\n".join(f"- {item}" for item in known) + "\n\n"
+    for material_id, units in units_by_material.items():
+        for unit in units:
+            text = (unit.content or "").strip()
+            if not text:
+                continue
+            label = f"[U{unit.id} | {filenames.get(material_id, '?')}"
+            if unit.page is not None:
+                label += f" | 第{unit.page}页"
+            label += f"]\n{text}"
+            if current and current_chars + len(label) > budget:
+                batches.append(_finish_unit_batch(prefix, current, current_materials, current_units, pass_name))
+                current, current_chars, current_materials, current_units = [], 0, [], {}
+            current.append(label)
+            current_chars += len(label)
+            if material_id not in current_materials:
+                current_materials.append(material_id)
+            current_units[material_id] = current_units.get(material_id, 0) + 1
+    if current:
+        batches.append(_finish_unit_batch(prefix, current, current_materials, current_units, pass_name))
+    return batches
+
+
+
+def _finish_unit_batch(prefix: str, blocks: list[str], material_ids: list[int],
+                       unit_counts: dict[int, int], pass_name: str) -> tuple[str, dict]:
+    text = prefix + "相关材料片段:\n" + "\n\n".join(blocks)
+    meta = {
+        "pass": pass_name,
+        "batch_material_ids": list(material_ids),
+        "batch_material_units": dict(unit_counts),
+        "batch_material_count": len(material_ids),
+        "retrieved_unit_count": sum(unit_counts.values()),
+        "retrieved_chars": sum(len(block) for block in blocks),
+        "context_chars": len(text),
+        "truncated": False,
+        "recovery": True,
+    }
+    return text, meta
+
 def fact_exists(content: str, task_id: str = "") -> bool:
     with session_scope() as s:
         query = select(ORMFact.c.id).where(ORMFact.c.content == content)
@@ -672,12 +817,18 @@ def fact_exists(content: str, task_id: str = "") -> bool:
 
 def save_fact_with_evidence(fact: Fact, evidence_list: list[Evidence], task_id: str = "",
                             origin_call_id: str = "") -> int:
+    source_locations = sorted({
+        f"{ev.source_file}|{ev.page or 0}|{ev.paragraph or 0}" for ev in evidence_list
+    })
+    stable_key = stable_hash({"dimension": fact.dimension, "sources": source_locations})
+    run_id = str(current_context().get("run_id") or "")
     with session_scope() as s:
         result = s.execute(
             ORMFact.insert().values(
                 content=fact.content, dimension=fact.dimension, source_level=fact.source_level,
                 fact_type=fact.fact_type, need_id=fact.need_id,
                 evidence_ids="[]", conflict_ids="[]", task_id=task_id, origin_call_id=origin_call_id,
+                stable_key=stable_key, lifecycle_status="active", introduced_run_id=run_id,
             )
         )
         fact.id = int(result.inserted_primary_key[0])
@@ -710,10 +861,18 @@ def save_claim(claim: Claim, status: str, origin_call_id: str = "", task_id: str
 
 def load_claims(task_id: str = "") -> list[dict]:
     """当前任务的全部陈述(含未提升的 pending)。"""
+    return load_claims_for_tasks([task_id] if task_id else [])
+
+
+def load_claims_for_tasks(task_ids: list[str]) -> list[dict]:
+    """Load claims from explicit task scope only; never fall back to whole DB."""
+    cleaned = [str(tid) for tid in task_ids if str(tid or "").strip()]
     with session_scope() as s:
         query = select(ORMClaim)
-        if task_id:
-            query = query.where(ORMClaim.c.task_id == task_id)
+        if cleaned:
+            query = query.where(ORMClaim.c.task_id.in_(cleaned))
+        else:
+            query = query.where(ORMClaim.c.task_id == "__no_task__")
         rows = s.execute(query.order_by(ORMClaim.c.id)).mappings().all()
     return [dict(row) for row in rows]
 
@@ -739,4 +898,4 @@ def load_evidence_quotes(fact_id: int) -> str:
         ).all()
     return ", ".join(str(row[0]) for row in rows)
 
-__all__ = ['bind_sources', 'EvidenceAgent', 'fact_exists', 'save_fact_with_evidence', 'save_claim', 'load_claims', 'save_conflict', 'load_evidence_quotes']
+__all__ = ['bind_sources', 'EvidenceAgent', 'fact_exists', 'save_fact_with_evidence', 'save_claim', 'load_claims', 'load_claims_for_tasks', 'save_conflict', 'load_evidence_quotes']

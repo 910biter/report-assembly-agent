@@ -29,7 +29,8 @@ _LAST_GENERATION_META = {
 
 class ModelGateway(Protocol):
     def generate(self, prompt: str, system: str | None = None) -> str: ...
-    def generate_json(self, prompt: str, system: str | None = None) -> dict: ...
+    def generate_json(self, prompt: str, system: str | None = None,
+                      think: bool | None = None) -> dict: ...
     def embed(self, texts: list[str]) -> list[list[float]]: ...
     def health(self) -> dict: ...
     def unload_model(self, model: str = "") -> bool: ...
@@ -68,7 +69,8 @@ class OllamaGateway:
         except Exception:
             return False
 
-    def _chat(self, prompt: str, system: str | None = None, json_mode: bool = False) -> str:
+    def _chat(self, prompt: str, system: str | None = None, json_mode: bool = False,
+              think: bool | None = None) -> str:
         messages = []
         if system:
             messages.append({"role": "system", "content": system})
@@ -77,15 +79,34 @@ class OllamaGateway:
             "model": settings.generation_model,
             "messages": messages,
             "stream": False,
-            "options": {"num_gpu": settings.gpu_layers},  # 统一放置策略:GPU 优先
+            "options": {
+                "num_gpu": settings.gpu_layers,
+                "num_ctx": settings.model_context_window_tokens,
+                "num_predict": settings.generation_reserve_tokens,
+            },
         }
         if json_mode:
             payload["format"] = "json"
-        response = httpx.post(
-            f"{self.base_url}/api/chat",
-            json=payload,
-            timeout=settings.gateway_timeout_seconds,
-        )
+        if think is not None:
+            payload["think"] = bool(think)
+        from app import task_control
+        task_id = task_control.active_task_id()
+        client = httpx.Client(timeout=settings.gateway_timeout_seconds)
+        if task_id:
+            task_control.register_client(task_id, client)
+        try:
+            response = client.post(f"{self.base_url}/api/chat", json=payload)
+        except Exception:
+            if task_id and task_control.is_paused(task_id):
+                raise RuntimeError("TASK_PAUSED")
+            raise
+        finally:
+            if task_id:
+                task_control.unregister_client(task_id, client)
+            try:
+                client.close()
+            except Exception:
+                pass
         response.raise_for_status()
         payload = response.json()
         _record_generation_stats(payload)
@@ -93,12 +114,13 @@ class OllamaGateway:
         _record_generation_meta(returned_chars=len(content), valid_json_chars=0)
         return content
 
-    def generate_json(self, prompt: str, system: str | None = None) -> dict:
+    def generate_json(self, prompt: str, system: str | None = None,
+                      think: bool | None = None) -> dict:
         # Do not enable Ollama's global JSON format by default. In real runs it
         # reduced output tokens but made structured stages much slower; this
         # project already gets high JSON compliance from prompts, and we repair
         # common truncation glitches below.
-        content = self._chat(prompt, system, json_mode=False)
+        content = self._chat(prompt, system, json_mode=False, think=think)
         fenced = re.search(r"```(?:json)?\s*(.*?)\s*```", content, re.DOTALL)
         if fenced:
             content = fenced.group(1)

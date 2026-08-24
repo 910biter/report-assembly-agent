@@ -31,4 +31,7 @@ class Inference:
     reasoning_chain: str = ""
     dimension: str = ""
     analysis_type: str = ""  # TREND / IMPACT / RISK / CAUSE / PREDICTION
+    confidence_level: str = "medium"  # high / medium / low
+    confidence_reason: str = ""
+    uncertainty: str = ""
     id: int | None = None

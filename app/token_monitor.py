@@ -6,6 +6,7 @@ import contextvars
 import json
 import time
 import uuid
+from statistics import median
 from typing import Any
 
 from app.db import session_scope
@@ -13,17 +14,20 @@ from app.infrastructure.orm import ORMLLMCall, ORMFact, ORMInference, ORMSentenc
 from sqlalchemy import select, update
 
 _task_id: contextvars.ContextVar[str] = contextvars.ContextVar("token_task_id", default="")
+_run_id: contextvars.ContextVar[str] = contextvars.ContextVar("token_run_id", default="")
 _stage: contextvars.ContextVar[str] = contextvars.ContextVar("token_stage", default="")
 _report_mode: contextvars.ContextVar[str] = contextvars.ContextVar("token_report_mode", default="")
 _material_count: contextvars.ContextVar[int] = contextvars.ContextVar("token_material_count", default=0)
 
 
 @contextlib.contextmanager
-def token_context(task_id: str = "", stage: str = "", report_mode: str = "",
+def token_context(task_id: str = "", run_id: str = "", stage: str = "", report_mode: str = "",
                   material_count: int | None = None):
     tokens = []
     if task_id:
         tokens.append((_task_id, _task_id.set(task_id)))
+    if run_id:
+        tokens.append((_run_id, _run_id.set(run_id)))
     if stage:
         tokens.append((_stage, _stage.set(stage)))
     if report_mode:
@@ -40,6 +44,7 @@ def token_context(task_id: str = "", stage: str = "", report_mode: str = "",
 def current_context() -> dict:
     return {
         "task_id": _task_id.get(),
+        "run_id": _run_id.get(),
         "stage": _stage.get(),
         "report_mode": _report_mode.get(),
         "material_count": _material_count.get(),
@@ -73,6 +78,7 @@ def log_llm_call(call_id: str, agent: str, input_chars: int, stats_delta: dict,
             ORMLLMCall.insert().values(
                 call_id=call_id,
                 task_id=ctx.get("task_id", ""),
+                run_id=ctx.get("run_id", ""),
                 agent=agent or "base",
                 stage=ctx.get("stage", ""),
                 report_mode=ctx.get("report_mode", ""),
@@ -112,6 +118,7 @@ def log_pipeline_event(agent: str, **funnel: Any) -> str:
             ORMLLMCall.insert().values(
                 call_id=call_id,
                 task_id=ctx.get("task_id", ""),
+                run_id=ctx.get("run_id", ""),
                 agent=agent or "pipeline",
                 stage=ctx.get("stage", ""),
                 report_mode=ctx.get("report_mode", ""),
@@ -219,16 +226,18 @@ def generation_delta(before: dict, after: dict) -> dict:
     return {key: round(float(after.get(key, 0)) - float(before.get(key, 0)), 3) for key in keys}
 
 
-def build_token_efficiency(task_id: str, report_id: int | None = None) -> dict:
+def build_token_efficiency(task_id: str, report_id: int | None = None, run_id: str = "") -> dict:
     """Compute post-run token utilization metrics from call logs and lineage tables."""
     with session_scope() as s:
-        calls = s.execute(
-            select(ORMLLMCall).where(ORMLLMCall.c.task_id == task_id)
-        ).mappings().all()
+        call_query = select(ORMLLMCall).where(ORMLLMCall.c.task_id == task_id)
+        if run_id:
+            call_query = call_query.where(ORMLLMCall.c.run_id == run_id)
+        calls = s.execute(call_query).mappings().all()
         call_ids = [c["call_id"] for c in calls]
-        facts = s.execute(
-            select(ORMFact.c.id, ORMFact.c.origin_call_id).where(ORMFact.c.task_id == task_id)
-        ).mappings().all()
+        fact_query = select(ORMFact.c.id, ORMFact.c.origin_call_id).where(ORMFact.c.task_id == task_id)
+        if run_id and call_ids:
+            fact_query = fact_query.where(ORMFact.c.origin_call_id.in_(call_ids))
+        facts = s.execute(fact_query).mappings().all()
         inferences = []
         if call_ids:
             inferences = s.execute(
@@ -684,11 +693,206 @@ def _aggregate_funnel(calls: list, final_text: str = "") -> dict:
     return result
 
 
-def list_llm_calls(task_id: str) -> list[dict]:
+
+def build_workload_profile(task_id: str, run_id: str = "") -> dict:
+    """Build stage/workload profiles for capacity planning.
+
+    This is a read-only aggregation over LLM call logs. It intentionally stays
+    outside the workflow prompts so observability cannot change report content.
+    """
+    calls = list_llm_calls(task_id, run_id=run_id)
+    profiles: dict[str, dict] = {}
+    for call in calls:
+        stage = str(call.get("stage") or "unknown")
+        workload = _workload_kind(stage, str(call.get("agent") or ""))
+        key = f"{stage}:{workload}"
+        item = profiles.setdefault(key, {
+            "stage": stage,
+            "workload": workload,
+            "calls": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "context_tokens": 0,
+            "latency_seconds": 0.0,
+            "prompt_eval_seconds": 0.0,
+            "output_eval_seconds": 0.0,
+            "retry_count": 0,
+            "errors": 0,
+            "input_output_ratios": [],
+            "context_lengths": [],
+            "prefill_speeds": [],
+            "decode_speeds": [],
+            "call_latencies": [],
+            "representative_agents": {},
+        })
+        input_tokens = int(call.get("input_tokens") or 0)
+        output_tokens = int(call.get("output_tokens") or 0)
+        context_tokens = int(call.get("context_tokens") or input_tokens or 0)
+        latency = int(call.get("latency_ms") or 0) / 1000
+        funnel = call.get("funnel_json") or {}
+        timing = funnel.get("model_timing") if isinstance(funnel, dict) else {}
+        prompt_seconds = float((timing or {}).get("prompt_eval_seconds") or 0)
+        output_seconds = float((timing or {}).get("output_eval_seconds") or 0)
+        item["calls"] += 1
+        item["input_tokens"] += input_tokens
+        item["output_tokens"] += output_tokens
+        item["context_tokens"] += context_tokens
+        item["latency_seconds"] += latency
+        item["prompt_eval_seconds"] += prompt_seconds
+        item["output_eval_seconds"] += output_seconds
+        item["retry_count"] += int(call.get("retry_count") or 0)
+        item["errors"] += 0 if int(call.get("success") or 0) else 1
+        item["input_output_ratios"].append(round(input_tokens / max(output_tokens, 1), 4))
+        item["context_lengths"].append(context_tokens)
+        item["call_latencies"].append(latency)
+        if prompt_seconds:
+            item["prefill_speeds"].append(input_tokens / prompt_seconds)
+        if output_seconds:
+            item["decode_speeds"].append(output_tokens / output_seconds)
+        agent = str(call.get("agent") or "unknown")
+        item["representative_agents"][agent] = int(item["representative_agents"].get(agent, 0)) + 1
+    finalized = []
+    totals = {"calls": 0, "input_tokens": 0, "output_tokens": 0, "latency_seconds": 0.0}
+    for item in profiles.values():
+        tokens_total = item["input_tokens"] + item["output_tokens"]
+        totals["calls"] += item["calls"]
+        totals["input_tokens"] += item["input_tokens"]
+        totals["output_tokens"] += item["output_tokens"]
+        totals["latency_seconds"] += item["latency_seconds"]
+        item["latency_seconds"] = round(item["latency_seconds"], 3)
+        item["input_share"] = round(item["input_tokens"] / max(totals["input_tokens"], 1), 4)
+        item["output_share"] = 0  # filled after totals are known
+        item["token_share"] = 0
+        ratios = item.pop("input_output_ratios")
+        contexts = item.pop("context_lengths")
+        prefill_speeds = item.pop("prefill_speeds")
+        decode_speeds = item.pop("decode_speeds")
+        latencies = item.pop("call_latencies")
+        item["input_output_ratio_p50"] = _p(ratios, 50)
+        item["input_output_ratio_p95"] = _p(ratios, 95)
+        item["context_length_p50"] = _p(contexts, 50)
+        item["context_length_p95"] = _p(contexts, 95)
+        item["prefill_tokens_per_second_p50"] = _p(prefill_speeds, 50)
+        item["prefill_tokens_per_second_p95"] = _p(prefill_speeds, 95)
+        item["decode_tokens_per_second_p50"] = _p(decode_speeds, 50)
+        item["decode_tokens_per_second_p95"] = _p(decode_speeds, 95)
+        item["latency_p50_seconds"] = _p(latencies, 50)
+        item["latency_p95_seconds"] = _p(latencies, 95)
+        item["compute_profile"] = _compute_profile(item["workload"], item["input_tokens"], item["output_tokens"])
+        item["sla_hint"] = _sla_hint(item["workload"])
+        item["tokens_total"] = tokens_total
+        finalized.append(item)
+    total_tokens = totals["input_tokens"] + totals["output_tokens"]
+    for item in finalized:
+        item["input_share"] = round(item["input_tokens"] / max(totals["input_tokens"], 1), 4)
+        item["output_share"] = round(item["output_tokens"] / max(totals["output_tokens"], 1), 4)
+        item["token_share"] = round(item["tokens_total"] / max(total_tokens, 1), 4)
+    finalized.sort(key=lambda x: (x["stage"], x["workload"]))
+    summary_by_workload: dict[str, dict] = {}
+    for item in finalized:
+        bucket = summary_by_workload.setdefault(item["workload"], {
+            "calls": 0, "input_tokens": 0, "output_tokens": 0, "latency_seconds": 0.0,
+        })
+        bucket["calls"] += item["calls"]
+        bucket["input_tokens"] += item["input_tokens"]
+        bucket["output_tokens"] += item["output_tokens"]
+        bucket["latency_seconds"] += item["latency_seconds"]
+    for bucket in summary_by_workload.values():
+        bucket["latency_seconds"] = round(bucket["latency_seconds"], 3)
+        bucket["input_share"] = round(bucket["input_tokens"] / max(totals["input_tokens"], 1), 4)
+        bucket["output_share"] = round(bucket["output_tokens"] / max(totals["output_tokens"], 1), 4)
+    return {
+        "task_id": task_id,
+        "totals": {
+            "calls": totals["calls"],
+            "input_tokens": totals["input_tokens"],
+            "output_tokens": totals["output_tokens"],
+            "total_tokens": total_tokens,
+            "latency_seconds": round(totals["latency_seconds"], 3),
+        },
+        "by_stage_workload": finalized,
+        "by_workload": summary_by_workload,
+        "notes": [
+            "CPU侧主要承载Docling解析、Unit入库、Embedding前处理、检索与JSON校验。",
+            "NPU/GPU侧主要承载LLM prefill与decode；输入长的阶段更考验prefill/带宽，输出长的阶段更考验decode吞吐。",
+        ],
+    }
+
+
+def _workload_kind(stage: str, agent: str) -> str:
+    if stage in {"material_analysis", "parse"}:
+        return "document_understanding"
+    if stage == "evidence":
+        return "evidence_extraction"
+    if stage == "conflict":
+        return "quality_guardrail"
+    if stage in {"analysis", "final_planning"}:
+        return "reasoning_planning"
+    if stage == "writing":
+        return "document_generation"
+    if stage in {"knowledge", "qa"} or agent in {"qa", "knowledge"}:
+        return "post_review_quality_or_memory"
+    if stage in {"planning"}:
+        return "reasoning_planning"
+    return "other"
+
+
+def _compute_profile(workload: str, input_tokens: int, output_tokens: int) -> dict:
+    ratio = input_tokens / max(output_tokens, 1)
+    if ratio >= 3:
+        pattern = "long_input_short_output"
+        accelerator_pressure = "prefill_bandwidth"
+    elif ratio <= 0.75:
+        pattern = "short_input_long_output"
+        accelerator_pressure = "decode_throughput"
+    else:
+        pattern = "balanced_input_output"
+        accelerator_pressure = "mixed"
+    return {
+        "io_pattern": pattern,
+        "input_output_ratio": round(ratio, 4),
+        "cpu_side": _cpu_side(workload),
+        "npu_gpu_side": accelerator_pressure,
+    }
+
+
+def _cpu_side(workload: str) -> str:
+    if workload == "document_understanding":
+        return "high_for_docling_parse_and_table_layout"
+    if workload == "evidence_extraction":
+        return "medium_for_retrieval_binding_and_json_validation"
+    if workload == "document_generation":
+        return "low_medium_for_rendering_and_source_binding"
+    return "low_medium_for_orchestration_and_validation"
+
+
+def _sla_hint(workload: str) -> dict:
+    return {
+        "document_understanding": {"primary_metric": "parse_success_rate", "target": ">=95% usable_or_partial"},
+        "evidence_extraction": {"primary_metric": "promoted_facts_per_material", "target": "no_zero_fact_run_when_text_units_exist"},
+        "reasoning_planning": {"primary_metric": "stage_latency", "target": "bounded_by_fact_count_and_context"},
+        "document_generation": {"primary_metric": "decode_tokens_per_second", "target": ">= target_model_baseline"},
+        "quality_guardrail": {"primary_metric": "recall_before_cost", "target": "skip_llm_only_when_no_candidate_signal"},
+        "post_review_quality_or_memory": {"primary_metric": "not_on_ttfr", "target": "background_or_non_blocking"},
+        "other": {"primary_metric": "latency", "target": "observable"},
+    }.get(workload, {"primary_metric": "latency", "target": "observable"})
+
+
+def _p(values: list[float | int], pct: int) -> float:
+    vals = sorted(float(v) for v in values if v is not None)
+    if not vals:
+        return 0.0
+    if pct == 50:
+        return round(float(median(vals)), 3)
+    idx = min(len(vals) - 1, max(0, int(round((pct / 100) * (len(vals) - 1)))))
+    return round(vals[idx], 3)
+
+def list_llm_calls(task_id: str, run_id: str = "") -> list[dict]:
     with session_scope() as s:
-        rows = s.execute(
-            select(ORMLLMCall).where(ORMLLMCall.c.task_id == task_id).order_by(ORMLLMCall.c.id)
-        ).mappings().all()
+        query = select(ORMLLMCall).where(ORMLLMCall.c.task_id == task_id)
+        if run_id:
+            query = query.where(ORMLLMCall.c.run_id == run_id)
+        rows = s.execute(query.order_by(ORMLLMCall.c.id)).mappings().all()
     result = []
     for row in rows:
         item = dict(row)

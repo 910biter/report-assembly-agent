@@ -17,6 +17,11 @@ def create_app() -> FastAPI:
     application = FastAPI(title="报告整编 Agent")
     application.include_router(api_router)
     application.include_router(web_router)
+    spa_assets = _WEB_DIR / "spa" / "assets"
+    if spa_assets.exists():
+        application.mount(
+            "/ui-assets/assets", StaticFiles(directory=str(spa_assets)), name="ui-assets"
+        )
     application.mount(
         "/static", StaticFiles(directory=str(_WEB_DIR / "static")), name="static"
     )

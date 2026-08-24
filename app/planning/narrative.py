@@ -15,41 +15,28 @@ _SYSTEM = """你是报告章节叙事规划师。你的任务不是写正文,而
   "core_question": "本章要回答的核心问题(一句话,可被材料证实/证伪)",
   "core_message": "本章核心信息/主线判断(一句话)",
   "central_message": "本章中心意思",
-  "dependencies": ["本章依赖的前置章节标题(无则空列表)"],
+  "evidence_status": "sufficient/limited/insufficient",
+  "evidence_reason": "证据对本章目标的承载判断",
+  "missing_information": ["当前材料仍缺少什么"],
   "logic_order": ["话题1", "话题2", "..."],
   "subsections": [
     {
       "title": "小节标题",
       "purpose": "该小节解决什么问题",
-      "topic_ids": ["T1"],
+      "core_message": "该小节需要传达的核心信息",
       "fact_ids": [1,2],
       "inference_ids": [3],
+      "target_words": 1200,
+      "evidence_status": "sufficient/limited/insufficient",
+      "evidence_reason": "为什么能够或不能支撑目标篇幅",
+      "missing_information": ["该小节仍缺少什么"],
       "detail_level": "expand/brief/reference",
-      "completion_criteria": ["表达什么才算完成"]
-    }
-  ],
-  "topics": [
-    {
-      "topic_id": "T1",
-      "name": "话题名称",
-      "purpose": "这个话题解决什么问题",
-      "core_question": "这个话题要回答的问题",
-      "core_message": "这个话题要传达的核心意思(一句话)",
-      "fact_ids": [1,2],
-      "supporting_fact_ids": [1,2],
-      "inference_ids": [3],
-      "detail_level": "expand/brief/reference",
-      "expected_content": "这个话题预期写出的内容要点",
       "completion_criteria": ["表达什么才算完成,如:说明入口", "说明操作主体", "说明关键步骤"],
-      "relation_to_previous": "与上一个话题的逻辑关系",
       "discourse_flow": [
-        {"role": "background", "facts": [1]},
-        {"role": "current_status", "facts": [2, 3]},
-        {"role": "evidence", "facts": [4]},
-        {"role": "analysis", "facts": []},
-        {"role": "limitation", "facts": [5]}
+        {"role": "background", "fact_ids": [1], "inference_ids": []},
+        {"role": "analysis", "fact_ids": [2], "inference_ids": [3]}
       ],
-      "writing_hint": "如何展开,避免事实罗列"
+      "writing_hint": "一句话说明如何自然展开"
     }
   ],
   "background_fact_ids": [1],
@@ -67,14 +54,17 @@ _SYSTEM = """你是报告章节叙事规划师。你的任务不是写正文,而
 7. completion_criteria 由材料内容决定(该话题在材料里能支撑什么就写什么),不按固定模板。
 8. 若当前章节规划包含 subsections,应优先继承并校准这些小节;若没有,只有在多个话题层次确实需要分层表达时才生成 subsections。
 9. 小节标题必须是结构标题,不能是一句带判断的正文;不得为了格式美观硬设小节。
-10. 【Discourse Plan——最重要的要求】每个 topic 的 discourse_flow 定义"这段按什么逻辑组织",role 取值:
+10. 每个小节的 discourse_flow 只定义必要的论证次序,role 取值:
     background(背景/定义)/ current_status(当前状态/进展)/ evidence(支撑证据/数据)/
     analysis(分析/因果/对比)/ limitation(限制/风险/未解决)/ judgment(判断/结论)。
-    flow 按逻辑顺序排列(背景→状态→证据→分析→限制→判断),每项 facts 列承担该角色的
-    fact_ids(可为空表示该角色靠推断/衔接);Writer 严格按 flow 顺序写,一段一个角色,
-    禁止把 flow 打散或按 fact 编号罗列。
-11. dependencies 列出本章写作前必须先完成的前置章节(如"机制概述"是"威胁分析"的前置),
-    用于 Writer 只注入依赖章节的记忆,防止上下文膨胀。"""
+    flow 按真实逻辑顺序排列,每项 facts 列承担该角色的 fact_ids(可为空表示该角色靠推断/衔接)。
+    flow 表达论证次序而不是自然段模板；Writer 可将直接相关的相邻角色组织在同一自然段中。
+11. subsections 是唯一的成文语义单元,不要再输出重复的 topics。若有两个及以上小节,每个小节必须明确目的、
+    话题、主要事实/推断和目标篇幅,各小节 target_words 总和应接近章节目标。
+12. Narrative Plan 不规划自然段数量或逐段骨架。自然段由 Writer 在小节内部根据事实关系、证据密度
+    和阅读需要自主组织,避免固定段数与事实逐条罗列。
+13. evidence_status 判断“当前事实与推断能否支撑计划目的和目标篇幅”。证据有限时保留原目标预算，
+    但明确缺口；不得通过重复、常识扩写或无依据概括把 limited/insufficient 伪装成 sufficient。"""
 
 _QA_SYSTEM = """你是章节叙事质量评审。根据 Narrative Plan 判断本章每个 Topic 是否按计划完成。
 严格输出 JSON,不要任何解释:
@@ -107,6 +97,10 @@ class NarrativeAgent(BaseAgent):
     name = "narrative"
     role = _SYSTEM
     max_retries = 1
+    # Evidence and Analysis have already performed the open-ended reasoning.
+    # This stage executes a bounded structure contract; hidden reasoning can
+    # otherwise consume the entire output budget and return no JSON at all.
+    thinking = False
 
     def plan_chapter(
         self,
@@ -117,13 +111,22 @@ class NarrativeAgent(BaseAgent):
         inferences: list[dict],
         business_block: str = "",
         report_memory: dict | None = None,
+        run_id: str = "",
     ) -> dict:
+        from app.config import settings
+
         fact_ids = {int(f["id"]) for f in facts if f.get("id") is not None}
         inference_ids = {int(i["id"]) for i in inferences if i.get("id") is not None}
+        safe_unit_words = max(800, int(settings.generation_reserve_tokens or 0) // 2)
         prompt = (
             f"全文标题:{report_plan.get('title','')}\n"
             f"全文核心判断:{report_plan.get('core_judgment','')}\n"
             f"全文叙事逻辑:{report_plan.get('narrative_logic','')}\n"
+            f"本轮更新目标:{report_plan.get('update_instruction','')}\n"
+            f"本章目标字数:{int(chapter_plan.get('target_words') or 0)}\n"
+            f"单个小节一次生成的建议安全规模:不超过约 {safe_unit_words} 字。"
+            "若章节较长且存在多个真实语义层次,应据此规划多个有独立目的的小节;"
+            "不得为了切分长度制造无意义小节。\n"
             f"当前章节规划:{json.dumps(chapter_plan, ensure_ascii=False)}\n"
             f"前文记忆:{json.dumps(serializable_memory(report_memory or {}), ensure_ascii=False)}\n"
             + (f"业务/证据边界:\n{business_block}\n" if business_block else "")
@@ -149,6 +152,7 @@ class NarrativeAgent(BaseAgent):
                     "business_block": business_block,
                 },
                 plan,
+                run_id=run_id,
             )
         except Exception:
             pass
@@ -267,7 +271,6 @@ def _strip_plan_for_qa(narrative_plan: dict) -> dict:
         "must_not_claim": narrative_plan.get("must_not_claim", []),
         "core_question": narrative_plan.get("core_question", ""),
         "core_message": narrative_plan.get("core_message", ""),
-        "dependencies": narrative_plan.get("dependencies", []),
         "transition_hint": narrative_plan.get("transition_hint", ""),
     }
 
@@ -298,16 +301,40 @@ def _sanitize_plan(payload: dict, chapter_plan: dict, fact_ids: set[int], infere
             "writing_hint": str(item.get("writing_hint") or "")[:220],
         })
         topics.append(normalized)
-    if not topics and fact_ids:
-        topics = _fallback_topics(chapter_plan, fact_ids)
+    subsections = _sanitize_subsections(payload.get("subsections"), chapter_plan, topics, fact_ids, inference_ids)
+    subsections = _normalize_subsection_targets(subsections, int(chapter_plan.get("target_words") or 0))
+    if not topics and subsections:
+        topics = _topics_from_subsections(subsections)
+        for index, subsection in enumerate(subsections, start=1):
+            subsection["topic_ids"] = [f"T{index}"]
+    if not topics and (fact_ids or inference_ids):
+        topics = _fallback_topics(chapter_plan, fact_ids, inference_ids)
     logic_order = [str(item)[:40] for item in payload.get("logic_order") or [] if str(item).strip()]
     if not logic_order:
         logic_order = [topic["name"] for topic in topics]
-    subsections = _sanitize_subsections(payload.get("subsections"), chapter_plan, topics, fact_ids, inference_ids)
+    evidence_status = _evidence_status(
+        payload.get("evidence_status"),
+        has_evidence=bool(fact_ids or inference_ids),
+    )
+    if evidence_status == "unknown" and subsections:
+        subsection_statuses = {str(item.get("evidence_status") or "unknown") for item in subsections}
+        if subsection_statuses == {"sufficient"}:
+            evidence_status = "sufficient"
+        elif subsection_statuses == {"insufficient"}:
+            evidence_status = "insufficient"
+        elif subsection_statuses & {"limited", "insufficient"}:
+            evidence_status = "limited"
     return {
         "chapter_title": str(payload.get("chapter_title") or chapter_plan.get("title") or ""),
         "central_message": str(payload.get("central_message") or chapter_plan.get("judgment") or "")[:240],
         "logic_order": logic_order,
+        "target_words": int(chapter_plan.get("target_words") or 0),
+        "evidence_status": evidence_status,
+        "evidence_limited": evidence_status in {"limited", "insufficient"},
+        "evidence_reason": str(payload.get("evidence_reason") or "")[:240],
+        "missing_information": [
+            str(item)[:160] for item in payload.get("missing_information") or [] if str(item).strip()
+        ],
         "subsections": subsections,
         "topics": topics,
         "background_fact_ids": [
@@ -317,6 +344,20 @@ def _sanitize_plan(payload: dict, chapter_plan: dict, fact_ids: set[int], infere
         "must_not_claim": [str(item) for item in payload.get("must_not_claim") or [] if str(item).strip()],
         "transition_hint": str(payload.get("transition_hint") or chapter_plan.get("next_bridge") or "")[:240],
     }
+
+
+def _safe_int(value) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _evidence_status(value, *, has_evidence: bool) -> str:
+    if not has_evidence:
+        return "insufficient"
+    status = str(value or "unknown").lower()
+    return status if status in {"sufficient", "limited", "insufficient"} else "unknown"
 
 
 def _sanitize_subsections(raw, chapter_plan: dict, topics: list[dict],
@@ -349,13 +390,85 @@ def _sanitize_subsections(raw, chapter_plan: dict, topics: list[dict],
         result.append({
             "title": title[:60],
             "purpose": str(item.get("purpose") or "")[:180],
+            "core_message": str(item.get("core_message") or "")[:220],
             "topic_ids": [t for t in topic_ids if t],
             "fact_ids": fids,
             "inference_ids": iids,
+            "target_words": max(0, _safe_int(item.get("target_words"))),
+            "evidence_status": _evidence_status(
+                item.get("evidence_status"), has_evidence=bool(fids or iids)
+            ),
+            "evidence_reason": str(item.get("evidence_reason") or "")[:240],
+            "missing_information": [
+                str(value)[:160] for value in item.get("missing_information") or [] if str(value).strip()
+            ],
             "detail_level": detail,
             "completion_criteria": [str(c)[:120] for c in (item.get("completion_criteria") or []) if str(c).strip()],
+            "discourse_flow": _sanitize_flow(item.get("discourse_flow"), fact_ids, inference_ids),
+            "writing_hint": str(item.get("writing_hint") or "")[:180],
         })
     return result
+
+
+def _sanitize_flow(raw, fact_ids: set[int], inference_ids: set[int]) -> list[dict]:
+    result = []
+    allowed_roles = {"background", "current_status", "evidence", "analysis", "limitation", "judgment"}
+    for item in raw or []:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "")
+        if role not in allowed_roles:
+            continue
+        result.append({
+            "role": role,
+            "facts": [
+                int(value) for value in item.get("fact_ids") or item.get("facts") or []
+                if str(value).isdigit() and int(value) in fact_ids
+            ],
+            "inferences": [
+                int(value) for value in item.get("inference_ids") or []
+                if str(value).isdigit() and int(value) in inference_ids
+            ],
+        })
+    return result
+
+
+def _topics_from_subsections(subsections: list[dict]) -> list[dict]:
+    return [{
+        "topic_id": f"T{index}",
+        "name": str(item.get("title") or ""),
+        "purpose": str(item.get("purpose") or ""),
+        "core_question": str(item.get("purpose") or ""),
+        "core_message": str(item.get("core_message") or ""),
+        "fact_ids": list(item.get("fact_ids") or []),
+        "inference_ids": list(item.get("inference_ids") or []),
+        "detail_level": str(item.get("detail_level") or "brief"),
+        "completion_criteria": list(item.get("completion_criteria") or []),
+        "discourse_flow": list(item.get("discourse_flow") or []),
+        "writing_hint": str(item.get("writing_hint") or ""),
+    } for index, item in enumerate(subsections, start=1)]
+
+
+def _normalize_subsection_targets(items: list[dict], chapter_target: int) -> list[dict]:
+    """Normalize semantic subsection budgets to the authoritative chapter target."""
+    if len(items) < 2 or chapter_target <= 0:
+        return items
+    declared = [max(0, _safe_int(item.get("target_words"))) for item in items]
+    if not sum(declared):
+        detail_weights = {"expand": 2.0, "brief": 1.0, "reference": 0.5}
+        declared = [
+            detail_weights.get(str(item.get("detail_level") or "brief"), 1.0)
+            * max(1.0, (len(item.get("fact_ids") or []) + len(item.get("inference_ids") or [])) ** 0.5)
+            for item in items
+        ]
+    total = sum(declared) or len(items)
+    allocated = []
+    used = 0
+    for index, (item, weight) in enumerate(zip(items, declared)):
+        target = chapter_target - used if index == len(items) - 1 else round(chapter_target * weight / total)
+        allocated.append({**item, "target_words": max(0, target)})
+        used += max(0, target)
+    return allocated
 
 
 def _clean_subsection_title(text: str) -> str:
@@ -368,13 +481,40 @@ def _key(text: str) -> str:
     return re.sub(r"\s+", "", str(text or "").strip())
 
 
-def _fallback_topics(chapter_plan: dict, fact_ids: set[int]) -> list[dict]:
+def _fallback_topics(chapter_plan: dict, fact_ids: set[int], inference_ids: set[int]) -> list[dict]:
+    """Preserve planner-defined semantic units when Narrative LLM output is unusable."""
     title = str(chapter_plan.get("title") or "本章")
+    topics = []
+    for subsection in chapter_plan.get("subsections") or []:
+        if not isinstance(subsection, dict):
+            continue
+        fids = [
+            int(i) for i in subsection.get("fact_ids") or subsection.get("primary_fact_ids") or []
+            if str(i).isdigit() and int(i) in fact_ids
+        ]
+        iids = [
+            int(i) for i in subsection.get("inference_ids") or subsection.get("primary_inference_ids") or []
+            if str(i).isdigit() and int(i) in inference_ids
+        ]
+        if not fids and not iids:
+            continue
+        topics.append({
+            "topic_id": f"T{len(topics) + 1}",
+            "name": _clean_subsection_title(str(subsection.get("title") or title)),
+            "purpose": str(subsection.get("purpose") or chapter_plan.get("judgment") or ""),
+            "fact_ids": list(dict.fromkeys(fids)),
+            "inference_ids": list(dict.fromkeys(iids)),
+            "detail_level": str(subsection.get("detail_level") or "expand"),
+            "writing_hint": "围绕该小节目的组织事实、比较关系与分析边界。",
+        })
+    if topics:
+        return topics
     return [{
+        "topic_id": "T1",
         "name": _clean_title(title),
         "purpose": str(chapter_plan.get("judgment") or "围绕本章核心问题组织事实。"),
         "fact_ids": sorted(fact_ids),
-        "inference_ids": [],
+        "inference_ids": sorted(inference_ids),
         "detail_level": "expand",
         "writing_hint": "围绕中心意思组织事实关系,不要逐条罗列。",
     }]

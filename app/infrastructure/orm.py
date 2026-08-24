@@ -117,7 +117,11 @@ CREATE TABLE IF NOT EXISTS facts (
     conflict_ids TEXT NOT NULL DEFAULT '[]',
     task_id TEXT NOT NULL DEFAULT '',
     origin_call_id TEXT NOT NULL DEFAULT '',
-    disposition TEXT NOT NULL DEFAULT 'UNASSIGNED'
+    disposition TEXT NOT NULL DEFAULT 'UNASSIGNED',
+    stable_key TEXT NOT NULL DEFAULT '',
+    lifecycle_status TEXT NOT NULL DEFAULT 'active',
+    introduced_run_id TEXT NOT NULL DEFAULT '',
+    superseded_by_fact_id INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS evidence (
@@ -148,7 +152,14 @@ CREATE TABLE IF NOT EXISTS inferences (
     based_fact_ids TEXT NOT NULL DEFAULT '[]',
     reasoning_chain TEXT NOT NULL DEFAULT '',
     dimension TEXT NOT NULL DEFAULT '',
-    origin_call_id TEXT NOT NULL DEFAULT ''
+    confidence_level TEXT NOT NULL DEFAULT 'medium',
+    confidence_reason TEXT NOT NULL DEFAULT '',
+    uncertainty TEXT NOT NULL DEFAULT '',
+    origin_call_id TEXT NOT NULL DEFAULT '',
+    stable_key TEXT NOT NULL DEFAULT '',
+    lifecycle_status TEXT NOT NULL DEFAULT 'active',
+    introduced_run_id TEXT NOT NULL DEFAULT '',
+    superseded_by_inference_id INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS style_library (
@@ -214,19 +225,36 @@ CREATE TABLE IF NOT EXISTS artifact_cache (
 CREATE TABLE IF NOT EXISTS task_artifacts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id TEXT NOT NULL,
+    run_id TEXT NOT NULL DEFAULT '',
     stage TEXT NOT NULL,
     input_hash TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'done',
     payload TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
     updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
-    UNIQUE(task_id, stage, input_hash)
+    UNIQUE(task_id, run_id, stage, input_hash)
+);
+
+CREATE TABLE IF NOT EXISTS task_runs (
+    run_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    revision INTEGER NOT NULL DEFAULT 1,
+    run_mode TEXT NOT NULL DEFAULT 'initial',
+    status TEXT NOT NULL DEFAULT 'created',
+    base_version_id INTEGER REFERENCES report_versions(id),
+    candidate_version_id INTEGER REFERENCES report_versions(id),
+    update_reason TEXT NOT NULL DEFAULT '',
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    started_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+    finished_at TEXT,
+    UNIQUE(task_id, revision)
 );
 
 CREATE TABLE IF NOT EXISTS llm_call_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     call_id TEXT NOT NULL UNIQUE,
     task_id TEXT NOT NULL DEFAULT '',
+    run_id TEXT NOT NULL DEFAULT '',
     agent TEXT NOT NULL DEFAULT '',
     stage TEXT NOT NULL DEFAULT '',
     report_mode TEXT NOT NULL DEFAULT '',
@@ -321,9 +349,77 @@ CREATE TABLE IF NOT EXISTS reports (
     created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
 );
 
+CREATE TABLE IF NOT EXISTS report_versions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    report_id INTEGER NOT NULL REFERENCES reports(id),
+    version_no INTEGER NOT NULL,
+    version_major INTEGER NOT NULL DEFAULT 1,
+    version_minor INTEGER NOT NULL DEFAULT 0,
+    based_on_version_id INTEGER,
+    task_id TEXT NOT NULL DEFAULT '',
+    run_id TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'snapshot',
+    title TEXT NOT NULL DEFAULT '',
+    user_requirements TEXT NOT NULL DEFAULT '',
+    template_id INTEGER,
+    material_fingerprints TEXT NOT NULL DEFAULT '[]',
+    report_plan_snapshot TEXT NOT NULL DEFAULT '{}',
+    narrative_plan_snapshot TEXT NOT NULL DEFAULT '{}',
+    scale_plan_snapshot TEXT NOT NULL DEFAULT '{}',
+    fact_snapshot TEXT NOT NULL DEFAULT '[]',
+    inference_snapshot TEXT NOT NULL DEFAULT '[]',
+    conflict_snapshot TEXT NOT NULL DEFAULT '[]',
+    sentence_snapshot TEXT NOT NULL DEFAULT '[]',
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    change_summary TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+    UNIQUE(report_id, version_no)
+);
+
+CREATE TABLE IF NOT EXISTS report_version_deltas (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    report_id INTEGER NOT NULL REFERENCES reports(id),
+    run_id TEXT NOT NULL DEFAULT '',
+    from_version_id INTEGER REFERENCES report_versions(id),
+    to_version_id INTEGER REFERENCES report_versions(id),
+    status TEXT NOT NULL DEFAULT 'planned',
+    update_reason TEXT NOT NULL DEFAULT '',
+    added_materials TEXT NOT NULL DEFAULT '[]',
+    duplicate_materials TEXT NOT NULL DEFAULT '[]',
+    added_facts TEXT NOT NULL DEFAULT '[]',
+    modified_facts TEXT NOT NULL DEFAULT '[]',
+    deprecated_facts TEXT NOT NULL DEFAULT '[]',
+    added_inferences TEXT NOT NULL DEFAULT '[]',
+    modified_inferences TEXT NOT NULL DEFAULT '[]',
+    deprecated_inferences TEXT NOT NULL DEFAULT '[]',
+    new_conflicts TEXT NOT NULL DEFAULT '[]',
+    resolved_conflicts TEXT NOT NULL DEFAULT '[]',
+    affected_chapters TEXT NOT NULL DEFAULT '[]',
+    structure_changes TEXT NOT NULL DEFAULT '[]',
+    evidence_changes TEXT NOT NULL DEFAULT '{}',
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+);
+
+CREATE TABLE IF NOT EXISTS report_change_decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    report_id INTEGER NOT NULL REFERENCES reports(id),
+    base_version_id INTEGER NOT NULL REFERENCES report_versions(id),
+    candidate_hash TEXT NOT NULL,
+    change_key TEXT NOT NULL,
+    scope_json TEXT NOT NULL DEFAULT '{}',
+    decision TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+    applied_at TEXT,
+    UNIQUE(base_version_id, candidate_hash, change_key)
+);
+
 CREATE TABLE IF NOT EXISTS report_sentences (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     report_id INTEGER NOT NULL REFERENCES reports(id),
+    lineage_id TEXT NOT NULL DEFAULT '',
+    parent_sentence_id INTEGER,
     section TEXT NOT NULL,
     paragraph INTEGER NOT NULL DEFAULT 1,
     position INTEGER NOT NULL,
@@ -397,6 +493,8 @@ CREATE INDEX IF NOT EXISTS idx_evidence_unit ON evidence(unit_id);
 CREATE INDEX IF NOT EXISTS idx_claims_material ON claims(material_id);
 CREATE INDEX IF NOT EXISTS idx_insights_material ON material_insights(material_id);
 CREATE INDEX IF NOT EXISTS idx_sentences_report ON report_sentences(report_id);
+CREATE INDEX IF NOT EXISTS idx_report_versions_report ON report_versions(report_id);
+CREATE INDEX IF NOT EXISTS idx_report_deltas_report ON report_version_deltas(report_id);
 """
 # 迁移/演进补充列(历史 ALTER 汇总;新库 create_all 直接含,旧库靠 _migrate 补齐)
 _MIGRATED_COLUMNS: tuple[tuple[str, str, str], ...] = (
@@ -409,12 +507,22 @@ _MIGRATED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ('facts', 'task_id', "TEXT NOT NULL DEFAULT ''"),
     ('facts', 'origin_call_id', "TEXT NOT NULL DEFAULT ''"),
     ('facts', 'disposition', "TEXT NOT NULL DEFAULT 'UNASSIGNED'"),
+    ('facts', 'stable_key', "TEXT NOT NULL DEFAULT ''"),
+    ('facts', 'lifecycle_status', "TEXT NOT NULL DEFAULT 'active'"),
+    ('facts', 'introduced_run_id', "TEXT NOT NULL DEFAULT ''"),
+    ('facts', 'superseded_by_fact_id', 'INTEGER'),
+    ('inferences', 'stable_key', "TEXT NOT NULL DEFAULT ''"),
+    ('inferences', 'lifecycle_status', "TEXT NOT NULL DEFAULT 'active'"),
+    ('inferences', 'introduced_run_id', "TEXT NOT NULL DEFAULT ''"),
+    ('inferences', 'superseded_by_inference_id', 'INTEGER'),
     ('claims', 'origin_call_id', "TEXT NOT NULL DEFAULT ''"),
     ('claims', 'task_id', "TEXT NOT NULL DEFAULT ''"),
     ('conflicts', 'origin_call_id', "TEXT NOT NULL DEFAULT ''"),
     ('conflicts', 'task_id', "TEXT NOT NULL DEFAULT ''"),
     ('inferences', 'origin_call_id', "TEXT NOT NULL DEFAULT ''"),
     ('report_sentences', 'origin_call_id', "TEXT NOT NULL DEFAULT ''"),
+    ('report_sentences', 'lineage_id', "TEXT NOT NULL DEFAULT ''"),
+    ('report_sentences', 'parent_sentence_id', 'INTEGER'),
     ('materials', 'file_hash', "TEXT NOT NULL DEFAULT ''"),
     ('materials', 'parser_version', "TEXT NOT NULL DEFAULT ''"),
     ('materials', 'parsed_at', 'TEXT'),
@@ -434,6 +542,9 @@ _MIGRATED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ('conflicts', 'claim_ids', "TEXT NOT NULL DEFAULT '[]'"),
     ('evidence', 'created_at', "TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)"),
     ('inferences', 'analysis_type', "TEXT NOT NULL DEFAULT ''"),
+    ('inferences', 'confidence_level', "TEXT NOT NULL DEFAULT 'medium'"),
+    ('inferences', 'confidence_reason', "TEXT NOT NULL DEFAULT ''"),
+    ('inferences', 'uncertainty', "TEXT NOT NULL DEFAULT ''"),
     ('style_variants', 'chapter_styles_json', "TEXT NOT NULL DEFAULT '[]'"),
     ('style_variants', 'reasoning_profile_json', "TEXT NOT NULL DEFAULT '{}'"),
     ('style_variants', 'institution_rules_json', "TEXT NOT NULL DEFAULT '{}'"),
@@ -464,6 +575,12 @@ _MIGRATED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ('llm_call_logs', 'candidate_count', 'INTEGER NOT NULL DEFAULT 0'),
     ('llm_call_logs', 'candidate_total', 'INTEGER NOT NULL DEFAULT 0'),
     ('llm_call_logs', 'funnel_json', "TEXT NOT NULL DEFAULT '{}'"),
+    ('llm_call_logs', 'run_id', "TEXT NOT NULL DEFAULT ''"),
+    ('task_artifacts', 'run_id', "TEXT NOT NULL DEFAULT ''"),
+    ('report_versions', 'version_major', 'INTEGER NOT NULL DEFAULT 1'),
+    ('report_versions', 'version_minor', 'INTEGER NOT NULL DEFAULT 0'),
+    ('report_versions', 'run_id', "TEXT NOT NULL DEFAULT ''"),
+    ('report_version_deltas', 'run_id', "TEXT NOT NULL DEFAULT ''"),
     ('entities', 'task_id', "TEXT NOT NULL DEFAULT ''"),
     ('events', 'task_id', "TEXT NOT NULL DEFAULT ''"),
     ('relations', 'task_id', "TEXT NOT NULL DEFAULT ''"),
@@ -479,7 +596,7 @@ def _build_tables_from_schema() -> None:
     ORM session 访问的是同一结构。
     """
     import re
-    from sqlalchemy import Column, Float, Integer, String, Table
+    from sqlalchemy import Column, Float, ForeignKey, Integer, String, Table, UniqueConstraint
 
 
     _type_map = {"INTEGER": Integer, "TEXT": String, "REAL": Float}
@@ -517,26 +634,34 @@ def _build_tables_from_schema() -> None:
             col_suffix = col_m.group(3) or ""
             is_pk = "PRIMARY KEY" in col_suffix.upper()
             is_uniq = "UNIQUE" in col_suffix.upper()
+            nullable = "NOT NULL" not in col_suffix.upper()
             default = _server_default(col_suffix)
+            fk_m = re.search(r"REFERENCES\s+(\w+)\s*\((\w+)\)", col_suffix, re.I)
+            args = [ForeignKey(f"{fk_m.group(1)}.{fk_m.group(2)}")] if fk_m else []
             if col_name == "id" or is_pk:
-                cols.append(Column(col_name, col_type, primary_key=True))
+                cols.append(Column(col_name, col_type, *args, primary_key=True, nullable=False))
             elif is_uniq:
-                cols.append(Column(col_name, col_type, unique=True, server_default=default))
+                cols.append(Column(col_name, col_type, *args, unique=True, nullable=nullable, server_default=default))
             else:
-                cols.append(Column(col_name, col_type, server_default=default))
+                cols.append(Column(col_name, col_type, *args, nullable=nullable, server_default=default))
         if cols:
             # 表级复合主键(关联表 PRIMARY KEY (a, b))
             from sqlalchemy import PrimaryKeyConstraint
             pk_m = re.search(r"PRIMARY KEY\s*\(([^)]+)\)", body, re.S)
+            table_constraints = []
+            for unique_m in re.finditer(r"UNIQUE\s*\(([^)]+)\)", body, re.I | re.S):
+                unique_cols = [c.strip() for c in unique_m.group(1).split(",")]
+                if all(c in {col.name for col in cols} for c in unique_cols):
+                    table_constraints.append(UniqueConstraint(*unique_cols))
             if pk_m:
                 pk_cols = [c.strip() for c in pk_m.group(1).split(",")]
                 if all(c in {col.name for col in cols} for c in pk_cols):
                     for col in cols:
                         if col.name in pk_cols:
                             col.primary_key = True
-                    Table(name, Base.metadata, *cols, PrimaryKeyConstraint(*pk_cols))
+                    Table(name, Base.metadata, *cols, PrimaryKeyConstraint(*pk_cols), *table_constraints)
             else:
-                Table(name, Base.metadata, *cols)
+                Table(name, Base.metadata, *cols, *table_constraints)
             created.add(name)
         # 合并迁移补充列(内置清单;新库 create_all 直接含,结构 100% 对齐)
         for _table, _col, _ddl in _MIGRATED_COLUMNS:
@@ -563,10 +688,14 @@ ORMInference = Base.metadata.tables["inferences"]
 ORMConflict = Base.metadata.tables["conflicts"]
 ORMPlan = Base.metadata.tables["report_plans"]
 ORMReport = Base.metadata.tables["reports"]
+ORMReportVersion = Base.metadata.tables["report_versions"]
+ORMReportVersionDelta = Base.metadata.tables["report_version_deltas"]
+ORMReportChangeDecision = Base.metadata.tables["report_change_decisions"]
 ORMVariant = Base.metadata.tables["style_variants"]
 ORMCluster = Base.metadata.tables["fact_clusters"]
 ORMRelation = Base.metadata.tables["fact_relations"]
 ORMTaskArtifact = Base.metadata.tables["task_artifacts"]
+ORMTaskRun = Base.metadata.tables["task_runs"]
 ORMShortMemory = Base.metadata.tables["short_memory"]
 ORMLLMCall = Base.metadata.tables["llm_call_logs"]
 ORMInsight = Base.metadata.tables["material_insights"]

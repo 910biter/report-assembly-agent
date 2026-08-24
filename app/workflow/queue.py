@@ -71,11 +71,24 @@ def request_control(task_id: str, action: str) -> dict:
         if state.get("status") != "running":
             return {"status": "not_running"}
         short_term.update_task(task_id, control_request="pause", control_requested_at=round(time.time(), 1))
+        from app import task_control
+        task_control.request_pause(task_id)
+        with _LOCK:
+            worker_owns_task = task_id == _RUNNING_TASK_ID
+            queued = task_id in _QUEUED_TASK_IDS
+        if not worker_owns_task and not queued:
+            return short_term.update_task(
+                task_id, stage="paused", control_request="",
+                queue_status={"status": "paused", "finished_at": round(time.time(), 1)},
+            ) | {"status": "paused"}
+        short_term.update_task(task_id, queue_status={"status": "pause_requested"})
         return {"status": "pause_requested"}
     if action == "resume":
         if task.get("stage") != "paused":
             return {"status": "not_paused"}
         short_term.update_task(task_id, control_request="resume", control_requested_at=round(time.time(), 1))
+        from app import task_control
+        task_control.clear_pause(task_id)
         return enqueue_task(task_id)
     if action == "restart":
         if state.get("status") in {"running", "queued"}:
@@ -141,6 +154,8 @@ def _worker_loop() -> None:
         )
         heartbeat.start()
         try:
+            from app import task_control
+            task_control.begin_task(item.task_id)
             WorkflowController(item.task_id).run_to_review()
             with _LOCK:
                 _STATS["completed"] += 1
@@ -153,6 +168,14 @@ def _worker_loop() -> None:
             with _LOCK:
                 _STATS["failed"] += 1
             paused = str(exc) == "TASK_PAUSED"
+            task = short_term.load_task(item.task_id) or {}
+            from app.task_runs import update_task_run
+            update_task_run(
+                str(task.get("run_id") or ""),
+                status="paused" if paused else "failed",
+                metadata={"error": "" if paused else str(exc)[:500]},
+                finished=not paused,
+            )
             short_term.update_task(item.task_id, stage="paused" if paused else "failed", error="" if paused else str(exc), queue_status={
                 "status": "paused" if paused else "failed",
                 "queue_wait_seconds": round(wait, 1),
@@ -160,6 +183,8 @@ def _worker_loop() -> None:
                 "error": "" if paused else str(exc),
             })
         finally:
+            from app import task_control
+            task_control.end_task(item.task_id)
             heartbeat_stop.set()
             with _LOCK:
                 if _RUNNING_TASK_ID == item.task_id:

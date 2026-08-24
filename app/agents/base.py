@@ -15,6 +15,7 @@ class BaseAgent:
     name = "base"
     role = ""
     max_retries = 2
+    thinking: bool | None = None
     last_call_id = ""
 
     def generate(self, prompt: str, system: str | None = None) -> str:
@@ -25,7 +26,10 @@ class BaseAgent:
 
     def generate_json(self, prompt: str, system: str | None = None) -> dict:
         return self._with_retry(
-            lambda: submit_llm_call(lambda: invoke("agent", model_gateway.generate_json, prompt, system=system or self.role)),
+            lambda: submit_llm_call(lambda: invoke(
+                "agent", model_gateway.generate_json, prompt,
+                system=system or self.role, think=self.thinking,
+            )),
             len(prompt),
         )
 
@@ -49,6 +53,8 @@ class BaseAgent:
                 )
                 return result
             except Exception as exc:
+                if str(exc) == "TASK_PAUSED":
+                    raise
                 elapsed = time.time() - started
                 count_llm_duration(self.name, elapsed, chars)
                 log_llm_call(

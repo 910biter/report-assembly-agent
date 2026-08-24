@@ -26,23 +26,25 @@ def artifact_input_hash(stage: str, effective_inputs: Any) -> str:
 
 
 def save_task_artifact(task_id: str, stage: str, effective_inputs: Any,
-                       payload: Any, status: str = "done") -> str:
+                       payload: Any, status: str = "done", run_id: str = "") -> str:
     """Persist a stage artifact and return its dependency hash."""
     input_hash = artifact_input_hash(stage, effective_inputs)
     with session_scope() as s:
         exists = s.execute(
             select(ORMTaskArtifact.c.id).where(
                 ORMTaskArtifact.c.task_id == task_id,
+                ORMTaskArtifact.c.run_id == run_id,
                 ORMTaskArtifact.c.stage == stage,
                 ORMTaskArtifact.c.input_hash == input_hash,
             )
         ).first()
-        values = dict(task_id=task_id, stage=stage, input_hash=input_hash,
+        values = dict(task_id=task_id, run_id=run_id, stage=stage, input_hash=input_hash,
                       status=status, payload=json.dumps(payload, ensure_ascii=False))
         if exists:
             s.execute(
                 ORMTaskArtifact.update()
                 .where(ORMTaskArtifact.c.task_id == task_id,
+                       ORMTaskArtifact.c.run_id == run_id,
                        ORMTaskArtifact.c.stage == stage,
                        ORMTaskArtifact.c.input_hash == input_hash)
                 .values(status=status, payload=values["payload"])
@@ -52,14 +54,17 @@ def save_task_artifact(task_id: str, stage: str, effective_inputs: Any,
     return input_hash
 
 
-def latest_task_artifact(task_id: str, stage: str) -> dict | None:
+def latest_task_artifact(task_id: str, stage: str, run_id: str | None = None) -> dict | None:
     """Return the latest artifact for a task stage, if present."""
     with session_scope() as s:
-        row = s.execute(
-            select(ORMTaskArtifact).where(
-                ORMTaskArtifact.c.task_id == task_id, ORMTaskArtifact.c.stage == stage
-            ).order_by(ORMTaskArtifact.c.updated_at.desc(), ORMTaskArtifact.c.id.desc()).limit(1)
-        ).mappings().first()
+        query = select(ORMTaskArtifact).where(
+            ORMTaskArtifact.c.task_id == task_id, ORMTaskArtifact.c.stage == stage
+        )
+        if run_id is not None:
+            query = query.where(ORMTaskArtifact.c.run_id == run_id)
+        row = s.execute(query.order_by(
+            ORMTaskArtifact.c.updated_at.desc(), ORMTaskArtifact.c.id.desc()
+        ).limit(1)).mappings().first()
     if row is None:
         return None
     try:
@@ -69,6 +74,7 @@ def latest_task_artifact(task_id: str, stage: str) -> dict | None:
     return {
         "id": row["id"],
         "task_id": row["task_id"],
+        "run_id": row.get("run_id", ""),
         "stage": row["stage"],
         "input_hash": row["input_hash"],
         "status": row["status"],

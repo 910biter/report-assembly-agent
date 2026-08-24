@@ -22,6 +22,7 @@ from app.db import session_scope
 from app.infrastructure.orm import ORMReport, ORMSentence
 from sqlalchemy import select
 from app.memory.style import get_locked_variant, get_variant
+from app.rendering.headings import detect_numbering_strategy, format_heading
 from app.template_engine import check_docx_conformance
 
 
@@ -55,10 +56,13 @@ def export_report(report_id: int) -> Path:
     _clear_body_keep_sections(doc)
     _apply_format(doc, format_spec, schema)
     _install_semantic_styles(doc, schema, format_spec)
+    heading_strategy = detect_numbering_strategy(schema)
 
     _add_role_paragraph(doc, report["title"], "document_title")
     current_section = None
     current_paragraph = None
+    chapter_index = 0
+    subsection_index = 0
     paragraph_buffer: list[str] = []
     for sentence in sentences:
         section_changed = sentence["section"] != current_section
@@ -67,7 +71,13 @@ def export_report(report_id: int) -> Path:
             _flush_paragraph(doc, paragraph_buffer)
             paragraph_buffer = []
             current_section = sentence["section"]
-            _add_role_paragraph(doc, current_section, "heading_1")
+            chapter_index += 1
+            subsection_index = 0
+            _add_role_paragraph(
+                doc,
+                format_heading(1, [chapter_index], current_section, heading_strategy),
+                "heading_1",
+            )
         elif paragraph_changed:
             _flush_paragraph(doc, paragraph_buffer)
             paragraph_buffer = []
@@ -75,7 +85,17 @@ def export_report(report_id: int) -> Path:
         if sentence["source_level"] == "SUBHEADING":
             _flush_paragraph(doc, paragraph_buffer)
             paragraph_buffer = []
-            _add_role_paragraph(doc, sentence["user_edit"] or sentence["content"], "heading_2")
+            subsection_index += 1
+            _add_role_paragraph(
+                doc,
+                format_heading(
+                    2,
+                    [chapter_index, subsection_index],
+                    sentence["user_edit"] or sentence["content"],
+                    heading_strategy,
+                ),
+                "heading_2",
+            )
             continue
         paragraph_buffer.append(sentence["user_edit"] or sentence["content"])
     _flush_paragraph(doc, paragraph_buffer)

@@ -27,27 +27,26 @@ const STAGE_BADGE = {
 function stageBadge(stage) {
   return `<span class="badge ${STAGE_BADGE[stage] || 'gray'}">${STAGE_NAMES[stage] || stage}</span>`;
 }
+function runModeText(t) {
+  return t.incremental_update || t.run_mode === "incremental"
+    ? `增量更新 #${t.run_revision || 1}` : `初始运行 #${t.run_revision || 1}`;
+}
 async function load() {
   const res = await fetch("/api/tasks");
   const tasks = await res.json();
   const box = document.getElementById("tasks");
   if (!tasks.length) { box.innerHTML = '<div class="empty">暂无任务</div>'; return; }
   box.innerHTML = tasks.map(t => {
-    const reportLink = t.report_id
-      ? `<a class="link" href="/reports/${t.report_id}">查看报告 →</a>`
-      : (t.stage === "failed"
-          ? `<span class="badge red">失败</span>`
-          : `<a class="link" href="/tasks/${t.task_id}">查看进度 →</a>`);
     const progress = progressText(t);
     return `<div class="list-row">
       <div>
         <div class="lr-title">${escapeHtml(t.theme || "(无主题)")}</div>
-        <div class="lr-meta">${t.created_at || "—"} | ${t.material_count || 0} 份材料 | ${escapeHtml(progress)}</div>
+        <div class="lr-meta">${t.material_count || 0} 份材料 · ${escapeHtml(runModeText(t))} · ${escapeHtml(progress)}</div>
       </div>
       ${stageBadge(t.stage)}
       <div>
         <a class="link" href="/tasks/${t.task_id}">任务详情</a>
-        <span style="margin-left:12px">${reportLink}</span>
+
         <button class="danger slim-action" onclick="deleteTask('${escapeJs(t.task_id)}')">删除</button>
       </div>
     </div>`;
@@ -65,15 +64,21 @@ async function deleteTask(taskId) {
 }
 function progressText(t) {
   const p = t.progress || {};
-  if ((p.queue_status || {}).status === "queued") return `排队中，第 ${p.queue_status.position || "?"} 位`;
-  if ((p.queue_status || {}).status === "running") return "正在运行";
-  if (p.write_progress && p.write_progress.total) {
+  const stage = p.stage || t.stage || "";
+  const queue = p.queue_status || {};
+  if (stage === "review") return "待审核";
+  if (stage === "done") return "已完成";
+  if (stage === "paused") return "已暂停";
+  if (stage === "failed") return "失败";
+  if (queue.status === "queued") return `排队中，第 ${queue.position || "?"} 位`;
+  if (queue.status === "running") return "正在运行";
+  if (stage === "writing" && p.write_progress && p.write_progress.total) {
     return `写作 ${p.write_progress.done || 0}/${p.write_progress.total}`;
   }
-  if (p.evidence_progress && p.evidence_progress.total) {
+  if (stage === "evidence" && p.evidence_progress && p.evidence_progress.total) {
     return `事实提取 ${p.evidence_progress.done || 0}/${p.evidence_progress.total}`;
   }
-  if (p.parse_progress && p.parse_progress.total) {
+  if (stage === "parsing" && p.parse_progress && p.parse_progress.total) {
     return `解析 ${p.parse_progress.done || 0}/${p.parse_progress.total}`;
   }
   if (p.total_seconds) return `总耗时 ${p.total_seconds}s`;

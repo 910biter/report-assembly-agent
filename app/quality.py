@@ -24,12 +24,12 @@ _VAGUE_TERMS = (
     "一定数量", "相关部门", "有关人员", "按要求", "及时提交", "适时完成",
 )
 _SPECIFIC_PATTERN = re.compile(
-    r"(\d{1,2}月\d{1,2}日|\d{4}年|《[^》]{2,}》|附件\d+|登记表|通讯稿|影像资料|视频|调研报告|访谈记录|系统|平台|渠道|截止|前提交)"
+    r"(\d{1,2}月\d{1,2}日|\d{4}年(?:\d{1,2}月)?|《[^》]{2,}》|"
+    r"\d+(?:\.\d+)?%|\d+(?:\.\d+)?(?:万|亿|项|个|份|页|小时|分钟))"
 )
 _BULLET_PREFIX_PATTERN = re.compile(r"^[•\-*]\s*")
 _STRUCTURED_ITEM_PATTERN = re.compile(
-    r"^(?:[•\-*]|[一二三四五六七八九十]+[、.]|\d+[、.]|"
-    r"必交材料方面[，,]|选交材料方面[，,]|时间节点方面[，,]|操作流程方面[，,]|评审条件方面[，,]|提交要求方面[，,])\s*"
+    r"^(?:[•\-*]|[一二三四五六七八九十]+[、.]|\d+[、.])\s*"
 )
 
 
@@ -89,21 +89,6 @@ def run_quality_check(report_id: int, plan_structure: list[str],
                 "quote": "", "note": "规划章节未生成内容",
             })
 
-    # 2.5 标题正文错配:只提示,不自动改标题或正文。
-    section_texts: dict[str, str] = {}
-    for row in rows:
-        section_texts[row["section"]] = section_texts.get(row["section"], "") + row["content"]
-    for section, text in section_texts.items():
-        if any(term in section for term in ("成效", "成果", "经验总结")) and not any(
-            term in text for term in ("取得", "形成", "完成", "成效", "成果", "经验")
-        ):
-            issues.append({
-                "type": "SECTION_ALIGNMENT_REVIEW",
-                "section": section,
-                "quote": text[:60],
-                "note": "章节标题指向成效/经验,但正文更像规范要求或执行事项。请复核:是正文写偏,还是标题需要调整。",
-            })
-
     # 3. 术语:违反模板禁止表达
     for word in (forbidden_terms or []):
         if not word:
@@ -144,7 +129,9 @@ def run_quality_check(report_id: int, plan_structure: list[str],
                 })
 
     # 4. 数字一致性:句子中的数字应在其引用事实(含原文片段)中出现(防模型改述出错)
-    _digit_re = re.compile(r"\d+(?:\.\d+)?")
+    # Do not treat architecture/product tokens such as x86 or SGXv1 as
+    # standalone quantitative claims.
+    _digit_re = re.compile(r"(?<![A-Za-z])\d+(?:\.\d+)?(?![A-Za-z])")
     from app.infrastructure.orm import ORMFact, ORMEvidence
     with session_scope() as s:
         fact_rows = s.execute(select(ORMFact.c.id, ORMFact.c.content)).mappings().all()
@@ -237,7 +224,7 @@ def run_quality_check(report_id: int, plan_structure: list[str],
             issues.append({
                 "type": "FORMAT_STYLE_ISSUE", "section": row["section"],
                 "quote": content[:60],
-                "note": "正式报告正文不应使用“•/-/*”等项目符号式前缀,建议改为“必交材料方面，……”等自然中文表达",
+                "note": "当前模板未允许项目符号式前缀。请改为符合本报告体例的自然段、编号项或表格表达",
             })
         if not _STRUCTURED_ITEM_PATTERN.match(content):
             continue

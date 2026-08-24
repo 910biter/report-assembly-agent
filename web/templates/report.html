@@ -7,6 +7,12 @@
       <a id="task-link" class="link" href="" style="display:none">返回任务</a>
       <h1>{{ report_title }}</h1>
       <p id="save-state" class="muted">已保存</p>
+      <p class="trace-legend muted">
+        <span class="legend-mark fact"></span>事实依据
+        <span class="legend-mark inference"></span>分析推论
+        <span class="legend-mark mixed"></span>事实与推论
+      </p>
+      <div id="version-strip" class="version-strip muted"></div>
     </div>
     <div class="actions-row">
       <div class="segmented">
@@ -14,9 +20,53 @@
         <button id="trace-mode">溯源模式</button>
       </div>
       <button id="finalize-btn" style="display:none">完成审核</button>
+      <button id="incremental-toggle" class="secondary">增量更新</button>
+      <button id="version-review-toggle" class="secondary">版本审阅</button>
+      <button id="snapshot-btn" class="secondary">生成版本快照</button>
       <button id="export-btn" class="secondary">导出 Word</button>
     </div>
   </header>
+  <section id="incremental-panel" class="card incremental-panel" style="display:none">
+    <div class="card-title-row">
+      <div>
+        <h2>基于当前版本增量更新</h2>
+        <p class="muted">新增材料会创建一个增量任务，复用历史版本的计划与事实基线，并生成新的报告草稿。</p>
+      </div>
+    </div>
+    <label>从材料库选择（可选）</label>
+    <select id="incremental-material-ids" multiple size="5"><option disabled>正在加载材料库…</option></select>
+    <label>上传新增材料（可选）</label>
+    <input id="incremental-files" type="file" multiple>
+    <label>本次更新说明</label>
+    <textarea id="incremental-reason" rows="3" placeholder="例如：补充最新政策材料，更新风险与建议章节"></textarea>
+    <div class="actions-row">
+      <button id="incremental-create">创建增量任务</button>
+      <span id="incremental-status" class="muted"></span>
+    </div>
+  </section>
+
+  <section id="version-diff-panel" class="version-review" style="display:none">
+    <div class="card-title-row">
+      <div>
+        <h2>版本差异审阅</h2>
+        <p class="muted">逐项决定保留当前候选稿或采用历史版本。决定会先暂存，统一应用后才修改正文。</p>
+      </div>
+      <div class="actions-row">
+        <button id="apply-version-decisions" disabled>应用已决定的更改</button>
+        <button id="close-version-review" class="tertiary">关闭</button>
+      </div>
+    </div>
+    <div class="version-review-controls">
+      <div id="version-actions" class="actions-row"></div>
+      <div class="diff-filters" id="diff-filters">
+        <button class="mini-tab active" data-diff-filter="all">全部</button>
+        <button class="mini-tab" data-diff-filter="modified">修改</button>
+        <button class="mini-tab" data-diff-filter="added">新增</button>
+        <button class="mini-tab" data-diff-filter="removed">删除</button>
+      </div>
+    </div>
+    <div id="version-diff" class="version-diff muted">选择一个历史版本查看差异。</div>
+  </section>
 
   <div class="editor-layout refined">
     <aside class="editor-toc">
@@ -48,12 +98,51 @@ let SENTENCES = {};
 let MODE = "edit";
 let PANEL = "evidence";
 let selectedId = null;
-let saveTimer = null;
+let sentenceSaveTimers = new Map();
 let titleSaveTimer = null;
 let sectionSaveTimers = new Map();
+let VERSIONS = [];
+let ACTIVE_DIFF = null;
+let ACTIVE_VERSION_ID = null;
+let DIFF_FILTER = "all";
 
 document.getElementById("edit-mode").addEventListener("click", () => setMode("edit"));
 document.getElementById("trace-mode").addEventListener("click", () => setMode("trace"));
+document.getElementById("version-review-toggle").addEventListener("click", () => {
+  const panel = document.getElementById("version-diff-panel");
+  panel.style.display = "block";
+  panel.scrollIntoView({ behavior: "smooth", block: "start" });
+});
+document.getElementById("close-version-review").addEventListener("click", () => {
+  document.getElementById("version-diff-panel").style.display = "none";
+});
+document.querySelectorAll("[data-diff-filter]").forEach(btn => btn.addEventListener("click", () => {
+  DIFF_FILTER = btn.dataset.diffFilter;
+  document.querySelectorAll("[data-diff-filter]").forEach(item => item.classList.toggle("active", item === btn));
+  applyDiffFilter();
+}));
+document.getElementById("apply-version-decisions").addEventListener("click", async () => {
+  if (!ACTIVE_DIFF || !ACTIVE_VERSION_ID) return;
+  const btn = document.getElementById("apply-version-decisions");
+  btn.disabled = true;
+  btn.textContent = "正在应用";
+  try {
+    const res = await fetch(`/api/report-versions/${ACTIVE_VERSION_ID}/decisions/apply`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ candidate_hash: ACTIVE_DIFF.candidate_hash }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "应用失败");
+    const reportRes = await fetch("/api/reports/{{ report_id }}", { cache: "no-store" });
+    render(await reportRes.json());
+    document.getElementById("version-diff").textContent = `已应用 ${data.applied || 0} 项决定。`;
+    ACTIVE_DIFF = null;
+  } catch (error) {
+    document.getElementById("version-diff").textContent = error.message || "应用失败，请重新加载差异。";
+  } finally {
+    btn.textContent = "应用已决定的更改";
+  }
+});
 document.querySelectorAll(".panel-tabs .mini-tab").forEach(btn => btn.addEventListener("click", () => {
   document.querySelectorAll(".panel-tabs .mini-tab").forEach(b => b.classList.remove("active"));
   btn.classList.add("active");
@@ -71,6 +160,7 @@ function setMode(mode) {
 
 function render(data) {
   DATA = data;
+  renderVersions(data.versions || []);
   const main = document.getElementById("report");
   const toc = document.getElementById("toc");
   main.innerHTML = "";
@@ -88,14 +178,14 @@ function render(data) {
     const h2 = document.createElement("h2");
     h2.id = anchor;
     h2.className = "editable-heading";
-    h2.textContent = section.title;
+    h2.textContent = section.display_title || section.title;
     h2.contentEditable = "true";
     h2.dataset.original = section.title;
     h2.title = "可编辑章节标题";
     main.appendChild(h2);
     const tocLink = document.createElement("a");
     tocLink.href = "#" + anchor;
-    tocLink.textContent = section.title;
+    tocLink.textContent = section.display_title || section.title;
     tocLink.dataset.sectionAnchor = anchor;
     toc.appendChild(tocLink);
     for (const para of section.paragraphs) {
@@ -154,14 +244,221 @@ function render(data) {
   });
 }
 
+function renderVersions(versions) {
+  VERSIONS = versions || [];
+  const box = document.getElementById("version-strip");
+  const actions = document.getElementById("version-actions");
+  if (!box) return;
+  if (!VERSIONS.length) {
+    box.innerHTML = "尚未生成版本快照";
+    return;
+  }
+  const latest = VERSIONS[0];
+  box.innerHTML = `当前快照：v${escapeHtml(latest.version_label || latest.version_no)} · ${escapeHtml(latest.status || "snapshot")} · ${escapeHtml(latest.created_at || "")}`;
+  if (actions) {
+    actions.innerHTML = VERSIONS.map(v => `<button class="secondary" data-version-diff="${v.id}">v${escapeHtml(v.version_label || v.version_no)}</button>`).join("");
+    actions.querySelectorAll("[data-version-diff]").forEach(btn => btn.addEventListener("click", () => loadVersionDiff(btn.dataset.versionDiff)));
+  }
+}
+
+async function loadVersionDiff(versionId) {
+  const box = document.getElementById("version-diff");
+  box.textContent = "正在生成差异…";
+  try {
+    const res = await fetch(`/api/report-versions/${versionId}/diff-current?granularity=sentence`, { cache: "no-store" });
+    const diff = await res.json();
+    if (!res.ok) throw new Error(diff.error || "差异生成失败");
+    ACTIVE_DIFF = diff;
+    ACTIVE_VERSION_ID = Number(versionId);
+    box.innerHTML = renderVersionDiff(diff, versionId);
+    bindDiffDecisionActions();
+    await loadStagedDecisions();
+  } catch (err) {
+    box.textContent = err.message || "差异生成失败";
+  }
+}
+
+function renderVersionDiff(diff, versionId) {
+  const summary = diff.summary || {};
+  const sections = diff.sections || [];
+  const header = `<div class="diff-summary">
+    <div><b>差异摘要</b><span>变化章节 ${summary.sections_changed || 0}</span><span>变化段落 ${summary.paragraphs_changed || 0}</span><span class="diff-count added">新增 ${summary.sentences_added || 0}</span><span class="diff-count modified">修改 ${summary.sentences_modified || 0}</span><span class="diff-count removed">删除 ${summary.sentences_removed || 0}</span></div>
+    <div id="decision-progress" class="muted">尚未作出决定</div>
+  </div>`;
+  const changedSections = sections.filter(s => s.change_type !== "unchanged");
+  if (!changedSections.length) return header + `<div class="empty">当前稿与该版本没有明显差异。</div>`;
+  const body = changedSections.map(section => `<details class="diff-block" data-change-kind="${section.change_type}">
+    <summary><span>${diffTypeName(section.change_type)}章节：${escapeHtml(section.section)}</span><span class="section-review-actions"><button class="tertiary" data-section-decision="keep_current" data-section-name="${escapeAttr(section.section)}">保留本章新版</button><button class="tertiary" data-section-decision="use_base" data-section-name="${escapeAttr(section.section)}">采用本章旧版</button></span></summary>
+    ${(section.paragraphs || []).filter(p => p.change_type !== "unchanged").map(para => renderParagraphDiff(versionId, section.section, para)).join("")}
+  </details>`).join("");
+  return header + body;
+}
+
+function renderParagraphDiff(versionId, section, para) {
+  const sentences = (para.sentences || []).filter(s => s.change_type !== "unchanged");
+  return `<div class="paragraph-diff">
+    <div class="paragraph-diff-title">
+      <b>${diffTypeName(para.change_type)}段落 ${para.paragraph}</b>
+      <span class="muted">旧段 ${para.old_paragraph ?? "-"} → 新段 ${para.new_paragraph ?? "-"}</span>
+    </div>
+    ${sentences.map(sent => renderSentenceDiff(versionId, section, para.paragraph, sent)).join("")}
+  </div>`;
+}
+
+function renderSentenceDiff(versionId, section, paragraph, sent) {
+  const payload = JSON.stringify({
+    version_id: versionId,
+    section,
+    paragraph,
+    sentence_index: sent.old_index,
+    old_sentence_id: sent.old_sentence_id,
+    current_sentence_id: sent.current_sentence_id,
+    change_type: sent.change_type
+  });
+  const labelIndex = sent.new_index != null ? sent.new_index : sent.old_index;
+  return `<div class="sentence-diff ${sent.change_type}" data-change-kind="${sent.change_type}" data-change-key="${escapeAttr(sent.change_key || "")}" data-section="${escapeAttr(section)}" data-scope='${escapeAttr(payload)}'>
+    <div class="sentence-diff-head">
+      <span>${diffTypeName(sent.change_type)}句子 ${Number(labelIndex || 0) + 1}${sent.similarity ? ` · 相似度 ${Math.round(sent.similarity * 100)}%` : ""}</span>
+      <span class="sentence-decision-actions"><button class="tertiary" data-change-decision="keep_current">保留新版</button><button class="tertiary" data-change-decision="use_base">${sent.change_type === "added" ? "采用旧版（删除）" : "采用旧版"}</button></span>
+    </div>
+    <div class="diff-cols compact">
+      <div><b>历史版本</b><p>${escapeHtml(sent.old_text || "")}</p></div>
+      <div><b>当前候选稿</b><p>${escapeHtml(sent.new_text || "")}</p></div>
+    </div>
+  </div>`;
+}
+
+function bindDiffDecisionActions() {
+  const box = document.getElementById("version-diff");
+  box.querySelectorAll("[data-change-decision]").forEach(btn => btn.addEventListener("click", async (event) => {
+    event.stopPropagation();
+    await stageDiffDecision(btn.closest(".sentence-diff"), btn.dataset.changeDecision);
+  }));
+  box.querySelectorAll("[data-section-decision]").forEach(btn => btn.addEventListener("click", async (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const rows = [...box.querySelectorAll(".sentence-diff")].filter(row => row.dataset.section === btn.dataset.sectionName);
+    btn.disabled = true;
+    await Promise.all(rows.map(row => stageDiffDecision(row, btn.dataset.sectionDecision, false)));
+    btn.disabled = false;
+    updateDecisionProgress();
+  }));
+  applyDiffFilter();
+}
+
+async function stageDiffDecision(row, decision, updateProgress = true) {
+  if (!row || !ACTIVE_DIFF || !ACTIVE_VERSION_ID) return;
+  const scope = JSON.parse(row.dataset.scope || "{}");
+  const res = await fetch(`/api/report-versions/${ACTIVE_VERSION_ID}/decisions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      candidate_hash: ACTIVE_DIFF.candidate_hash,
+      change_key: row.dataset.changeKey,
+      change_type: row.dataset.changeKind,
+      scope,
+      decision,
+    }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || "保存审阅决定失败");
+  markDecision(row, decision);
+  if (updateProgress) updateDecisionProgress();
+}
+
+function markDecision(row, decision) {
+  row.dataset.decision = decision;
+  row.classList.toggle("decision-current", decision === "keep_current");
+  row.classList.toggle("decision-base", decision === "use_base");
+  row.querySelectorAll("[data-change-decision]").forEach(btn => {
+    btn.classList.toggle("active", btn.dataset.changeDecision === decision);
+  });
+}
+
+async function loadStagedDecisions() {
+  if (!ACTIVE_DIFF || !ACTIVE_VERSION_ID) return;
+  const res = await fetch(`/api/report-versions/${ACTIVE_VERSION_ID}/decisions?candidate_hash=${encodeURIComponent(ACTIVE_DIFF.candidate_hash)}`, { cache: "no-store" });
+  const payload = await res.json();
+  const byKey = new Map((payload.decisions || []).filter(item => item.status === "pending").map(item => [item.change_key, item.decision]));
+  document.querySelectorAll("#version-diff .sentence-diff").forEach(row => {
+    if (byKey.has(row.dataset.changeKey)) markDecision(row, byKey.get(row.dataset.changeKey));
+  });
+  updateDecisionProgress();
+}
+
+function updateDecisionProgress() {
+  const rows = [...document.querySelectorAll("#version-diff .sentence-diff")];
+  const decided = rows.filter(row => row.dataset.decision).length;
+  const progress = document.getElementById("decision-progress");
+  if (progress) progress.textContent = `已决定 ${decided}/${rows.length} 项`;
+  const apply = document.getElementById("apply-version-decisions");
+  if (apply) apply.disabled = decided === 0;
+}
+
+function applyDiffFilter() {
+  document.querySelectorAll("#version-diff .sentence-diff").forEach(row => {
+    row.hidden = DIFF_FILTER !== "all" && row.dataset.changeKind !== DIFF_FILTER;
+  });
+  document.querySelectorAll("#version-diff .diff-block").forEach(block => {
+    const visible = [...block.querySelectorAll(".sentence-diff")].some(row => !row.hidden);
+    block.hidden = !visible;
+  });
+}
+
+
+async function restoreScope(raw) {
+  let payload = {};
+  try { payload = JSON.parse(raw || "{}"); } catch { return; }
+  const versionId = payload.version_id;
+  delete payload.version_id;
+  const res = await fetch(`/api/report-versions/${versionId}/restore-scope`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    alert(data.error || "恢复失败");
+    return;
+  }
+  const refreshed = await fetch("/api/reports/{{ report_id }}", { cache: "no-store" });
+  render(await refreshed.json());
+  await loadVersionDiff(versionId);
+}
+
+async function restoreVersion(versionId) {
+  if (!confirm("确定恢复这个历史版本吗？当前候选稿会被替换，但历史快照仍会保留。")) return;
+  const res = await fetch(`/api/report-versions/${versionId}/restore`, { method: "POST" });
+  const data = await res.json();
+  if (!res.ok) {
+    alert(data.error || "恢复失败");
+    return;
+  }
+  const refreshed = await fetch("/api/reports/{{ report_id }}", { cache: "no-store" });
+  render(await refreshed.json());
+}
+
+function diffTypeName(type) {
+  return ({added: "新增", modified: "修改", removed: "删除"})[type] || type || "变化";
+}
+
 function makeSentenceSpan(s) {
   const span = document.createElement("span");
-  span.className = "sentence clean-sentence" + (s.selected ? "" : " excluded");
+  span.className = "sentence clean-sentence " + traceClass(s) + (s.selected ? "" : " excluded");
   span.dataset.id = s.id;
   span.contentEditable = "true";
-  span.textContent = s.content;
+  span.textContent = s.display_content || s.content;
   span.dataset.original = s.content;
   return span;
+}
+
+function traceClass(s) {
+  const hasFacts = (s.sources || []).length > 0 || s.source_level === "MATERIAL_FACT";
+  const hasInferences = (s.inferences || []).length > 0 || s.source_level === "MATERIAL_INFERENCE" || s.source_level === "EXTERNAL_INFORMATION";
+  if (hasFacts && hasInferences) return "trace-mixed";
+  if (hasInferences) return "trace-inference";
+  if (hasFacts) return "trace-fact";
+  return "trace-transition";
 }
 
 function isListItem(text) {
@@ -188,9 +485,12 @@ document.getElementById("report").addEventListener("input", (e) => {
   }
   if (!e.target.classList.contains("sentence")) return;
   setSaveState("正在保存");
-  clearTimeout(saveTimer);
   const id = e.target.dataset.id;
-  saveTimer = setTimeout(() => saveSentence(id, { content: e.target.textContent }), 600);
+  clearTimeout(sentenceSaveTimers.get(id));
+  sentenceSaveTimers.set(id, setTimeout(async () => {
+    await saveSentence(id, { content: e.target.textContent });
+    sentenceSaveTimers.delete(id);
+  }, 600));
 });
 
 async function saveSentence(id, body) {
@@ -201,7 +501,11 @@ async function saveSentence(id, body) {
       body: JSON.stringify(body)
     });
     if (!res.ok) throw new Error("save failed");
-    if (SENTENCES[id] && body.content != null) SENTENCES[id].content = body.content;
+    const data = await res.json().catch(() => ({}));
+    if (SENTENCES[id] && body.content != null) {
+      SENTENCES[id].content = data.content || body.content;
+      if (data.display_content) SENTENCES[id].display_content = data.display_content;
+    }
     setSaveState("已保存");
   } catch {
     setSaveState("保存失败");
@@ -253,14 +557,25 @@ async function saveSectionTitle(el) {
     const res = await fetch(`/api/reports/{{ report_id }}/sections`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ old_title: oldTitle, new_title: newTitle })
+      body: JSON.stringify({
+        old_title: oldTitle,
+        new_title: newTitle,
+        section_index: Number(anchor.replace("sec-", "")) + 1
+      })
     });
     if (!res.ok) throw new Error("save failed");
-    el.dataset.original = newTitle;
+    const data = await res.json().catch(() => ({}));
+    const savedTitle = data.title || newTitle;
+    const displayTitle = data.display_title || savedTitle;
+    el.dataset.original = savedTitle;
+    el.textContent = displayTitle;
     const link = document.querySelector(`[data-section-anchor="${el.id}"]`);
-    if (link) link.textContent = newTitle;
+    if (link) link.textContent = displayTitle;
     for (const section of DATA.sections || []) {
-      if (section.title === oldTitle) section.title = newTitle;
+      if (section.title === oldTitle) {
+        section.title = savedTitle;
+        section.display_title = displayTitle;
+      }
     }
     setSaveState("已保存");
   } catch {
@@ -271,7 +586,17 @@ async function saveSectionTitle(el) {
 function renderPanel() {
   const box = document.getElementById("context-panel");
   if (PANEL === "qa") {
-    box.innerHTML = `<div class="panel-section"><h3>质量检查</h3><p class="muted">质量问题会在任务“分析”页集中展示。当前面板保留为报告审核上下文。</p></div>`;
+    const issues = (DATA && DATA.qa_issues) || [];
+    if (!issues.length) {
+      box.innerHTML = `<div class="panel-section"><h3>质量检查</h3><p class="muted">当前没有待处理的质量问题。</p></div>`;
+      return;
+    }
+    box.innerHTML = `<div class="panel-section"><h3>质量检查 · ${issues.length}</h3>${issues.map(issue => {
+      const title = issue.issue_type || issue.type || issue.category || "质量问题";
+      const message = issue.message || issue.note || issue.description || issue.detail || JSON.stringify(issue);
+      const severity = issue.severity || issue.level || "medium";
+      return `<div class="qa-review-item ${escapeAttr(severity)}"><b>${escapeHtml(title)}</b><p>${escapeHtml(message)}</p></div>`;
+    }).join("")}</div>`;
     return;
   }
   if (!selectedId || !SENTENCES[selectedId]) {
@@ -304,8 +629,11 @@ function renderPanel() {
     html += `<div class="panel-section"><h3>分析推断</h3>`;
     for (const inf of s.inferences) {
       html += `<div class="panel-value"><b>#${inf.inference_id}</b> ${escapeHtml(inf.content)}</div>
+        <div class="panel-value muted">类型：${analysisTypeName(inf.analysis_type)} · 置信度：${confidenceLabel(inf)}</div>
         <div class="panel-value muted">依据事实：${(inf.based_fact_ids || []).join("、") || "无"}</div>
-        ${inf.reasoning_chain ? `<div class="panel-quote">推理：${escapeHtml(inf.reasoning_chain)}</div>` : ""}`;
+        ${inf.reasoning_chain ? `<div class="panel-quote">依据说明：${escapeHtml(inf.reasoning_chain)}</div>` : ""}
+        ${inf.confidence_reason ? `<div class="panel-quote">置信理由：${escapeHtml(inf.confidence_reason)}</div>` : ""}
+        ${inf.uncertainty ? `<div class="panel-quote">不确定性：${escapeHtml(inf.uncertainty)}</div>` : ""}`;
     }
     html += "</div>";
   }
@@ -322,21 +650,115 @@ async function toggleSentence(id, selected) {
 document.getElementById("export-btn").addEventListener("click", () => {
   location.href = `/api/reports/{{ report_id }}/export`;
 });
+document.getElementById("incremental-toggle").addEventListener("click", () => {
+  const panel = document.getElementById("incremental-panel");
+  panel.style.display = panel.style.display === "none" ? "block" : "none";
+  if (panel.style.display === "block") loadIncrementalMaterials();
+});
+async function loadIncrementalMaterials() {
+  const select = document.getElementById("incremental-material-ids");
+  if (select.dataset.loaded) return;
+  try {
+    const res = await fetch("/api/materials", { cache: "no-store" });
+    const materials = await res.json();
+    select.innerHTML = (materials || []).map(item => `<option value="${item.id}">${escapeHtml(item.filename)} · ${escapeHtml(item.file_type || "")}</option>`).join("") || `<option disabled>材料库暂无材料</option>`;
+    select.dataset.loaded = "1";
+  } catch {
+    select.innerHTML = `<option disabled>材料库加载失败</option>`;
+  }
+}
+document.getElementById("incremental-create").addEventListener("click", async () => {
+  const status = document.getElementById("incremental-status");
+  const btn = document.getElementById("incremental-create");
+  const form = new FormData();
+  const selectedMaterials = [...document.getElementById("incremental-material-ids").selectedOptions].map(option => option.value);
+  form.append("existing_material_ids", selectedMaterials.join(","));
+  form.append("update_reason", document.getElementById("incremental-reason").value || "");
+  for (const file of document.getElementById("incremental-files").files || []) {
+    form.append("files", file);
+  }
+  btn.disabled = true;
+  status.textContent = "正在创建增量任务…";
+  try {
+    const res = await fetch(`/api/reports/{{ report_id }}/incremental/tasks`, { method: "POST", body: form });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "创建失败");
+    status.innerHTML = `已创建增量任务：<a class="link" href="/tasks/${data.task_id}">${data.task_id}</a>，新增材料 ${data.added_material_count || 0} 份`;
+  } catch (err) {
+    status.textContent = err.message || "创建失败";
+  } finally {
+    btn.disabled = false;
+  }
+});
+document.getElementById("snapshot-btn").addEventListener("click", async () => {
+  const btn = document.getElementById("snapshot-btn");
+  btn.disabled = true;
+  btn.textContent = "正在生成快照";
+  try {
+    const res = await fetch(`/api/reports/{{ report_id }}/versions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ change_summary: "用户手动生成版本快照" })
+    });
+    if (!res.ok) throw new Error("snapshot failed");
+    const dataRes = await fetch("/api/reports/{{ report_id }}");
+    render(await dataRes.json());
+    btn.textContent = "生成版本快照";
+  } catch {
+    btn.textContent = "快照失败";
+  } finally {
+    btn.disabled = false;
+  }
+});
 document.getElementById("finalize-btn").addEventListener("click", async () => {
   const btn = document.getElementById("finalize-btn");
   btn.disabled = true;
   btn.textContent = "正在完成";
-  await fetch(`/api/reports/{{ report_id }}/finalize`, { method: "POST" });
-  btn.textContent = "已完成";
+  try {
+    let res = await fetch(`/api/reports/{{ report_id }}/finalize`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: "{}"
+    });
+    let payload = await res.json();
+    if (res.status === 409 && payload.error === "QA_BLOCKING") {
+      const proceed = window.confirm(`仍有 ${payload.issues.length} 个关键质量问题。确定要完成审核吗？`);
+      if (!proceed) throw new Error("请先处理质量问题");
+      res = await fetch(`/api/reports/{{ report_id }}/finalize`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ force: true })
+      });
+      payload = await res.json();
+    }
+    if (!res.ok) throw new Error(payload.error || "完成审核失败");
+    btn.textContent = "已完成";
+  } catch (error) {
+    btn.disabled = false;
+    btn.textContent = "完成审核";
+    setSaveState(error.message || "完成审核失败");
+  }
 });
 
 function setSaveState(text) {
   document.getElementById("save-state").textContent = text;
 }
+function escapeAttr(text) {
+  return String(text == null ? "" : text).replace(/&/g, "&amp;").replace(/'/g, "&#39;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
 function escapeHtml(text) {
   const div = document.createElement("div");
   div.textContent = text == null ? "" : String(text);
   return div.innerHTML;
+}
+function confidenceLabel(item) {
+  const level = String((item && item.confidence_level) || "").toLowerCase();
+  const hasAssessment = !!String((item && (item.confidence_reason || item.uncertainty || item.analysis_type)) || "").trim();
+  if (!level || (level === "medium" && !hasAssessment)) return "需人工复核";
+  return ({ high: "高", medium: "中", low: "低", "高": "高", "中": "中", "低": "低" })[level] || "需人工复核";
+}
+function analysisTypeName(type) {
+  return ({
+    OBSERVATION: "观察", CAUSE: "原因", IMPACT: "影响", RISK: "风险",
+    TREND: "趋势", PREDICTION: "预测", COMPARISON: "比较",
+    CONSTRAINT: "约束", UNCERTAINTY: "不确定性", SYNTHESIS: "综合"
+  })[String(type || "").toUpperCase()] || "综合";
 }
 (async () => {
   const res = await fetch("/api/reports/{{ report_id }}");

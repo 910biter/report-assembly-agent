@@ -145,23 +145,59 @@ def _detect_role_paragraphs(paragraphs: list) -> dict:
     }
     if paragraphs:
         roles[ROLE_DOCUMENT_TITLE] = paragraphs[0]
+    roles[ROLE_BODY] = _best_body_paragraph(paragraphs[1:])
     for para in paragraphs[1:]:
         role = _paragraph_role(para)
         if role in {ROLE_HEADING_1, ROLE_HEADING_2, ROLE_HEADING_3} and roles[role] is None:
             roles[role] = para
     for para in paragraphs[1:]:
         text = para.text.strip()
-        if (
-            roles[ROLE_BODY] is None
-            and _paragraph_role(para) == ROLE_BODY
-            and _looks_like_body_sample(para)
-        ):
-            roles[ROLE_BODY] = para
         if roles[ROLE_SIGNATURE] is None and re.search(r"(单位|日期|年\s*月\s*日|盖章|署名)", text):
             roles[ROLE_SIGNATURE] = para
     if roles[ROLE_BODY] is None and len(paragraphs) > 1:
         roles[ROLE_BODY] = next((p for p in paragraphs[1:] if _paragraph_role(p) == ROLE_BODY), paragraphs[1])
     return roles
+
+
+def _best_body_paragraph(paragraphs: list):
+    candidates = [
+        (_body_candidate_score(para), para)
+        for para in paragraphs
+        if _paragraph_role(para) == ROLE_BODY and _looks_like_body_sample(para)
+    ]
+    candidates = [(score, para) for score, para in candidates if score > 0]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
+
+
+def _body_candidate_score(para) -> int:
+    text = para.text.strip()
+    style = para.style.name if para.style is not None else ""
+    align = _alignment(
+        para.alignment,
+        _pf_value(para.style.paragraph_format if para.style is not None else None, "alignment"),
+        None,
+    )
+    score = 0
+    if "正文" in style or "body" in style.lower():
+        score += 8
+    if len(text) >= 24:
+        score += 5
+    if len(text) >= 48:
+        score += 3
+    if _is_template_instruction(text):
+        score += 4
+    if align in {None, "both", "justify"}:
+        score += 5
+    if align in {"center", "right"}:
+        score -= 8
+    if _looks_like_non_body_meta(text):
+        score -= 20
+    if re.search(r"(报告|方案|综述|总结)$", text) and len(text) <= 28:
+        score -= 10
+    return score
 
 
 def _paragraph_role(para) -> str:
@@ -439,6 +475,8 @@ def _looks_like_body_sample(para) -> bool:
     style = para.style.name if para.style is not None else ""
     if not text or _heading_items(text):
         return False
+    if _looks_like_non_body_meta(text):
+        return False
     if _is_template_instruction(text):
         return "正文样式" in style
     if any(marker in text for marker in ("摘", "关键词", "中图法分类号")) and ("[" in text or "：" in text):
@@ -446,6 +484,23 @@ def _looks_like_body_sample(para) -> bool:
     if len(text) < 12 and "正文" not in style:
         return False
     return True
+
+
+def _looks_like_non_body_meta(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return True
+    if "××" in stripped or "XXX" in stripped.upper():
+        return True
+    if re.fullmatch(r"[（(]?\d{4}\s*年度[）)]?", stripped):
+        return True
+    if re.fullmatch(r"[×xX]{1,4}\s*年\s*[×xX]?\s*月\s*[×xX]?\s*日", stripped):
+        return True
+    if re.fullmatch(r".{1,20}(单位|部门|委员会|办公室)", stripped):
+        return True
+    if re.fullmatch(r"[（(].{1,30}[）)]", stripped):
+        return True
+    return False
 
 
 def _is_template_instruction(text: str) -> bool:

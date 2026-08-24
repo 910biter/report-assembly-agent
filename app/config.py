@@ -61,9 +61,10 @@ class Settings(BaseSettings):
     # 上下文容量配置(物理上限派生,非内容决策):
     # 单批可用 tokens = 窗口 - 输出预留 - 固定 prompt 开销 - 安全余量
     model_context_window_tokens: int = 65536  # 远端模型上下文窗口
-    generation_reserve_tokens: int = 8192  # 单批输出预留(Evidence 长输出)
+    generation_reserve_tokens: int = 8192  # 单次模型输出上限/预留，覆盖 Evidence 与小节成文
     prompt_overhead_tokens: int = 3000  # 固定 prompt(系统提示+维度+insights 头)
     safety_margin_tokens: int = 2048  # 安全余量(防估算偏差)
+    writer_min_budget_completion_ratio: float = 0.8  # 规模 QA 阈值,不授权虚构或重复补齐
     vector_backend: str = "auto"  # auto / qdrant / off
     qdrant_url: str = ""
     qdrant_api_key: str = ""

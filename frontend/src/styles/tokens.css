@@ -1,0 +1,38 @@
+:root {
+  --color-bg: #f4f5f7;
+  --color-surface: #ffffff;
+  --color-surface-soft: #f8f9fb;
+  --color-text: #20242a;
+  --color-muted: #69707a;
+  --color-faint: #9298a1;
+  --color-border: #e2e5e9;
+  --color-border-strong: #d2d7de;
+  --color-primary: #245b9e;
+  --color-primary-hover: #1d4c86;
+  --color-primary-soft: #eaf1fa;
+  --color-success: #287a52;
+  --color-success-soft: #eaf5ef;
+  --color-warning: #9a6115;
+  --color-warning-soft: #fff4df;
+  --color-danger: #b33a3a;
+  --color-danger-soft: #fbecec;
+  --color-fact: #eaf3fb;
+  --color-inference: #edf6ee;
+  --font-ui: "Source Han Sans SC", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif;
+  --font-doc: "SimSun", "Songti SC", serif;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+  --radius-sm: 4px;
+  --radius-md: 7px;
+  --shadow-float: 0 12px 28px rgba(28, 39, 54, 0.12);
+  --shadow-paper: 0 5px 18px rgba(31, 39, 50, 0.09);
+  --nav-width: 232px;
+  --header-height: 60px;
+  --content-max: 1380px;
+  --motion-fast: 160ms ease;
+}
