@@ -61,6 +61,19 @@ from app.workflow.queue import enqueue_task, request_control, task_queue_status
 router = APIRouter(prefix="/api")
 
 
+def _ui_timestamp(value) -> str:
+    """Normalize mixed historical timestamps for browser display and sorting."""
+    if value in (None, ""):
+        return ""
+    if isinstance(value, datetime):
+        return value.astimezone().isoformat(timespec="seconds")
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    return datetime.fromtimestamp(numeric).astimezone().isoformat(timespec="seconds")
+
+
 # ---------- 任务 ----------
 
 @router.post("/tasks")
@@ -337,9 +350,10 @@ def list_tasks():
             "theme": payload.get("theme", ""),
             "stage": payload.get("stage", ""),
             "created_at": payload.get("created_at", ""),
-            "updated_at": payload.get("updated_at") or payload.get("last_progress_at") or payload.get("created_at", ""),
+            "updated_at": _ui_timestamp(payload.get("updated_at") or payload.get("last_progress_at") or payload.get("created_at", "")),
             "report_id": payload.get("report_id"),
             "material_count": len(payload.get("material_ids", []) or []),
+            "variant_id": payload.get("variant_id"),
             "run_revision": int(payload.get("run_revision") or 1),
             "run_mode": payload.get("run_mode") or "initial",
             "run_history": payload.get("run_history") or [],
@@ -577,6 +591,7 @@ def list_materials():
         rows = s.execute(
             select(
                 ORMMaterial.c.id, ORMMaterial.c.filename, ORMMaterial.c.file_type,
+                ORMMaterial.c.parsed_at,
                 ORMMaterial.c.is_duplicate, ORMMaterial.c.duplicate_of,
                 func.count(ORMUnit.c.id).label("unit_count"),
             )
@@ -585,6 +600,7 @@ def list_materials():
             )
             .group_by(
                 ORMMaterial.c.id, ORMMaterial.c.filename, ORMMaterial.c.file_type,
+                ORMMaterial.c.parsed_at,
                 ORMMaterial.c.is_duplicate, ORMMaterial.c.duplicate_of,
             )
             .order_by(ORMMaterial.c.id.desc())
@@ -593,6 +609,8 @@ def list_materials():
         "id": r["id"], "filename": r["filename"], "file_type": r["file_type"],
         "unit_count": r["unit_count"], "is_duplicate": r["is_duplicate"],
         "duplicate_of": r["duplicate_of"],
+        "parsed_at": r["parsed_at"],
+        "parse_status": "ready" if r["unit_count"] else "pending",
         "tasks": material_tasks.get(r["id"], []),
     } for r in rows]
 
@@ -612,6 +630,8 @@ def get_material(material_id: int):
         ).mappings().all()
     return {
         "id": material["id"], "filename": material["filename"], "file_type": material["file_type"],
+        "parsed_at": material["parsed_at"],
+        "parse_status": "ready" if units else "pending",
         "is_duplicate": material["is_duplicate"], "duplicate_of": material["duplicate_of"],
         "tasks": material_tasks.get(material["id"], []),
         "units": [{

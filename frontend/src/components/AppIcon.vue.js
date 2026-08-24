@@ -74,6 +74,21 @@ else if (__VLS_ctx.name === 'plus') {
         d: "M12 5v14M5 12h14",
     });
 }
+else if (__VLS_ctx.name === 'close') {
+    __VLS_asFunctionalElement1(__VLS_intrinsics.path)({
+        d: "m6 6 12 12M18 6 6 18",
+    });
+}
+else if (__VLS_ctx.name === 'search') {
+    __VLS_asFunctionalElement1(__VLS_intrinsics.circle)({
+        cx: "11",
+        cy: "11",
+        r: "6",
+    });
+    __VLS_asFunctionalElement1(__VLS_intrinsics.path)({
+        d: "m16 16 4 4",
+    });
+}
 else if (__VLS_ctx.name === 'menu') {
     __VLS_asFunctionalElement1(__VLS_intrinsics.path)({
         d: "M4 7h16M4 12h16M4 17h16",
@@ -90,7 +105,7 @@ else {
     });
 }
 // @ts-ignore
-[size, size, name, name, name, name, name, name, name,];
+[size, size, name, name, name, name, name, name, name, name, name,];
 const __VLS_export = (await import('vue')).defineComponent({
     __typeProps: {},
 });

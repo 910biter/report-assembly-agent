@@ -1,10 +1,110 @@
 <script setup lang="ts">
-import { computed, ref } from "vue"; import { useMutation, useQuery, useQueryClient } from "@tanstack/vue-query"; import { RouterLink } from "vue-router"; import { api } from "@/api/http"; import type { TaskSummary } from "@/api/types"; import StatusBadge from "@/components/StatusBadge.vue";
-const queryClient=useQueryClient(); const search=ref(""); const stage=ref("");
-const tasks=useQuery({queryKey:["tasks"],queryFn:()=>api<TaskSummary[]>("/api/tasks"),refetchInterval:8000});
-const filtered=computed(()=>(tasks.data.value||[]).filter(t=>(!search.value||t.theme.toLowerCase().includes(search.value.toLowerCase())||t.task_id.includes(search.value))&&(!stage.value||t.stage===stage.value)));
-const remove=useMutation({mutationFn:(id:string)=>api(`/api/tasks/${id}`,{method:"DELETE"}),onSuccess:()=>queryClient.invalidateQueries({queryKey:["tasks"]})});
-function deleteTask(task:TaskSummary){if(confirm(`删除任务“${task.theme}”？该操作不可恢复。`))remove.mutate(task.task_id)}
+import { computed, ref } from "vue";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/vue-query";
+import { RouterLink } from "vue-router";
+import { api } from "@/api/http";
+import type { TaskSummary } from "@/api/types";
+import StatusBadge from "@/components/StatusBadge.vue";
+import AppIcon from "@/components/AppIcon.vue";
+
+type TaskView = "all" | "pending" | "active" | "paused" | "review" | "completed" | "failed";
+const queryClient = useQueryClient();
+const search = ref("");
+const view = ref<TaskView>("all");
+const dateRange = ref("all");
+const variant = ref("");
+const sortBy = ref("updated_desc");
+const selectedId = ref<string | null>(null);
+const tasks = useQuery({ queryKey: ["tasks"], queryFn: () => api<TaskSummary[]>("/api/tasks"), refetchInterval: 8_000 });
+const templates = useQuery({ queryKey: ["templates"], queryFn: () => api<any[]>("/api/style/variants") });
+const templateNames = computed(() => new Map((templates.data.value || []).map(item => [Number(item.id), item.name || item.label || `模板 ${item.id}`])));
+
+function inView(task: TaskSummary, target: TaskView) {
+  if (target === "all") return true;
+  if (target === "pending") return task.stage === "created";
+  if (target === "paused") return task.stage === "paused";
+  if (target === "review") return task.stage === "review";
+  if (target === "completed") return task.stage === "done";
+  if (target === "failed") return task.stage === "failed";
+  return !["created", "review", "done", "failed", "paused"].includes(task.stage);
+}
+function parseTimestamp(value?: string) {
+  if (!value) return 0;
+  const numeric = Number(value);
+  if (Number.isFinite(numeric) && String(value).trim() !== "") return numeric < 1e12 ? numeric * 1000 : numeric;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+function withinDate(task: TaskSummary) {
+  if (dateRange.value === "all") return true;
+  const value = parseTimestamp(task.updated_at || task.created_at);
+  return value > 0 && value >= Date.now() - Number(dateRange.value) * 86_400_000;
+}
+function timestamp(task: TaskSummary) {
+  return parseTimestamp(task.updated_at || task.created_at);
+}
+const viewItems = computed(() => [
+  { key: "all" as const, label: "全部", count: (tasks.data.value || []).length },
+  { key: "pending" as const, label: "待运行", count: (tasks.data.value || []).filter(item => inView(item, "pending")).length },
+  { key: "active" as const, label: "进行中", count: (tasks.data.value || []).filter(item => inView(item, "active")).length },
+  { key: "paused" as const, label: "已暂停", count: (tasks.data.value || []).filter(item => inView(item, "paused")).length },
+  { key: "review" as const, label: "待审核", count: (tasks.data.value || []).filter(item => inView(item, "review")).length },
+  { key: "completed" as const, label: "已完成", count: (tasks.data.value || []).filter(item => inView(item, "completed")).length },
+  { key: "failed" as const, label: "异常", count: (tasks.data.value || []).filter(item => inView(item, "failed")).length },
+]);
+const filtered = computed(() => {
+  const keyword = search.value.trim().toLowerCase();
+  return (tasks.data.value || [])
+    .filter(task => !keyword || `${task.theme} ${task.task_id} ${task.update_reason || ""}`.toLowerCase().includes(keyword))
+    .filter(task => inView(task, view.value)).filter(withinDate)
+    .filter(task => !variant.value || String(task.variant_id || "") === variant.value)
+    .sort((a, b) => {
+      if (sortBy.value === "created_desc") return parseTimestamp(b.created_at) - parseTimestamp(a.created_at);
+      if (sortBy.value === "name") return a.theme.localeCompare(b.theme, "zh-CN");
+      if (sortBy.value === "materials_desc") return (b.material_count || 0) - (a.material_count || 0);
+      return timestamp(b) - timestamp(a);
+    });
+});
+const selected = computed(() => (tasks.data.value || []).find(item => item.task_id === selectedId.value) || null);
+const hasFilters = computed(() => Boolean(search.value || dateRange.value !== "all" || variant.value || sortBy.value !== "updated_desc"));
+function resetFilters() { search.value = ""; dateRange.value = "all"; variant.value = ""; sortBy.value = "updated_desc"; }
+function formatDate(value?: string) { const timestamp = parseTimestamp(value); if (!timestamp) return "—"; return new Date(timestamp).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" }); }
+const remove = useMutation({ mutationFn: (id: string) => api(`/api/tasks/${id}`, { method: "DELETE" }), onSuccess: () => { selectedId.value = null; queryClient.invalidateQueries({ queryKey: ["tasks"] }); } });
+function deleteTask(task: TaskSummary) { if (confirm(`删除任务“${task.theme}”？该操作不可恢复。`)) remove.mutate(task.task_id); }
 </script>
-<template><div class="page-stack"><header class="page-header"><div><h1>任务</h1><p>任务是材料、分析、报告与版本记录的业务容器。</p></div><RouterLink class="btn primary" to="/?create=1">新建任务</RouterLink></header><section class="surface"><div class="filters"><input v-model="search" placeholder="搜索任务名称或 ID"/><select v-model="stage"><option value="">全部状态</option><option value="created">待运行</option><option value="writing">报告生成</option><option value="review">待审核</option><option value="done">已完成</option><option value="failed">异常</option></select></div><div v-if="tasks.isLoading.value" class="loading-line"></div><div v-if="filtered.length" class="data-list"><div v-for="task in filtered" :key="task.task_id" class="data-row task-line"><RouterLink :to="`/tasks/${task.task_id}`"><strong>{{ task.theme }}</strong><small class="mono">{{ task.task_id }}</small></RouterLink><span>{{ task.material_count || 0 }} 份材料</span><span>{{ task.updated_at || task.created_at || '—' }}</span><StatusBadge :stage="task.stage"/><div class="button-row"><RouterLink class="btn tertiary" :to="`/tasks/${task.task_id}`">打开</RouterLink><button class="btn tertiary danger" @click="deleteTask(task)">删除</button></div></div></div><div v-else-if="!tasks.isLoading.value" class="empty"><div><strong>没有匹配的任务</strong>调整筛选条件或新建任务。</div></div></section></div></template>
-<style scoped>.filters{display:grid;grid-template-columns:minmax(260px,1fr) 180px;gap:12px;padding:16px}.task-line{grid-template-columns:minmax(260px,1fr) 90px 150px auto auto}.task-line strong,.task-line small{display:block}.task-line small{font-size:11px;color:var(--color-faint);margin-top:2px}@media(max-width:900px){.task-line{grid-template-columns:1fr auto}.task-line>span:nth-of-type(-n+2){display:none}}@media(max-width:600px){.filters{grid-template-columns:1fr}}</style>
+
+<template>
+  <div class="page-stack tasks-page">
+    <header class="page-header"><div><h1>任务</h1><p>查找、跟进和管理报告任务。</p></div><RouterLink class="btn primary page-action" to="/?create=1"><AppIcon name="plus" :size="16" />新建任务</RouterLink></header>
+    <section class="surface task-browser" :class="{ 'has-detail': selected }">
+      <div class="browser-main">
+        <nav class="view-tabs" aria-label="任务视图"><button v-for="item in viewItems" :key="item.key" :class="{ active: view === item.key }" @click="view = item.key">{{ item.label }}<span>{{ item.count }}</span></button></nav>
+        <div class="filter-bar">
+          <label class="search-box"><AppIcon name="search" :size="16" /><input v-model="search" placeholder="搜索任务名称、ID 或更新说明" /></label>
+          <select v-model="dateRange"><option value="all">全部时间</option><option value="7">近 7 天</option><option value="30">近 30 天</option><option value="90">近 90 天</option></select>
+          <select v-model="variant"><option value="">全部模板</option><option v-for="item in templates.data.value || []" :key="item.id" :value="String(item.id)">{{ item.name || item.label || `模板 ${item.id}` }}</option></select>
+          <select v-model="sortBy"><option value="updated_desc">最近更新</option><option value="created_desc">最近创建</option><option value="materials_desc">材料最多</option><option value="name">按名称</option></select>
+          <button v-if="hasFilters" class="btn tertiary reset" @click="resetFilters">重置</button>
+        </div>
+        <div class="result-meta"><span>共 {{ filtered.length }} 个任务</span><span v-if="tasks.isFetching.value && !tasks.isLoading.value">正在更新…</span></div>
+        <div v-if="tasks.isLoading.value" class="loading-line"></div>
+        <div v-if="filtered.length" class="task-table">
+          <div class="table-head"><span>任务名称</span><span>状态</span><span>材料</span><span>模板</span><span>最近更新</span><span></span></div>
+          <div v-for="task in filtered" :key="task.task_id" class="task-row" :class="{ selected: selectedId === task.task_id }" @click="selectedId = task.task_id">
+            <div class="task-name"><strong>{{ task.theme }}</strong><small class="mono">{{ task.task_id }}</small></div><StatusBadge :stage="task.stage" /><span>{{ task.material_count || 0 }} 份</span><span class="truncate">{{ task.variant_id ? templateNames.get(Number(task.variant_id)) || `模板 ${task.variant_id}` : '默认模板' }}</span><time>{{ formatDate(task.updated_at || task.created_at) }}</time><RouterLink class="open-link" :to="`/tasks/${task.task_id}`" @click.stop>打开</RouterLink>
+          </div>
+        </div>
+        <div v-else-if="!tasks.isLoading.value" class="empty"><div><strong>没有匹配的任务</strong>调整筛选条件，或创建新的报告任务。</div></div>
+      </div>
+      <aside v-if="selected" class="task-detail">
+        <div class="detail-head"><small>任务摘要</small><button class="icon-button" aria-label="关闭详情" @click="selectedId = null"><AppIcon name="close" :size="17" /></button></div><h2>{{ selected.theme }}</h2><StatusBadge :stage="selected.stage" />
+        <dl><dt>任务 ID</dt><dd class="mono">{{ selected.task_id }}</dd><dt>材料数量</dt><dd>{{ selected.material_count || 0 }} 份</dd><dt>报告版本</dt><dd>第 {{ selected.run_revision || 1 }} 版</dd><dt>任务类型</dt><dd>{{ selected.incremental_update ? '增量更新' : '首次生成' }}</dd><dt>使用模板</dt><dd>{{ selected.variant_id ? templateNames.get(Number(selected.variant_id)) || `模板 ${selected.variant_id}` : '默认模板' }}</dd><dt>创建时间</dt><dd>{{ formatDate(selected.created_at) }}</dd><dt>最近更新</dt><dd>{{ formatDate(selected.updated_at || selected.created_at) }}</dd></dl>
+        <p v-if="selected.update_reason" class="update-reason"><b>更新说明</b>{{ selected.update_reason }}</p><div class="detail-actions"><RouterLink class="btn primary" :to="`/tasks/${selected.task_id}`">打开任务</RouterLink><button class="btn danger" @click="deleteTask(selected)">删除任务</button></div>
+      </aside>
+    </section>
+  </div>
+</template>
+
+<style scoped>
+.page-action{display:inline-flex;align-items:center;gap:7px}.task-browser{display:grid;grid-template-columns:minmax(0,1fr);min-height:620px;overflow:hidden}.task-browser.has-detail{grid-template-columns:minmax(680px,1fr) 320px}.browser-main{min-width:0}.view-tabs{display:flex;gap:4px;padding:14px 16px 0;border-bottom:1px solid var(--color-border)}.view-tabs button{display:flex;align-items:center;gap:7px;padding:8px 12px 11px;border:0;border-bottom:2px solid transparent;background:transparent;color:var(--color-muted)}.view-tabs button.active{color:var(--color-primary);border-bottom-color:var(--color-primary);font-weight:650}.view-tabs span{min-width:20px;padding:0 5px;border-radius:10px;background:var(--color-surface-soft);color:var(--color-faint);font-size:11px}.view-tabs button.active span{background:var(--color-primary-soft);color:var(--color-primary)}.filter-bar{display:grid;grid-template-columns:minmax(260px,1fr) 130px 150px 130px auto;gap:10px;padding:16px}.search-box{position:relative}.search-box :deep(svg){position:absolute;left:11px;top:50%;z-index:1;transform:translateY(-50%);color:var(--color-faint)}.search-box input{padding-left:35px}.reset{padding-inline:7px}.result-meta{display:flex;justify-content:space-between;min-height:30px;padding:0 16px;color:var(--color-faint);font-size:12px}.table-head,.task-row{display:grid;grid-template-columns:minmax(240px,1.5fr) 88px 64px minmax(100px,.7fr) 120px 42px;gap:12px;align-items:center}.table-head{padding:8px 16px;background:var(--color-surface-soft);border-block:1px solid var(--color-border);color:var(--color-faint);font-size:12px}.task-row{min-height:64px;padding:10px 16px;border-bottom:1px solid var(--color-border);cursor:pointer;transition:background var(--motion-fast)}.task-row:hover,.task-row.selected{background:#f4f7fb}.task-name strong,.task-name small{display:block}.task-name small{margin-top:2px;color:var(--color-faint);font-size:11px}.task-row>span,.task-row time{color:var(--color-muted);font-size:13px}.truncate{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.open-link{color:var(--color-primary);font-size:13px}.task-detail{padding:20px;border-left:1px solid var(--color-border);background:#fbfcfd}.detail-head{display:flex;align-items:center;justify-content:space-between;color:var(--color-faint)}.icon-button{display:grid;place-items:center;width:30px;height:30px;border:0;background:transparent;color:var(--color-muted);border-radius:4px}.icon-button:hover{background:var(--color-surface-soft)}.task-detail h2{margin:12px 0 10px}.task-detail dl{display:grid;grid-template-columns:76px minmax(0,1fr);gap:10px;margin:24px 0;padding-top:18px;border-top:1px solid var(--color-border)}.task-detail dt{color:var(--color-faint)}.task-detail dd{min-width:0;margin:0;word-break:break-all}.update-reason{display:grid;gap:5px;padding:12px;background:var(--color-surface-soft);color:var(--color-muted)}.update-reason b{color:var(--color-text)}.detail-actions{display:grid;grid-template-columns:1fr auto;gap:8px;margin-top:24px}.detail-actions .btn{text-align:center}@media(max-width:1180px){.task-browser.has-detail{grid-template-columns:1fr}.task-detail{position:fixed;inset:var(--header-height) 0 0 auto;z-index:22;width:min(380px,100%);box-shadow:var(--shadow-float);overflow:auto}}@media(max-width:900px){.filter-bar{grid-template-columns:1fr 1fr}.search-box{grid-column:1/-1}.table-head,.task-row{grid-template-columns:minmax(220px,1fr) 88px 84px 42px}.table-head>*:nth-child(3),.table-head>*:nth-child(4),.task-row>*:nth-child(3),.task-row>*:nth-child(4){display:none}}@media(max-width:600px){.filter-bar{grid-template-columns:1fr}.search-box{grid-column:auto}.view-tabs{overflow:auto}.view-tabs button{white-space:nowrap}.table-head,.task-row{grid-template-columns:minmax(0,1fr) auto 36px}.table-head>*:nth-child(5),.task-row>*:nth-child(5){display:none}}
+</style>

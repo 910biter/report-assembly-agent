@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from "vue";
+import { computed, ref, watch } from "vue";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/vue-query";
 import { useRoute, useRouter, RouterLink } from "vue-router";
 import { api } from "@/api/http";
 import type { MaterialSummary, TaskSummary } from "@/api/types";
 import StatusBadge from "@/components/StatusBadge.vue";
+import AppIcon from "@/components/AppIcon.vue";
 
 const route = useRoute(); const router = useRouter(); const queryClient = useQueryClient();
 const createOpen = ref(false); const form = ref<HTMLFormElement>(); const error = ref("");
@@ -15,7 +16,11 @@ const recent = computed(() => (tasks.data.value || []).slice(0, 6));
 const waiting = computed(() => (tasks.data.value || []).filter(t => t.stage === "review"));
 const finished = computed(() => (tasks.data.value || []).filter(t => t.stage === "done" || t.stage === "review"));
 watch(() => route.query.create, value => { if (value) createOpen.value = true; }, { immediate: true });
-onMounted(() => { if (!(tasks.data.value || []).length) createOpen.value = true; });
+watch(
+  [() => tasks.isSuccess.value, () => tasks.data.value?.length],
+  ([ready, count]) => { if (ready && count === 0) createOpen.value = true; },
+  { immediate: true },
+);
 
 function closeCreate() {
   createOpen.value = false;
@@ -36,9 +41,9 @@ const createTask = useMutation({
 </script>
 <template>
   <div class="page-stack dashboard">
-    <header class="page-header"><div><h1>工作台</h1><p>从材料进入分析，以可核验的证据完成报告。</p></div></header>
+    <header class="page-header"><div><h1>工作台</h1><p>从材料进入分析，以可核验的证据完成报告。</p></div><button class="btn primary header-create" type="button" @click="createOpen ? closeCreate() : createOpen = true"><AppIcon :name="createOpen ? 'close' : 'plus'" :size="16" />{{ createOpen ? '收起创建' : '新建任务' }}</button></header>
     <section v-if="createOpen" class="surface create-panel">
-      <div class="create-intro"><div class="intro-heading"><h2>新建报告任务</h2><button type="button" @click="closeCreate">收起</button></div><p>提供业务目标、材料和模板，系统将自动理解材料并规划报告。</p></div>
+      <div class="create-intro"><div class="intro-heading"><h2>新建报告任务</h2></div><p>提供业务目标、材料和模板，系统将自动理解材料并规划报告。</p></div>
       <form ref="form" class="create-form" @submit.prevent="createTask.mutate()">
         <label class="field field-wide"><span>报告主题</span><input name="theme" required placeholder="例如：可信执行环境远程证明机制研究综述" /></label>
         <label class="field field-wide"><span>报告要求</span><textarea name="requirements" rows="4" placeholder="描述用途、重点、篇幅或必须回答的问题。无需配置系统参数。"></textarea></label>
@@ -56,6 +61,6 @@ const createTask = useMutation({
   </div>
 </template>
 <style scoped>
-.create-panel { display: grid; grid-template-columns: 280px 1fr; overflow: hidden; }.create-intro { display:flex; flex-direction:column; justify-content:center; padding:28px; color:#fff; background:#294f79; }.intro-heading{display:flex;align-items:center;justify-content:space-between;gap:12px}.intro-heading button{padding:4px 0;border:0;background:transparent;color:#dbe7f4;font-size:12px}.intro-heading button:hover{color:#fff}.create-intro h2 { margin:0; font-size:20px; }.create-intro p { margin:10px 0 0;color:#dbe7f4;line-height:1.7; }.create-form { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; padding: 26px; }.field-wide,.submit-row { grid-column: 1/-1; }.submit-row { display:flex; align-items:center; justify-content:flex-end; gap:12px; }.dashboard-grid { display:grid; grid-template-columns:minmax(0,1.65fr) minmax(300px,.75fr); gap:24px; }.task-row { grid-template-columns:minmax(0,1fr) 90px auto; }.task-row strong,.task-row small { display:block; }.task-row small { color:var(--color-faint); margin-top:2px; }.side-stack { display:grid; align-content:start; gap:24px; }.compact-link { display:flex; justify-content:space-between; align-items:center; gap:12px; padding:12px 0; border-top:1px solid var(--color-border); }.compact-link span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }.compact-link b { color:var(--color-primary); font-size:12px; white-space:nowrap; }.quiet-empty { padding:28px 0 8px; color:var(--color-faint); text-align:center; }
+.header-create{display:inline-flex;align-items:center;gap:7px}.create-panel { display: grid; grid-template-columns: 280px 1fr; overflow: hidden; }.create-intro { display:flex; flex-direction:column; justify-content:center; padding:28px; color:#fff; background:#294f79; }.intro-heading{display:flex;align-items:center;justify-content:space-between;gap:12px}.intro-heading button{padding:4px 0;border:0;background:transparent;color:#dbe7f4;font-size:12px}.intro-heading button:hover{color:#fff}.create-intro h2 { margin:0; font-size:20px; }.create-intro p { margin:10px 0 0;color:#dbe7f4;line-height:1.7; }.create-form { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; padding: 26px; }.field-wide,.submit-row { grid-column: 1/-1; }.submit-row { display:flex; align-items:center; justify-content:flex-end; gap:12px; }.dashboard-grid { display:grid; grid-template-columns:minmax(0,1.65fr) minmax(300px,.75fr); gap:24px; }.task-row { grid-template-columns:minmax(0,1fr) 90px auto; }.task-row strong,.task-row small { display:block; }.task-row small { color:var(--color-faint); margin-top:2px; }.side-stack { display:grid; align-content:start; gap:24px; }.compact-link { display:flex; justify-content:space-between; align-items:center; gap:12px; padding:12px 0; border-top:1px solid var(--color-border); }.compact-link span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }.compact-link b { color:var(--color-primary); font-size:12px; white-space:nowrap; }.quiet-empty { padding:28px 0 8px; color:var(--color-faint); text-align:center; }
 @media(max-width:980px){.create-panel,.dashboard-grid{grid-template-columns:1fr}.create-form{grid-template-columns:1fr}.field,.field-wide,.submit-row{grid-column:1}}
 </style>

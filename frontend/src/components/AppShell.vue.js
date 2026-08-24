@@ -31,7 +31,6 @@ let __VLS_directives;
 /** @type {__VLS_StyleScopedClasses['nav-toggle']} */ ;
 /** @type {__VLS_StyleScopedClasses['nav-scrim']} */ ;
 /** @type {__VLS_StyleScopedClasses['topbar']} */ ;
-/** @type {__VLS_StyleScopedClasses['top-action']} */ ;
 /** @type {__VLS_StyleScopedClasses['content']} */ ;
 __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
     ...{ class: "app-shell" },
@@ -138,37 +137,6 @@ const __VLS_15 = __VLS_14({
 }, ...__VLS_functionalComponentArgsRest(__VLS_14));
 __VLS_asFunctionalElement1(__VLS_intrinsics.strong, __VLS_intrinsics.strong)({});
 (__VLS_ctx.route.meta.title);
-if (!__VLS_ctx.editor) {
-    let __VLS_18;
-    /** @ts-ignore @type { | typeof __VLS_components.RouterLink | typeof __VLS_components.RouterLink} */
-    RouterLink;
-    // @ts-ignore
-    const __VLS_19 = __VLS_asFunctionalComponent1(__VLS_18, new __VLS_18({
-        to: "/?create=1",
-        ...{ class: "btn primary top-action" },
-    }));
-    const __VLS_20 = __VLS_19({
-        to: "/?create=1",
-        ...{ class: "btn primary top-action" },
-    }, ...__VLS_functionalComponentArgsRest(__VLS_19));
-    /** @type {__VLS_StyleScopedClasses['btn']} */ ;
-    /** @type {__VLS_StyleScopedClasses['primary']} */ ;
-    /** @type {__VLS_StyleScopedClasses['top-action']} */ ;
-    const { default: __VLS_23 } = __VLS_21.slots;
-    const __VLS_24 = AppIcon;
-    // @ts-ignore
-    const __VLS_25 = __VLS_asFunctionalComponent1(__VLS_24, new __VLS_24({
-        name: "plus",
-        size: (16),
-    }));
-    const __VLS_26 = __VLS_25({
-        name: "plus",
-        size: (16),
-    }, ...__VLS_functionalComponentArgsRest(__VLS_25));
-    // @ts-ignore
-    [editor, route,];
-    var __VLS_21;
-}
 __VLS_asFunctionalElement1(__VLS_intrinsics.main, __VLS_intrinsics.main)({
     ...{ class: "content" },
     ...{ class: ({ wide: __VLS_ctx.route.meta.wide, editor: __VLS_ctx.editor }) },
@@ -176,7 +144,7 @@ __VLS_asFunctionalElement1(__VLS_intrinsics.main, __VLS_intrinsics.main)({
 /** @type {__VLS_StyleScopedClasses['content']} */ ;
 /** @type {__VLS_StyleScopedClasses['wide']} */ ;
 /** @type {__VLS_StyleScopedClasses['editor']} */ ;
-var __VLS_29 = {};
+var __VLS_18 = {};
 if (__VLS_ctx.ui.navOpen) {
     __VLS_asFunctionalElement1(__VLS_intrinsics.button, __VLS_intrinsics.button)({
         ...{ onClick: (...[$event]) => {
@@ -184,7 +152,7 @@ if (__VLS_ctx.ui.navOpen) {
                     throw 0;
                 return (__VLS_ctx.ui.closeNav());
                 // @ts-ignore
-                [editor, ui, ui, route,];
+                [editor, ui, ui, route, route,];
             } },
         ...{ class: "nav-scrim" },
         'aria-label': "关闭导航",
@@ -192,7 +160,7 @@ if (__VLS_ctx.ui.navOpen) {
     /** @type {__VLS_StyleScopedClasses['nav-scrim']} */ ;
 }
 // @ts-ignore
-var __VLS_30 = __VLS_29;
+var __VLS_19 = __VLS_18;
 // @ts-ignore
 [];
 const __VLS_base = (await import('vue')).defineComponent({});

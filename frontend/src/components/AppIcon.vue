@@ -9,6 +9,8 @@ defineProps<{ name: string; size?: number }>();
     <template v-else-if="name === 'template'"><rect x="4" y="3" width="16" height="18" rx="2"/><path d="M8 7h8M8 11h5M8 15h8"/></template>
     <template v-else-if="name === 'settings'"><circle cx="12" cy="12" r="3"/><path d="M19 13.5v-3l-2-.7-.7-1.7.9-1.9-2.1-2.1-1.9.9-1.7-.7-.7-2H8l-.7 2-1.7.7-1.9-.9-2.1 2.1.9 1.9-.7 1.7-2 .7v3l2 .7.7 1.7-.9 1.9 2.1 2.1 1.9-.9 1.7.7.7 2h3l.7-2 1.7-.7 1.9.9 2.1-2.1-.9-1.9.7-1.7 2-.7Z" transform="scale(.8) translate(3 3)"/></template>
     <template v-else-if="name === 'plus'"><path d="M12 5v14M5 12h14"/></template>
+    <template v-else-if="name === 'close'"><path d="m6 6 12 12M18 6 6 18"/></template>
+    <template v-else-if="name === 'search'"><circle cx="11" cy="11" r="6"/><path d="m16 16 4 4"/></template>
     <template v-else-if="name === 'menu'"><path d="M4 7h16M4 12h16M4 17h16"/></template>
     <template v-else><circle cx="12" cy="12" r="9"/><path d="M12 8v4l3 2"/></template>
   </svg>

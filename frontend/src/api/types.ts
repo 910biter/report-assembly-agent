@@ -8,6 +8,7 @@ export interface TaskSummary {
   updated_at?: string;
   report_id?: number;
   material_count?: number;
+  variant_id?: number;
   progress?: Record<string, any>;
   queue_status?: Record<string, any>;
   run_revision?: number;
@@ -22,6 +23,8 @@ export interface MaterialSummary {
   unit_count: number;
   is_duplicate?: boolean;
   duplicate_of?: number;
+  parsed_at?: string;
+  parse_status?: "ready" | "pending" | "error" | string;
   tasks?: Array<{ task_id: string; theme?: string } | string>;
   [key: string]: any;
 }
