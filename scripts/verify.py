@@ -124,6 +124,15 @@ class FakeGateway:
             ]}
         if "知识抽取员" in system:
             return {"entities": [], "events": [], "relations": []}
+        if "证据约束的关系抽取员" in system:
+            return {
+                "entities": [{"name": "监管机构", "type": "机构", "fact_ids": [1]}],
+                "assertions": [{
+                    "subject": "监管机构", "predicate": "发布", "object": "行业监管政策文件",
+                    "object_kind": "value", "event_name": "", "valid_from": "2026年",
+                    "valid_to": "", "fact_ids": [1], "confidence": "high",
+                }],
+            }
         if "质量检查员" in system:
             return {"issues": []}
         if "报告修订员" in system:
@@ -447,6 +456,13 @@ check("Task Cache:阶段 Artifact 写入",
       {"parse", "material_analysis", "plan", "evidence", "analysis", "write"} <= artifact_stages)
 check("Task Cache:章节草稿 Artifact 写入",
       any(stage.startswith("chapter_draft:") for stage in artifact_stages))
+with session_scope() as s:
+    from app.infrastructure.orm import ORMKGAssertion, ORMKGAssertionFact
+    graph_assertions = s.execute(select(ORMKGAssertion)).mappings().all()
+    graph_fact_links = s.execute(select(ORMKGAssertionFact)).mappings().all()
+check("任务图谱:关系只从 Fact 构建且保留依据",
+      len(graph_assertions) >= 1 and graph_assertions[0]["status"] == "validated"
+      and len(graph_fact_links) >= 1 and int(graph_fact_links[0]["fact_id"]) == 1)
 check("Material Cache:解析版本记录",
       material_row is not None and material_row["parser_version"] == "verify-mock")
 
@@ -480,6 +496,10 @@ check("材料库 API 绑定所属任务", r.status_code == 200 and any(item.get(
 r = client.get("/api/tasks/r3d/analysis")
 check("analysis API:事实/推断",
       r.status_code == 200 and len(r.json()["facts"]) == 1 and len(r.json()["inferences"]) >= 1)
+r = client.get("/api/tasks/r3d/graph")
+check("任务图谱 API:只返回任务关系和事实绑定",
+      r.status_code == 200 and r.json().get("stats", {}).get("assertion_count", 0) >= 1
+      and r.json().get("edges", [{}])[0].get("fact_ids") == [1])
 r = client.get(f"/api/reports/{task['report_id']}")
 data = r.json()
 check("报告详情 API 返回所属任务", data.get("task_id") == "r3d" and data.get("status") == "draft")
@@ -519,6 +539,15 @@ r = client.post(f"/api/reports/{task['report_id']}/finalize")
 check("审核完成:报告 final 且任务 done",
       r.status_code == 200
       and short_term.load_task("r3d").get("stage") == "done")
+with session_scope() as s:
+    from app.infrastructure.orm import ORMKGChangeSet
+    graph_final = s.execute(select(ORMKGAssertion.c.status)).scalar()
+    graph_changes = s.execute(select(ORMKGChangeSet).where(ORMKGChangeSet.c.task_id == "r3d")).mappings().all()
+check("长期图谱:仅审核后确认并绑定变更记录",
+      graph_final == "confirmed" and any(
+          item["change_type"] == "PUBLISH_TASK_GRAPH" and item["report_version_id"] is not None
+          for item in graph_changes
+      ))
 r = client.patch(f"/api/style/variants/{va.id}", json={"name": "政策研究报告(改名)"})
 check("变体改名 PATCH", r.status_code == 200 and style.get_variant(va.id).name == "政策研究报告(改名)")
 check("页面 / 含模板下拉", "使用默认模板" in client.get("/").text)

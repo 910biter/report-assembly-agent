@@ -558,6 +558,27 @@ def task_analysis(task_id: str):
     return {"facts": facts, "inferences": inferences, "conflicts": conflicts}
 
 
+@router.get("/tasks/{task_id}/graph")
+def task_graph(task_id: str):
+    """Evidence-grounded task graph for the Analysis workspace.
+
+    The API intentionally exposes only this task's graph projection. Every
+    edge carries Fact IDs, so the UI can return to the ordinary evidence panel.
+    """
+    if short_term.load_task(task_id) is None:
+        return JSONResponse({"error": "TASK_NOT_FOUND"}, status_code=404)
+    from app.graph import graph_service
+    return graph_service.task_graph(task_id)
+
+
+@router.get("/tasks/{task_id}/graph/changesets")
+def task_graph_changesets(task_id: str):
+    if short_term.load_task(task_id) is None:
+        return JSONResponse({"error": "TASK_NOT_FOUND"}, status_code=404)
+    from app.graph import graph_service
+    return {"changesets": graph_service.changesets(task_id)}
+
+
 @router.get("/tasks/{task_id}/workload-profile")
 def task_workload_profile(task_id: str):
     """任务级工作负载画像:阶段Token分布、上下文长度、Prefill/Decode与算力需求。"""
@@ -1108,6 +1129,7 @@ def health():
 
     try:
         status = invoke("health", model_gateway.health)
+        from app.graph import graph_service
         return {
             "version": status.get("version"),
             "models": status.get("models", {}),
@@ -1116,6 +1138,10 @@ def health():
             "queues": {
                 "tasks": task_queue_status(),
                 "llm": llm_queue_stats(),
+            },
+            "graph": {
+                "mode": graph_service.mode,
+                "neo4j_configured": graph_service.projector.available(),
             },
         }
     except Exception as exc:

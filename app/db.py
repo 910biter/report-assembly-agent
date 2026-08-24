@@ -91,6 +91,25 @@ def _migrate_integrity() -> None:
             "CREATE UNIQUE INDEX IF NOT EXISTS uq_task_runs_task_revision "
             "ON task_runs(task_id, revision)"
         ))
+        # Graph read/write paths are task and assertion centric. Keep these
+        # indexes here because the schema parser intentionally only creates
+        # tables; PostgreSQL owns operational index creation.
+        conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS idx_kg_assertions_workspace_status "
+            "ON kg_assertions(workspace_id, status)"
+        ))
+        conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS idx_kg_membership_task_assertion "
+            "ON kg_task_membership(task_id, assertion_id)"
+        ))
+        conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS idx_kg_assertion_facts_fact "
+            "ON kg_assertion_facts(fact_id, assertion_id)"
+        ))
+        conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS idx_graph_outbox_status "
+            "ON graph_outbox(status, id)"
+        ))
 
 
 def init_db() -> None:

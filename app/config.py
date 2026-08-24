@@ -72,6 +72,17 @@ class Settings(BaseSettings):
     qdrant_collection_materials: str = "ira_materials"
     qdrant_collection_facts: str = "ira_facts"
 
+    # PostgreSQL stores the auditable canonical graph. Neo4j is an optional,
+    # rebuildable query projection and must never become a second fact source.
+    graph_mode: str = "off"  # off / shadow / active
+    graph_workspace_id: str = "default"
+    graph_build_before_analysis: bool = True
+    graph_max_hops: int = 2
+    neo4j_uri: str = ""  # e.g. bolt://127.0.0.1:7687
+    neo4j_user: str = "neo4j"
+    neo4j_password: str = ""
+    neo4j_database: str = "neo4j"
+
     @property
     def materials_dir(self) -> Path:
         return self.runtime_root / "materials"

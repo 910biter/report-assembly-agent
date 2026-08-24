@@ -468,6 +468,92 @@ CREATE TABLE IF NOT EXISTS relations (
     task_id TEXT NOT NULL DEFAULT ''
 );
 
+-- Canonical graph records. Neo4j is a rebuildable projection of these rows,
+-- never a second source of truth for facts or provenance.
+CREATE TABLE IF NOT EXISTS kg_entities (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    entity_key TEXT NOT NULL UNIQUE,
+    workspace_id TEXT NOT NULL DEFAULT 'default',
+    canonical_name TEXT NOT NULL,
+    entity_type TEXT NOT NULL DEFAULT 'other',
+    aliases_json TEXT NOT NULL DEFAULT '[]',
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+    updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+);
+
+CREATE TABLE IF NOT EXISTS kg_entity_aliases (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    entity_id INTEGER NOT NULL REFERENCES kg_entities(id),
+    alias TEXT NOT NULL,
+    normalized_alias TEXT NOT NULL,
+    source_task_id TEXT NOT NULL DEFAULT '',
+    confidence REAL NOT NULL DEFAULT 1.0,
+    status TEXT NOT NULL DEFAULT 'confirmed',
+    UNIQUE(entity_id, normalized_alias)
+);
+
+CREATE TABLE IF NOT EXISTS kg_assertions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    assertion_key TEXT NOT NULL UNIQUE,
+    workspace_id TEXT NOT NULL DEFAULT 'default',
+    task_id TEXT NOT NULL DEFAULT '',
+    subject_entity_id INTEGER NOT NULL REFERENCES kg_entities(id),
+    predicate TEXT NOT NULL,
+    object_entity_id INTEGER REFERENCES kg_entities(id),
+    object_value TEXT NOT NULL DEFAULT '',
+    object_kind TEXT NOT NULL DEFAULT 'entity',
+    event_name TEXT NOT NULL DEFAULT '',
+    valid_from TEXT NOT NULL DEFAULT '',
+    valid_to TEXT NOT NULL DEFAULT '',
+    confidence TEXT NOT NULL DEFAULT 'medium',
+    status TEXT NOT NULL DEFAULT 'candidate',
+    extraction_method TEXT NOT NULL DEFAULT 'llm',
+    created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+    updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+);
+
+CREATE TABLE IF NOT EXISTS kg_assertion_facts (
+    assertion_id INTEGER NOT NULL REFERENCES kg_assertions(id),
+    fact_id INTEGER NOT NULL REFERENCES facts(id),
+    PRIMARY KEY (assertion_id, fact_id)
+);
+
+CREATE TABLE IF NOT EXISTS kg_task_membership (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL,
+    entity_id INTEGER REFERENCES kg_entities(id),
+    assertion_id INTEGER REFERENCES kg_assertions(id),
+    role TEXT NOT NULL DEFAULT 'observed',
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+    UNIQUE(task_id, entity_id, assertion_id, role)
+);
+
+CREATE TABLE IF NOT EXISTS kg_changesets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    changeset_key TEXT NOT NULL UNIQUE,
+    workspace_id TEXT NOT NULL DEFAULT 'default',
+    task_id TEXT NOT NULL,
+    report_version_id INTEGER,
+    change_type TEXT NOT NULL,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'pending_review',
+    created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+);
+
+CREATE TABLE IF NOT EXISTS graph_outbox (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_key TEXT NOT NULL UNIQUE,
+    event_type TEXT NOT NULL,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+    projected_at TEXT
+);
+
 CREATE TABLE IF NOT EXISTS inference_fact (
     inference_id INTEGER NOT NULL REFERENCES inferences(id),
     fact_id INTEGER NOT NULL REFERENCES facts(id),
@@ -700,6 +786,13 @@ ORMShortMemory = Base.metadata.tables["short_memory"]
 ORMLLMCall = Base.metadata.tables["llm_call_logs"]
 ORMInsight = Base.metadata.tables["material_insights"]
 ORMMaterialScan = Base.metadata.tables["material_scan"]
+ORMKGEntity = Base.metadata.tables["kg_entities"]
+ORMKGEntityAlias = Base.metadata.tables["kg_entity_aliases"]
+ORMKGAssertion = Base.metadata.tables["kg_assertions"]
+ORMKGAssertionFact = Base.metadata.tables["kg_assertion_facts"]
+ORMKGTaskMembership = Base.metadata.tables["kg_task_membership"]
+ORMKGChangeSet = Base.metadata.tables["kg_changesets"]
+ORMGraphOutbox = Base.metadata.tables["graph_outbox"]
 # 关联表(复合主键;writer 血缘等访问)
 ORMSentenceFact = Base.metadata.tables["report_sentence_fact"]
 ORMSentenceInference = Base.metadata.tables["report_sentence_inference"]

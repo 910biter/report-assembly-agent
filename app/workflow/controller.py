@@ -34,7 +34,6 @@ from app.infrastructure.orm import (
     ORMTaskArtifact,
     ORMUnit,
 )
-from app.knowledge import KnowledgeAgent
 from app.llm_queue import PRIORITY_BACKGROUND, llm_priority
 from app.memory import short_term
 from app.models import Stage, Unit
@@ -72,7 +71,6 @@ planner = PlannerAgent()
 evidence_agent = EvidenceAgent()
 analysis_agent = AnalysisAgent()
 writer_agent = WriterAgent()
-knowledge_agent = KnowledgeAgent()
 
 
 def _analysis_groups(facts: list[dict], max_group_size: int = 45) -> dict[str, list[dict]]:
@@ -226,6 +224,14 @@ class WorkflowController:
             "fact_count": len(facts),
         })
         _mark("evidence")
+        # Build the task graph from validated Facts before Analysis. A graph
+        # failure is recorded and degrades to ordinary Hybrid RAG; it never
+        # blocks the report path or weakens evidence requirements.
+        if settings.graph_build_before_analysis:
+            with self._token_context("graph_build"):
+                self._build_task_graph(facts)
+        self._record_artifact("graph", {"graph_status": self.task.get("graph_status", {})})
+        _mark("graph")
         if self.task.get("conflict_ids"):
             self._update(stage=str(Stage.CONFLICT), resume={"stage": "conflict", "status": "reused"})
         else:
@@ -904,14 +910,35 @@ class WorkflowController:
             ledger = build_ledger(self.task_id, needs, fact_rows)
             persist_ledger(self.task_id, ledger)
             self._update(intelligence_ledger=ledger)
-            # Intelligence Graph:事实约束的关系图谱(供检索/分析交叉印证)
-            try:
-                from app.intelligence.graph import seed_graph_from_ledger
-                seed_graph_from_ledger(self.task_id)
-            except Exception:
-                pass
         except Exception:
             pass  # 整编失败不阻塞主流程(evidence 本身已落库)
+
+    def _build_task_graph(self, facts: list[dict]) -> None:
+        """Create an evidence-grounded task graph and publish an outbox event."""
+        try:
+            from app.graph import graph_service
+
+            graph_facts = facts
+            if self.task.get("incremental_update"):
+                # Incremental runs only construct graph deltas for newly
+                # extracted facts. Inherited facts already have their task
+                # memberships and must not incur another extraction pass.
+                new_ids = {int(value) for value in self.task.get("incremental_new_fact_ids") or [] if str(value).isdigit()}
+                graph_facts = [fact for fact in facts if int(fact.get("id") or 0) in new_ids]
+                if not graph_facts:
+                    if graph_service.has_task_graph(self.task_id):
+                        self._update(graph_status={"status": "reused", "entity_count": 0, "assertion_count": 0})
+                        return
+                    graph_facts = facts  # one-time backfill for pre-graph tasks
+            result = graph_service.build_task_graph(
+                self.task_id,
+                graph_facts,
+                workspace_id=str(self.task.get("workspace_id") or ""),
+                active_fact_ids={int(fact.get("id") or 0) for fact in facts if fact.get("id") is not None},
+            )
+            self._update(graph_status=result.as_dict())
+        except Exception as exc:
+            self._update(graph_status={"status": "degraded", "error": str(exc)[:300]})
 
 
     def detect_conflicts(self) -> None:
@@ -968,20 +995,19 @@ class WorkflowController:
                 f"- 事实聚簇:{clusters or '无'}\n"
                 f"- 事实关系:{relations or '无'}\n"
             )
-            try:
-                from app.intelligence.graph import IntelligenceGraph, graph_block
-                _graph = IntelligenceGraph(self.task_id).build()
-                graph_hint = graph_block(_graph, str((self._plan() or {}).get("core_question") or ""))
-                if graph_hint:
-                    ledger_block += graph_hint
-            except Exception:
-                pass
         # Map:仅在 Analysis 阶段补充通用元数据,避免影响后续 Planner/Writer。
         analysis_facts = self._facts_for_analysis(facts)
         groups = _analysis_groups(analysis_facts)
         local_inferences: list = []
         for dimension, group_facts in groups.items():
             context_block = self.cm.for_analysis(group_facts, conflicts, timeline_block, memory_block) if self.cm else ""
+            try:
+                from app.graph import graph_service
+                graph_block = graph_service.context_for_analysis(self.task_id, group_facts)
+                if graph_block:
+                    context_block = f"{graph_block}\n\n{context_block}"
+            except Exception:
+                pass
             if ledger_block:
                 context_block = f"{ledger_block}\n{context_block}"
             local_inferences.extend(analysis_agent.analyze_local(dimension, group_facts, context_block))
@@ -1143,15 +1169,7 @@ class WorkflowController:
         return [{"id": row["id"], "fact_key": row["fact_key"], "entries": row["entries"]} for row in rows]
 
     def _knowledge_block(self) -> str:
-        """历史知识参考:已沉淀实体/事件(供推断参考,轻量)。"""
-        from app.knowledge import load_entity_names
-
-        try:
-            names = load_entity_names(self.task_id)
-            if names:
-                return "历史实体: " + "、".join(names[:20])
-        except Exception:
-            pass
+        """Graph RAG is injected per analysis group; no stale global block."""
         return ""
 
     def _prepare_incremental_write_scope(self) -> list[str] | None:
@@ -1407,19 +1425,8 @@ class WorkflowController:
         return rules
 
     def _timeline_block(self) -> str:
-        """轻量事件时间线:从已沉淀事件(含时间)按时间排序生成,供 Writer 引用。"""
-        from app.knowledge import load_events
-
-        try:
-            events = load_events(self.task_id)
-        except Exception:
-            events = []
-        dated = [e for e in events if e.get("time")]
-        if not dated:
-            return ""
-        dated.sort(key=lambda e: str(e.get("time", "")))
-        lines = [f"- {e.get('time', '')}: {e.get('name', '')}" for e in dated[:15]]
-        return "\n".join(lines)
+        """Timeline context is supplied by evidence-grounded Graph RAG when active."""
+        return ""
 
     def _run_quality_check(self, variant, plan: dict, report_id: int) -> None:
         """报告质量检查:重复/模板缺失/术语违规/机构规则/逻辑跳跃 → qa_notes 供人工审核。"""
@@ -1672,27 +1679,19 @@ class WorkflowController:
                 )
 
     def _sink_knowledge(self, facts: list[dict]) -> None:
-        """知识沉淀:实体直接复用材料理解结果(零 LLM),事件/关系轻量抽取。
+        """Publish reviewed task assertions into the workspace graph.
 
-        材料理解阶段已稳定识别 entities/times,Knowledge 阶段只补充
-        材料理解无法可靠完成的事件与关系(输入仅 facts+inferences,不重复整体理解)。
+        The graph was already built from Facts before Analysis. Post-review
+        work only promotes its validated assertions; it must not perform a
+        second unbounded material extraction that can diverge from Evidence.
         """
-        from app.knowledge import save_entity
+        from app.graph import graph_service
 
-        entity_count = 0
-        for insight in self.task.get("material_insights", []):
-            for name in insight.get("entities", []) or []:
-                try:
-                    save_entity(str(name), "", task_id=self.task_id)
-                    entity_count += 1
-                except Exception:
-                    continue
-        inferences = self._inferences()
-        texts = [f["content"] for f in facts] + [i["content"] for i in inferences]
-        knowledge_agent.task_id = self.task_id
-        stats = knowledge_agent.extract(texts)
-        stats["entities_from_insights"] = entity_count
-        self._update(knowledge_stats=stats)
+        # Review has not yet been accepted by a human. Keep assertions
+        # validated and projectable for this task, but do not publish them into
+        # the workspace's confirmed long-term graph until finalize().
+        projected = graph_service.project_pending()
+        self._update(knowledge_stats={"validated_task_graph": True, "projected_events": projected})
 
     def _start_background_post_review(self, facts: list[dict]) -> None:
         """Run non-critical post-review jobs without delaying TTFR."""
@@ -1728,7 +1727,7 @@ class WorkflowController:
         threading.Thread(target=_run, daemon=True).start()
 
     def finalize(self) -> None:
-        """收尾:报告置为 final,阶段完成(知识已在 _sink_knowledge 沉淀;增量更新预留点)。"""
+        """审核完成后发布确认断言并生成最终报告版本。"""
         report_id = self.task.get("report_id")
         version_info = {}
         if report_id is not None:
@@ -1744,6 +1743,14 @@ class WorkflowController:
                     attach_delta_version(int(self.task["incremental_delta_id"]), version.version_id, status="applied")
                 except Exception:
                     pass
+            try:
+                from app.graph import graph_service
+                published = graph_service.promote_task_graph(self.task_id, version.version_id)
+                projected = graph_service.project_pending()
+                version_info["published_graph_assertions"] = published
+                version_info["projected_graph_events"] = projected
+            except Exception as exc:
+                version_info["graph_publish_error"] = str(exc)[:200]
         self._update(stage=str(Stage.DONE), report_version=version_info)
 
     # ---------- 辅助 ----------

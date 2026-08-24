@@ -24,3 +24,6 @@ numpy
 
 # 数据库
 psycopg[binary]
+
+# Graph query projection (PostgreSQL remains the audit source of truth)
+neo4j>=6.0

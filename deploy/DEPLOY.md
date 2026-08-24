@@ -109,6 +109,29 @@ IRA_GPU_MEMORY_TIGHT=true
 IRA_GPU_LAYERS=999
 ```
 
+### 知识图谱 Neo4j
+
+Neo4j 只保存 PostgreSQL 中已验证关系的可重建投影，不保存材料正文或替代事实库。
+
+```bash
+cd <agent-server>
+cp deploy/neo4j.env.example .neo4j.env
+# 编辑 .neo4j.env，设置强密码；不要提交该文件
+set -a; . ./.neo4j.env; set +a
+NEO4J_PASSWORD="$NEO4J_PASSWORD" docker compose \
+  --env-file .neo4j.env -f deploy/neo4j-compose.yml up -d
+
+cat >> .env <<'EOF'
+IRA_NEO4J_URI=bolt://127.0.0.1:7687
+IRA_NEO4J_USER=neo4j
+IRA_NEO4J_PASSWORD=<same-password>
+IRA_NEO4J_DATABASE=neo4j
+IRA_GRAPH_MODE=shadow
+EOF
+```
+
+先以 `shadow` 跑真实任务，检查 `/api/tasks/<task_id>/graph` 的实体、关系和 Fact 绑定；确认质量后改为 `IRA_GRAPH_MODE=active`。Neo4j 不可用时，系统自动退回 Hybrid RAG，报告生成不受阻塞。
+
 ## 八、启动应用
 
 ```bash
