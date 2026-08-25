@@ -103,6 +103,7 @@ let __VLS_directives;
 /** @type {__VLS_StyleScopedClasses['review-target']} */ ;
 /** @type {__VLS_StyleScopedClasses['review-target']} */ ;
 /** @type {__VLS_StyleScopedClasses['pager']} */ ;
+/** @type {__VLS_StyleScopedClasses['collaboration-shell']} */ ;
 /** @type {__VLS_StyleScopedClasses['collaboration-grid']} */ ;
 /** @type {__VLS_StyleScopedClasses['artifact-review']} */ ;
 __VLS_asFunctionalElement1(__VLS_intrinsics.section, __VLS_intrinsics.section)({
@@ -293,6 +294,7 @@ if (__VLS_ctx.selected) {
     // @ts-ignore
     const __VLS_1 = __VLS_asFunctionalComponent1(__VLS_0, new __VLS_0({
         ...{ 'onApplied': {} },
+        compact: true,
         taskId: (__VLS_ctx.taskId),
         reportId: (__VLS_ctx.reportId),
         artifactType: (__VLS_ctx.selected.artifact_type),
@@ -302,6 +304,7 @@ if (__VLS_ctx.selected) {
     }));
     const __VLS_2 = __VLS_1({
         ...{ 'onApplied': {} },
+        compact: true,
         taskId: (__VLS_ctx.taskId),
         reportId: (__VLS_ctx.reportId),
         artifactType: (__VLS_ctx.selected.artifact_type),

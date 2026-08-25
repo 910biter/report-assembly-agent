@@ -3,10 +3,39 @@ import unittest
 from unittest.mock import patch
 
 from app import llm_scheduler
-from app.interaction import _build_interaction_prompt, _estimate_tokens, _merge_draft_change, _thread_summary
+from app.interaction import (
+    _build_interaction_prompt,
+    _estimate_tokens,
+    _is_explicit_change_request,
+    _is_progress_question,
+    _merge_draft_change,
+    _normalize_proposal,
+    _thread_summary,
+)
 
 
 class InteractionRuntimeTests(unittest.TestCase):
+    def test_status_question_cannot_become_change_request(self):
+        self.assertTrue(_is_progress_question("你现在进行到哪一步了？"))
+        self.assertFalse(_is_explicit_change_request("你现在进行到哪一步了？"))
+
+    def test_explicit_edit_is_recognized(self):
+        self.assertTrue(_is_explicit_change_request("请把报告要求调整得更精炼一些"))
+        self.assertFalse(_is_explicit_change_request("你认为报告要求应该怎么调整？"))
+
+    def test_proposal_is_limited_to_current_artifact_schema(self):
+        thread = {"artifact_type": "task_brief"}
+        current = {"theme": "原主题", "requirements": "原要求", "stage": "analysis"}
+        proposal = _normalize_proposal(
+            thread, current, "请调整报告要求",
+            {"after": {"requirements": "新要求", "content": "不应混入的报告正文", "stage": "done"}},
+        )
+        self.assertEqual(proposal["after"], {"requirements": "新要求"})
+        self.assertIsNone(_normalize_proposal(
+            thread, current, "现在进行到哪一步了？",
+            {"after": {"requirements": "无意义提案"}},
+        ))
+
     def test_draft_change_normalizes_requirements_and_content(self):
         current = {"theme": "原主题", "requirements": "原要求"}
         self.assertEqual(

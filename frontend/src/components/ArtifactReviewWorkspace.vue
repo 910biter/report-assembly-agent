@@ -173,6 +173,7 @@ function pretty(value: any) {
             <b>{{ selected.title }}</b>
           </div>
           <ReviewCopilot
+            compact
             :task-id="taskId"
             :report-id="reportId"
             :artifact-type="selected.artifact_type"
@@ -196,6 +197,11 @@ function pretty(value: any) {
 
 <style scoped>
 .collaboration-shell {
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  height: min(780px, calc(100vh - 190px));
+  min-height: 600px;
+  overflow: hidden;
   background: #fff;
   border: 1px solid var(--color-border);
 }
@@ -256,7 +262,8 @@ function pretty(value: any) {
 .collaboration-grid {
   display: grid;
   grid-template-columns: 180px minmax(280px, 380px) minmax(420px, 1fr);
-  min-height: 640px;
+  min-height: 0;
+  overflow: hidden;
 }
 .artifact-groups,
 .artifact-browser {
@@ -264,6 +271,7 @@ function pretty(value: any) {
 }
 .artifact-groups {
   padding: 12px;
+  overflow: auto;
 }
 .artifact-groups button {
   display: flex;
@@ -291,6 +299,7 @@ function pretty(value: any) {
 .artifact-browser {
   display: grid;
   grid-template-rows: auto 1fr auto;
+  min-height: 0;
   min-width: 0;
 }
 .browser-tools {
@@ -355,9 +364,12 @@ function pretty(value: any) {
 .inline-detail dt { color: var(--color-faint); }
 .inline-detail dd { color: var(--color-text); }
 .artifact-review {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
   min-width: 0;
+  min-height: 0;
   padding: 20px;
-  overflow: auto;
+  overflow: hidden;
 }
 .review-target {
   margin-bottom: 14px;
@@ -383,11 +395,15 @@ function pretty(value: any) {
   font-size: 12px;
 }
 @media (max-width: 1100px) {
+  .collaboration-shell { height: auto; max-height: none; overflow: visible; }
   .collaboration-grid {
     grid-template-columns: 160px 1fr;
+    min-height: 640px;
+    overflow: visible;
   }
   .artifact-review {
     grid-column: 1/-1;
+    height: 560px;
     border-top: 1px solid var(--color-border);
   }
 }

@@ -13,17 +13,30 @@ const conversationStream = ref(null);
 const expandedProposalIds = ref(new Set());
 const agentPending = computed(() => Boolean(thread.value?.pending));
 const proposals = computed(() => thread.value?.proposals || []);
-const conversationItems = computed(() => [
-    ...(thread.value?.messages || []).map((item) => ({ ...item, itemType: "message" })),
-    ...proposals.value.map((item) => ({ ...item, itemType: "proposal" })),
-].sort((left, right) => {
-    const byTime = String(left.created_at || "").localeCompare(String(right.created_at || ""));
-    if (byTime)
-        return byTime;
-    if (left.itemType !== right.itemType)
-        return left.itemType === "message" ? -1 : 1;
-    return Number(left.id || 0) - Number(right.id || 0);
-}));
+const conversationItems = computed(() => {
+    const messages = (thread.value?.messages || []).map((item) => ({ ...item, itemType: "message" }));
+    const linked = new Map();
+    const unlinked = [];
+    for (const proposal of proposals.value) {
+        let sourceId = Number(proposal?.impact?.source_message_id || 0);
+        if (!sourceId) {
+            const prior = [...messages].reverse().find((item) => item.role === "assistant" && String(item.created_at || "") <= String(proposal.created_at || ""));
+            sourceId = Number(prior?.id || 0);
+        }
+        if (!sourceId)
+            unlinked.push({ ...proposal, itemType: "proposal" });
+        else
+            linked.set(sourceId, [...(linked.get(sourceId) || []), { ...proposal, itemType: "proposal" }]);
+    }
+    const result = [];
+    for (const item of messages) {
+        result.push(item, ...(linked.get(Number(item.id)) || []).sort((a, b) => Number(a.id) - Number(b.id)));
+    }
+    return [...result, ...unlinked.sort((a, b) => {
+            const byTime = String(a.created_at || "").localeCompare(String(b.created_at || ""));
+            return byTime || Number(a.id || 0) - Number(b.id || 0);
+        })];
+});
 const readOnly = computed(() => thread.value?.status === "closed");
 const scopeKey = computed(() => `${props.taskId || "draft"}:${props.reportId || ""}:${props.artifactType}:${props.artifactVersion || ""}:${props.objectId || "root"}`);
 const artifactLabels = {
@@ -126,7 +139,7 @@ function executionLabel(proposal) {
         completed: "候选版本已生成", failed: "后台处理失败" }[proposal.execution_status] || "已记录";
 }
 function proposalExpanded(proposal) {
-    return !props.compact || expandedProposalIds.value.has(Number(proposal.id));
+    return expandedProposalIds.value.has(Number(proposal.id));
 }
 function toggleProposal(proposal) {
     const next = new Set(expandedProposalIds.value);
@@ -148,17 +161,27 @@ function formatTime(value) {
     }
     return date.toLocaleDateString("zh-CN", { month: "2-digit", day: "2-digit" });
 }
-function proposalText(value, fallback) {
-    if (!value || typeof value !== "object")
+function diffValue(value, fallback) {
+    if (value == null || value === "")
         return fallback;
-    for (const key of ["requirements", "content", "title", "text", "value"]) {
-        if (String(value[key] ?? "").trim())
-            return String(value[key]).trim();
-    }
-    const readable = Object.entries(value)
-        .filter(([, item]) => ["string", "number", "boolean"].includes(typeof item) && String(item).trim())
-        .map(([key, item]) => `${key}：${String(item)}`);
-    return readable.length ? readable.join("\n") : fallback;
+    if (typeof value === "object")
+        return JSON.stringify(value, null, 2);
+    return String(value);
+}
+const fieldLabels = {
+    theme: "报告主题", requirements: "报告要求", content: "内容", title: "标题",
+    material_role: "材料角色", claim_support: "事实边界", allowed_usage: "允许用途",
+    forbidden_usage: "禁止用途", missing_information: "缺失信息", chapter_plans: "章节规划",
+    narrative_logic: "叙事逻辑", budget: "规模预算", confidence_level: "置信度",
+};
+function proposalDiffRows(proposal) {
+    const after = proposal?.after && typeof proposal.after === "object" ? proposal.after : {};
+    const before = proposal?.before && typeof proposal.before === "object" ? proposal.before : {};
+    return Object.keys(after).map((key) => ({
+        key, label: fieldLabels[key] || key,
+        before: diffValue(before[key], "未设置"),
+        after: diffValue(after[key], "未设置"),
+    }));
 }
 async function ensureThread() {
     if (thread.value?.status === "open")
@@ -266,7 +289,6 @@ const __VLS_ctx = {
 let __VLS_components;
 let __VLS_intrinsics;
 let __VLS_directives;
-/** @type {__VLS_StyleScopedClasses['copilot']} */ ;
 /** @type {__VLS_StyleScopedClasses['session-title']} */ ;
 /** @type {__VLS_StyleScopedClasses['session-title']} */ ;
 /** @type {__VLS_StyleScopedClasses['session-title']} */ ;
@@ -301,6 +323,9 @@ let __VLS_directives;
 /** @type {__VLS_StyleScopedClasses['proposal-list']} */ ;
 /** @type {__VLS_StyleScopedClasses['proposal-head']} */ ;
 /** @type {__VLS_StyleScopedClasses['proposal-head']} */ ;
+/** @type {__VLS_StyleScopedClasses['changed-fields']} */ ;
+/** @type {__VLS_StyleScopedClasses['diff-preview']} */ ;
+/** @type {__VLS_StyleScopedClasses['diff-preview']} */ ;
 /** @type {__VLS_StyleScopedClasses['diff-preview']} */ ;
 /** @type {__VLS_StyleScopedClasses['diff-preview']} */ ;
 /** @type {__VLS_StyleScopedClasses['diff-preview']} */ ;
@@ -405,7 +430,7 @@ if (__VLS_ctx.conversationItems.length) {
             __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({});
             __VLS_asFunctionalElement1(__VLS_intrinsics.small, __VLS_intrinsics.small)({});
             __VLS_asFunctionalElement1(__VLS_intrinsics.b, __VLS_intrinsics.b)({});
-            (item.status === "proposed" ? "等待你的确认" : "提案处理结果");
+            (item.status === "proposed" ? `建议修改${__VLS_ctx.artifactLabel(item)}` : "提案处理结果");
             __VLS_asFunctionalElement1(__VLS_intrinsics.p, __VLS_intrinsics.p)({});
             (item.rationale);
             __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({
@@ -414,34 +439,51 @@ if (__VLS_ctx.conversationItems.length) {
             });
             /** @type {__VLS_StyleScopedClasses['badge']} */ ;
             (item.risk_level);
-            if (__VLS_ctx.compact) {
-                __VLS_asFunctionalElement1(__VLS_intrinsics.button, __VLS_intrinsics.button)({
-                    ...{ onClick: (...[$event]) => {
-                            if (!(__VLS_ctx.conversationItems.length))
-                                throw 0;
-                            if (!!(item.itemType === 'message'))
-                                throw 0;
-                            if (!(__VLS_ctx.compact))
-                                throw 0;
-                            return (__VLS_ctx.toggleProposal(item));
-                            // @ts-ignore
-                            [compact, historyOpen, threads, threads, startNewConversation, conversationItems, conversationItems, toggleProposal,];
-                        } },
-                    ...{ class: "proposal-toggle" },
-                    type: "button",
+            __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
+                ...{ class: "changed-fields" },
+            });
+            /** @type {__VLS_StyleScopedClasses['changed-fields']} */ ;
+            for (const [row] of __VLS_vFor((__VLS_ctx.proposalDiffRows(item)))) {
+                __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({
+                    key: (row.key),
                 });
-                /** @type {__VLS_StyleScopedClasses['proposal-toggle']} */ ;
-                (__VLS_ctx.proposalExpanded(item) ? "收起修改详情" : "查看修改前后");
+                (row.label);
+                // @ts-ignore
+                [artifactLabel, historyOpen, threads, threads, startNewConversation, conversationItems, conversationItems, proposalDiffRows,];
             }
+            __VLS_asFunctionalElement1(__VLS_intrinsics.button, __VLS_intrinsics.button)({
+                ...{ onClick: (...[$event]) => {
+                        if (!(__VLS_ctx.conversationItems.length))
+                            throw 0;
+                        if (!!(item.itemType === 'message'))
+                            throw 0;
+                        return (__VLS_ctx.toggleProposal(item));
+                        // @ts-ignore
+                        [toggleProposal,];
+                    } },
+                ...{ class: "proposal-toggle" },
+                type: "button",
+            });
+            /** @type {__VLS_StyleScopedClasses['proposal-toggle']} */ ;
+            (__VLS_ctx.proposalExpanded(item) ? "收起修改详情" : "查看修改前后");
             if (__VLS_ctx.proposalExpanded(item)) {
                 __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
                     ...{ class: "diff-preview" },
                 });
                 /** @type {__VLS_StyleScopedClasses['diff-preview']} */ ;
-                __VLS_asFunctionalElement1(__VLS_intrinsics.del, __VLS_intrinsics.del)({});
-                (__VLS_ctx.proposalText(item.before, "原内容为空"));
-                __VLS_asFunctionalElement1(__VLS_intrinsics.ins, __VLS_intrinsics.ins)({});
-                (__VLS_ctx.proposalText(item.after, "建议内容为空"));
+                for (const [row] of __VLS_vFor((__VLS_ctx.proposalDiffRows(item)))) {
+                    __VLS_asFunctionalElement1(__VLS_intrinsics.section, __VLS_intrinsics.section)({
+                        key: (row.key),
+                    });
+                    __VLS_asFunctionalElement1(__VLS_intrinsics.b, __VLS_intrinsics.b)({});
+                    (row.label);
+                    __VLS_asFunctionalElement1(__VLS_intrinsics.del, __VLS_intrinsics.del)({});
+                    (row.before);
+                    __VLS_asFunctionalElement1(__VLS_intrinsics.ins, __VLS_intrinsics.ins)({});
+                    (row.after);
+                    // @ts-ignore
+                    [proposalDiffRows, proposalExpanded, proposalExpanded,];
+                }
                 __VLS_asFunctionalElement1(__VLS_intrinsics.small, __VLS_intrinsics.small)({});
                 (item.impact?.invalidates?.join("、") || "局部检查");
             }
@@ -460,7 +502,7 @@ if (__VLS_ctx.conversationItems.length) {
                                 throw 0;
                             return (__VLS_ctx.decide(item, 'accepted'));
                             // @ts-ignore
-                            [proposalExpanded, proposalExpanded, proposalText, proposalText, decide,];
+                            [decide,];
                         } },
                     ...{ class: "btn primary" },
                 });

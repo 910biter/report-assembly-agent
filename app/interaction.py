@@ -39,9 +39,11 @@ EDITABLE_ARTIFACTS = {
 }
 
 _COPILOT_SYSTEM = """你是报告整编工作台中的审阅助手。用户正在讨论一个明确作用域的产物。
-你只能解释、提出修改建议，不得声称已经修改数据库。若用户要求修改，请输出可审阅的 ChangeProposal。
+你只能解释、提出修改建议，不得声称已经修改数据库。只有用户明确要求修改当前产物时，才能输出 ChangeProposal。
+询问进度、依据、原因、影响、可行性或“应该怎么改”，均属于讨论，不得创建提案。
 严格输出 JSON：
 {
+  "intent": "answer/change",
   "reply": "对用户的简洁答复",
   "proposal": null 或 {
     "operation": "replace/update/reorganize/recheck",
@@ -50,6 +52,9 @@ _COPILOT_SYSTEM = """你是报告整编工作台中的审阅助手。用户正�
     "risk_level": "low/medium/high"
   }
 }
+
+proposal.after 只能包含提示中“允许修改字段”列出的字段，并且只表达当前产物的修改结果；
+不得把报告正文、其他阶段产物或解释文字塞入任务需求、标题等不相干字段。
 
 真实性和溯源是硬边界。不得凭空添加事实；事实、推论、章节结构的语义修改至少为 medium 风险。
 事实或推论存在疑问时，应提出 recheck/reorganize，而不是直接编造替代内容。
@@ -285,6 +290,13 @@ def _generate_interaction_reply(thread_id: int, content: str, request_id: str = 
     if thread is None:
         raise ValueError("INTERACTION_THREAD_NOT_FOUND")
     current = _resolve_current(thread)
+    if _is_progress_question(content):
+        reply = _progress_reply(str(thread.get("task_id") or ""))
+        metadata = {"status": "completed", "intent": "answer"}
+        if request_id:
+            metadata["request_id"] = request_id
+        _save_message(thread_id, "assistant", reply, metadata)
+        return {"reply": reply, "proposal": None}
     prompt = _build_interaction_prompt(thread, current, content)
     # Do not submit this request to the long-running workflow queue. Sending it
     # directly lets vLLM observe its priority and preempt/reorder queued work.
@@ -298,14 +310,17 @@ def _generate_interaction_reply(thread_id: int, content: str, request_id: str = 
             max_tokens=int(settings.interactive_output_tokens),
         )
     reply = str(result.get("reply") or "已记录你的意见。")
-    metadata = {"status": "completed"}
+    metadata = {"status": "completed", "intent": str(result.get("intent") or "answer")}
     if request_id:
         metadata["request_id"] = request_id
-    _save_message(thread_id, "assistant", reply, metadata)
+    assistant_message_id = _save_message(thread_id, "assistant", reply, metadata)
     proposal = result.get("proposal") if isinstance(result, dict) else None
     proposal_detail = None
-    if isinstance(proposal, dict) and isinstance(proposal.get("after"), dict):
-        proposal_detail = _create_proposal(thread, current, proposal)
+    normalized = _normalize_proposal(thread, current, content, proposal)
+    if normalized is not None:
+        proposal_detail = _create_proposal(
+            thread, current, normalized, source_message_id=assistant_message_id,
+        )
     return {"reply": reply, "proposal": proposal_detail}
 
 
@@ -345,12 +360,15 @@ def decide_proposal(proposal_id: int, decision: str) -> dict[str, Any]:
     return _proposal_detail(current)
 
 
-def _create_proposal(thread: dict, current: dict, proposal: dict) -> dict:
+def _create_proposal(thread: dict, current: dict, proposal: dict,
+                     source_message_id: int | None = None) -> dict:
     artifact_type = thread["artifact_type"]
     risk = str(proposal.get("risk_level") or _default_risk(artifact_type))
     if artifact_type in {"fact", "inference", "analysis_plan", "final_plan", "narrative_plan"} and risk == "low":
         risk = "medium"
     impact = _impact_for(artifact_type, thread)
+    if source_message_id is not None:
+        impact["source_message_id"] = int(source_message_id)
     with session_scope() as s:
         result = s.execute(insert(ORMChangeProposal).values(
             proposal_key=uuid.uuid4().hex,
@@ -588,11 +606,96 @@ def _build_interaction_prompt(thread: dict, current: dict, message: str) -> str:
         f"当前作用域：{_truncate_tokens(_dump(thread.get('scope') or {}), 280)}",
         f"任务边界：{_truncate_tokens(_dump(task_context), allocations['task'])}",
         f"当前对象：{_truncate_tokens(_dump(current), allocations['current'])}",
+        f"允许修改字段：{_dump(_editable_fields(thread, current))}",
         f"直接依据：{_truncate_tokens(_dump(grounding), allocations['grounding'])}",
         f"已确认变更：{_truncate_tokens(_dump(accepted), allocations['accepted'])}",
         f"最近完整对话：{_dump(history)}",
     ))
     return _truncate_tokens(prompt, total_budget)
+
+
+def _editable_fields(thread: dict, current: dict) -> list[str]:
+    artifact_type = str(thread.get("artifact_type") or "")
+    fixed = {
+        "task_draft": ["theme", "requirements"],
+        "task_brief": ["theme", "requirements"],
+        "material_role": ["material_role", "claim_support", "allowed_usage", "forbidden_usage", "missing_information"],
+        "fact": ["content", "dimension", "fact_type"],
+        "inference": ["content", "based_fact_ids", "confidence_level", "confidence_reason", "uncertainty", "reasoning_chain"],
+        "report_title": ["title"],
+        "section_title": ["title"],
+        "paragraph": ["content"],
+        "sentence": ["content"],
+    }
+    if artifact_type in fixed:
+        return fixed[artifact_type]
+    excluded = {"id", "task_id", "report_id", "stage", "status", "source_refs", "created_at", "updated_at"}
+    return sorted(str(key) for key in current if str(key) not in excluded)
+
+
+_DIRECT_CHANGE_PATTERNS = (
+    r"(?:请|帮我|需要|希望|我要|务必).{0,24}(?:修改|调整|删除|删掉|去掉|增加|新增|补充|重写|改写|替换|改名|修正|重组|草拟|拟定)",
+    r"(?:把|将).{1,100}(?:改成|改为|调整为|替换为|删除|删掉|去掉|补充|重写|改写)",
+    r"^(?:修改|调整|删除|删掉|去掉|增加|新增|补充|重写|改写|替换|改名|修正|重组|草拟|拟定)",
+    r"\b(?:change|edit|rewrite|replace|remove|delete|add|revise)\b",
+)
+
+
+def _is_explicit_change_request(message: str) -> bool:
+    text = str(message or "").strip().lower()
+    return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in _DIRECT_CHANGE_PATTERNS)
+
+
+def _normalize_proposal(thread: dict, current: dict, message: str,
+                        proposal: Any) -> dict | None:
+    if not _is_explicit_change_request(message) or not isinstance(proposal, dict):
+        return None
+    after = proposal.get("after")
+    if not isinstance(after, dict):
+        return None
+    allowed = set(_editable_fields(thread, current))
+    cleaned = {str(key): value for key, value in after.items() if str(key) in allowed}
+    if not cleaned:
+        return None
+    if all(current.get(key) == value for key, value in cleaned.items()):
+        return None
+    return {**proposal, "after": cleaned}
+
+
+def _is_progress_question(message: str) -> bool:
+    if _is_explicit_change_request(message):
+        return False
+    text = re.sub(r"\s+", "", str(message or "").lower())
+    return bool(re.search(
+        r"(?:现在|当前|目前).{0,8}(?:进行到|运行到|做到|处于|在哪).{0,8}(?:哪|什么|哪里|阶段|步骤)|"
+        r"(?:任务|报告).{0,6}(?:进度|进行到哪|运行到哪)|进度怎么样|完成了吗",
+        text,
+    ))
+
+
+def _progress_reply(task_id: str) -> str:
+    if not task_id:
+        return "当前讨论尚未绑定任务，提交任务后才能读取实时进度。"
+    from app.memory import short_term
+    task = short_term.load_task(task_id) or {}
+    stage = str(task.get("stage") or "created")
+    labels = {
+        "created": "等待开始", "parsing": "材料解析", "dedup": "材料去重",
+        "material_analysis": "材料理解", "planning": "分析规划", "evidence": "事实与证据提取",
+        "conflict": "冲突核验", "analysis": "综合分析", "writing": "报告生成",
+        "review": "等待审核", "done": "已完成", "paused": "已暂停", "failed": "运行异常",
+    }
+    details = []
+    for key, label in (
+        ("parse_progress", "材料"), ("material_analysis_progress", "材料理解"),
+        ("evidence_progress", "证据批次"), ("write_progress", "章节"),
+    ):
+        progress = task.get(key) or (task.get("progress") or {}).get(key) or {}
+        done, total = progress.get("done"), progress.get("total")
+        if done is not None and total:
+            details.append(f"{label} {done}/{total}")
+    suffix = f"；已完成：{'、'.join(details)}" if details else ""
+    return f"当前处于“{labels.get(stage, stage)}”阶段{suffix}。"
 
 
 def _interaction_task_context(task_id: str) -> dict[str, Any]:
