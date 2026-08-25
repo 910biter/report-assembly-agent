@@ -219,14 +219,24 @@ if (__VLS_ctx.task.data.value) {
         ...{ class: "button-row" },
     });
     /** @type {__VLS_StyleScopedClasses['button-row']} */ ;
-    const __VLS_6 = StatusBadge;
-    // @ts-ignore
-    const __VLS_7 = __VLS_asFunctionalComponent1(__VLS_6, new __VLS_6({
-        stage: (__VLS_ctx.task.data.value.stage),
-    }));
-    const __VLS_8 = __VLS_7({
-        stage: (__VLS_ctx.task.data.value.stage),
-    }, ...__VLS_functionalComponentArgsRest(__VLS_7));
+    if (__VLS_ctx.isComparison) {
+        __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({
+            ...{ class: "badge" },
+            ...{ class: (__VLS_ctx.task.data.value.stage === 'failed' ? 'danger' : __VLS_ctx.task.data.value.stage === 'review' ? 'warning' : __VLS_ctx.task.data.value.stage === 'done' ? 'success' : '') },
+        });
+        /** @type {__VLS_StyleScopedClasses['badge']} */ ;
+        (__VLS_ctx.task.data.value.stage === 'failed' ? '对比异常' : __VLS_ctx.task.data.value.stage === 'review' ? '等待审阅' : __VLS_ctx.task.data.value.stage === 'done' ? '审阅完成' : '对比中');
+    }
+    else {
+        const __VLS_6 = StatusBadge;
+        // @ts-ignore
+        const __VLS_7 = __VLS_asFunctionalComponent1(__VLS_6, new __VLS_6({
+            stage: (__VLS_ctx.task.data.value.stage),
+        }));
+        const __VLS_8 = __VLS_7({
+            stage: (__VLS_ctx.task.data.value.stage),
+        }, ...__VLS_functionalComponentArgsRest(__VLS_7));
+    }
     if (['created', 'failed'].includes(__VLS_ctx.task.data.value.stage)) {
         __VLS_asFunctionalElement1(__VLS_intrinsics.button, __VLS_intrinsics.button)({
             ...{ onClick: (__VLS_ctx.run) },
@@ -246,7 +256,7 @@ if (__VLS_ctx.task.data.value) {
                         throw 0;
                     return (__VLS_ctx.control('pause'));
                     // @ts-ignore
-                    [task, task, task, task, task, task, task, task, run, command, running, control,];
+                    [task, task, task, task, task, task, task, task, task, task, task, task, task, task, isComparison, run, command, running, control,];
                 } },
             ...{ class: "btn" },
         });
@@ -336,11 +346,11 @@ if (__VLS_ctx.task.data.value) {
             ? "已完成"
             : index === __VLS_ctx.stageIndex
                 ? __VLS_ctx.task.data.value.stage === "review"
-                    ? "待审核"
+                    ? __VLS_ctx.isComparison ? "待审阅" : "待审核"
                     : "正在进行"
                 : "等待中");
         // @ts-ignore
-        [task, isComparison, stages, stageIndex, stageIndex, stageIndex, stageIndex,];
+        [task, isComparison, isComparison, stages, stageIndex, stageIndex, stageIndex, stageIndex,];
     }
     __VLS_asFunctionalElement1(__VLS_intrinsics.button, __VLS_intrinsics.button)({
         ...{ onClick: (...[$event]) => {
@@ -590,7 +600,7 @@ if (__VLS_ctx.task.data.value) {
                 /** @type {__VLS_StyleScopedClasses['primary']} */ ;
                 const { default: __VLS_33 } = __VLS_31.slots;
                 // @ts-ignore
-                [task, task, task, task, task, task, task, task, task, task, task, task, task, task, task, task, task, task, task, running, isComparison, isComparison, stages, stageIndex, active, active, active, materials, facts, inferences, conflicts,];
+                [task, task, task, task, task, task, task, task, task, task, task, task, task, task, task, task, task, task, task, isComparison, isComparison, running, stages, stageIndex, active, active, active, materials, facts, inferences, conflicts,];
                 var __VLS_31;
             }
             else {

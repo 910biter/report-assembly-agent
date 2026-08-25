@@ -160,7 +160,7 @@ function versionsList() {
         </p>
       </div>
       <div class="button-row">
-        <StatusBadge :stage="task.data.value.stage" /><button
+        <span v-if="isComparison" class="badge" :class="task.data.value.stage === 'failed' ? 'danger' : task.data.value.stage === 'review' ? 'warning' : task.data.value.stage === 'done' ? 'success' : ''">{{ task.data.value.stage === 'failed' ? '对比异常' : task.data.value.stage === 'review' ? '等待审阅' : task.data.value.stage === 'done' ? '审阅完成' : '对比中' }}</span><StatusBadge v-else :stage="task.data.value.stage" /><button
           v-if="['created', 'failed'].includes(task.data.value.stage)"
           class="btn primary"
           :disabled="command.isPending.value"
@@ -206,7 +206,7 @@ function versionsList() {
                 ? "已完成"
                 : index === stageIndex
                   ? task.data.value.stage === "review"
-                    ? "待审核"
+                    ? isComparison ? "待审阅" : "待审核"
                     : "正在进行"
                   : "等待中"
             }}</small>
