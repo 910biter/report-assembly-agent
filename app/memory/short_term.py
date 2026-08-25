@@ -33,6 +33,15 @@ def load_task(task_id: str) -> dict | None:
     return json.loads(row[0]) if row else None
 
 
+def list_tasks() -> list[tuple[str, dict]]:
+    """Return persisted task payloads for process-level state reconciliation."""
+    with session_scope() as s:
+        rows = s.execute(
+            select(ORMShortMemory.c.task_id, ORMShortMemory.c.payload)
+        ).all()
+    return [(str(row[0]), json.loads(row[1])) for row in rows]
+
+
 def delete_task(task_id: str) -> None:
     with session_scope() as s:
         s.execute(delete(ORMShortMemory).where(ORMShortMemory.c.task_id == task_id))
