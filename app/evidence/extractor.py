@@ -892,6 +892,10 @@ def save_fact_with_evidence(fact: Fact, evidence_list: list[Evidence], task_id: 
 
 def save_claim(claim: Claim, status: str, origin_call_id: str = "", task_id: str = "") -> int:
     fact_id = int(claim.fact_id) if claim.fact_id is not None else None
+    if fact_id is not None and fact_id <= 0:
+        fact_id = None
+    if status == "promoted" and fact_id is None:
+        raise ValueError("A promoted claim must reference a persisted fact")
     with session_scope() as s:
         result = s.execute(
             ORMClaim.insert().values(
