@@ -165,7 +165,10 @@ def complete_comparison_task(task_id: str) -> dict[str, Any]:
     candidates = _candidate_sets(new_facts, baseline_facts)
     candidates = _merge_candidate_sets(
         candidates,
-        _semantic_candidate_sets(new_facts, baseline_facts, str(baseline.get("task_id") or "")),
+        _semantic_candidate_sets(
+            new_facts, baseline_facts,
+            str(baseline.get("task_id") or ""), str(run.get("task_id") or ""),
+        ),
     )
     classified = _classify_batches(candidates, str(run["focus"] or baseline.get("user_requirements") or ""))
     baseline_by_id = {int(item["id"]): item for item in baseline_facts if item.get("id") is not None}
@@ -284,7 +287,8 @@ def _candidate_sets(new_facts: list[dict], baseline_facts: list[dict], limit: in
 
 
 def _semantic_candidate_sets(new_facts: list[dict], baseline_facts: list[dict],
-                             baseline_task_id: str, limit: int = 4) -> dict[int, list[dict]]:
+                             baseline_task_id: str, new_task_id: str = "",
+                             limit: int = 4) -> dict[int, list[dict]]:
     """Use Qdrant fact vectors when available; lexical retrieval remains fallback."""
     if not new_facts or not baseline_facts or not baseline_task_id:
         return {}
@@ -297,11 +301,20 @@ def _semantic_candidate_sets(new_facts: list[dict], baseline_facts: list[dict],
         old_vectors = [(fact_id, vector) for fact_id, vector in vector_store.fact_vectors(baseline_task_id) if fact_id in allowed]
         if not old_vectors:
             return {}
-        query_vectors = embed_texts(
-            [str(item.get("content") or "") for item in new_facts], query=True,
-        )
+        indexed_new_vectors = dict(vector_store.fact_vectors(new_task_id)) if new_task_id else {}
+        missing = [item for item in new_facts if int(item["id"]) not in indexed_new_vectors]
+        if missing:
+            generated = embed_texts(
+                [str(item.get("content") or "") for item in missing], query=True,
+            )
+            indexed_new_vectors.update(
+                (int(item["id"]), vector) for item, vector in zip(missing, generated)
+            )
         result: dict[int, list[dict]] = {}
-        for fact, vector in zip(new_facts, query_vectors):
+        for fact in new_facts:
+            vector = indexed_new_vectors.get(int(fact["id"]))
+            if vector is None:
+                continue
             scored = sorted(
                 ((cosine(np.asarray(vector, dtype=np.float32), old_vector), fact_id) for fact_id, old_vector in old_vectors),
                 reverse=True,
