@@ -350,6 +350,8 @@ def _classify_batches(candidates: dict[int, list[dict]], focus: str) -> dict[int
                 model_gateway.generate_json,
                 _CLASSIFY_PROMPT.replace("{focus}", focus[:1200]).replace("{payload}", _dump(batch)),
                 system="你只负责证据变化分类，不改写报告。",
+                think=False,
+                max_tokens=3200,
             )
         except Exception:
             payload = {}
