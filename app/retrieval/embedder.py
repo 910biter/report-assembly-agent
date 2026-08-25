@@ -15,8 +15,8 @@ _EMBED_TOKEN_BUDGET = 8192
 _throughput: list[float] = []
 
 
-def embed_texts(texts: list[str]) -> list[list[float]]:
-    return invoke("embed", model_gateway.embed, texts)
+def embed_texts(texts: list[str], query: bool = False) -> list[list[float]]:
+    return invoke("embed", model_gateway.embed, texts, query=query)
 
 
 def _batch_by_tokens(texts: list[str], budget: int) -> list[list[str]]:

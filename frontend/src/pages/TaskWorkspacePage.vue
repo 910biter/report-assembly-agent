@@ -5,13 +5,14 @@ import { useRoute, RouterLink } from "vue-router";
 import { api } from "@/api/http";
 import type { TaskSummary } from "@/api/types";
 import StatusBadge from "@/components/StatusBadge.vue";
+import ArtifactReviewWorkspace from "@/components/ArtifactReviewWorkspace.vue";
 const GraphNetwork = defineAsyncComponent(
   () => import("@/components/GraphNetwork.vue"),
 );
 const route = useRoute();
 const qc = useQueryClient();
 const taskId = String(route.params.taskId);
-const active = ref("overview");
+const active = ref(String(route.query.tab || "overview"));
 const analysisType = ref("facts");
 const detailsOpen = ref(false);
 const selectedGraphEdge = ref<any>(null);
@@ -63,19 +64,44 @@ const command = useMutation({
   mutationFn: ({ path }: { path: string }) => api(path, { method: "POST" }),
   onSuccess: () => qc.invalidateQueries({ queryKey: ["task", taskId] }),
 });
-const stages = [
-  { name: "材料准备", keys: ["created", "parsing", "dedup"] },
-  {
-    name: "分析规划",
-    keys: ["material_analysis", "planning", "evidence", "conflict", "analysis"],
-  },
-  { name: "报告生成", keys: ["writing", "knowledge"] },
-  { name: "审核完成", keys: ["review", "done"] },
-];
+const stages = computed(() =>
+  task.data.value?.run_mode === "material_comparison"
+    ? [
+        {
+          name: "新增材料准备",
+          keys: [
+            "created",
+            "parsing",
+            "dedup",
+            "material_analysis",
+            "planning",
+          ],
+        },
+        { name: "证据与变化分析", keys: ["evidence", "conflict", "analysis"] },
+        { name: "变化审阅", keys: ["review", "done"] },
+      ]
+    : [
+        { name: "材料准备", keys: ["created", "parsing", "dedup"] },
+        {
+          name: "分析规划",
+          keys: [
+            "material_analysis",
+            "planning",
+            "evidence",
+            "conflict",
+            "analysis",
+          ],
+        },
+        { name: "报告生成", keys: ["writing", "knowledge"] },
+        { name: "审核完成", keys: ["review", "done"] },
+      ],
+);
 const stageIndex = computed(() =>
   Math.max(
     0,
-    stages.findIndex((x) => x.keys.includes(task.data.value?.stage || "")),
+    stages.value.findIndex((x) =>
+      x.keys.includes(task.data.value?.stage || ""),
+    ),
   ),
 );
 const running = computed(
@@ -209,6 +235,7 @@ function versionsList() {
           ['analysis', '分析'],
           ['report', '报告'],
           ['versions', '版本'],
+          ['collaboration', '协作审阅'],
         ]"
         :key="tab[0]"
         class="tab"
@@ -290,6 +317,33 @@ function versionsList() {
         </div>
       </div>
       <aside class="side-column">
+        <div
+          v-if="task.data.value.run_mode === 'material_comparison'"
+          class="surface section-block"
+        >
+          <h2>对比结果</h2>
+          <template v-if="task.data.value.material_comparison?.summary">
+            <p>
+              {{
+                task.data.value.material_comparison.summary.new_fact_count || 0
+              }}
+              条新增事实，影响
+              {{
+                task.data.value.material_comparison.summary.affected_sections
+                  ?.length || 0
+              }}
+              个章节。
+            </p>
+            <RouterLink
+              class="btn primary"
+              :to="`/reports/${task.data.value.comparison_report_id}`"
+              >返回基线报告审阅变化</RouterLink
+            >
+          </template>
+          <p v-else class="muted">
+            完成后将在基线报告的“新增材料对比”中集中审阅。
+          </p>
+        </div>
         <div class="surface section-block">
           <h2>任务产物</h2>
           <RouterLink
@@ -516,6 +570,12 @@ function versionsList() {
         >
       </div>
     </section>
+    <ArtifactReviewWorkspace
+      v-else-if="active === 'collaboration'"
+      :task-id="taskId"
+      :report-id="task.data.value.report_id"
+      :run-revision="task.data.value.run_revision || 1"
+    />
     <section
       v-else-if="active === 'report'"
       class="surface section-block report-entry"

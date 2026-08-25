@@ -156,6 +156,13 @@ def _worker_loop() -> None:
         try:
             from app import task_control
             task_control.begin_task(item.task_id)
+            starting_task = short_term.load_task(item.task_id) or {}
+            if str(starting_task.get("run_mode") or "") == "interaction_revision":
+                try:
+                    from app.interaction import mark_recompute_running
+                    mark_recompute_running(str(starting_task.get("run_id") or ""))
+                except Exception:
+                    pass
             WorkflowController(item.task_id).run_to_review()
             with _LOCK:
                 _STATS["completed"] += 1
@@ -176,6 +183,12 @@ def _worker_loop() -> None:
                 metadata={"error": "" if paused else str(exc)[:500]},
                 finished=not paused,
             )
+            if not paused and str(task.get("run_mode") or "") == "interaction_revision":
+                try:
+                    from app.interaction import fail_recompute_for_run
+                    fail_recompute_for_run(str(task.get("run_id") or ""), str(exc))
+                except Exception:
+                    pass
             short_term.update_task(item.task_id, stage="paused" if paused else "failed", error="" if paused else str(exc), queue_status={
                 "status": "paused" if paused else "failed",
                 "queue_wait_seconds": round(wait, 1),
@@ -190,6 +203,11 @@ def _worker_loop() -> None:
                 if _RUNNING_TASK_ID == item.task_id:
                     _RUNNING_TASK_ID = None
             _QUEUE.task_done()
+            try:
+                from app.interaction import dispatch_pending_revisions
+                dispatch_pending_revisions(item.task_id)
+            except Exception:
+                pass
 
 
 def _heartbeat_loop(task_id: str, stop: threading.Event) -> None:

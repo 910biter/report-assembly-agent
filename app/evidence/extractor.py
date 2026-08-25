@@ -8,10 +8,14 @@ Claim 提升(promote)为 Fact 并绑定 Evidence;未通过的保留为 pending C
 """
 import json
 import re
+import contextvars
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 
 from app.agents.base import BaseAgent
 from app.cache import stable_hash
+from app.config import settings
 from app.db import session_scope
 from app.infrastructure.orm import ORMFact, ORMEvidence, ORMClaim
 from sqlalchemy import select, update
@@ -21,6 +25,7 @@ from app.retrieval.embedder import embed_texts
 from app.token_monitor import current_context, log_pipeline_event, update_call_funnel, update_call_metrics, update_call_products
 
 _FACT_TYPES = ("EVENT", "PERSON", "LOCATION", "TIME", "NUMBER", "STATEMENT")
+_FACT_PERSIST_LOCK = threading.RLock()
 
 
 def _assert_not_paused(task_id: str) -> None:
@@ -279,6 +284,7 @@ def _conflict_candidate_groups(claims: list[dict], limit: int = 12) -> list[dict
 
 
 class EvidenceAgent(BaseAgent):
+    output_token_limit = settings.evidence_output_tokens
     name = "evidence"
     role = _SYSTEM
 
@@ -313,11 +319,9 @@ class EvidenceAgent(BaseAgent):
         first_pass_facts = 0
         if cm is not None and hasattr(cm, "for_first_pass"):
             batches = cm.for_first_pass(needs, insights)
-            for batch_index, (material_text, batch_meta) in enumerate(batches, start=1):
-                produced = self._process_batch(
-                    needs, material_text, batch_meta, units_by_material, filenames,
-                    task_id, batch_index, len(batches),
-                )
+            for produced in self._process_batches(
+                batches, needs, units_by_material, filenames, task_id,
+            ):
                 first_pass_facts += len(produced)
                 facts.extend(produced)
         else:  # 无 Context Manager:全量文本直接处理
@@ -339,11 +343,10 @@ class EvidenceAgent(BaseAgent):
                 recovery_batch_count=len(recovery_batches),
                 total_materials=len(units_by_material),
             )
-            for batch_index, (material_text, batch_meta) in enumerate(recovery_batches, start=1):
-                facts.extend(self._process_batch(
-                    needs, material_text, batch_meta, units_by_material, filenames,
-                    task_id, batch_index, len(recovery_batches), round_tag=-1,
-                ))
+            for produced in self._process_batches(
+                recovery_batches, needs, units_by_material, filenames, task_id, round_tag=-1,
+            ):
+                facts.extend(produced)
         report_phase(2)
 
         # Coverage Audit + Iterative Retrieval:缺口补检,足够即停
@@ -360,11 +363,10 @@ class EvidenceAgent(BaseAgent):
                 gap_batches = cm.for_gap_retrieval(gaps, insights, known_contents=known_contents)
             else:
                 gap_batches = []
-            for batch_index, (material_text, batch_meta) in enumerate(gap_batches, start=1):
-                facts.extend(self._process_batch(
-                    gaps, material_text, batch_meta, units_by_material, filenames,
-                    task_id, batch_index, len(gap_batches), round_tag=round_index,
-                ))
+            for produced in self._process_batches(
+                gap_batches, gaps, units_by_material, filenames, task_id, round_tag=round_index,
+            ):
+                facts.extend(produced)
             if len(facts) == before_count and _has_text_units(units_by_material):
                 recovery_batches = self._gap_sweep_batches(gaps, units_by_material, filenames, known_contents)
                 log_pipeline_event(
@@ -373,16 +375,51 @@ class EvidenceAgent(BaseAgent):
                     recovery_batch_count=len(recovery_batches),
                     uncovered_need_count=len(gaps),
                 )
-                for batch_index, (material_text, batch_meta) in enumerate(recovery_batches, start=1):
-                    facts.extend(self._process_batch(
-                        gaps, material_text, batch_meta, units_by_material, filenames,
-                        task_id, batch_index, len(recovery_batches), round_tag=round_index + 10,
-                    ))
+                for produced in self._process_batches(
+                    recovery_batches, gaps, units_by_material, filenames, task_id,
+                    round_tag=round_index + 10,
+                ):
+                    facts.extend(produced)
             if len(facts) == before_count:
                 break  # 无新证据:接受 information_gap,不再空转
             gaps = self._coverage_audit(facts, needs, task_id)
         report_phase(3)
         return facts
+
+    def _process_batches(
+        self,
+        batches: list[tuple[str, dict]],
+        needs: list[dict],
+        units_by_material: dict[int, list[Unit]],
+        filenames: dict[int, str],
+        task_id: str,
+        round_tag: int = 0,
+    ) -> list[list[Fact]]:
+        """Run independent extraction calls concurrently and merge by batch order."""
+        if not batches:
+            return []
+        concurrency = max(1, int(settings.evidence_batch_concurrency or 1))
+        if str(settings.generation_backend).lower() != "vllm":
+            concurrency = 1
+
+        def run_one(batch_index: int, material_text: str, batch_meta: dict) -> list[Fact]:
+            worker = EvidenceAgent()
+            return worker._process_batch(
+                needs, material_text, batch_meta, units_by_material, filenames,
+                task_id, batch_index, len(batches), round_tag=round_tag,
+            )
+
+        if concurrency == 1 or len(batches) == 1:
+            return [run_one(index, text, meta) for index, (text, meta) in enumerate(batches, start=1)]
+        results: list[list[Fact] | None] = [None] * len(batches)
+        with ThreadPoolExecutor(max_workers=min(concurrency, len(batches)), thread_name_prefix="evidence-batch") as pool:
+            futures = []
+            for index, (text, meta) in enumerate(batches, start=1):
+                context = contextvars.copy_context()
+                futures.append((index, pool.submit(context.run, run_one, index, text, meta)))
+            for index, future in futures:
+                results[index - 1] = future.result()
+        return [item or [] for item in results]
 
     def _process_batch(self, needs: list[dict], material_text: str, batch_meta: dict,
                        units_by_material: dict[int, list[Unit]], filenames: dict[int, str],
@@ -463,9 +500,6 @@ class EvidenceAgent(BaseAgent):
             if not (0 <= need_idx < len(needs_list) + 1):
                 need_idx = 0
             dimension = needs_list[need_idx - 1].get("dimension", "开放发现") if need_idx > 0 else "开放发现"
-            if fact_exists(content, task_id):
-                duplicate_claims += 1
-                continue
             evidence_list = bind_sources(quote, units_by_material, filenames, unit_id=unit_id)
             claim = Claim(
                 material_id=evidence_list[0].material_id if evidence_list else 0,
@@ -474,6 +508,10 @@ class EvidenceAgent(BaseAgent):
                 fact_type=fact_type, dimension=dimension, need_id=need_idx,
             )
             if not evidence_list:
+                with _FACT_PERSIST_LOCK:
+                    if fact_exists(content, task_id):
+                        duplicate_claims += 1
+                        continue
                 pending_claims += 1
                 save_claim(claim, status="pending", origin_call_id=call_id, task_id=task_id)
                 continue
@@ -481,7 +519,13 @@ class EvidenceAgent(BaseAgent):
             contributed_materials.update(int(ev.material_id) for ev in evidence_list)
             contributed_units.update(int(ev.unit_id) for ev in evidence_list)
             fact = Fact(content=content, dimension=dimension, fact_type=fact_type, need_id=need_idx)
-            fact.id = save_fact_with_evidence(fact, evidence_list, task_id, origin_call_id=call_id)
+            # Check-and-insert is serialized within the process so concurrent
+            # extraction batches cannot create duplicate task facts.
+            with _FACT_PERSIST_LOCK:
+                if fact_exists(content, task_id):
+                    duplicate_claims += 1
+                    continue
+                fact.id = save_fact_with_evidence(fact, evidence_list, task_id, origin_call_id=call_id)
             facts.append(fact)
             produced_fact_ids.append(int(fact.id))
             stored_chars += len(fact.content or "") + sum(len(ev.quote or "") for ev in evidence_list)

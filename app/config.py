@@ -45,8 +45,25 @@ class Settings(BaseSettings):
     host: str = "127.0.0.1"  # 服务监听地址(IRA_HOST,支持 .env;容器/远端部署设 0.0.0.0)
     port: int = 8000  # 服务监听端口(IRA_PORT)
     ollama_url: str = "http://100.120.119.108:11434"
+    generation_backend: str = "vllm"  # production generation backend
+    generation_url: str = ""  # OpenAI-compatible base URL, e.g. http://127.0.0.1:8100/v1
+    generation_api_key: str = ""
     generation_model: str = "qwen-agent:latest"
-    embedding_model: str = "qwen-embed:latest"
+    embedding_backend: str = "transformers-cpu"
+    embedding_model: str = "Qwen3-Embedding-0.6B"
+    embedding_model_path: str = "/home/nas511/zhangruqi/models/Qwen3-Embedding-0.6B"
+    embedding_batch_size: int = 2
+    embedding_max_length: int = 8192
+    embedding_cpu_threads: int = 8
+    embedding_query_instruction: str = "Retrieve relevant evidence passages for the current report analysis question"
+    llm_concurrency: int = 1  # vLLM continuous batching入口并发；Ollama始终按1处理
+    evidence_batch_concurrency: int = 1  # 独立 Evidence 批次并发；仅 vLLM 部署建议设为2
+    # 同一物理模型上的交互控制通道。交互请求不进入长工作流的本地队列，
+    # 但仍通过独立信号量限制并发，并由 vLLM priority scheduler 统一调度。
+    interactive_concurrency: int = 1
+    interactive_input_tokens: int = 6144
+    interactive_history_tokens: int = 1536
+    interactive_output_tokens: int = 1024
     # Parser and multimodal extraction are Docling-only. The project no longer
     # maintains a separate OCR/ASR/Vision provider path.
     docling_ocr_engine: str = "rapidocr"  # rapidocr(PP-OCRv6,满血)/ auto / easyocr / tesseract
@@ -57,11 +74,18 @@ class Settings(BaseSettings):
     asr_model: str = "medium"  # ASR whisper 档位: tiny/base/small/medium/large(默认 medium:中文质量高且 CPU 可跑)
     asr_language: str = "zh"  # ASR 转写语言(默认中文;空=whisper 自动检测)
     gateway_timeout_seconds: int = 900
-    max_context_chars: int = 12000  # 模型上下文物理上限(字符),用于动态截取,不预设内容决策
+    max_context_chars: int = 18000  # 24K 服务窗口下的保守文本装箱上限
     # 上下文容量配置(物理上限派生,非内容决策):
     # 单批可用 tokens = 窗口 - 输出预留 - 固定 prompt 开销 - 安全余量
-    model_context_window_tokens: int = 65536  # 远端模型上下文窗口
+    model_context_window_tokens: int = 24576  # 必须与 vLLM max-model-len 保持一致
     generation_reserve_tokens: int = 8192  # 单次模型输出上限/预留，覆盖 Evidence 与小节成文
+    structured_output_tokens: int = 3072  # Planner/Analysis/QA 等结构化阶段默认输出预算
+    final_planner_output_tokens: int = 4096  # 最终结构需容纳完整章节/小节契约
+    writer_output_tokens: int = 3072  # 单个 Narrative subsection 的正文输出预算
+    writer_visible_word_token_ratio: float = 0.30  # JSON+引用绑定后的保守可见正文容量
+    evidence_output_tokens: int = 4096  # Evidence 结构化输出预算；与 Writer 长文预算分离
+    evidence_first_pass_input_tokens: int = 160000  # 首轮 Evidence 总输入资源边界
+    evidence_gap_input_tokens: int = 60000  # 单轮缺口检索输入资源边界
     prompt_overhead_tokens: int = 3000  # 固定 prompt(系统提示+维度+insights 头)
     safety_margin_tokens: int = 2048  # 安全余量(防估算偏差)
     writer_min_budget_completion_ratio: float = 0.8  # 规模 QA 阈值,不授权虚构或重复补齐
@@ -76,8 +100,10 @@ class Settings(BaseSettings):
     # rebuildable query projection and must never become a second fact source.
     graph_mode: str = "off"  # off / shadow / active
     graph_workspace_id: str = "default"
-    graph_build_before_analysis: bool = True
+    graph_build_before_analysis: bool = False
     graph_max_hops: int = 2
+    graph_output_tokens: int = 4096
+    graph_batch_concurrency: int = 2
     neo4j_uri: str = ""  # e.g. bolt://127.0.0.1:7687
     neo4j_user: str = "neo4j"
     neo4j_password: str = ""

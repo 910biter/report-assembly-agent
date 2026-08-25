@@ -80,6 +80,7 @@ function formatDate(value) { const timestamp = parseTimestamp(value); if (!times
 const remove = useMutation({ mutationFn: (id) => api(`/api/tasks/${id}`, { method: "DELETE" }), onSuccess: () => { selectedId.value = null; queryClient.invalidateQueries({ queryKey: ["tasks"] }); } });
 function deleteTask(task) { if (confirm(`删除任务“${task.theme}”？该操作不可恢复。`))
     remove.mutate(task.task_id); }
+function taskType(task) { return task.run_mode === "material_comparison" ? "新增材料对比" : task.incremental_update ? "增量更新" : "首次生成"; }
 const __VLS_ctx = {
     ...{},
     ...{},
@@ -444,7 +445,7 @@ if (__VLS_ctx.selected) {
     (__VLS_ctx.selected.run_revision || 1);
     __VLS_asFunctionalElement1(__VLS_intrinsics.dt, __VLS_intrinsics.dt)({});
     __VLS_asFunctionalElement1(__VLS_intrinsics.dd, __VLS_intrinsics.dd)({});
-    (__VLS_ctx.selected.incremental_update ? '增量更新' : '首次生成');
+    (__VLS_ctx.taskType(__VLS_ctx.selected));
     __VLS_asFunctionalElement1(__VLS_intrinsics.dt, __VLS_intrinsics.dt)({});
     __VLS_asFunctionalElement1(__VLS_intrinsics.dd, __VLS_intrinsics.dd)({});
     (__VLS_ctx.selected.variant_id ? __VLS_ctx.templateNames.get(Number(__VLS_ctx.selected.variant_id)) || `模板 ${__VLS_ctx.selected.variant_id}` : '默认模板');
@@ -482,7 +483,7 @@ if (__VLS_ctx.selected) {
     /** @type {__VLS_StyleScopedClasses['primary']} */ ;
     const { default: __VLS_44 } = __VLS_42.slots;
     // @ts-ignore
-    [selected, selected, selected, selected, selected, selected, selected, selected, selected, selected, selected, selected, selected, selected, selected, templateNames, formatDate, formatDate,];
+    [selected, selected, selected, selected, selected, selected, selected, selected, selected, selected, selected, selected, selected, selected, selected, templateNames, formatDate, formatDate, taskType,];
     var __VLS_42;
     __VLS_asFunctionalElement1(__VLS_intrinsics.button, __VLS_intrinsics.button)({
         ...{ onClick: (...[$event]) => {

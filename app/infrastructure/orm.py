@@ -183,7 +183,109 @@ CREATE TABLE IF NOT EXISTS style_variants (
     confidence REAL NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'draft',
     source_hash TEXT NOT NULL DEFAULT '',
+    structure_policy_json TEXT NOT NULL DEFAULT '{}',
+    evidence_usage_profile_json TEXT NOT NULL DEFAULT '{}',
+    exemplar_bank_json TEXT NOT NULL DEFAULT '[]',
+    learning_cases_json TEXT NOT NULL DEFAULT '[]',
+    profile_confidence_json TEXT NOT NULL DEFAULT '{}',
+    profile_version INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+);
+
+CREATE TABLE IF NOT EXISTS material_comparison_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    comparison_key TEXT NOT NULL UNIQUE,
+    task_id TEXT NOT NULL UNIQUE,
+    report_id INTEGER NOT NULL REFERENCES reports(id),
+    base_version_id INTEGER NOT NULL REFERENCES report_versions(id),
+    status TEXT NOT NULL DEFAULT 'created',
+    focus TEXT NOT NULL DEFAULT '',
+    material_ids_json TEXT NOT NULL DEFAULT '[]',
+    summary_json TEXT NOT NULL DEFAULT '{}',
+    error TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+    finished_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS material_comparison_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    comparison_id INTEGER NOT NULL REFERENCES material_comparison_runs(id),
+    item_key TEXT NOT NULL,
+    change_type TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending_review',
+    confidence TEXT NOT NULL DEFAULT 'medium',
+    new_fact_id INTEGER REFERENCES facts(id),
+    baseline_fact_id INTEGER,
+    baseline_inference_id INTEGER,
+    title TEXT NOT NULL DEFAULT '',
+    rationale TEXT NOT NULL DEFAULT '',
+    evidence_json TEXT NOT NULL DEFAULT '{}',
+    impact_json TEXT NOT NULL DEFAULT '{}',
+    user_note TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+    UNIQUE(comparison_id, item_key)
+);
+
+CREATE TABLE IF NOT EXISTS interaction_threads (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    thread_key TEXT NOT NULL UNIQUE,
+    task_id TEXT NOT NULL DEFAULT '',
+    report_id INTEGER REFERENCES reports(id),
+    artifact_type TEXT NOT NULL,
+    artifact_version TEXT NOT NULL DEFAULT '',
+    object_id TEXT NOT NULL DEFAULT '',
+    scope_json TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'open',
+    created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+    updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+);
+
+CREATE TABLE IF NOT EXISTS interaction_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    thread_id INTEGER NOT NULL REFERENCES interaction_threads(id),
+    role TEXT NOT NULL,
+    content TEXT NOT NULL,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+);
+
+CREATE TABLE IF NOT EXISTS change_proposals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    proposal_key TEXT NOT NULL UNIQUE,
+    thread_id INTEGER NOT NULL REFERENCES interaction_threads(id),
+    task_id TEXT NOT NULL DEFAULT '',
+    report_id INTEGER REFERENCES reports(id),
+    artifact_type TEXT NOT NULL,
+    artifact_version TEXT NOT NULL DEFAULT '',
+    object_id TEXT NOT NULL DEFAULT '',
+    operation TEXT NOT NULL,
+    before_json TEXT NOT NULL DEFAULT '{}',
+    after_json TEXT NOT NULL DEFAULT '{}',
+    impact_json TEXT NOT NULL DEFAULT '{}',
+    rationale TEXT NOT NULL DEFAULT '',
+    risk_level TEXT NOT NULL DEFAULT 'low',
+    status TEXT NOT NULL DEFAULT 'proposed',
+    execution_status TEXT NOT NULL DEFAULT 'not_required',
+    execution_run_id TEXT NOT NULL DEFAULT '',
+    base_version_id INTEGER REFERENCES report_versions(id),
+    candidate_version_id INTEGER REFERENCES report_versions(id),
+    execution_error TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+    decided_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS interaction_notifications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL DEFAULT '',
+    report_id INTEGER REFERENCES reports(id),
+    notification_type TEXT NOT NULL,
+    title TEXT NOT NULL,
+    message TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'unread',
+    action_url TEXT NOT NULL DEFAULT '',
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+    read_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS claims (
@@ -581,6 +683,12 @@ CREATE INDEX IF NOT EXISTS idx_insights_material ON material_insights(material_i
 CREATE INDEX IF NOT EXISTS idx_sentences_report ON report_sentences(report_id);
 CREATE INDEX IF NOT EXISTS idx_report_versions_report ON report_versions(report_id);
 CREATE INDEX IF NOT EXISTS idx_report_deltas_report ON report_version_deltas(report_id);
+CREATE INDEX IF NOT EXISTS idx_comparison_runs_report ON material_comparison_runs(report_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_comparison_items_run ON material_comparison_items(comparison_id, change_type);
+CREATE INDEX IF NOT EXISTS idx_interaction_threads_report ON interaction_threads(report_id, artifact_type);
+CREATE INDEX IF NOT EXISTS idx_change_proposals_thread ON change_proposals(thread_id, status);
+CREATE INDEX IF NOT EXISTS idx_change_proposals_execution ON change_proposals(task_id, execution_status);
+CREATE INDEX IF NOT EXISTS idx_interaction_notifications_task ON interaction_notifications(task_id, status, created_at);
 """
 # 迁移/演进补充列(历史 ALTER 汇总;新库 create_all 直接含,旧库靠 _migrate 补齐)
 _MIGRATED_COLUMNS: tuple[tuple[str, str, str], ...] = (
@@ -634,6 +742,17 @@ _MIGRATED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ('style_variants', 'chapter_styles_json', "TEXT NOT NULL DEFAULT '[]'"),
     ('style_variants', 'reasoning_profile_json', "TEXT NOT NULL DEFAULT '{}'"),
     ('style_variants', 'institution_rules_json', "TEXT NOT NULL DEFAULT '{}'"),
+    ('style_variants', 'structure_policy_json', "TEXT NOT NULL DEFAULT '{}'"),
+    ('style_variants', 'evidence_usage_profile_json', "TEXT NOT NULL DEFAULT '{}'"),
+    ('style_variants', 'exemplar_bank_json', "TEXT NOT NULL DEFAULT '[]'"),
+    ('style_variants', 'learning_cases_json', "TEXT NOT NULL DEFAULT '[]'"),
+    ('style_variants', 'profile_confidence_json', "TEXT NOT NULL DEFAULT '{}'"),
+    ('style_variants', 'profile_version', 'INTEGER NOT NULL DEFAULT 1'),
+    ('change_proposals', 'execution_status', "TEXT NOT NULL DEFAULT 'not_required'"),
+    ('change_proposals', 'execution_run_id', "TEXT NOT NULL DEFAULT ''"),
+    ('change_proposals', 'base_version_id', 'INTEGER REFERENCES report_versions(id)'),
+    ('change_proposals', 'candidate_version_id', 'INTEGER REFERENCES report_versions(id)'),
+    ('change_proposals', 'execution_error', "TEXT NOT NULL DEFAULT ''"),
     ('long_memory', 'scope', "TEXT NOT NULL DEFAULT 'institution'"),
     ('report_plans', 'objective', "TEXT NOT NULL DEFAULT ''"),
     ('report_plans', 'audience', "TEXT NOT NULL DEFAULT ''"),
@@ -793,6 +912,12 @@ ORMKGAssertionFact = Base.metadata.tables["kg_assertion_facts"]
 ORMKGTaskMembership = Base.metadata.tables["kg_task_membership"]
 ORMKGChangeSet = Base.metadata.tables["kg_changesets"]
 ORMGraphOutbox = Base.metadata.tables["graph_outbox"]
+ORMMaterialComparisonRun = Base.metadata.tables["material_comparison_runs"]
+ORMMaterialComparisonItem = Base.metadata.tables["material_comparison_items"]
+ORMInteractionThread = Base.metadata.tables["interaction_threads"]
+ORMInteractionMessage = Base.metadata.tables["interaction_messages"]
+ORMChangeProposal = Base.metadata.tables["change_proposals"]
+ORMInteractionNotification = Base.metadata.tables["interaction_notifications"]
 # 关联表(复合主键;writer 血缘等访问)
 ORMSentenceFact = Base.metadata.tables["report_sentence_fact"]
 ORMSentenceInference = Base.metadata.tables["report_sentence_inference"]

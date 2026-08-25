@@ -192,7 +192,21 @@ class PlannerAgent(BaseAgent):
             ).mappings().first()
         previous_budget = json.loads(existing["budget"] or "{}") if existing else {}
         previous_requirements = str(existing["user_requirements"] or "") if existing else ""
-        payload = self.generate_json(f"{context_block}\n\n请输出最终报告结构 JSON。", system=_FINAL_SYSTEM)
+        from app.config import settings
+
+        safe_unit_words = max(
+            500,
+            int(settings.writer_output_tokens * settings.writer_visible_word_token_ratio),
+        )
+        payload = self.generate_json(
+            f"{context_block}\n\n"
+            f"执行资源边界:单个小节一次成文的安全容量约 {safe_unit_words} 字。"
+            "章节与小节数量仍由内容逻辑决定，但任何小节的 target_words 不得超过该容量；"
+            "较长内容应在规划阶段拆成多个各自有明确研究问题的语义小节，不得依赖 Writer 续写或事后补写。\n"
+            "请输出字段完整、闭合的最终报告结构 JSON。",
+            system=_FINAL_SYSTEM,
+            max_tokens=settings.final_planner_output_tokens,
+        )
         chapters = payload.get("chapters") if isinstance(payload.get("chapters"), list) else []
         if not chapters:
             chapters = [{"title": "综合分析", "questions": [], "judgment": payload.get("core_judgment", "")}]

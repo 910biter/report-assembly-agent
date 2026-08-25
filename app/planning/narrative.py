@@ -117,7 +117,10 @@ class NarrativeAgent(BaseAgent):
 
         fact_ids = {int(f["id"]) for f in facts if f.get("id") is not None}
         inference_ids = {int(i["id"]) for i in inferences if i.get("id") is not None}
-        safe_unit_words = max(800, int(settings.generation_reserve_tokens or 0) // 2)
+        safe_unit_words = max(
+            500,
+            int(settings.writer_output_tokens * settings.writer_visible_word_token_ratio),
+        )
         prompt = (
             f"全文标题:{report_plan.get('title','')}\n"
             f"全文核心判断:{report_plan.get('core_judgment','')}\n"

@@ -10,6 +10,8 @@ import json
 import re
 import time
 import unicodedata
+import contextvars
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
@@ -89,6 +91,7 @@ class GraphBuildResult:
 class GraphExtractionAgent(BaseAgent):
     name = "graph_extract"
     role = _GRAPH_SYSTEM
+    output_token_limit = settings.graph_output_tokens
 
     def extract(self, facts: list[dict]) -> dict:
         lines = []
@@ -242,7 +245,26 @@ class GraphService:
         workspace_id = workspace_id or settings.graph_workspace_id
         started = time.time()
         try:
-            payloads = [self.extractor.extract(batch) for batch in _fact_batches(facts)]
+            batches = _fact_batches(facts)
+            concurrency = max(1, int(settings.graph_batch_concurrency or 1))
+
+            def extract_one(batch: list[dict]) -> dict:
+                return GraphExtractionAgent().extract(batch)
+
+            if concurrency == 1 or len(batches) <= 1:
+                payloads = [extract_one(batch) for batch in batches]
+            else:
+                payloads = [None] * len(batches)
+                with ThreadPoolExecutor(
+                    max_workers=min(concurrency, len(batches)),
+                    thread_name_prefix="graph-batch",
+                ) as pool:
+                    futures = []
+                    for index, batch in enumerate(batches):
+                        context = contextvars.copy_context()
+                        futures.append((index, pool.submit(context.run, extract_one, batch)))
+                    for index, future in futures:
+                        payloads[index] = future.result()
             entity_count = assertion_count = changes = 0
             with session_scope() as s:
                 valid_fact_ids = {int(item["id"]) for item in facts if item.get("id") is not None}
@@ -519,14 +541,24 @@ class GraphService:
 
 
 def _fact_batches(facts: list[dict]) -> list[list[dict]]:
-    """Partition complete facts by the model's physical prompt budget, never trim text."""
-    max_chars = max(8_000, int((settings.model_context_window_tokens - settings.generation_reserve_tokens - settings.prompt_overhead_tokens) * 3.2))
+    """Partition facts by both prompt capacity and estimated JSON capacity."""
+    prompt_tokens = max(
+        1024,
+        settings.model_context_window_tokens
+        - settings.graph_output_tokens
+        - settings.prompt_overhead_tokens
+        - settings.safety_margin_tokens,
+    )
+    max_chars = max(4_000, int(prompt_tokens * 2.2))
+    # Entity + assertion JSON is output-heavy. This is a protocol/resource
+    # estimate, not a semantic selection rule: every Fact remains included.
+    max_facts = max(12, int(settings.graph_output_tokens / 80))
     batches: list[list[dict]] = []
     current: list[dict] = []
     size = 0
     for fact in facts:
         text_size = len(str(fact.get("content") or "")) + 32
-        if current and size + text_size > max_chars:
+        if current and (size + text_size > max_chars or len(current) >= max_facts):
             batches.append(current)
             current, size = [], 0
         current.append(fact)

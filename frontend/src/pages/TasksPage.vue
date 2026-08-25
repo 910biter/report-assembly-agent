@@ -71,6 +71,7 @@ function resetFilters() { search.value = ""; dateRange.value = "all"; variant.va
 function formatDate(value?: string) { const timestamp = parseTimestamp(value); if (!timestamp) return "—"; return new Date(timestamp).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" }); }
 const remove = useMutation({ mutationFn: (id: string) => api(`/api/tasks/${id}`, { method: "DELETE" }), onSuccess: () => { selectedId.value = null; queryClient.invalidateQueries({ queryKey: ["tasks"] }); } });
 function deleteTask(task: TaskSummary) { if (confirm(`删除任务“${task.theme}”？该操作不可恢复。`)) remove.mutate(task.task_id); }
+function taskType(task: TaskSummary) { return task.run_mode === "material_comparison" ? "新增材料对比" : task.incremental_update ? "增量更新" : "首次生成"; }
 </script>
 
 <template>
@@ -98,7 +99,7 @@ function deleteTask(task: TaskSummary) { if (confirm(`删除任务“${task.them
       </div>
       <aside v-if="selected" class="task-detail">
         <div class="detail-head"><small>任务摘要</small><button class="icon-button" aria-label="关闭详情" @click="selectedId = null"><AppIcon name="close" :size="17" /></button></div><h2>{{ selected.theme }}</h2><StatusBadge :stage="selected.stage" />
-        <dl><dt>任务 ID</dt><dd class="mono">{{ selected.task_id }}</dd><dt>材料数量</dt><dd>{{ selected.material_count || 0 }} 份</dd><dt>报告版本</dt><dd>第 {{ selected.run_revision || 1 }} 版</dd><dt>任务类型</dt><dd>{{ selected.incremental_update ? '增量更新' : '首次生成' }}</dd><dt>使用模板</dt><dd>{{ selected.variant_id ? templateNames.get(Number(selected.variant_id)) || `模板 ${selected.variant_id}` : '默认模板' }}</dd><dt>创建时间</dt><dd>{{ formatDate(selected.created_at) }}</dd><dt>最近更新</dt><dd>{{ formatDate(selected.updated_at || selected.created_at) }}</dd></dl>
+        <dl><dt>任务 ID</dt><dd class="mono">{{ selected.task_id }}</dd><dt>材料数量</dt><dd>{{ selected.material_count || 0 }} 份</dd><dt>报告版本</dt><dd>第 {{ selected.run_revision || 1 }} 版</dd><dt>任务类型</dt><dd>{{ taskType(selected) }}</dd><dt>使用模板</dt><dd>{{ selected.variant_id ? templateNames.get(Number(selected.variant_id)) || `模板 ${selected.variant_id}` : '默认模板' }}</dd><dt>创建时间</dt><dd>{{ formatDate(selected.created_at) }}</dd><dt>最近更新</dt><dd>{{ formatDate(selected.updated_at || selected.created_at) }}</dd></dl>
         <p v-if="selected.update_reason" class="update-reason"><b>更新说明</b>{{ selected.update_reason }}</p><div class="detail-actions"><RouterLink class="btn primary" :to="`/tasks/${selected.task_id}`">打开任务</RouterLink><button class="btn danger" @click="deleteTask(selected)">删除任务</button></div>
       </aside>
     </section>

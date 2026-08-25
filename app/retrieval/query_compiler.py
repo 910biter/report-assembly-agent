@@ -41,7 +41,7 @@ class QueryCompiler:
         if query.text in self._vector_cache:
             return self._vector_cache[query.text]
         try:
-            vector = embed_texts([query.text])[0]
+            vector = embed_texts([query.text], query=True)[0]
         except Exception:
             vector = None
         self._vector_cache[query.text] = vector

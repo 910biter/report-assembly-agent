@@ -4,9 +4,12 @@ import { useRoute, useRouter, RouterLink } from "vue-router";
 import { api } from "@/api/http";
 import StatusBadge from "@/components/StatusBadge.vue";
 import AppIcon from "@/components/AppIcon.vue";
+import { useUiStore } from "@/stores/ui";
 const route = useRoute();
 const router = useRouter();
 const queryClient = useQueryClient();
+const ui = useUiStore();
+ui.ensureDraftId();
 const createOpen = ref(false);
 const form = ref();
 const error = ref("");
@@ -121,6 +124,11 @@ if (__VLS_ctx.createOpen) {
         ...{ class: "create-form" },
     });
     /** @type {__VLS_StyleScopedClasses['create-form']} */ ;
+    __VLS_asFunctionalElement1(__VLS_intrinsics.input)({
+        type: "hidden",
+        name: "interaction_draft_id",
+        value: (__VLS_ctx.ui.draftId),
+    });
     __VLS_asFunctionalElement1(__VLS_intrinsics.label, __VLS_intrinsics.label)({
         ...{ class: "field field-wide" },
     });
@@ -132,6 +140,7 @@ if (__VLS_ctx.createOpen) {
         required: true,
         placeholder: "例如：可信执行环境远程证明机制研究综述",
     });
+    (__VLS_ctx.ui.taskDraft.theme);
     __VLS_asFunctionalElement1(__VLS_intrinsics.label, __VLS_intrinsics.label)({
         ...{ class: "field field-wide" },
     });
@@ -139,6 +148,7 @@ if (__VLS_ctx.createOpen) {
     /** @type {__VLS_StyleScopedClasses['field-wide']} */ ;
     __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({});
     __VLS_asFunctionalElement1(__VLS_intrinsics.textarea, __VLS_intrinsics.textarea)({
+        value: (__VLS_ctx.ui.taskDraft.requirements),
         name: "requirements",
         rows: "4",
         placeholder: "描述用途、重点、篇幅或必须回答的问题。无需配置系统参数。",
@@ -170,7 +180,7 @@ if (__VLS_ctx.createOpen) {
         });
         (item.filename);
         // @ts-ignore
-        [materials,];
+        [ui, ui, ui, materials,];
     }
     __VLS_asFunctionalElement1(__VLS_intrinsics.label, __VLS_intrinsics.label)({
         ...{ class: "field" },

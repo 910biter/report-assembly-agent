@@ -1,9 +1,7 @@
-"""Single-model priority queue.
+"""Bounded priority dispatcher for model generation.
 
-The deployment currently has one generation model. Running multiple generation
-requests concurrently mostly moves the bottleneck into the model server, so we
-serialize generation calls and prioritize user-visible work over background
-jobs.
+Ollama remains serialized. A batching backend such as vLLM may run a bounded
+number of requests concurrently so its scheduler can continuously batch them.
 """
 from __future__ import annotations
 
@@ -15,6 +13,8 @@ import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
+
+from app.config import settings
 
 PRIORITY_INTERACTIVE = 10
 PRIORITY_NORMAL = 50
@@ -32,6 +32,7 @@ class _QueuedCall:
     sequence: int
     submitted_at: float = field(compare=False)
     fn: Callable[[], Any] = field(compare=False)
+    context: contextvars.Context = field(compare=False)
     done: threading.Event = field(default_factory=threading.Event, compare=False)
     result: Any = field(default=None, compare=False)
     error: BaseException | None = field(default=None, compare=False)
@@ -41,7 +42,7 @@ class _QueuedCall:
 
 _QUEUE: queue.PriorityQueue[_QueuedCall] = queue.PriorityQueue()
 _SEQUENCE = itertools.count()
-_WORKER_STARTED = False
+_WORKERS_STARTED = 0
 _WORKER_LOCK = threading.Lock()
 _STATS_LOCK = threading.Lock()
 _STATS = {
@@ -50,18 +51,31 @@ _STATS = {
     "failed": 0,
     "queue_wait_seconds": 0.0,
     "max_queue_wait_seconds": 0.0,
+    "active": 0,
+    "max_active": 0,
 }
 
 
-def _ensure_worker() -> None:
-    global _WORKER_STARTED
-    if _WORKER_STARTED:
+def _configured_concurrency() -> int:
+    if str(settings.generation_backend).lower() != "vllm":
+        return 1
+    return max(1, int(settings.llm_concurrency or 1))
+
+
+def _ensure_workers() -> None:
+    global _WORKERS_STARTED
+    target = _configured_concurrency()
+    if _WORKERS_STARTED >= target:
         return
     with _WORKER_LOCK:
-        if _WORKER_STARTED:
-            return
-        threading.Thread(target=_worker_loop, daemon=True, name="llm-priority-worker").start()
-        _WORKER_STARTED = True
+        while _WORKERS_STARTED < target:
+            index = _WORKERS_STARTED + 1
+            threading.Thread(
+                target=_worker_loop,
+                daemon=True,
+                name=f"llm-priority-worker-{index}",
+            ).start()
+            _WORKERS_STARTED += 1
 
 
 def _worker_loop() -> None:
@@ -72,8 +86,16 @@ def _worker_loop() -> None:
         with _STATS_LOCK:
             _STATS["queue_wait_seconds"] = round(float(_STATS["queue_wait_seconds"]) + wait, 3)
             _STATS["max_queue_wait_seconds"] = max(float(_STATS["max_queue_wait_seconds"]), round(wait, 3))
+            _STATS["active"] += 1
+            _STATS["max_active"] = max(int(_STATS["max_active"]), int(_STATS["active"]))
         try:
-            item.result = item.fn()
+            # Preserve task/monitor context across the queue boundary. Each
+            # item owns its copied Context, so concurrent workers stay isolated.
+            def invoke_in_context():
+                with llm_priority(item.priority):
+                    return item.fn()
+
+            item.result = item.context.run(invoke_in_context)
             with _STATS_LOCK:
                 _STATS["completed"] += 1
         except BaseException as exc:  # propagate the original failure to caller
@@ -82,23 +104,31 @@ def _worker_loop() -> None:
                 _STATS["failed"] += 1
         finally:
             item.finished_at = time.time()
+            with _STATS_LOCK:
+                _STATS["active"] = max(0, int(_STATS["active"]) - 1)
             item.done.set()
             _QUEUE.task_done()
 
 
 def submit_llm_call(fn: Callable[[], Any], priority: int | None = None) -> Any:
     """Submit one model generation call and block until it completes."""
-    _ensure_worker()
+    _ensure_workers()
     item = _QueuedCall(
         priority=int(priority if priority is not None else _priority_context.get()),
         sequence=next(_SEQUENCE),
         submitted_at=time.time(),
         fn=fn,
+        context=contextvars.copy_context(),
     )
     with _STATS_LOCK:
         _STATS["submitted"] += 1
     _QUEUE.put(item)
     item.done.wait()
+    # ContextVar writes made in a copied worker context do not propagate back
+    # automatically. Transfer only request telemetry; task and business state
+    # remain isolated in their original contexts.
+    from app.gateway import transfer_last_generation_call
+    transfer_last_generation_call(item.context)
     if item.error is not None:
         raise item.error
     return item.result
@@ -113,10 +143,16 @@ def llm_priority(priority: int):
         _priority_context.reset(token)
 
 
+def current_llm_priority() -> int:
+    return int(_priority_context.get())
+
+
 def llm_queue_stats() -> dict:
     with _STATS_LOCK:
         stats = dict(_STATS)
     stats["pending"] = _QUEUE.qsize()
+    stats["configured_concurrency"] = _configured_concurrency()
+    stats["backend"] = str(settings.generation_backend).lower()
     completed = int(stats.get("completed") or 0)
     stats["avg_queue_wait_seconds"] = (
         round(float(stats.get("queue_wait_seconds") or 0.0) / completed, 3)
