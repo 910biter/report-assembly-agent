@@ -53,7 +53,7 @@ def enqueue_task(task_id: str, priority: int = TASK_PRIORITY_NORMAL) -> dict:
         _QUEUED_TASK_IDS.add(task_id)
         _STATS["submitted"] += 1
         position = _QUEUE.qsize() + 1
-        short_term.update_task(task_id, queue_status={
+        short_term.update_task(task_id, error="", queue_status={
             "status": "queued",
             "position": position,
             "queued_at": round(time.time(), 1),
@@ -142,7 +142,7 @@ def _worker_loop() -> None:
             _STATS["started"] += 1
             _STATS["queue_wait_seconds"] = round(float(_STATS["queue_wait_seconds"]) + wait, 3)
             _STATS["max_queue_wait_seconds"] = max(float(_STATS["max_queue_wait_seconds"]), round(wait, 3))
-        short_term.update_task(item.task_id, queue_status={
+        short_term.update_task(item.task_id, error="", queue_status={
             "status": "running",
             "queue_wait_seconds": round(wait, 1),
             "started_at": round(time.time(), 1),
