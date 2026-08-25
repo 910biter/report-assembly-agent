@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import contextlib
 import math
 import re
 import time
@@ -31,6 +32,7 @@ from app.llm_scheduler import invoke
 from app.llm_queue import PRIORITY_INTERACTIVE, llm_priority
 from app.config import settings
 from app.report_versions import ensure_report_version
+from app.token_monitor import new_call_id, token_context
 
 EDITABLE_ARTIFACTS = {
     "task_draft", "task_brief", "material_role", "analysis_plan", "fact", "inference",
@@ -288,7 +290,15 @@ def _generate_interaction_reply(thread_id: int, content: str, request_id: str = 
     prompt = _build_interaction_prompt(thread, current, content)
     # Do not submit this request to the long-running workflow queue. Sending it
     # directly lets vLLM observe its priority and preempt/reorder queued work.
-    with llm_priority(PRIORITY_INTERACTIVE):
+    capture_scope = contextlib.nullcontext()
+    if settings.benchmark_capture_enabled:
+        from app.benchmark_capture import benchmark_call_context
+        call_id = new_call_id()
+        capture_scope = benchmark_call_context(
+            call_id=call_id, logical_call_id=call_id,
+            agent="review_copilot", attempt=0,
+        )
+    with token_context(task_id=str(thread.get("task_id") or ""), stage="interaction"), capture_scope, llm_priority(PRIORITY_INTERACTIVE):
         result = invoke(
             "review_copilot",
             model_gateway.generate_json,

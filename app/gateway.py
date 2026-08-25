@@ -31,6 +31,18 @@ _LAST_GENERATION_META_CONTEXT = contextvars.ContextVar("last_generation_meta", d
 _LAST_GENERATION_STATS = contextvars.ContextVar("last_generation_stats", default={})
 
 
+def _capture_benchmark(**event) -> None:
+    """Keep raw benchmark capture completely out of the normal hot path."""
+    if not bool(settings.benchmark_capture_enabled):
+        return
+    try:
+        from app.benchmark_capture import capture_llm_call
+        capture_llm_call(**event)
+    except Exception:
+        # Benchmark instrumentation must never affect a business response.
+        pass
+
+
 class ModelGateway(Protocol):
     def generate(self, prompt: str, system: str | None = None,
                  max_tokens: int | None = None) -> str: ...
@@ -82,7 +94,7 @@ class OllamaGateway:
         if system:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
-        payload = {
+        request_payload = {
             "model": settings.generation_model,
             "messages": messages,
             "stream": False,
@@ -93,17 +105,21 @@ class OllamaGateway:
             },
         }
         if json_mode:
-            payload["format"] = "json"
+            request_payload["format"] = "json"
         if think is not None:
-            payload["think"] = bool(think)
+            request_payload["think"] = bool(think)
         from app import task_control
         task_id = task_control.active_task_id()
         client = httpx.Client(timeout=settings.gateway_timeout_seconds)
         if task_id:
             task_control.register_client(task_id, client)
         try:
-            response = client.post(f"{self.base_url}/api/chat", json=payload)
-        except Exception:
+            response = client.post(f"{self.base_url}/api/chat", json=request_payload)
+        except Exception as exc:
+            _capture_benchmark(
+                backend="ollama", endpoint=f"{self.base_url}/api/chat",
+                request=request_payload, elapsed_seconds=0.0, error=str(exc),
+            )
             if task_id and task_control.is_paused(task_id):
                 raise RuntimeError("TASK_PAUSED")
             raise
@@ -114,11 +130,22 @@ class OllamaGateway:
                 client.close()
             except Exception:
                 pass
-        response.raise_for_status()
-        payload = response.json()
-        _record_generation_stats(payload)
-        content = payload["message"]["content"].strip()
+        try:
+            response.raise_for_status()
+        except Exception as exc:
+            _capture_benchmark(
+                backend="ollama", endpoint=f"{self.base_url}/api/chat",
+                request=request_payload, elapsed_seconds=0.0, error=str(exc),
+            )
+            raise
+        response_payload = response.json()
+        _record_generation_stats(response_payload)
+        content = response_payload["message"]["content"].strip()
         _record_generation_meta(returned_chars=len(content), valid_json_chars=0)
+        _capture_benchmark(
+            backend="ollama", endpoint=f"{self.base_url}/api/chat",
+            request=request_payload, response=response_payload, content=content,
+        )
         return content
 
     def generate_json(self, prompt: str, system: str | None = None,
@@ -231,7 +258,7 @@ class OpenAICompatibleGateway(OllamaGateway):
         if system:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
-        payload = {
+        request_payload = {
             "model": settings.generation_model,
             "messages": messages,
             "stream": False,
@@ -239,14 +266,14 @@ class OpenAICompatibleGateway(OllamaGateway):
         }
         # Lower values are more urgent in vLLM's priority scheduler.
         from app.llm_queue import current_llm_priority
-        payload["priority"] = current_llm_priority()
+        request_payload["priority"] = current_llm_priority()
         if think is not None:
-            payload["chat_template_kwargs"] = {
+            request_payload["chat_template_kwargs"] = {
                 "enable_thinking": bool(think),
                 "preserve_thinking": False,
             }
         if json_mode:
-            payload["response_format"] = {"type": "json_object"}
+            request_payload["response_format"] = {"type": "json_object"}
         from app import task_control
         task_id = task_control.active_task_id()
         client = httpx.Client(timeout=settings.gateway_timeout_seconds)
@@ -257,20 +284,24 @@ class OpenAICompatibleGateway(OllamaGateway):
             response = client.post(
                 f"{self.generation_url}/chat/completions",
                 headers=self._headers(),
-                json=payload,
+                json=request_payload,
             )
             adjusted_max_tokens = _context_safe_max_tokens(
                 response,
-                requested_max_tokens=int(payload["max_tokens"]),
+                requested_max_tokens=int(request_payload["max_tokens"]),
             )
             if adjusted_max_tokens is not None:
-                payload["max_tokens"] = adjusted_max_tokens
+                request_payload["max_tokens"] = adjusted_max_tokens
                 response = client.post(
                     f"{self.generation_url}/chat/completions",
                     headers=self._headers(),
-                    json=payload,
+                    json=request_payload,
                 )
-        except Exception:
+        except Exception as exc:
+            _capture_benchmark(
+                backend="openai-compatible", endpoint=f"{self.generation_url}/chat/completions",
+                request=request_payload, elapsed_seconds=time.perf_counter() - started, error=str(exc),
+            )
             if task_id and task_control.is_paused(task_id):
                 raise RuntimeError("TASK_PAUSED")
             raise
@@ -282,15 +313,31 @@ class OpenAICompatibleGateway(OllamaGateway):
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
             detail = response.text.strip().replace("\n", " ")[:500]
+            _capture_benchmark(
+                backend="openai-compatible", endpoint=f"{self.generation_url}/chat/completions",
+                request=request_payload, elapsed_seconds=time.perf_counter() - started,
+                error=f"MODEL_HTTP_{response.status_code}:{detail or 'empty response'}",
+            )
             raise RuntimeError(
                 f"MODEL_HTTP_{response.status_code}:{detail or 'empty response'}"
             ) from exc
         result = response.json()
         _record_openai_generation_stats(result, time.perf_counter() - started)
         if _completion_was_truncated(result):
+            _capture_benchmark(
+                backend="openai-compatible", endpoint=f"{self.generation_url}/chat/completions",
+                request=request_payload, response=result,
+                content=str(result["choices"][0]["message"].get("content") or ""),
+                elapsed_seconds=time.perf_counter() - started, error="MODEL_OUTPUT_TRUNCATED",
+            )
             raise RuntimeError("MODEL_OUTPUT_TRUNCATED")
         content = str(result["choices"][0]["message"].get("content") or "").strip()
         _record_generation_meta(returned_chars=len(content), valid_json_chars=0)
+        _capture_benchmark(
+            backend="openai-compatible", endpoint=f"{self.generation_url}/chat/completions",
+            request=request_payload, response=result, content=content,
+            elapsed_seconds=time.perf_counter() - started,
+        )
         return content
 
     def health(self) -> dict:

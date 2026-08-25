@@ -8,8 +8,10 @@
   (settings.gpu_memory_tight)决定是否临时卸载推理模型——unload 是
   资源调度策略,不是业务工作流的一部分;显存够时保持常驻零开销。
 """
+import contextlib
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 
 from app.config import settings
@@ -58,12 +60,21 @@ def invoke(kind: str, fn, *args, **kwargs):
             return fn(*args, **kwargs)
     # 交互请求需要先到达 vLLM，服务端优先级才有机会生效。它不能与长工作流
     # 共用本地 generation semaphore，否则所有工作流槽位繁忙时会被提前阻塞。
-    if kind == "review_copilot":
-        return _invoke_lane("interactive", _interactive_slots, fn, *args, **kwargs)
-    return _invoke_lane("workflow", _generation_slots, fn, *args, **kwargs)
+    capture_scope = contextlib.nullcontext()
+    if settings.benchmark_capture_enabled:
+        from app.benchmark_capture import benchmark_call_context, current_benchmark_call_context
+        if not current_benchmark_call_context().get("call_id"):
+            call_id = uuid.uuid4().hex[:16]
+            capture_scope = benchmark_call_context(
+                call_id=call_id, logical_call_id=call_id, agent=str(kind), attempt=0,
+            )
+    with capture_scope:
+        if kind == "review_copilot":
+            return _invoke_lane("interactive", _interactive_slots, fn, *args, capture_kind=kind, **kwargs)
+        return _invoke_lane("workflow", _generation_slots, fn, *args, capture_kind=kind, **kwargs)
 
 
-def _invoke_lane(lane: str, slots, fn, *args, **kwargs):
+def _invoke_lane(lane: str, slots, fn, *args, capture_kind: str = "", **kwargs):
     submitted_at = time.perf_counter()
     with _lane_stats_lock:
         _lane_stats[lane]["submitted"] += 1
@@ -74,19 +85,36 @@ def _invoke_lane(lane: str, slots, fn, *args, **kwargs):
             stats["slot_wait_seconds"] += wait
             stats["active"] += 1
             stats["max_active"] = max(stats["max_active"], stats["active"])
+        executed_at = time.perf_counter()
+        success = False
+        error = ""
         try:
             result = fn(*args, **kwargs)
-        except Exception:
+        except Exception as exc:
+            error = str(exc)[:500]
             with _lane_stats_lock:
                 _lane_stats[lane]["failed"] += 1
             raise
         else:
             with _lane_stats_lock:
                 _lane_stats[lane]["completed"] += 1
+            success = True
             return result
         finally:
             with _lane_stats_lock:
                 _lane_stats[lane]["active"] -= 1
+            if settings.benchmark_capture_enabled:
+                try:
+                    from app.benchmark_capture import capture_enrichment, current_benchmark_call_context
+                    call_id = str(current_benchmark_call_context().get("call_id") or "")
+                    capture_enrichment(call_id, "scheduler", {
+                        "kind": str(capture_kind), "lane": lane,
+                        "queue_wait_seconds": round(wait, 6),
+                        "execution_seconds": round(time.perf_counter() - executed_at, 6),
+                        "success": success, "error": error,
+                    })
+                except Exception:
+                    pass
 
 
 def model_lane_stats() -> dict:

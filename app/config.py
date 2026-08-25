@@ -64,6 +64,16 @@ class Settings(BaseSettings):
     interactive_input_tokens: int = 6144
     interactive_history_tokens: int = 1536
     interactive_output_tokens: int = 1024
+    # Raw Benchmark capture is opt-in and writes through an asynchronous side
+    # channel. It is intended only for explicitly selected test tasks.
+    benchmark_capture_enabled: bool = False
+    benchmark_capture_all: bool = False
+    benchmark_capture_task_ids: str = ""
+    benchmark_capture_dir: Path = _PROJECT_ROOT / "runtime" / "benchmarks" / "captures"
+    benchmark_capture_queue_size: int = 256
+    benchmark_capture_sample_interval_seconds: float = 0.5
+    benchmark_capture_metrics_url: str = ""  # optional vLLM Prometheus endpoint
+    benchmark_capture_accelerator_probe_command: str = ""  # optional local JSON probe for NPU/other accelerators
     # Parser and multimodal extraction are Docling-only. The project no longer
     # maintains a separate OCR/ASR/Vision provider path.
     docling_ocr_engine: str = "rapidocr"  # rapidocr(PP-OCRv6,满血)/ auto / easyocr / tesseract

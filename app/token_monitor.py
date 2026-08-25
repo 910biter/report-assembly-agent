@@ -9,6 +9,7 @@ import uuid
 from statistics import median
 from typing import Any
 
+from app.config import settings
 from app.db import session_scope
 from app.infrastructure.orm import ORMLLMCall, ORMFact, ORMInference, ORMSentence
 from sqlalchemy import select, update
@@ -18,6 +19,17 @@ _run_id: contextvars.ContextVar[str] = contextvars.ContextVar("token_run_id", de
 _stage: contextvars.ContextVar[str] = contextvars.ContextVar("token_stage", default="")
 _report_mode: contextvars.ContextVar[str] = contextvars.ContextVar("token_report_mode", default="")
 _material_count: contextvars.ContextVar[int] = contextvars.ContextVar("token_material_count", default=0)
+
+
+def _capture_baseline_enrichment(call_id: str, kind: str, payload: dict[str, Any]) -> None:
+    """Side-channel benchmark enrichment; never affects token accounting."""
+    if not bool(settings.benchmark_capture_enabled):
+        return
+    try:
+        from app.benchmark_capture import capture_enrichment
+        capture_enrichment(call_id, kind, _json_safe(payload))
+    except Exception:
+        pass
 
 
 @contextlib.contextmanager
@@ -102,6 +114,23 @@ def log_llm_call(call_id: str, agent: str, input_chars: int, stats_delta: dict,
             update(ORMLLMCall).where(ORMLLMCall.c.call_id == call_id)
             .values(funnel_json=json.dumps({"model_timing": timing}, ensure_ascii=False))
         )
+    _capture_baseline_enrichment(call_id, "call_log", {
+        "agent": agent or "base",
+        "context": ctx,
+        "input_chars": int(input_chars),
+        "input_tokens": prompt_tokens,
+        "output_tokens": output_tokens,
+        "context_tokens": context_tokens,
+        "latency_ms": int(latency_seconds * 1000),
+        "retry_count": int(retry_count),
+        "success": bool(success),
+        "error": str(error or "")[:500],
+        "returned_chars": int(returned_chars or 0),
+        "valid_json_chars": int(valid_json_chars or 0),
+        "returned_tokens": returned_tokens,
+        "parsed_tokens": parsed_tokens,
+        "model_timing": timing,
+    })
 
 
 def log_pipeline_event(agent: str, **funnel: Any) -> str:
@@ -156,6 +185,7 @@ def update_call_products(call_id: str, **products: list[int]) -> None:
         return
     with session_scope() as s:
         s.execute(update(ORMLLMCall).where(ORMLLMCall.c.call_id == call_id).values(**values))
+    _capture_baseline_enrichment(call_id, "products", values)
 
 
 def update_call_metrics(call_id: str, **metrics: int) -> None:
@@ -185,6 +215,7 @@ def update_call_metrics(call_id: str, **metrics: int) -> None:
         return
     with session_scope() as s:
         s.execute(update(ORMLLMCall).where(ORMLLMCall.c.call_id == call_id).values(**values))
+    _capture_baseline_enrichment(call_id, "metrics", values)
 
 
 def update_call_funnel(call_id: str, **funnel: Any) -> None:
@@ -209,6 +240,7 @@ def update_call_funnel(call_id: str, **funnel: Any) -> None:
             update(ORMLLMCall).where(ORMLLMCall.c.call_id == call_id)
             .values(funnel_json=json.dumps(current, ensure_ascii=False))
         )
+    _capture_baseline_enrichment(call_id, "funnel", funnel)
 
 
 def _json_safe(value: Any) -> Any:
