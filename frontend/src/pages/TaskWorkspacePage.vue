@@ -1,11 +1,12 @@
 <script setup lang="ts">
-import { computed, defineAsyncComponent, ref } from "vue";
+import { computed, defineAsyncComponent, ref, watch } from "vue";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/vue-query";
 import { useRoute, RouterLink } from "vue-router";
 import { api } from "@/api/http";
 import type { TaskSummary } from "@/api/types";
 import StatusBadge from "@/components/StatusBadge.vue";
 import ArtifactReviewWorkspace from "@/components/ArtifactReviewWorkspace.vue";
+import MaterialComparisonWorkspace from "@/components/MaterialComparisonWorkspace.vue";
 const GraphNetwork = defineAsyncComponent(
   () => import("@/components/GraphNetwork.vue"),
 );
@@ -24,6 +25,10 @@ const task = useQuery({
       ? 15000
       : 4000,
 });
+const isComparison = computed(() => task.data.value?.run_mode === "material_comparison");
+watch(() => task.data.value?.run_mode, mode => {
+  if (mode === "material_comparison" && !route.query.tab) active.value = "comparison";
+}, { immediate: true });
 const materials = useQuery({
   queryKey: ["task-materials", taskId],
   queryFn: () => api<any[]>(`/api/tasks/${taskId}/materials`),
@@ -96,6 +101,9 @@ const stages = computed(() =>
         { name: "审核完成", keys: ["review", "done"] },
       ],
 );
+const taskTabs = computed(() => isComparison.value
+  ? [["comparison", "对比结果"], ["materials", "新增材料"], ["runtime", "运行详情"]]
+  : [["overview", "概览"], ["materials", "材料"], ["analysis", "分析"], ["report", "报告"], ["versions", "版本"], ["collaboration", "协作审阅"]]);
 const stageIndex = computed(() =>
   Math.max(
     0,
@@ -174,11 +182,16 @@ function versionsList() {
           class="btn"
           :to="`/reports/${task.data.value.report_id}`"
           >打开报告</RouterLink
+        ><RouterLink
+          v-else-if="isComparison && task.data.value.comparison_report_id"
+          class="btn"
+          :to="`/reports/${task.data.value.comparison_report_id}`"
+          >查看基线报告</RouterLink
         >
       </div>
     </header>
     <section class="surface progress-block">
-      <div class="progress-rail">
+      <div class="progress-rail" :class="{ compact: isComparison }">
         <div
           v-for="(item, index) in stages"
           :key="item.name"
@@ -229,14 +242,7 @@ function versionsList() {
     </section>
     <nav class="tabs workspace-tabs">
       <button
-        v-for="tab in [
-          ['overview', '概览'],
-          ['materials', '材料'],
-          ['analysis', '分析'],
-          ['report', '报告'],
-          ['versions', '版本'],
-          ['collaboration', '协作审阅'],
-        ]"
+        v-for="tab in taskTabs"
         :key="tab[0]"
         class="tab"
         :class="{ active: active === tab[0] }"
@@ -245,7 +251,17 @@ function versionsList() {
         {{ tab[1] }}
       </button>
     </nav>
-    <section v-if="active === 'overview'" class="workspace-grid">
+    <MaterialComparisonWorkspace
+      v-if="active === 'comparison' && isComparison"
+      embedded
+      :report-id="Number(task.data.value.comparison_report_id)"
+      :comparison-id="Number(task.data.value.comparison_id)"
+    />
+    <section v-else-if="active === 'runtime' && isComparison" class="surface section-block">
+      <div class="section-head"><div><h2>运行详情</h2><p class="muted">对比任务只执行新增材料解析、事实提取和变化核验，不生成或改写报告。</p></div></div>
+      <div class="status-summary"><div><span>内部阶段</span><b>{{ task.data.value.stage }}</b></div><div><span>队列状态</span><b>{{ task.data.value.queue_status?.status || "—" }}</b></div><div><span>解析进度</span><b>{{ task.data.value.parse_progress?.done || 0 }} / {{ task.data.value.parse_progress?.total || "—" }}</b></div></div>
+    </section>
+    <section v-else-if="active === 'overview'" class="workspace-grid">
       <div class="main-column">
         <div v-if="task.data.value.stage === 'failed'" class="notice warning">
           <b>任务运行异常</b><br />{{
@@ -670,6 +686,9 @@ function versionsList() {
 .progress-rail {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
+}
+.progress-rail.compact {
+  grid-template-columns: repeat(3, 1fr);
 }
 .progress-step {
   position: relative;

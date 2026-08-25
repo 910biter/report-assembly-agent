@@ -4,7 +4,13 @@ import inspect
 from app.evidence.extractor import EvidenceAgent
 from app.infrastructure.orm import Base
 from app.interaction import _artifact_summary, _proposal_instruction
-from app.material_comparison import _candidate_sets, _fallback_decision, _lineage_impacts
+from app.material_comparison import (
+    CHANGE_TYPES,
+    _candidate_sets,
+    _comparison_document,
+    _fallback_decision,
+    _lineage_impacts,
+)
 from app.memory.style import _editorial_confidence, _normalize_profile_label, _validate_profile_payload
 from app.memory.style_profile import (
     aggregate_style_metrics,
@@ -115,6 +121,24 @@ class ProductExtensionTests(unittest.TestCase):
         }]})
         self.assertEqual(impacts[3][0]["section"], "风险分析")
         self.assertEqual(impacts[3][0]["reason"], "lineage")
+
+    def test_comparison_document_maps_changes_to_stable_report_sentences(self):
+        document = _comparison_document(
+            {"sentence_snapshot": [{
+                "id": 8, "section": "风险分析", "paragraph": 2,
+                "position": 1, "content": "原报告事实。", "source_refs": {"fact_ids": [3]},
+            }]},
+            [{
+                "id": 21, "change_type": "conflict", "status": "pending_review",
+                "confidence": "high", "impact": {"report_locations": [{"sentence_id": 8}]},
+            }],
+        )
+        self.assertEqual(document["sentences"][0]["changes"][0]["item_id"], 21)
+        self.assertEqual(document["sentences"][0]["changes"][0]["change_type"], "conflict")
+        self.assertEqual(document["unmapped_item_ids"], [])
+
+    def test_comparison_can_retain_related_material_without_calling_it_irrelevant(self):
+        self.assertIn("related", CHANGE_TYPES)
 
     def test_structure_policy_separates_layout_from_content_planning(self):
         variant = StyleVariant(library_id=1, structure={"sections": [{"title": "模板示例目录"}]})

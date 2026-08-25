@@ -18,6 +18,7 @@ from sqlalchemy import delete, insert, select, update
 from app.db import session_scope
 from app.gateway import model_gateway
 from app.infrastructure.orm import (
+    ORMEvidence,
     ORMFact,
     ORMInference,
     ORMMaterialComparisonItem,
@@ -29,7 +30,7 @@ from app.report_versions import get_report_version
 
 CHANGE_TYPES = {
     "addition", "corroboration", "refinement", "update", "conflict",
-    "weakening", "irrelevant", "uncertain",
+    "weakening", "related", "irrelevant", "uncertain",
 }
 
 _CLASSIFY_PROMPT = """你是新增材料变化核验员。请比较“新增事实”和候选基线事实，判断它对基线报告的真实影响。
@@ -38,7 +39,7 @@ _CLASSIFY_PROMPT = """你是新增材料变化核验员。请比较“新增事�
   "items": [{
     "new_fact_id": 1,
     "baseline_fact_id": 2或null,
-    "change_type": "addition/corroboration/refinement/update/conflict/weakening/irrelevant/uncertain",
+    "change_type": "addition/corroboration/refinement/update/conflict/weakening/related/irrelevant/uncertain",
     "confidence": "high/medium/low",
     "title": "简洁变化标题",
     "rationale": "一句话说明判断依据"
@@ -52,6 +53,7 @@ _CLASSIFY_PROMPT = """你是新增材料变化核验员。请比较“新增事�
 - update：同一事项出现更晚版本、状态或替代值；
 - conflict：相同主体、事项、时间/适用范围下不能同时成立；
 - weakening：不直接构成相反事实，但削弱既有判断；
+- related：与既有事实或报告主题相关，但尚不足以构成新增断言、补强、细化、更新或冲突；
 - irrelevant：真实但不影响当前报告目标；
 - uncertain：证据不足以稳定分类。
 不得仅因措辞不同判为冲突，不得猜测材料中没有的信息。
@@ -101,7 +103,16 @@ def get_comparison(comparison_id: int) -> dict[str, Any] | None:
             ORMMaterialComparisonItem.c.comparison_id == int(comparison_id)
         ).order_by(ORMMaterialComparisonItem.c.id)).mappings().all()
     result = _run_detail(row, include_items=False)
-    result["items"] = [_item_detail(item) for item in items]
+    result_items = [_item_detail(item) for item in items]
+    _attach_new_fact_evidence(result_items)
+    result["items"] = result_items
+    baseline = get_report_version(int(row["base_version_id"]))
+    result["baseline"] = {
+        "id": int(row["base_version_id"]),
+        "title": str((baseline or {}).get("title") or ""),
+        "version_label": str((baseline or {}).get("version_label") or (baseline or {}).get("version_no") or ""),
+    }
+    result["document"] = _comparison_document(baseline or {}, result_items)
     return result
 
 
@@ -171,7 +182,7 @@ def complete_comparison_task(task_id: str) -> dict[str, Any]:
         if not impacts:
             impacts = _section_overlap_impacts(str(fact.get("content") or ""), sections)
         evidence = {
-            "new_fact": _compact_fact(fact),
+            "new_fact": _compact_fact(fact, include_evidence=True),
             "baseline_fact": baseline_fact,
         }
         item_key = hashlib.sha256(
@@ -419,8 +430,83 @@ def _inference_impact_summary(new_items: list[dict], baseline_items: list[dict])
     return {"generated": len(new_items), "related_to_baseline": affected, "requires_review": bool(new_items)}
 
 
-def _compact_fact(fact: dict) -> dict:
-    return {key: fact.get(key) for key in ("id", "content", "dimension", "source_level", "stable_key")}
+def _compact_fact(fact: dict, *, include_evidence: bool = False) -> dict:
+    result = {key: fact.get(key) for key in ("id", "content", "dimension", "source_level", "stable_key")}
+    if include_evidence:
+        result["evidence"] = list(fact.get("evidence") or [])
+    return result
+
+
+def _attach_new_fact_evidence(items: list[dict[str, Any]]) -> None:
+    """Backfill provenance for comparisons created before evidence was embedded."""
+    fact_ids = sorted({
+        int(item["new_fact_id"]) for item in items if item.get("new_fact_id") is not None
+    })
+    if not fact_ids:
+        return
+    with session_scope() as s:
+        rows = s.execute(
+            select(ORMEvidence).where(ORMEvidence.c.fact_id.in_(fact_ids)).order_by(ORMEvidence.c.id)
+        ).mappings().all()
+    evidence_by_fact: dict[int, list[dict[str, Any]]] = {}
+    for row in rows:
+        evidence_by_fact.setdefault(int(row["fact_id"]), []).append({
+            "evidence_id": int(row["id"]),
+            "material_id": int(row["material_id"]),
+            "unit_id": int(row["unit_id"]),
+            "source_file": row["source_file"],
+            "page": row["page"],
+            "paragraph": row["paragraph"],
+            "quote": row["quote"],
+        })
+    for item in items:
+        fact = (item.get("evidence") or {}).get("new_fact")
+        if not isinstance(fact, dict):
+            continue
+        fact["evidence"] = evidence_by_fact.get(int(item["new_fact_id"]), [])
+
+
+def _comparison_document(baseline: dict, items: list[dict[str, Any]]) -> dict[str, Any]:
+    """Build a stable sentence-oriented view without changing the baseline report."""
+    changes_by_sentence: dict[int, list[dict[str, Any]]] = {}
+    mapped_item_ids: set[int] = set()
+    for item in items:
+        for location in (item.get("impact") or {}).get("report_locations", []):
+            sentence_id = location.get("sentence_id")
+            if sentence_id is None:
+                continue
+            try:
+                sentence_key = int(sentence_id)
+            except (TypeError, ValueError):
+                continue
+            mapped_item_ids.add(int(item["id"]))
+            changes_by_sentence.setdefault(sentence_key, []).append({
+                "item_id": int(item["id"]),
+                "change_type": item["change_type"],
+                "status": item["status"],
+                "confidence": item["confidence"],
+            })
+
+    sentences = []
+    for row in baseline.get("sentence_snapshot") or []:
+        sentence_id = row.get("id")
+        try:
+            sentence_key = int(sentence_id)
+        except (TypeError, ValueError):
+            sentence_key = -1
+        sentences.append({
+            "id": sentence_id,
+            "section": row.get("section") or "正文",
+            "paragraph": row.get("paragraph") or 0,
+            "position": row.get("position") or 0,
+            "text": row.get("rendered_text") or row.get("content") or "",
+            "source_refs": row.get("source_refs") or {},
+            "changes": changes_by_sentence.get(sentence_key, []),
+        })
+    return {
+        "sentences": sentences,
+        "unmapped_item_ids": [int(item["id"]) for item in items if int(item["id"]) not in mapped_item_ids],
+    }
 
 
 def _text_overlap(left: str, right: str) -> float:
