@@ -891,10 +891,11 @@ def save_fact_with_evidence(fact: Fact, evidence_list: list[Evidence], task_id: 
 
 
 def save_claim(claim: Claim, status: str, origin_call_id: str = "", task_id: str = "") -> int:
+    fact_id = int(claim.fact_id) if claim.fact_id is not None else None
     with session_scope() as s:
         result = s.execute(
             ORMClaim.insert().values(
-                fact_id=claim.fact_id or 0, material_id=claim.material_id,
+                fact_id=fact_id, material_id=claim.material_id,
                 content=claim.content, quote=claim.quote, source=claim.source,
                 fact_type=claim.fact_type, dimension=claim.dimension, need_id=claim.need_id,
                 status=status, task_id=task_id, origin_call_id=origin_call_id,
