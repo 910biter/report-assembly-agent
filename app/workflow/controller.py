@@ -241,6 +241,33 @@ class WorkflowController:
                 self.detect_conflicts()
         self._record_artifact("conflict", {"conflict_ids": self.task.get("conflict_ids", [])})
         _mark("conflict")
+        if self.task.get("run_mode") == "material_comparison":
+            # Comparison is a fact-and-provenance product. Ordinary report
+            # inferences do not participate in baseline sentence matching.
+            from app.material_comparison import complete_comparison_task, mark_comparison_failed
+            try:
+                comparison = complete_comparison_task(self.task_id)
+            except Exception as exc:
+                mark_comparison_failed(self.task_id, str(exc))
+                raise
+            _mark("material_comparison")
+            run_id = str(self.task.get("run_id") or "")
+            self._update(
+                stage=str(Stage.REVIEW),
+                material_comparison=comparison,
+                stage_timings=_marks,
+                stage_durations=_durations,
+                llm_stats=llm_stats(),
+                token_efficiency=build_token_efficiency(self.task_id, None, run_id=run_id),
+                workload_profile=build_workload_profile(self.task_id, run_id=run_id),
+                critical_path_done=True,
+            )
+            update_task_run(
+                run_id, status="review",
+                metadata={"comparison_id": comparison.get("id"), "report_id": comparison.get("report_id")},
+                finished=True,
+            )
+            return
         if self.task.get("analysis_done"):
             self._update(stage=str(Stage.ANALYSIS), resume={"stage": "analysis", "status": "reused"})
         elif self.task.get("incremental_update"):
@@ -291,34 +318,6 @@ class WorkflowController:
             "external_ids": self.task.get("external_ids", []),
         })
         _mark("analysis")
-        if self.task.get("run_mode") == "material_comparison":
-            # New-material comparison is a read-only analysis product.  It
-            # deliberately stops before Final Plan / Writer and never mutates
-            # the baseline report selected by the user.
-            from app.material_comparison import complete_comparison_task, mark_comparison_failed
-            try:
-                comparison = complete_comparison_task(self.task_id)
-            except Exception as exc:
-                mark_comparison_failed(self.task_id, str(exc))
-                raise
-            _mark("material_comparison")
-            run_id = str(self.task.get("run_id") or "")
-            self._update(
-                stage=str(Stage.REVIEW),
-                material_comparison=comparison,
-                stage_timings=_marks,
-                stage_durations=_durations,
-                llm_stats=llm_stats(),
-                token_efficiency=build_token_efficiency(self.task_id, None, run_id=run_id),
-                workload_profile=build_workload_profile(self.task_id, run_id=run_id),
-                critical_path_done=True,
-            )
-            update_task_run(
-                run_id, status="review",
-                metadata={"comparison_id": comparison.get("id"), "report_id": comparison.get("report_id")},
-                finished=True,
-            )
-            return
         if self.task.get("incremental_update"):
             # 增量 final_plan 策略:
             # - 无新增材料(补写模式):复用 base 规划,结构不变,只补写内容。
