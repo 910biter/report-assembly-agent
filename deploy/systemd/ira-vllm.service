@@ -1,0 +1,21 @@
+[Unit]
+Description=IRA vLLM generation service
+Wants=network-online.target
+After=network-online.target remote-fs.target
+RequiresMountsFor=/home/nas511/zhangruqi/models
+
+[Service]
+Type=simple
+User=zhangruqi
+WorkingDirectory=/home/nas511/zhangruqi/agent-235
+EnvironmentFile=-/home/nas511/zhangruqi/agent-235/deploy/vllm.env
+ExecStart=/home/nas511/zhangruqi/agent-235/deploy/start-vllm-qwen36.sh
+Restart=on-failure
+RestartSec=15
+TimeoutStartSec=infinity
+TimeoutStopSec=120
+KillMode=mixed
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

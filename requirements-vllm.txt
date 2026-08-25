@@ -1,0 +1,5 @@
+-r requirements.txt
+
+# Linux/NVIDIA generation serving profile. Keep separate from the portable
+# application dependencies so CPU-only development environments remain usable.
+vllm==0.27.1

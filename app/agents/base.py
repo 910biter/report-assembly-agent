@@ -5,30 +5,47 @@
 import threading
 import time
 
-from app.gateway import generation_stats, last_generation_meta, model_gateway, reset_generation_stats
+from app.config import settings
+from app.gateway import (
+    generation_stats,
+    last_generation_meta,
+    last_generation_stats,
+    model_gateway,
+    reset_generation_stats,
+    reset_last_generation_call,
+)
 from app.llm_queue import submit_llm_call
 from app.llm_scheduler import invoke
-from app.token_monitor import generation_delta, log_llm_call, new_call_id
+from app.token_monitor import log_llm_call, new_call_id
 
 
 class BaseAgent:
     name = "base"
     role = ""
     max_retries = 2
-    thinking: bool | None = None
+    # Structured workflow agents must return bounded, auditable JSON. Qwen's
+    # chat template enables hidden thinking when this value is omitted, which
+    # can consume the output budget before the JSON result is produced.
+    thinking: bool | None = False
+    output_token_limit: int | None = settings.structured_output_tokens
     last_call_id = ""
 
     def generate(self, prompt: str, system: str | None = None) -> str:
         return self._with_retry(
-            lambda: submit_llm_call(lambda: invoke("agent", model_gateway.generate, prompt, system=system or self.role)),
+            lambda: submit_llm_call(lambda: invoke(
+                "agent", model_gateway.generate, prompt,
+                system=system or self.role, max_tokens=self.output_token_limit,
+            )),
             len(prompt),
         )
 
-    def generate_json(self, prompt: str, system: str | None = None) -> dict:
+    def generate_json(self, prompt: str, system: str | None = None,
+                      max_tokens: int | None = None) -> dict:
         return self._with_retry(
             lambda: submit_llm_call(lambda: invoke(
                 "agent", model_gateway.generate_json, prompt,
                 system=system or self.role, think=self.thinking,
+                max_tokens=max_tokens or self.output_token_limit,
             )),
             len(prompt),
         )
@@ -39,7 +56,7 @@ class BaseAgent:
             call_id = new_call_id()
             self.last_call_id = call_id
             count_llm_call(chars)
-            before_tokens = generation_stats()
+            reset_last_generation_call()
             started = time.time()
             try:
                 result = fn()
@@ -47,7 +64,7 @@ class BaseAgent:
                 count_llm_duration(self.name, elapsed, chars)
                 log_llm_call(
                     call_id, self.name, chars,
-                    generation_delta(before_tokens, generation_stats()),
+                    last_generation_stats(),
                     elapsed, retry_count=attempt, success=True,
                     **last_generation_meta(),
                 )
@@ -59,7 +76,7 @@ class BaseAgent:
                 count_llm_duration(self.name, elapsed, chars)
                 log_llm_call(
                     call_id, self.name, chars,
-                    generation_delta(before_tokens, generation_stats()),
+                    last_generation_stats(),
                     elapsed, retry_count=attempt, success=False, error=str(exc),
                     **last_generation_meta(),
                 )

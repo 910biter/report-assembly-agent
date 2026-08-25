@@ -6,8 +6,11 @@ import { api } from "@/api/http";
 import type { MaterialSummary, TaskSummary } from "@/api/types";
 import StatusBadge from "@/components/StatusBadge.vue";
 import AppIcon from "@/components/AppIcon.vue";
+import { useUiStore } from "@/stores/ui";
 
 const route = useRoute(); const router = useRouter(); const queryClient = useQueryClient();
+const ui = useUiStore();
+ui.ensureDraftId();
 const createOpen = ref(false); const form = ref<HTMLFormElement>(); const error = ref("");
 const tasks = useQuery({ queryKey: ["tasks"], queryFn: () => api<TaskSummary[]>("/api/tasks"), refetchInterval: 8_000 });
 const materials = useQuery({ queryKey: ["materials"], queryFn: () => api<MaterialSummary[]>("/api/materials") });
@@ -21,7 +24,6 @@ watch(
   ([ready, count]) => { if (ready && count === 0) createOpen.value = true; },
   { immediate: true },
 );
-
 function closeCreate() {
   createOpen.value = false;
   const query = { ...route.query };
@@ -45,8 +47,9 @@ const createTask = useMutation({
     <section v-if="createOpen" class="surface create-panel">
       <div class="create-intro"><div class="intro-heading"><h2>新建报告任务</h2></div><p>提供业务目标、材料和模板，系统将自动理解材料并规划报告。</p></div>
       <form ref="form" class="create-form" @submit.prevent="createTask.mutate()">
-        <label class="field field-wide"><span>报告主题</span><input name="theme" required placeholder="例如：可信执行环境远程证明机制研究综述" /></label>
-        <label class="field field-wide"><span>报告要求</span><textarea name="requirements" rows="4" placeholder="描述用途、重点、篇幅或必须回答的问题。无需配置系统参数。"></textarea></label>
+        <input type="hidden" name="interaction_draft_id" :value="ui.draftId" />
+        <label class="field field-wide"><span>报告主题</span><input v-model="ui.taskDraft.theme" name="theme" required placeholder="例如：可信执行环境远程证明机制研究综述" /></label>
+        <label class="field field-wide"><span>报告要求</span><textarea v-model="ui.taskDraft.requirements" name="requirements" rows="4" placeholder="描述用途、重点、篇幅或必须回答的问题。无需配置系统参数。"></textarea></label>
         <label class="field"><span>上传新材料</span><input name="files" type="file" multiple /></label>
         <label class="field"><span>从材料库选择</span><select name="existing_material_ids" multiple size="5"><option v-for="item in materials.data.value || []" :key="item.id" :value="item.id">{{ item.filename }}</option></select></label>
         <label class="field"><span>文档模板</span><select name="variant_id"><option value="">使用默认模板</option><option v-for="item in templates.data.value || []" :key="item.id" :value="item.id">{{ item.name || item.label || `模板 ${item.id}` }}</option></select></label>

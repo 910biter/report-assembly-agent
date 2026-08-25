@@ -9,7 +9,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import APIRouter, File, Form, UploadFile
+from fastapi import APIRouter, BackgroundTasks, File, Form, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from sqlalchemy import delete, func, insert, select, update
 from sqlalchemy.exc import IntegrityError
@@ -33,8 +33,27 @@ from app.infrastructure.orm import (
     ORMUnit,
 )
 from app.llm_queue import llm_queue_stats
-from app.llm_scheduler import invoke
+from app.llm_scheduler import invoke, model_lane_stats
 from app.memory import short_term, style
+from app.memory.style_jobs import create_job as create_style_job
+from app.memory.style_jobs import get_job as get_style_job
+from app.memory.style_jobs import run_job as run_style_job
+from app.interaction import create_thread as create_interaction_thread
+from app.interaction import close_thread as close_interaction_thread
+from app.interaction import decide_proposal, get_thread as get_interaction_thread
+from app.interaction import list_notifications as list_interaction_notifications
+from app.interaction import list_threads as list_interaction_threads
+from app.interaction import mark_notification_read, review_workspace
+from app.interaction import post_message as post_interaction_message
+from app.interaction import queue_message as queue_interaction_message
+from app.interaction import attach_draft_thread
+from app.material_comparison import (
+    accepted_update_handoff,
+    create_comparison_run,
+    get_comparison,
+    list_comparisons,
+    update_comparison_item,
+)
 from app.parser import parse_file
 from app.rendering.headings import detect_numbering_strategy, format_heading, strip_heading_prefix
 from app.report_versions import (
@@ -82,6 +101,7 @@ def create_task(
     requirements: str = Form(""),
     variant_id: int | None = Form(None),
     existing_material_ids: str = Form(""),
+    interaction_draft_id: str = Form(""),
     files: list[UploadFile] | None = File(default=None),
 ):
     """创建任务:上传材料 + 指定主题 + 可选模板(不选则用全局默认模板)。"""
@@ -106,6 +126,7 @@ def create_task(
         "run_mode": "initial",
         "run_history": [],
     })
+    attach_draft_thread(interaction_draft_id, task_id)
     return {"task_id": task_id, "material_count": len(material_ids)}
 
 
@@ -114,6 +135,7 @@ def create_incremental_task(
     report_id: int,
     update_reason: str = Form(""),
     existing_material_ids: str = Form(""),
+    source_comparison_id: int | None = Form(None),
     files: list[UploadFile] | None = File(default=None),
 ):
     """在原任务上创建一个增量运行轮次,不创建新的业务任务。"""
@@ -188,6 +210,14 @@ def create_incremental_task(
     ]
     if not submitted_material_ids and not update_reason.strip():
         return JSONResponse({"error": "UPDATE_REASON_REQUIRED"}, status_code=400)
+    comparison_handoff = None
+    if source_comparison_id is not None:
+        try:
+            comparison_handoff = accepted_update_handoff(int(source_comparison_id))
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        if int(comparison_handoff["report_id"]) != int(report_id):
+            return JSONResponse({"error": "COMPARISON_REPORT_MISMATCH"}, status_code=409)
     previous_revision = max(1, int(base_task.get("run_revision") or 1))
     revision = previous_revision + 1
     run_id = create_task_run(
@@ -251,6 +281,8 @@ def create_incremental_task(
         "incremental_plan": {},
         "incremental_delta": {},
         "incremental_structure_review_required": False,
+        "incremental_source_comparison_id": source_comparison_id,
+        "incremental_selected_change_ids": (comparison_handoff or {}).get("accepted_item_ids", []),
         "analysis_done": False,
         # 增量默认沿用已冻结目录;受影响范围由 Delta 决定,避免重写旧 Plan。
         "final_plan_frozen": bool(plan_snapshot.get("structure")),
@@ -284,7 +316,108 @@ def create_incremental_task(
         "material_count": len(material_ids),
         "added_material_count": len(added_material_ids),
         "status": "created",
+        "source_comparison_id": source_comparison_id,
     }
+
+
+@router.post("/reports/{report_id}/material-comparisons")
+def create_material_comparison(
+    report_id: int,
+    focus: str = Form(""),
+    base_version_id: int | None = Form(None),
+    existing_material_ids: str = Form(""),
+    files: list[UploadFile] | None = File(default=None),
+):
+    """Create an independent, read-only new-material comparison task."""
+    root_task_id = _find_task_by_report(report_id)
+    if root_task_id is None:
+        return JSONResponse({"error": "REPORT_NOT_FOUND"}, status_code=404)
+    base_task = short_term.load_task(root_task_id) or {}
+    if base_version_id is not None:
+        version = get_report_version(int(base_version_id))
+        if version is None or int(version["report_id"]) != int(report_id):
+            return JSONResponse({"error": "REPORT_VERSION_NOT_FOUND"}, status_code=404)
+    else:
+        snapshot = ensure_report_version(
+            report_id, task_id=root_task_id, status="snapshot",
+            change_summary="新增材料对比基线", kind="minor",
+        )
+        version = get_report_version(snapshot.version_id)
+    comparison_task_id = f"cmp-{uuid.uuid4().hex[:12]}"
+    try:
+        material_ids = _collect_material_ids(comparison_task_id, existing_material_ids, files)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=409)
+    if not material_ids:
+        return JSONResponse({"error": "NO_NEW_MATERIALS"}, status_code=400)
+    run_id = create_task_run(
+        comparison_task_id, revision=1, run_mode="material_comparison",
+        base_version_id=int(version["id"]), update_reason=focus,
+    )
+    comparison = create_comparison_run(
+        comparison_task_id, report_id, int(version["id"]), material_ids, focus=focus,
+    )
+    short_term.save_task(comparison_task_id, {
+        "theme": f"新增材料对比：{version.get('title') or base_task.get('theme') or '报告'}",
+        "user_requirements": (
+            "只分析新增材料相对于基线报告带来的新增、补强、细化、更新、冲突、削弱与无关信息；"
+            "不得修改基线报告。" + (f"\n用户关注：{focus}" if focus.strip() else "")
+        ),
+        "variant_id": version.get("template_id") or base_task.get("variant_id"),
+        "material_ids": material_ids,
+        "stage": "created",
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "run_revision": 1,
+        "run_id": run_id,
+        "run_mode": "material_comparison",
+        "comparison_id": comparison["id"],
+        "comparison_report_id": report_id,
+        "comparison_base_version_id": int(version["id"]),
+        "comparison_base_task_id": root_task_id,
+        "queue_status": {"status": "created"},
+    })
+    queue = enqueue_task(comparison_task_id)
+    return {
+        "comparison_id": comparison["id"], "task_id": comparison_task_id,
+        "report_id": report_id, "base_version_id": int(version["id"]),
+        "material_count": len(material_ids), "queue": queue,
+    }
+
+
+@router.get("/reports/{report_id}/material-comparisons")
+def report_material_comparisons(report_id: int):
+    return list_comparisons(report_id)
+
+
+@router.get("/material-comparisons/{comparison_id}")
+def material_comparison_detail(comparison_id: int):
+    result = get_comparison(comparison_id)
+    if result is None:
+        return JSONResponse({"error": "COMPARISON_NOT_FOUND"}, status_code=404)
+    return result
+
+
+@router.patch("/material-comparisons/{comparison_id}/items/{item_id}")
+def review_material_comparison_item(comparison_id: int, item_id: int, payload: dict):
+    try:
+        result = update_comparison_item(
+            comparison_id, item_id, status=str(payload.get("status") or "pending_review"),
+            user_note=str(payload.get("user_note") or ""), change_type=payload.get("change_type"),
+        )
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    if result is None:
+        return JSONResponse({"error": "COMPARISON_ITEM_NOT_FOUND"}, status_code=404)
+    return result
+
+
+@router.post("/material-comparisons/{comparison_id}/update-handoff")
+def material_comparison_update_handoff(comparison_id: int):
+    """Prepare selected changes for the existing incremental-update flow."""
+    try:
+        return accepted_update_handoff(comparison_id)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
 
 
 def _collect_material_ids(task_id: str, existing_material_ids: str = "",
@@ -393,6 +526,44 @@ def get_task(task_id: str):
     if task is None:
         return JSONResponse({"error": "TASK_NOT_FOUND"}, status_code=404)
     return _task_view(task)
+
+
+@router.get("/tasks/{task_id}/assistant-context")
+def task_assistant_context(task_id: str):
+    task = short_term.load_task(task_id)
+    if task is None:
+        return JSONResponse({"error": "TASK_NOT_FOUND"}, status_code=404)
+    return _assistant_task_context(task_id, task)
+
+
+@router.get("/reports/{report_id}/assistant-context")
+def report_assistant_context(report_id: int):
+    task_id = _find_task_by_report(report_id)
+    if task_id is None:
+        return JSONResponse({"error": "REPORT_NOT_FOUND"}, status_code=404)
+    task = short_term.load_task(task_id) or {}
+    result = _assistant_task_context(task_id, task)
+    result["report_id"] = int(report_id)
+    return result
+
+
+def _assistant_task_context(task_id: str, task: dict) -> dict:
+    """Small polling payload for the always-available collaboration assistant."""
+    return {
+        "task_id": task_id,
+        "report_id": task.get("report_id"),
+        "theme": task.get("theme", ""),
+        "user_requirements": task.get("user_requirements", ""),
+        "stage": task.get("stage", "created"),
+        "run_revision": task.get("run_revision", 1),
+        "queue_status": task.get("queue_status") or {},
+        "parse_progress": task.get("parse_progress") or {},
+        "material_analysis_progress": task.get("material_analysis_progress") or {},
+        "evidence_progress": task.get("evidence_progress") or {},
+        "write_progress": task.get("write_progress") or {},
+        "error": task.get("error") or task.get("failure_reason") or "",
+        "updated_at": task.get("updated_at") or task.get("last_progress_at"),
+    }
 
 
 @router.post("/tasks/{task_id}/evidence-gaps/retrieve")
@@ -1041,6 +1212,40 @@ def export(report_id: int):
 
 # ---------- 模板中心 ----------
 
+@router.post("/style/analyze-jobs", status_code=202)
+def create_style_learning_job(
+    background_tasks: BackgroundTasks,
+    files: list[UploadFile] = File(...),
+):
+    """Accept uploads quickly, then learn the template asynchronously."""
+    if not files:
+        return JSONResponse({"error": "NO_FILES"}, status_code=400)
+    job_id = uuid.uuid4().hex[:16]
+    job_dir = settings.runtime_root / "style_jobs" / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    stored: list[dict] = []
+    try:
+        for index, upload in enumerate(files, start=1):
+            filename = Path(upload.filename or f"template-{index}.docx").name
+            target = job_dir / f"{index:03d}-{filename}"
+            with target.open("wb") as handle:
+                shutil.copyfileobj(upload.file, handle)
+            stored.append({"filename": filename, "path": str(target), "size": target.stat().st_size})
+    except Exception as exc:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        return JSONResponse({"error": f"UPLOAD_SAVE_FAILED:{exc}"}, status_code=500)
+    job = create_style_job(stored, job_id=job_id)
+    background_tasks.add_task(run_style_job, job["id"])
+    return job
+
+
+@router.get("/style/analyze-jobs/{job_id}")
+def style_learning_job(job_id: str):
+    job = get_style_job(job_id)
+    if job is None:
+        return JSONResponse({"error": "STYLE_JOB_NOT_FOUND"}, status_code=404)
+    return job
+
 @router.post("/style/analyze")
 def analyze_style(files: list[UploadFile] = File(...)):
     """上传模板或参考成品报告 → 提取文档格式与写作风格 → 生成可复核模板。
@@ -1076,7 +1281,9 @@ def analyze_style(files: list[UploadFile] = File(...)):
 
 @router.get("/style/variants")
 def list_style_variants():
-    return [variant_fields(v) for v in style.list_variants()]
+    # The exemplar bank can contain hundreds of long paragraphs. Keep the
+    # selector/list payload light and load the full profile only on inspection.
+    return [variant_summary_fields(v) for v in style.list_variants()]
 
 
 @router.get("/style/variants/{variant_id}/template-schema")
@@ -1120,6 +1327,105 @@ def lock_style_variant(variant_id: int):
     return {"ok": True}
 
 
+@router.get("/style/variants/{variant_id}/profile")
+def get_style_profile(variant_id: int):
+    variant = style.get_variant(variant_id)
+    if variant is None:
+        return JSONResponse({"error": "VARIANT_NOT_FOUND"}, status_code=404)
+    return variant_fields(variant)
+
+
+@router.patch("/style/variants/{variant_id}/profile")
+def update_style_profile(variant_id: int, payload: dict):
+    try:
+        variant = style.update_profile(variant_id, payload)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=404)
+    return variant_fields(variant)
+
+
+# ---------- 异步用户介入 ----------
+
+@router.post("/interactions")
+def start_interaction(payload: dict):
+    try:
+        return create_interaction_thread(
+            task_id=str(payload.get("task_id") or ""),
+            report_id=int(payload["report_id"]) if payload.get("report_id") is not None else None,
+            artifact_type=str(payload.get("artifact_type") or ""),
+            artifact_version=str(payload.get("artifact_version") or ""),
+            object_id=str(payload.get("object_id") or ""),
+            scope=payload.get("scope") if isinstance(payload.get("scope"), dict) else {},
+        )
+    except (TypeError, ValueError) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+
+
+@router.get("/interactions")
+def interactions(task_id: str = "", report_id: int | None = None, draft_id: str = ""):
+    return list_interaction_threads(task_id=task_id, report_id=report_id, draft_id=draft_id)
+
+
+@router.get("/tasks/{task_id}/review-workspace")
+def task_review_workspace(task_id: str, artifact_type: str = "task_brief", q: str = "",
+                          offset: int = 0, limit: int = 50):
+    try:
+        return review_workspace(task_id, artifact_type=artifact_type, query=q, offset=offset, limit=limit)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=404)
+
+
+@router.get("/interaction-notifications")
+def interaction_notifications(task_id: str = "", report_id: int | None = None):
+    return list_interaction_notifications(task_id=task_id, report_id=report_id)
+
+
+@router.patch("/interaction-notifications/{notification_id}/read")
+def read_interaction_notification(notification_id: int):
+    if not mark_notification_read(notification_id):
+        return JSONResponse({"error": "NOTIFICATION_NOT_FOUND"}, status_code=404)
+    return {"ok": True}
+
+
+@router.get("/interactions/{thread_id}")
+def interaction_detail(thread_id: int):
+    result = get_interaction_thread(thread_id)
+    if result is None:
+        return JSONResponse({"error": "INTERACTION_THREAD_NOT_FOUND"}, status_code=404)
+    return result
+
+
+@router.post("/interactions/{thread_id}/close")
+def close_interaction(thread_id: int):
+    try:
+        return close_interaction_thread(thread_id)
+    except ValueError as exc:
+        status = 409 if str(exc) == "INTERACTION_THREAD_BUSY" else 404
+        return JSONResponse({"error": str(exc)}, status_code=status)
+
+
+@router.post("/interactions/{thread_id}/messages")
+def send_interaction_message(thread_id: int, payload: dict):
+    try:
+        if bool(payload.get("async", True)):
+            return queue_interaction_message(
+                thread_id,
+                str(payload.get("content") or ""),
+                request_id=str(payload.get("request_id") or ""),
+            )
+        return post_interaction_message(thread_id, str(payload.get("content") or ""))
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+
+
+@router.post("/change-proposals/{proposal_id}/decision")
+def decide_change_proposal(proposal_id: int, payload: dict):
+    try:
+        return decide_proposal(proposal_id, str(payload.get("decision") or ""))
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+
+
 # ---------- 系统 ----------
 
 @router.get("/health")
@@ -1127,17 +1433,25 @@ def health():
     """网关连通与模型在位状态(系统设置页使用)。"""
     from app.gateway import model_gateway
 
+    generation_url = (
+        settings.generation_url
+        if str(settings.generation_backend).lower() == "vllm"
+        else settings.ollama_url
+    )
+
     try:
         status = invoke("health", model_gateway.health)
         from app.graph import graph_service
         return {
             "version": status.get("version"),
             "models": status.get("models", {}),
-            "gateway_url": settings.ollama_url,
+            "gateway_url": generation_url,
+            "embedding_url": settings.ollama_url,
             "runtime_root": str(settings.runtime_root),
             "queues": {
                 "tasks": task_queue_status(),
                 "llm": llm_queue_stats(),
+                "model_lanes": model_lane_stats(),
             },
             "graph": {
                 "mode": graph_service.mode,
@@ -1147,7 +1461,8 @@ def health():
     except Exception as exc:
         return {
             "error": str(exc),
-            "gateway_url": settings.ollama_url,
+            "gateway_url": generation_url,
+            "embedding_url": settings.ollama_url,
             "runtime_root": str(settings.runtime_root),
         }
 
@@ -1397,14 +1712,38 @@ def variant_fields(variant) -> dict:
         "description": variant.description,
         "structure": variant.structure,
         "writing_style": variant.writing_style,
+        "writing_patterns": variant.writing_patterns,
         "terminology": variant.terminology,
         "format_spec": variant.format_spec,
         "style_samples": variant.style_samples,
         "chapter_styles": variant.chapter_styles,
         "reasoning_profile": variant.reasoning_profile,
         "institution_rules": variant.institution_rules,
+        "structure_policy": variant.structure_policy,
+        "exemplar_bank": variant.exemplar_bank,
+        "profile_confidence": {
+            key: value for key, value in (variant.profile_confidence or {}).items()
+            if key != "evidence_usage"
+        },
+        "profile_version": variant.profile_version,
         "source_reports": variant.source_reports,
         "status": variant.status,
+    }
+
+
+def variant_summary_fields(variant) -> dict:
+    return {
+        "id": variant.id,
+        "name": variant.name,
+        "description": variant.description,
+        "status": variant.status,
+        "profile_version": variant.profile_version,
+        "profile_confidence": {
+            key: value for key, value in (variant.profile_confidence or {}).items()
+            if key != "evidence_usage"
+        },
+        "source_reports": variant.source_reports,
+        "exemplar_count": len(variant.exemplar_bank or []),
     }
 
 

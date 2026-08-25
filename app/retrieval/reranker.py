@@ -7,12 +7,15 @@
 """
 from __future__ import annotations
 
+import re
+
 from app.context import _ngram_similarity
 
 
 def utility_score(unit_text: str, need_text: str, query_vector=None,
                   unit_vector=None, known_contents: set[str] | None = None,
-                  source: str = "", source_freq: dict | None = None) -> float:
+                  source: str = "", source_freq: dict | None = None,
+                  known_ngrams: set[str] | None = None) -> float:
     """Unit 对当前 Evidence Need 的 utility 分数(0~1)。
 
     组成(FER 修正:效用主导,相关是候选入口非主导):
@@ -38,8 +41,15 @@ def utility_score(unit_text: str, need_text: str, query_vector=None,
 
     gain = 0.0
     if known_contents:
-        max_overlap = max((_ngram_similarity(unit_text, kc) for kc in known_contents), default=0.0)
-        gain = (1.0 - max_overlap) * 0.2  # 与已知事实低重叠 = 新信息
+        # Compare against one prebuilt corpus index rather than every Fact.
+        # This keeps novelty scoring linear as the task knowledge base grows.
+        unit_ngrams = _char_ngrams(unit_text)
+        corpus_ngrams = known_ngrams if known_ngrams is not None else _known_corpus_ngrams(known_contents)
+        overlap = (
+            len(unit_ngrams & corpus_ngrams) / max(len(unit_ngrams), 1)
+            if unit_ngrams else 0.0
+        )
+        gain = (1.0 - overlap) * 0.2
     else:
         gain = 0.2  # 无已知事实:默认视为新信息
 
@@ -73,6 +83,7 @@ def rerank(candidates: list[tuple], need_text: str, query_vector=None,
         src = str(getattr(unit, "material_id", "") or "")
         if src:
             source_freq[src] = source_freq.get(src, 0) + 1
+    known_ngrams = _known_corpus_ngrams(known_contents)
     scored = []
     for item in candidates:
         if len(item) == 3:
@@ -83,7 +94,22 @@ def rerank(candidates: list[tuple], need_text: str, query_vector=None,
         unit_vec = (unit_vectors or {}).get(unit_id)
         src = str(getattr(unit, "material_id", "") or "")
         u = utility_score(unit.content or "", need_text, query_vector, unit_vec,
-                          known_contents, source=src, source_freq=source_freq)
+                          known_contents, source=src, source_freq=source_freq,
+                          known_ngrams=known_ngrams)
         scored.append((u, unit))
     scored.sort(key=lambda pair: pair[0], reverse=True)
     return scored if limit is None else scored[:limit]
+
+
+def _char_ngrams(text: str, n: int = 3) -> set[str]:
+    normalized = re.sub(r"\s+", "", text or "")
+    if len(normalized) < n:
+        return {normalized} if normalized else set()
+    return {normalized[index:index + n] for index in range(len(normalized) - n + 1)}
+
+
+def _known_corpus_ngrams(known_contents: set[str] | None) -> set[str]:
+    grams: set[str] = set()
+    for content in known_contents or set():
+        grams.update(_char_ngrams(content))
+    return grams

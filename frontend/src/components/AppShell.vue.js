@@ -2,6 +2,7 @@ import { computed } from "vue";
 import { useRoute, RouterLink } from "vue-router";
 import { useUiStore } from "@/stores/ui";
 import AppIcon from "./AppIcon.vue";
+import WorkflowAssistant from "./WorkflowAssistant.vue";
 const route = useRoute();
 const ui = useUiStore();
 const editor = computed(() => Boolean(route.meta.editor));
@@ -159,6 +160,10 @@ if (__VLS_ctx.ui.navOpen) {
     });
     /** @type {__VLS_StyleScopedClasses['nav-scrim']} */ ;
 }
+const __VLS_20 = WorkflowAssistant;
+// @ts-ignore
+const __VLS_21 = __VLS_asFunctionalComponent1(__VLS_20, new __VLS_20({}));
+const __VLS_22 = __VLS_21({}, ...__VLS_functionalComponentArgsRest(__VLS_21));
 // @ts-ignore
 var __VLS_19 = __VLS_18;
 // @ts-ignore

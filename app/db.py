@@ -110,6 +110,30 @@ def _migrate_integrity() -> None:
             "CREATE INDEX IF NOT EXISTS idx_graph_outbox_status "
             "ON graph_outbox(status, id)"
         ))
+        conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS idx_comparison_runs_report "
+            "ON material_comparison_runs(report_id, created_at)"
+        ))
+        conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS idx_comparison_items_run "
+            "ON material_comparison_items(comparison_id, change_type)"
+        ))
+        conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS idx_interaction_threads_report "
+            "ON interaction_threads(report_id, artifact_type)"
+        ))
+        conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS idx_change_proposals_thread "
+            "ON change_proposals(thread_id, status)"
+        ))
+        conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS idx_change_proposals_execution "
+            "ON change_proposals(task_id, execution_status)"
+        ))
+        conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS idx_interaction_notifications_task "
+            "ON interaction_notifications(task_id, status, created_at)"
+        ))
 
 
 def init_db() -> None:

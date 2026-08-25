@@ -1,5 +1,6 @@
 """Context Manager: build minimal context by workflow stage with hybrid retrieval."""
 
+from app.config import settings
 from app.models import Unit
 from app.retrieval.query_compiler import QueryCompiler, RetrievalQuery
 from app.retrieval import embed_texts, vector_store
@@ -76,7 +77,7 @@ def _evidence_batch_budget() -> int:
 
     usable = (
         settings.model_context_window_tokens
-        - settings.generation_reserve_tokens
+        - settings.evidence_output_tokens
         - settings.prompt_overhead_tokens
         - settings.safety_margin_tokens
     )
@@ -98,6 +99,57 @@ def _dynamic_cutoff(scores: list[float]) -> int:
     if round(max_gap - mean_gap, 6) > 0:
         return gaps.index(max_gap) + 1
     return len(scores)
+
+
+def _select_evidence_candidates(
+    per_material: list[tuple[int, list[tuple[float, object]]]],
+    token_budget: int,
+) -> list[tuple[int, list[object]]]:
+    """Select a source-diverse, utility-ranked set under a stage SLA budget.
+
+    The first candidate from each represented material is protected so a large
+    source cannot crowd out smaller sources. Remaining units compete globally
+    by utility. Missing Evidence Needs are handled by the later gap pass rather
+    than expanding a smooth score distribution to the entire corpus.
+    """
+    budget = max(1, int(token_budget or 0))
+    selected: dict[int, list[object]] = {}
+    selected_ids: set[int] = set()
+    consumed = 0
+
+    # Coverage seed: one best candidate per represented source.
+    for material_id, ranked in per_material:
+        if not ranked:
+            continue
+        _score, unit = ranked[0]
+        unit_id = int(getattr(unit, "id", 0) or id(unit))
+        if unit_id in selected_ids:
+            continue
+        selected.setdefault(material_id, []).append(unit)
+        selected_ids.add(unit_id)
+        consumed += _estimate_tokens(getattr(unit, "content", "") or "")
+
+    remaining: list[tuple[float, int, object]] = []
+    for material_id, ranked in per_material:
+        for score, unit in ranked[1:]:
+            unit_id = int(getattr(unit, "id", 0) or id(unit))
+            if unit_id not in selected_ids:
+                remaining.append((float(score), material_id, unit))
+    remaining.sort(key=lambda item: item[0], reverse=True)
+
+    for _score, material_id, unit in remaining:
+        unit_tokens = _estimate_tokens(getattr(unit, "content", "") or "")
+        if consumed + unit_tokens > budget:
+            continue
+        selected.setdefault(material_id, []).append(unit)
+        selected_ids.add(int(getattr(unit, "id", 0) or id(unit)))
+        consumed += unit_tokens
+
+    return [
+        (material_id, selected.get(material_id, []))
+        for material_id, _ranked in per_material
+        if selected.get(material_id)
+    ]
 
 
 class ContextManager:
@@ -199,7 +251,20 @@ class ContextManager:
         if policy_block:
             lines.append(policy_block)
         lines.append(style_block or "")
-        fitted, _meta = _fit_with_meta("\n".join(lines), self.budget_chars())
+        # Final Planner needs a larger output contract than ordinary analysis
+        # agents. Reserve that output plus the system prompt and tokenizer
+        # variance instead of filling the whole generic context budget.
+        final_budget_chars = max(
+            4000,
+            min(
+                self.budget_chars(),
+                int(settings.model_context_window_tokens)
+                - int(settings.final_planner_output_tokens)
+                - int(settings.safety_margin_tokens)
+                - 4000,
+            ),
+        )
+        fitted, _meta = _fit_with_meta("\n".join(lines), final_budget_chars)
         return fitted
 
     def for_evidence(self, dimension: str, insights: list[dict],
@@ -283,6 +348,7 @@ class ContextManager:
 
         known_contents:已提取事实(迭代轮次 feedback)——信息增益重排依据。
         """
+        from app.config import settings
         from app.retrieval.reranker import rerank
 
         per_batch_tokens = _evidence_batch_budget()
@@ -305,7 +371,7 @@ class ContextManager:
 
         need_text = " ".join(queries)
         # 检索候选:Qdrant 粗召回(查询相关)→ rerank;Qdrant 不可用时回退 Python 打分
-        per_material: list[tuple[int, list]] = []
+        per_material: list[tuple[int, list[tuple[float, object]]]] = []
         for material_id, units in self.units_by_material.items():
             candidates: dict[int, object] = {}
             for query in queries:
@@ -339,10 +405,17 @@ class ContextManager:
                     unit_vectors=unit_vectors,
                     known_contents=known_contents,
                 )
-                per_material.append((material_id, [unit for _u, unit in ranked]))
+                per_material.append((material_id, ranked))
+
+        stage_budget = (
+            int(settings.evidence_first_pass_input_tokens)
+            if pass_name == "first_pass"
+            else int(settings.evidence_gap_input_tokens)
+        )
+        selected_by_material = _select_evidence_candidates(per_material, stage_budget)
 
         blocks_by_material: list[tuple[int, list]] = []
-        for material_id, selected in per_material:
+        for material_id, selected in selected_by_material:
             block_units: list = []
             block_tokens = 0
             for unit in selected:
@@ -427,7 +500,7 @@ class ContextManager:
                 query_vector = None
                 try:
                     from app.retrieval.embedder import embed_texts
-                    query_vector = embed_texts([query])[0]
+                    query_vector = embed_texts([query], query=True)[0]
                 except Exception:
                     query_vector = None
                 scored = sorted(
@@ -670,7 +743,7 @@ class ContextManager:
             return []
         used_fact_ids = used_fact_ids or set()
         try:
-            query_vector = embed_texts([query])[0]
+            query_vector = embed_texts([query], query=True)[0]
             vec_by_id = {
                 int(fact_id): vector
                 for fact_id, vector in vector_store.fact_vectors(str(self.task.get("id") or self.task.get("task_id") or ""))

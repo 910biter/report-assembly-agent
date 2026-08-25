@@ -66,7 +66,7 @@ def hybrid_retrieve_units(
 
 def _semantic_hits(query: str, limit: int, filters: dict | None) -> list[RetrievalHit]:
     try:
-        query_vector = embed_texts([query])[0]
+        query_vector = embed_texts([query], query=True)[0]
         return [
             RetrievalHit(unit_id=int(unit_id), score=float(score), source="semantic")
             for unit_id, score in vector_store.search_units(query_vector, top_k=limit, query_text=query, filters=filters)

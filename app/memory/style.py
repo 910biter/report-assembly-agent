@@ -17,10 +17,22 @@ from sqlalchemy import select
 from app.gateway import model_gateway
 from app.llm_scheduler import invoke
 from app.models import StyleVariant
+from app.memory.style_profile import (
+    aggregate_style_metrics,
+    annotate_exemplars,
+    build_report_exemplars,
+    compact_exemplar_bank,
+)
 from app.template_engine import compile_template
 
 _MAX_CHARS_PER_REPORT = 3000
 _SAMPLE_LENGTH = 150
+_STYLE_LEARNER_VERSION = "editorial-v3"
+_DEFAULT_PROFILE_NAME = "综合报告风格"
+_REALIZATION_KEYS = (
+    "fact_expression", "judgment_expression", "fact_judgment_transition",
+    "information_compression", "attribution_style",
+)
 
 # ---------- 风格库(v2):逐份分析 → 聚类 → 变体 ----------
 
@@ -28,10 +40,43 @@ _HEADING_RE = re.compile(r"^(第?[一二三四五六七八九十百]+[章节部�
 
 _FEATURE_PROMPT = """分析以下报告的体裁与风格特征,严格输出 JSON(不要任何解释):
 {
-  "topic_type": "报告类型,用 2-4 字简称,如:政策研究/情报快报/专题分析/风险研判/周报月报/工作总结/其他",
+  "topic_type": "用简短中文名概括报告体裁，只填写结果，不要复述字段说明或示例",
   "structure_notes": "章节组织特点(是否先结论后展开、典型章节顺序)",
   "language_notes": "语言特点(正式程度、句式、数据使用)"
 }"""
+
+
+def _normalize_profile_label(value, fallback: str = _DEFAULT_PROFILE_NAME) -> str:
+    """Accept a concise model label, but never persist prompt/schema text as data."""
+    label = re.sub(r"\s+", "", str(value or "").strip().strip('"\''))
+    protocol_markers = ("报告类型,", "报告类型名", "用2-4字", "用简短中文名", "如:", "如：", "沿用{")
+    if (
+        not label
+        or len(label) > 24
+        or any(marker in label for marker in protocol_markers)
+        or label.count("/") >= 2
+    ):
+        return fallback
+    return label
+
+
+def _editorial_confidence(
+    writing: dict, writing_patterns: dict, member_count: int, exemplar_count: int,
+) -> str:
+    semantic_patterns = {key: value for key, value in writing_patterns.items() if key != "observed_metrics" and value}
+    if not writing or not semantic_patterns:
+        return "low"
+    return "high" if member_count >= 2 and exemplar_count >= 12 else "medium"
+
+
+def _validate_profile_payload(payload: dict) -> None:
+    if not isinstance(payload.get("writing_style"), dict) or not payload.get("writing_style"):
+        raise ValueError("STYLE_PROFILE_WRITING_STYLE_EMPTY")
+    patterns = payload.get("writing_patterns")
+    if not isinstance(patterns, dict) or not patterns:
+        raise ValueError("STYLE_PROFILE_WRITING_PATTERNS_EMPTY")
+    if sum(bool(patterns.get(key)) for key in _REALIZATION_KEYS) < 3:
+        raise ValueError("STYLE_PROFILE_CONTENT_REALIZATION_INCOMPLETE")
 
 _VARIANT_PROMPT = """以下为同一机构、同一类型({type})的 {count} 份报告(每份含章节结构与片段采样):
 
@@ -40,7 +85,6 @@ _VARIANT_PROMPT = """以下为同一机构、同一类型({type})的 {count} 份
 请提炼该类型报告的写作规范,严格输出 JSON(不要任何解释):
 {{
   "name": "报告类型名(沿用 {type})",
-  "description": "一句话描述该类型报告的定位与用途",
   "structure": {{
     "sections": [{{"title": "一、…", "children": ["二级标题…"]}}],
     "summary_first": true或false,
@@ -50,6 +94,22 @@ _VARIANT_PROMPT = """以下为同一机构、同一类型({type})的 {count} 份
     "tone": "正式程度",
     "sentence_pattern": "句式习惯",
     "analysis_style": "先事实后判断等"
+  }},
+  "writing_patterns": {{
+    "information_progression": "段落通常如何从已知信息推进到判断",
+    "paragraph_architecture": "段内常见组织方式,不要写固定句数",
+    "sentence_rhythm": "长短句、复句和承接方式",
+    "transition_style": "章节和段落之间如何衔接",
+    "specificity_preference": "具体事实与抽象概括如何取舍",
+    "fact_expression": "名称、数字、时间、行动和结果等事实通常如何进入句子",
+    "judgment_expression": "结论、风险、趋势和建议通常如何措辞并控制确定性",
+    "fact_judgment_transition": "文章如何从事实陈述自然过渡到解释或判断",
+    "information_compression": "并列事实何时展开、合并、概括或列举",
+    "attribution_style": "来源、依据和主体通常如何在正文中表述",
+    "stance_and_modality": "确定、审慎、风险与建议分别如何措辞",
+    "opening_pattern": "开篇通常完成什么表达任务",
+    "closing_pattern": "收束通常完成什么表达任务",
+    "list_table_preference": "何时使用自然段、清单或表格"
   }},
   "terminology": {{
     "preferred": ["惯用表达"],
@@ -70,11 +130,21 @@ _VARIANT_PROMPT = """以下为同一机构、同一类型({type})的 {count} 份
     "word_count": "字数要求或区间",
     "inference_ratio": "推断与事实的比例限制说明",
     "data_requirements": "数据引用要求(如:关键数字必须注明来源)"
-  }}
+  }},
+  "sample_annotations": [
+    {{"sample_id": "输入中的样例编号", "sample_type": "opening/fact/analysis/risk/conclusion/transition", "purpose": "该段承担的表达任务", "tags": ["可检索语义标签"]}}
+  ]
 }}"""
 
+_STYLE_SAMPLE_NOTE = """以下是按章节与自然段抽取的候选样例。请分析表达方式，不要复述或泛化其中的业务事实：
+{style_samples}
+"""
 
-def analyze_library(reports: list[dict], force: bool = False) -> list[StyleVariant]:
+def analyze_library(
+    reports: list[dict],
+    force: bool = False,
+    progress_callback=None,
+) -> list[StyleVariant]:
     """从参考报告构建机构风格库(幂等:同一文件默认只产生一个稳定变体)。
 
     reports: [{"filename": str, "text": str, "path": str|None}]
@@ -90,10 +160,11 @@ def analyze_library(reports: list[dict], force: bool = False) -> list[StyleVaria
     if not force:
         reused = _reuse_by_source_hash(reports)
         if reused is not None:
+            _emit_progress(progress_callback, "profiling", 1, 1, "复用已学习画像")
             return reused
 
     features = []
-    for report in reports:
+    for report_index, report in enumerate(reports, start=1):
         text = report.get("text", "")
         headings = _extract_headings(text, report.get("path"))
         samples = _sample_report(text)
@@ -102,10 +173,12 @@ def analyze_library(reports: list[dict], force: bool = False) -> list[StyleVaria
                 "template", model_gateway.generate_json,
                 f"报告文本:\n{text[:_MAX_CHARS_PER_REPORT]}",
                 system=_FEATURE_PROMPT,
+                think=False,
+                max_tokens=256,
             )
-            topic_type = str(payload.get("topic_type", "其他")).strip() or "其他"
+            topic_type = _normalize_profile_label(payload.get("topic_type"))
         except Exception:
-            topic_type = "其他"
+            topic_type = _DEFAULT_PROFILE_NAME
         features.append({
             "filename": report.get("filename", ""),
             "text": text,
@@ -114,27 +187,50 @@ def analyze_library(reports: list[dict], force: bool = False) -> list[StyleVaria
             "samples": samples,
             "topic_type": topic_type,
         })
+        _emit_progress(
+            progress_callback, "classifying", report_index, len(reports),
+            str(report.get("filename") or ""),
+        )
     # 聚类:按体裁分组;体裁不明的归入"其他"组按结构再拆
     groups: dict[str, list[dict]] = {}
     for feature in features:
         groups.setdefault(feature["topic_type"], []).append(feature)
     variants = []
-    for topic_type, members in groups.items():
+    group_items = list(groups.items())
+    for group_index, (topic_type, members) in enumerate(group_items, start=1):
+        _emit_progress(
+            progress_callback, "profiling", group_index - 1, len(group_items), topic_type,
+        )
         variants.append(_build_variant(library_id, topic_type, members))
+        _emit_progress(
+            progress_callback, "profiling", group_index, len(group_items), topic_type,
+        )
     _record_source_hash(reports, variants)
     return variants
 
 
+def _emit_progress(callback, phase: str, current: int, total: int, label: str = "") -> None:
+    if callback is None:
+        return
+    try:
+        callback({"phase": phase, "current": current, "total": total, "label": label})
+    except Exception:
+        pass
+
+
 def _source_hash(report: dict) -> str:
-    """模板源文件内容 hash(稳定模板身份;无 path 时退回 filename)。"""
+    """Source content plus learner version, so upgraded profiles are relearned."""
     import hashlib
     path = report.get("path")
     try:
         if path and Path(path).exists():
-            return hashlib.sha256(Path(path).read_bytes()).hexdigest()[:16]
+            digest = hashlib.sha256(Path(path).read_bytes())
+            digest.update(_STYLE_LEARNER_VERSION.encode())
+            return digest.hexdigest()[:16]
     except Exception:
         pass
-    return hashlib.sha256((report.get("filename") or "").encode()).hexdigest()[:16]
+    fallback = f"{report.get('filename') or ''}:{_STYLE_LEARNER_VERSION}"
+    return hashlib.sha256(fallback.encode()).hexdigest()[:16]
 
 
 def _reuse_by_source_hash(reports: list[dict]) -> list[StyleVariant] | None:
@@ -232,6 +328,8 @@ def _sample_report(text: str) -> dict:
 
 def _build_variant(library_id: int, topic_type: str, members: list[dict]) -> StyleVariant:
     """提炼一个变体:LLM 结构/语言/术语 + 规则格式(dominant/alternatives)+ 分类型范例。"""
+    all_exemplars = build_report_exemplars(members)
+    exemplar_bank = compact_exemplar_bank(all_exemplars, limit=200)
     report_blocks = []
     for member in members:
         heading_lines = []
@@ -252,35 +350,66 @@ def _build_variant(library_id: int, topic_type: str, members: list[dict]) -> Sty
             f"正文: {member['samples']['middle'][:150]}\n"
             f"结尾: {member['samples']['ending'][:150]}"
         )
-    try:
-        payload = invoke(
-            "template", model_gateway.generate_json,
-            _VARIANT_PROMPT.replace("{type}", topic_type)
-            .replace("{reports}", "\n\n---\n\n".join(report_blocks)),
-            system="你是机构报告风格分析师。",
-        )
-    except Exception:
-        payload = {}
+    sample_packet = "\n\n".join(
+        f"[{item.get('exemplar_id')}] 来源={item.get('source_report')} / 章节={item.get('section')} / "
+        f"位置={item.get('structural_role')}\n{str(item.get('content') or '')[:700]}"
+        for item in compact_exemplar_bank(all_exemplars, limit=24)
+    ) or "(没有可用的自然段样例)"
+    payload = invoke(
+        "template", model_gateway.generate_json,
+        _VARIANT_PROMPT.replace("{type}", topic_type)
+        .replace("{reports}", "\n\n---\n\n".join(report_blocks))
+        + "\n\n"
+        + _STYLE_SAMPLE_NOTE.replace("{style_samples}", sample_packet),
+        system="你是机构报告风格分析师。每个字段只写可由样例支持的简洁结论，不输出空泛解释。",
+        think=False,
+        max_tokens=4096,
+    )
+    _validate_profile_payload(payload)
     structure = payload.get("structure") if isinstance(payload.get("structure"), dict) else {}
     writing = payload.get("writing_style") if isinstance(payload.get("writing_style"), dict) else {}
+    writing_patterns = payload.get("writing_patterns") if isinstance(payload.get("writing_patterns"), dict) else {}
     terminology = payload.get("terminology") if isinstance(payload.get("terminology"), dict) else {}
     chapter_styles = payload.get("chapter_styles") if isinstance(payload.get("chapter_styles"), list) else []
     reasoning = payload.get("reasoning_profile") if isinstance(payload.get("reasoning_profile"), dict) else {}
     institution_rules = payload.get("institution_rules") if isinstance(payload.get("institution_rules"), dict) else {}
-    samples = _collect_samples(members)
+    annotations = payload.get("sample_annotations") if isinstance(payload.get("sample_annotations"), list) else []
+    exemplar_bank = annotate_exemplars(exemplar_bank, annotations)
+    observed_metrics = aggregate_style_metrics(all_exemplars)
+    if observed_metrics:
+        writing_patterns = {**writing_patterns, "observed_metrics": observed_metrics}
+    samples = [
+        {"sample_type": item.get("sample_type", "fact"), "content": item.get("content", "")}
+        for item in exemplar_bank[:12]
+    ] or _collect_samples(members)
     format_spec = _collect_format(members)
     variant = StyleVariant(
         library_id=library_id,
-        name=str(payload.get("name") or topic_type),
-        description=str(payload.get("description", "")),
+        name=_normalize_profile_label(payload.get("name"), fallback=topic_type),
+        description="",
         structure=structure,
         writing_style=writing,
+        writing_patterns=writing_patterns,
         terminology=terminology,
         format_spec=format_spec,
         style_samples=samples,
         chapter_styles=chapter_styles,
         reasoning_profile=reasoning,
         institution_rules=institution_rules,
+        exemplar_bank=exemplar_bank[:200],
+        structure_policy={
+            "mode": "SOFT_STRUCTURE",
+            "source": "inferred_from_reports",
+            "confirmed": False,
+            "principle": "历史目录仅作参考；内容结构由当前任务的事实和分析决定。",
+        },
+        profile_confidence={
+            "document_format": "high" if format_spec else "unavailable",
+            "content_structure": "medium" if structure else "low",
+            "editorial_style": _editorial_confidence(
+                writing, writing_patterns, len(members), len(exemplar_bank),
+            ),
+        },
         source_reports=[m["filename"] for m in members],
         status="draft",
     )
@@ -310,7 +439,7 @@ def _collect_samples(members: list[dict]) -> list[dict]:
 
 
 def _collect_format(members: list[dict]) -> dict:
-    """Merge DOCX template layout tokens, retaining conflicts and alternatives."""
+    """Keep complete DOCX variants; never build a field-level hybrid template."""
     specs: list[dict] = []
     for member in members:
         if member.get("path") and str(member["path"]).lower().endswith(".docx"):
@@ -320,7 +449,11 @@ def _collect_format(members: list[dict]) -> dict:
                 specs.append(spec)
     if not specs:
         return {}
-    dominant, conflicts = _merge_format_specs(specs)
+    # A renderer must use one coherent OOXML template.  Mixing the title from
+    # one file with body/numbering from another creates a document that never
+    # existed and cannot be reliably validated.
+    dominant = max(specs, key=_value_completeness)
+    _unused, conflicts = _merge_format_specs(specs)
     field_confidence = _field_confidence(specs, dominant)
     alternatives = []
     seen = {_freeze_spec(dominant)}
@@ -336,17 +469,16 @@ def _collect_format(members: list[dict]) -> dict:
         "field_confidence": field_confidence,
         "template_profile": _template_profile(dominant, conflicts, field_confidence),
         "selection_strategy": {
-            "mode": "token_majority_vote",
-            "principle": "按字段独立投票，优先选择出现频次最高且信息更完整的版式 token。",
+            "mode": "whole_template_variant",
+            "principle": "始终选择一份完整原始 DOCX 作为渲染母版，不跨模板拼接格式字段。",
             "tie_breakers": [
-                "优先非空值",
-                "优先覆盖字段更多的模板",
-                "若票数相同则采用首个完整度更高的候选",
+                "优先用户明确选择或锁定的模板",
+                "未指定时优先结构化字段更完整的模板",
+                "其余模板作为完整 alternatives 保留",
             ],
             "conflict_policy": [
-                "页面、正文、标题等硬格式按字段多数决，不强行整份模板覆盖。",
-                "封面、目录、页眉页脚等结构性差异保留冲突，导出时优先采用锁定变体的 dominant。",
-                "同票冲突时优先选择字段更完整、来源模板更接近当前报告体裁的候选。",
+                "格式冲突不自动投票合并，必须选择完整模板变体。",
+                "结构策略与文档版式分开确认，FORMAT_ONLY 不继承示例目录。",
             ],
         },
         "sample_count": len(specs),
@@ -485,6 +617,12 @@ def save_variant(variant: StyleVariant) -> StyleVariant:
                 chapter_styles_json=json.dumps(variant.chapter_styles, ensure_ascii=False),
                 reasoning_profile_json=json.dumps(variant.reasoning_profile, ensure_ascii=False),
                 institution_rules_json=json.dumps(variant.institution_rules, ensure_ascii=False),
+                structure_policy_json=json.dumps(variant.structure_policy, ensure_ascii=False),
+                evidence_usage_profile_json=json.dumps(variant.evidence_usage_profile, ensure_ascii=False),
+                exemplar_bank_json=json.dumps(variant.exemplar_bank, ensure_ascii=False),
+                learning_cases_json=json.dumps(variant.learning_cases, ensure_ascii=False),
+                profile_confidence_json=json.dumps(variant.profile_confidence, ensure_ascii=False),
+                profile_version=int(variant.profile_version or 1),
                 source_reports=json.dumps(variant.source_reports, ensure_ascii=False),
                 confidence=0.0, status=variant.status,
             )
@@ -545,6 +683,35 @@ def update_variant(variant_id: int, name: str | None = None, description: str | 
             s.execute(ORMVariant.update().where(ORMVariant.c.id == variant_id).values(**values))
 
 
+def update_profile(variant_id: int, payload: dict) -> StyleVariant:
+    """Update explicit, user-reviewable profile layers without touching OOXML."""
+    allowed = {
+        "writing_style": "writing_style_json",
+        "writing_patterns": "writing_patterns_json",
+        "terminology": "terminology_json",
+        "chapter_styles": "chapter_styles_json",
+        "structure_policy": "structure_policy_json",
+        "exemplar_bank": "exemplar_bank_json",
+        "profile_confidence": "profile_confidence_json",
+    }
+    values: dict = {}
+    for key, column in allowed.items():
+        if key in payload:
+            values[column] = json.dumps(payload[key], ensure_ascii=False)
+    if not values:
+        variant = get_variant(variant_id)
+        if variant is None:
+            raise ValueError("VARIANT_NOT_FOUND")
+        return variant
+    current = get_variant(variant_id)
+    if current is None:
+        raise ValueError("VARIANT_NOT_FOUND")
+    values["profile_version"] = int(current.profile_version or 1) + 1
+    with session_scope() as s:
+        s.execute(ORMVariant.update().where(ORMVariant.c.id == variant_id).values(**values))
+    return get_variant(variant_id)
+
+
 def delete_variant(variant_id: int) -> bool:
     """Soft-delete a template/style variant from the template center.
 
@@ -581,6 +748,12 @@ def _row_to_variant(row) -> StyleVariant:
         chapter_styles=_loads_samples(row["chapter_styles_json"]),
         reasoning_profile=_loads(row["reasoning_profile_json"]),
         institution_rules=_loads(row["institution_rules_json"]),
+        structure_policy=_loads(row.get("structure_policy_json", "{}")),
+        evidence_usage_profile=_loads(row.get("evidence_usage_profile_json", "{}")),
+        exemplar_bank=_loads_samples(row.get("exemplar_bank_json", "[]")),
+        learning_cases=_loads_samples(row.get("learning_cases_json", "[]")),
+        profile_confidence=_loads(row.get("profile_confidence_json", "{}")),
+        profile_version=int(row.get("profile_version") or 1),
         source_reports=_loads_list(row["source_reports"]),
         status=row["status"],
     )

@@ -271,6 +271,24 @@ def _planned_subsection_titles(narrative_plan: dict) -> list[str]:
     return titles
 
 
+def _style_sample_type(unit_plan: dict, chapter_index: int, chapter_count: int) -> str:
+    """Map Narrative discourse roles to a style-retrieval intent."""
+    roles = {
+        str(item.get("role") or "").strip().lower()
+        for item in (unit_plan or {}).get("discourse_flow") or []
+        if isinstance(item, dict)
+    }
+    if roles & {"limitation", "risk"}:
+        return "risk"
+    if roles & {"analysis", "judgment"}:
+        return "analysis"
+    if chapter_index == 1:
+        return "opening"
+    if chapter_index == chapter_count:
+        return "conclusion"
+    return "fact"
+
+
 def _subsection_generation_units(narrative_plan: dict, chapter_target: int,
                                  minimum_ratio: float = 0.0) -> list[dict]:
     """Turn semantic subsection planning into one-shot Writer units.
@@ -461,6 +479,48 @@ def _fit_block(text: str, budget_chars: int, overhead_chars: int = 800) -> str:
     return text[:remaining] if len(text) > remaining else text
 
 
+def _writer_prompt_char_budget() -> int:
+    """Conservative user-prompt budget derived from the serving context."""
+    token_budget = (
+        int(settings.model_context_window_tokens)
+        - int(settings.writer_output_tokens)
+        - int(settings.safety_margin_tokens)
+        - len(_SYSTEM)
+    )
+    return max(4000, min(int(settings.max_context_chars), token_budget))
+
+
+def _pack_writer_evidence(
+    fact_lines: list[str],
+    inference_lines: list[str],
+    available_chars: int,
+) -> tuple[list[str], list[str]]:
+    """Pack complete traceable lines, preserving both facts and inferences."""
+    available = max(0, int(available_chars or 0))
+
+    def take(lines: list[str], budget: int) -> tuple[list[str], int]:
+        selected: list[str] = []
+        used = 0
+        for line in lines:
+            cost = len(line) + 1
+            if selected and used + cost > budget:
+                break
+            if cost > budget:
+                continue
+            selected.append(line)
+            used += cost
+        return selected, used
+
+    inference_share = available // 3 if inference_lines else 0
+    selected_inferences, inference_used = take(inference_lines, inference_share)
+    selected_facts, fact_used = take(fact_lines, available - inference_used)
+    remaining = available - inference_used - fact_used
+    if remaining > 0 and len(selected_inferences) < len(inference_lines):
+        extra, _ = take(inference_lines[len(selected_inferences):], remaining)
+        selected_inferences.extend(extra)
+    return selected_facts, selected_inferences
+
+
 def _chapter_position(chapter_index: int, local_position: int) -> int:
     return max(1, int(chapter_index or 1)) * 10000 + max(1, int(local_position or 1))
 
@@ -546,6 +606,8 @@ def _normalize_sentence_item(sentence, paragraph_fact_ids=None, paragraph_infere
 
 
 class WriterAgent(BaseAgent):
+    # Writer is the only workflow Agent that may need a long-form response.
+    output_token_limit = settings.writer_output_tokens
     name = "writer"
     role = _SYSTEM
     max_retries = 1
@@ -569,6 +631,14 @@ class WriterAgent(BaseAgent):
         """
         self._task_id = task_id
         self._run_id = run_id
+        style_variant = None
+        if profile_id is not None:
+            try:
+                from app.memory.style import get_variant
+
+                style_variant = get_variant(int(profile_id))
+            except Exception:
+                style_variant = None
         # Incremental revisions may reuse a plan created before the unified
         # scale contract. Recover and align it before any chapter is written.
         plan = normalize_execution_plan(plan)
@@ -625,6 +695,7 @@ class WriterAgent(BaseAgent):
             for title in existing_titles - target_titles:
                 completed_sections.add(title)
         chapter_count = len(chapters) or 1
+        failed_chapters: list[str] = []
         for chapter_index, chapter_plan in enumerate(chapters, start=1):
             chapter_title = str(chapter_plan.get("title", "") or f"章节{chapter_index}")
             chapter_start = time.time()
@@ -676,12 +747,14 @@ class WriterAgent(BaseAgent):
                 narrative_plan=narrative_plan,
                 policy_block=policy_prompt_block(_writer_policy_only(report_policy or {})),
                 minimum_ratio=minimum_ratio,
+                style_variant=style_variant,
             )
             if not chapter_sentences:
                 # A failed generation is not a reviewable version. Keep the
                 # stored chapter intact rather than replacing it with emptiness.
                 if progress_callback:
                     progress_callback(chapter_index - 1, chapter_count, chapter_title, "failed", round(time.time() - chapter_start, 1))
+                failed_chapters.append(chapter_title)
                 continue
             chapter_assessment = assess_chapter_output(
                 target_words=int(chapter_plan.get("target_words") or 0),
@@ -696,6 +769,31 @@ class WriterAgent(BaseAgent):
                 ),
             )
             chapter_assessment.update(getattr(self, "_last_chapter_generation_stats", {}) or {})
+            if style_variant is not None and task_id:
+                try:
+                    from app.memory.style_profile import assess_style_alignment
+
+                    style_diagnostic = assess_style_alignment(
+                        "".join(str(item.get("text") or "") for item in chapter_sentences),
+                        style_variant.writing_patterns,
+                        style_variant.terminology,
+                    )
+                    save_task_artifact(
+                        task_id,
+                        f"style_diagnostic:{chapter_title}",
+                        {
+                            "profile_id": style_variant.id,
+                            "profile_version": style_variant.profile_version,
+                            "chapter_title": chapter_title,
+                        },
+                        style_diagnostic,
+                        run_id=run_id,
+                    )
+                    chapter_assessment["style_alignment"] = style_diagnostic
+                except Exception:
+                    # Style diagnostics are advisory and must never block a
+                    # traceable draft from reaching review.
+                    pass
             paragraph_number = 0
             written_fact_ids: set[int] = set()
             written_inference_ids: set[int] = set()
@@ -856,6 +954,11 @@ class WriterAgent(BaseAgent):
                     "status": "done",
                     **chapter_assessment,
                 })
+        if failed_chapters:
+            raise RuntimeError(
+                "WRITER_INCOMPLETE_CHAPTERS:" + " | ".join(failed_chapters)
+            )
+
         # EvidenceGap 接口(WriteHERE 预留):未解决问题汇总落 artifact,供 Evidence 回流/后续升级
         gaps = report_memory.get("unresolved_issues") or []
         if gaps:
@@ -923,10 +1026,17 @@ class WriterAgent(BaseAgent):
                 row = s.execute(
                     select(ORMReport).where(ORMReport.c.id == int(existing_report_id))
                 ).mappings().first()
+                if row is not None and int(row["plan_id"]) != int(plan["id"]):
+                    # A revision can create a new FinalPlan while retaining the
+                    # same report workspace. Keep the report-to-plan pointer in
+                    # sync so version snapshots explain the candidate correctly.
+                    s.execute(update(ORMReport).where(
+                        ORMReport.c.id == int(existing_report_id)
+                    ).values(plan_id=int(plan["id"])))
             if row is not None:
                 return Report(
                     id=row["id"],
-                    plan_id=row["plan_id"],
+                    plan_id=int(plan["id"]),
                     title=row["title"],
                     style_profile_id=row["style_profile_id"],
                     status=row["status"],
@@ -1028,7 +1138,8 @@ class WriterAgent(BaseAgent):
                           business_block: str = "",
                           narrative_plan: dict | None = None,
                           policy_block: str = "",
-                          minimum_ratio: float | None = None) -> list[dict]:
+                          minimum_ratio: float | None = None,
+                          style_variant=None) -> list[dict]:
         """Generate each Narrative subsection exactly once, without continuation."""
         chapter_plan = chapter_plan or {}
         narrative_plan = narrative_plan or {}
@@ -1061,9 +1172,36 @@ class WriterAgent(BaseAgent):
                     str(topic.get("name") or "") for topic in unit_narrative["topics"]
                     if str(topic.get("name") or "").strip()
                 ]
+            unit_style = chapter_style
+            if style_variant is not None:
+                unit_plan = unit.get("plan") or {}
+                purpose = str(
+                    unit_plan.get("purpose")
+                    or unit_plan.get("core_message")
+                    or narrative_plan.get("core_message")
+                    or chapter_plan.get("judgment")
+                    or ""
+                )
+                keywords = [
+                    str(value) for value in (
+                        list(unit_plan.get("completion_criteria") or [])
+                        + list(narrative_plan.get("logic_order") or [])
+                    ) if str(value).strip()
+                ]
+                dynamic_style = style_variant.writer_prompt_block({
+                    "title": str(unit.get("title") or chapter_title),
+                    "purpose": purpose,
+                    "report_type": str(plan.get("report_type") or ""),
+                    "keywords": keywords,
+                    "target_words": int(unit.get("target_words") or 0),
+                    "sample_type": _style_sample_type(unit_plan, chapter_index, chapter_count),
+                })
+                unit_style = "\n\n".join(
+                    value for value in (dynamic_style, chapter_style) if str(value).strip()
+                )
             generated = self._generate_chapter_pass(
                 chapter_title, chapter_index, chapter_count, structure,
-                chapter_facts, chapter_inferences, chapter_style,
+                chapter_facts, chapter_inferences, unit_style,
                 plan, report_memory, valid_fact_ids, valid_inf_ids,
                 chapter_plan=unit_chapter_plan,
                 institution_rules=institution_rules,
@@ -1179,21 +1317,13 @@ class WriterAgent(BaseAgent):
                     "机构级全文要求(仅当前小节与其直接相关时落实,不要在每个小节重复):\n- "
                     + "\n- ".join(str(m) for m in must) + "\n"
                 )
-        fact_budget = BUDGET_TOKENS * _CHARS_PER_TOKEN
         unit_plan = generation_unit.get("plan") or {}
         preferred_fact_ids = set(_int_ids(unit_plan.get("fact_ids")))
         ordered_facts = sorted(
             chapter_facts,
             key=lambda item: 0 if int(item.get("id") or 0) in preferred_fact_ids else 1,
         )
-        fact_lines = []
-        used = 0
-        for _f in ordered_facts:
-            line = f"{_f['id']}. {_f['content']}"
-            used += len(line) + 1
-            if used > fact_budget and fact_lines:
-                break
-            fact_lines.append(line)
+        fact_lines = [f"{_f['id']}. {_f['content']}" for _f in ordered_facts]
         preferred_inference_ids = set(_int_ids(unit_plan.get("inference_ids")))
         ordered_inferences = sorted(
             chapter_inferences,
@@ -1206,7 +1336,8 @@ class WriterAgent(BaseAgent):
         subsection_hint = _subsection_execution_hint(planned_subsections)
         evidence_hint = _evidence_execution_hint(generation_unit)
         current_unit_block = _json_dumps(unit_plan, limit=900) if unit_plan else ""
-        prompt = (
+        def build_prompt(selected_facts: list[str], selected_inferences: list[str]) -> str:
+            return (
             f"报告标题:{plan.get('title', '')}\n"
             f"报告核心判断:{plan.get('core_judgment', '')}\n"
             f"总体叙事逻辑:{plan.get('narrative_logic', '')}\n"
@@ -1238,8 +1369,8 @@ class WriterAgent(BaseAgent):
                 "不得为了简短而遗漏完成条件所必需的核心证据；其他补充事实按论证需要选择，不追求机械全覆盖。\n"
                 if unit_plan else ""
             )
-            + "本章相关事实清单(当前小节事实优先排列,其余事实仅用于必要背景和关系校验):\n" + "\n".join(fact_lines) + "\n\n"
-            + "本章相关推断清单:\n" + "\n".join(inference_lines) + "\n\n"
+            + "本章相关事实清单(当前小节事实优先排列,其余事实仅用于必要背景和关系校验):\n" + "\n".join(selected_facts) + "\n\n"
+            + "本章相关推断清单:\n" + "\n".join(selected_inferences) + "\n\n"
             + f"{chapter_style}\n"
             + "请严格按 Narrative Plan 和 ChapterPlan 撰写当前章节或小节。先在内部设计自然段的主题、顺序和承接关系,再输出正式、连贯、可阅读的正文;"
               "自然段数量和每段篇幅由你根据话题关系、证据密度与阅读需要决定,不要套用固定段数;"
@@ -1247,7 +1378,14 @@ class WriterAgent(BaseAgent):
               "paragraphs 每项代表一个自然段,包含 sentences 数组;sentences 每项包含 text/fact_ids/inference_ids。"
               "同一自然段内多句话应放在同一个 paragraph 中,不要每句话单独建段。"
               "不要输出小标题或 source_level=\"SUBHEADING\";小标题由系统按 Narrative Plan 渲染。不要输出解释、备选文本、Markdown 代码块或额外字段。"
+            )
+
+        empty_prompt = build_prompt([], [])
+        evidence_chars = max(0, _writer_prompt_char_budget() - len(empty_prompt))
+        fact_lines, inference_lines = _pack_writer_evidence(
+            fact_lines, inference_lines, evidence_chars,
         )
+        prompt = build_prompt(fact_lines, inference_lines)
         try:
             payload = self.generate_json(prompt)
         except Exception:

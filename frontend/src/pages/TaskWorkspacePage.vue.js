@@ -3,11 +3,12 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/vue-query";
 import { useRoute, RouterLink } from "vue-router";
 import { api } from "@/api/http";
 import StatusBadge from "@/components/StatusBadge.vue";
+import ArtifactReviewWorkspace from "@/components/ArtifactReviewWorkspace.vue";
 const GraphNetwork = defineAsyncComponent(() => import("@/components/GraphNetwork.vue"));
 const route = useRoute();
 const qc = useQueryClient();
 const taskId = String(route.params.taskId);
-const active = ref("overview");
+const active = ref(String(route.query.tab || "overview"));
 const analysisType = ref("facts");
 const detailsOpen = ref(false);
 const selectedGraphEdge = ref(null);
@@ -51,16 +52,37 @@ const command = useMutation({
     mutationFn: ({ path }) => api(path, { method: "POST" }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["task", taskId] }),
 });
-const stages = [
-    { name: "材料准备", keys: ["created", "parsing", "dedup"] },
-    {
-        name: "分析规划",
-        keys: ["material_analysis", "planning", "evidence", "conflict", "analysis"],
-    },
-    { name: "报告生成", keys: ["writing", "knowledge"] },
-    { name: "审核完成", keys: ["review", "done"] },
-];
-const stageIndex = computed(() => Math.max(0, stages.findIndex((x) => x.keys.includes(task.data.value?.stage || ""))));
+const stages = computed(() => task.data.value?.run_mode === "material_comparison"
+    ? [
+        {
+            name: "新增材料准备",
+            keys: [
+                "created",
+                "parsing",
+                "dedup",
+                "material_analysis",
+                "planning",
+            ],
+        },
+        { name: "证据与变化分析", keys: ["evidence", "conflict", "analysis"] },
+        { name: "变化审阅", keys: ["review", "done"] },
+    ]
+    : [
+        { name: "材料准备", keys: ["created", "parsing", "dedup"] },
+        {
+            name: "分析规划",
+            keys: [
+                "material_analysis",
+                "planning",
+                "evidence",
+                "conflict",
+                "analysis",
+            ],
+        },
+        { name: "报告生成", keys: ["writing", "knowledge"] },
+        { name: "审核完成", keys: ["review", "done"] },
+    ]);
+const stageIndex = computed(() => Math.max(0, stages.value.findIndex((x) => x.keys.includes(task.data.value?.stage || ""))));
 const running = computed(() => !["created", "review", "done", "failed", "paused"].includes(task.data.value?.stage || "created"));
 const facts = computed(() => analysis.data.value?.facts || []);
 const inferences = computed(() => (analysis.data.value?.inferences || []).filter((x) => x.source_level === "MATERIAL_INFERENCE"));
@@ -336,6 +358,7 @@ if (__VLS_ctx.task.data.value) {
         ['analysis', '分析'],
         ['report', '报告'],
         ['versions', '版本'],
+        ['collaboration', '协作审阅'],
     ]))) {
         __VLS_asFunctionalElement1(__VLS_intrinsics.button, __VLS_intrinsics.button)({
             ...{ onClick: (...[$event]) => {
@@ -467,6 +490,44 @@ if (__VLS_ctx.task.data.value) {
             ...{ class: "side-column" },
         });
         /** @type {__VLS_StyleScopedClasses['side-column']} */ ;
+        if (__VLS_ctx.task.data.value.run_mode === 'material_comparison') {
+            __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
+                ...{ class: "surface section-block" },
+            });
+            /** @type {__VLS_StyleScopedClasses['surface']} */ ;
+            /** @type {__VLS_StyleScopedClasses['section-block']} */ ;
+            __VLS_asFunctionalElement1(__VLS_intrinsics.h2, __VLS_intrinsics.h2)({});
+            if (__VLS_ctx.task.data.value.material_comparison?.summary) {
+                __VLS_asFunctionalElement1(__VLS_intrinsics.p, __VLS_intrinsics.p)({});
+                (__VLS_ctx.task.data.value.material_comparison.summary.new_fact_count || 0);
+                (__VLS_ctx.task.data.value.material_comparison.summary.affected_sections
+                    ?.length || 0);
+                let __VLS_17;
+                /** @ts-ignore @type { | typeof __VLS_components.RouterLink | typeof __VLS_components.RouterLink} */
+                RouterLink;
+                // @ts-ignore
+                const __VLS_18 = __VLS_asFunctionalComponent1(__VLS_17, new __VLS_17({
+                    ...{ class: "btn primary" },
+                    to: (`/reports/${__VLS_ctx.task.data.value.comparison_report_id}`),
+                }));
+                const __VLS_19 = __VLS_18({
+                    ...{ class: "btn primary" },
+                    to: (`/reports/${__VLS_ctx.task.data.value.comparison_report_id}`),
+                }, ...__VLS_functionalComponentArgsRest(__VLS_18));
+                /** @type {__VLS_StyleScopedClasses['btn']} */ ;
+                /** @type {__VLS_StyleScopedClasses['primary']} */ ;
+                const { default: __VLS_22 } = __VLS_20.slots;
+                // @ts-ignore
+                [task, task, task, task, task, task, task, task, task, task, task, task, task, running, stages, stageIndex, active, materials, facts, inferences, conflicts,];
+                var __VLS_20;
+            }
+            else {
+                __VLS_asFunctionalElement1(__VLS_intrinsics.p, __VLS_intrinsics.p)({
+                    ...{ class: "muted" },
+                });
+                /** @type {__VLS_StyleScopedClasses['muted']} */ ;
+            }
+        }
         __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
             ...{ class: "surface section-block" },
         });
@@ -474,20 +535,20 @@ if (__VLS_ctx.task.data.value) {
         /** @type {__VLS_StyleScopedClasses['section-block']} */ ;
         __VLS_asFunctionalElement1(__VLS_intrinsics.h2, __VLS_intrinsics.h2)({});
         if (__VLS_ctx.task.data.value.report_id) {
-            let __VLS_17;
+            let __VLS_23;
             /** @ts-ignore @type { | typeof __VLS_components.RouterLink | typeof __VLS_components.RouterLink} */
             RouterLink;
             // @ts-ignore
-            const __VLS_18 = __VLS_asFunctionalComponent1(__VLS_17, new __VLS_17({
+            const __VLS_24 = __VLS_asFunctionalComponent1(__VLS_23, new __VLS_23({
                 to: (`/reports/${__VLS_ctx.task.data.value.report_id}`),
                 ...{ class: "artifact-link" },
             }));
-            const __VLS_19 = __VLS_18({
+            const __VLS_25 = __VLS_24({
                 to: (`/reports/${__VLS_ctx.task.data.value.report_id}`),
                 ...{ class: "artifact-link" },
-            }, ...__VLS_functionalComponentArgsRest(__VLS_18));
+            }, ...__VLS_functionalComponentArgsRest(__VLS_24));
             /** @type {__VLS_StyleScopedClasses['artifact-link']} */ ;
-            const { default: __VLS_22 } = __VLS_20.slots;
+            const { default: __VLS_28 } = __VLS_26.slots;
             __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({});
             __VLS_asFunctionalElement1(__VLS_intrinsics.b, __VLS_intrinsics.b)({});
             __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({});
@@ -496,8 +557,8 @@ if (__VLS_ctx.task.data.value) {
                 : "持续生成中");
             __VLS_asFunctionalElement1(__VLS_intrinsics.strong, __VLS_intrinsics.strong)({});
             // @ts-ignore
-            [task, task, task, task, task, task, task, task, task, task, task, running, stages, stageIndex, active, materials, facts, inferences, conflicts,];
-            var __VLS_20;
+            [task, task, task,];
+            var __VLS_26;
         }
         __VLS_asFunctionalElement1(__VLS_intrinsics.button, __VLS_intrinsics.button)({
             ...{ onClick: (...[$event]) => {
@@ -710,23 +771,23 @@ if (__VLS_ctx.task.data.value) {
                 : "图谱观测模式");
             __VLS_asFunctionalElement1(__VLS_intrinsics.small, __VLS_intrinsics.small)({});
             if (__VLS_ctx.graph.data.value?.edges?.length) {
-                let __VLS_23;
+                let __VLS_29;
                 /** @ts-ignore @type { | typeof __VLS_components.GraphNetwork} */
                 GraphNetwork;
                 // @ts-ignore
-                const __VLS_24 = __VLS_asFunctionalComponent1(__VLS_23, new __VLS_23({
+                const __VLS_30 = __VLS_asFunctionalComponent1(__VLS_29, new __VLS_29({
                     ...{ 'onSelect': {} },
                     nodes: (__VLS_ctx.graph.data.value.nodes),
                     edges: (__VLS_ctx.graph.data.value.edges),
                 }));
-                const __VLS_25 = __VLS_24({
+                const __VLS_31 = __VLS_30({
                     ...{ 'onSelect': {} },
                     nodes: (__VLS_ctx.graph.data.value.nodes),
                     edges: (__VLS_ctx.graph.data.value.edges),
-                }, ...__VLS_functionalComponentArgsRest(__VLS_24));
-                let __VLS_28;
-                const __VLS_29 = {
-                    /** @type {typeof __VLS_28.select} */
+                }, ...__VLS_functionalComponentArgsRest(__VLS_30));
+                let __VLS_34;
+                const __VLS_35 = {
+                    /** @type {typeof __VLS_34.select} */
                     onSelect: (...[$event]) => {
                         if (!(__VLS_ctx.task.data.value))
                             throw 0;
@@ -749,8 +810,8 @@ if (__VLS_ctx.task.data.value) {
                         [graph, graph, graph, graph, graph, analysisType, selectedGraphEdge,];
                     },
                 };
-                var __VLS_26;
-                var __VLS_27;
+                var __VLS_32;
+                var __VLS_33;
             }
             if (__VLS_ctx.selectedGraphEdge) {
                 __VLS_asFunctionalElement1(__VLS_intrinsics.article, __VLS_intrinsics.article)({
@@ -854,6 +915,20 @@ if (__VLS_ctx.task.data.value) {
             }
         }
     }
+    else if (__VLS_ctx.active === 'collaboration') {
+        const __VLS_36 = ArtifactReviewWorkspace;
+        // @ts-ignore
+        const __VLS_37 = __VLS_asFunctionalComponent1(__VLS_36, new __VLS_36({
+            taskId: (__VLS_ctx.taskId),
+            reportId: (__VLS_ctx.task.data.value.report_id),
+            runRevision: (__VLS_ctx.task.data.value.run_revision || 1),
+        }));
+        const __VLS_38 = __VLS_37({
+            taskId: (__VLS_ctx.taskId),
+            reportId: (__VLS_ctx.task.data.value.report_id),
+            runRevision: (__VLS_ctx.task.data.value.run_revision || 1),
+        }, ...__VLS_functionalComponentArgsRest(__VLS_37));
+    }
     else if (__VLS_ctx.active === 'report') {
         __VLS_asFunctionalElement1(__VLS_intrinsics.section, __VLS_intrinsics.section)({
             ...{ class: "surface section-block report-entry" },
@@ -875,24 +950,24 @@ if (__VLS_ctx.task.data.value) {
                 ...{ class: "button-row" },
             });
             /** @type {__VLS_StyleScopedClasses['button-row']} */ ;
-            let __VLS_30;
+            let __VLS_41;
             /** @ts-ignore @type { | typeof __VLS_components.RouterLink | typeof __VLS_components.RouterLink} */
             RouterLink;
             // @ts-ignore
-            const __VLS_31 = __VLS_asFunctionalComponent1(__VLS_30, new __VLS_30({
+            const __VLS_42 = __VLS_asFunctionalComponent1(__VLS_41, new __VLS_41({
                 ...{ class: "btn primary" },
                 to: (`/reports/${__VLS_ctx.task.data.value.report_id}`),
             }));
-            const __VLS_32 = __VLS_31({
+            const __VLS_43 = __VLS_42({
                 ...{ class: "btn primary" },
                 to: (`/reports/${__VLS_ctx.task.data.value.report_id}`),
-            }, ...__VLS_functionalComponentArgsRest(__VLS_31));
+            }, ...__VLS_functionalComponentArgsRest(__VLS_42));
             /** @type {__VLS_StyleScopedClasses['btn']} */ ;
             /** @type {__VLS_StyleScopedClasses['primary']} */ ;
-            const { default: __VLS_35 } = __VLS_33.slots;
+            const { default: __VLS_46 } = __VLS_44.slots;
             // @ts-ignore
-            [task, task, task, task, active,];
-            var __VLS_33;
+            [task, task, task, task, task, task, active, active, taskId,];
+            var __VLS_44;
             if (['review', 'done'].includes(__VLS_ctx.task.data.value.stage)) {
                 __VLS_asFunctionalElement1(__VLS_intrinsics.a, __VLS_intrinsics.a)({
                     ...{ class: "btn" },
@@ -945,24 +1020,24 @@ if (__VLS_ctx.task.data.value) {
                 (item.change_summary || "报告版本快照");
                 __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({});
                 (item.created_at || "—");
-                let __VLS_36;
+                let __VLS_47;
                 /** @ts-ignore @type { | typeof __VLS_components.RouterLink | typeof __VLS_components.RouterLink} */
                 RouterLink;
                 // @ts-ignore
-                const __VLS_37 = __VLS_asFunctionalComponent1(__VLS_36, new __VLS_36({
+                const __VLS_48 = __VLS_asFunctionalComponent1(__VLS_47, new __VLS_47({
                     ...{ class: "btn tertiary" },
                     to: (`/reports/${__VLS_ctx.task.data.value.report_id}?version=${item.id}`),
                 }));
-                const __VLS_38 = __VLS_37({
+                const __VLS_49 = __VLS_48({
                     ...{ class: "btn tertiary" },
                     to: (`/reports/${__VLS_ctx.task.data.value.report_id}?version=${item.id}`),
-                }, ...__VLS_functionalComponentArgsRest(__VLS_37));
+                }, ...__VLS_functionalComponentArgsRest(__VLS_48));
                 /** @type {__VLS_StyleScopedClasses['btn']} */ ;
                 /** @type {__VLS_StyleScopedClasses['tertiary']} */ ;
-                const { default: __VLS_41 } = __VLS_39.slots;
+                const { default: __VLS_52 } = __VLS_50.slots;
                 // @ts-ignore
                 [task, task, task, versionsList, versionsList,];
-                var __VLS_39;
+                var __VLS_50;
                 // @ts-ignore
                 [];
             }

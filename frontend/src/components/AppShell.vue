@@ -3,6 +3,7 @@ import { computed } from "vue";
 import { useRoute, RouterLink } from "vue-router";
 import { useUiStore } from "@/stores/ui";
 import AppIcon from "./AppIcon.vue";
+import WorkflowAssistant from "./WorkflowAssistant.vue";
 
 const route = useRoute();
 const ui = useUiStore();
@@ -34,6 +35,7 @@ const nav = [
       <main class="content" :class="{ wide: route.meta.wide, editor }"><slot /></main>
     </div>
     <button v-if="ui.navOpen" class="nav-scrim" aria-label="关闭导航" @click="ui.closeNav()"></button>
+    <WorkflowAssistant />
   </div>
 </template>
 <style scoped>

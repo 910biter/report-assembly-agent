@@ -182,7 +182,9 @@ class WorkflowController:
         })
         _mark("plan")
         self._control_boundary()
-        if self.task.get("incremental_update") and not self.task.get("incremental_added_material_ids"):
+        if (self.task.get("incremental_update")
+                and not self.task.get("incremental_added_material_ids")
+                and not self.task.get("intervention_force_evidence")):
             # 增量补写模式(无新增材料):直接复用 base 任务已提取的 facts,
             # 不做 evidence 提取/引入(省重跑)。fact_ids 已在建任务时预置为 base 事实全集,
             # self._facts() 按 task 注册的 fact_ids 取出,无需新确认。
@@ -242,7 +244,16 @@ class WorkflowController:
         if self.task.get("analysis_done"):
             self._update(stage=str(Stage.ANALYSIS), resume={"stage": "analysis", "status": "reused"})
         elif self.task.get("incremental_update"):
-            if not self.task.get("incremental_added_material_ids"):
+            if self.task.get("intervention_force_analysis"):
+                self._update(
+                    inference_ids=[], external_ids=[], analysis_done=False,
+                    incremental_generated_inference_ids=[],
+                    incremental_generated_external_ids=[],
+                    analysis_global_meta={},
+                )
+                with self._token_context("analysis"):
+                    self.analyze(facts)
+            elif not self.task.get("incremental_added_material_ids"):
                 # 补写模式(无新增材料):继承 base 全部推断,不重新分析。
                 self._update(
                     stage=str(Stage.ANALYSIS),
@@ -280,12 +291,43 @@ class WorkflowController:
             "external_ids": self.task.get("external_ids", []),
         })
         _mark("analysis")
+        if self.task.get("run_mode") == "material_comparison":
+            # New-material comparison is a read-only analysis product.  It
+            # deliberately stops before Final Plan / Writer and never mutates
+            # the baseline report selected by the user.
+            from app.material_comparison import complete_comparison_task, mark_comparison_failed
+            try:
+                comparison = complete_comparison_task(self.task_id)
+            except Exception as exc:
+                mark_comparison_failed(self.task_id, str(exc))
+                raise
+            _mark("material_comparison")
+            run_id = str(self.task.get("run_id") or "")
+            self._update(
+                stage=str(Stage.REVIEW),
+                material_comparison=comparison,
+                stage_timings=_marks,
+                stage_durations=_durations,
+                llm_stats=llm_stats(),
+                token_efficiency=build_token_efficiency(self.task_id, None, run_id=run_id),
+                workload_profile=build_workload_profile(self.task_id, run_id=run_id),
+                critical_path_done=True,
+            )
+            update_task_run(
+                run_id, status="review",
+                metadata={"comparison_id": comparison.get("id"), "report_id": comparison.get("report_id")},
+                finished=True,
+            )
+            return
         if self.task.get("incremental_update"):
             # 增量 final_plan 策略:
             # - 无新增材料(补写模式):复用 base 规划,结构不变,只补写内容。
             # - 有新增材料:基于新 facts 重新规划 final_plan,让新结构参与
             #   build_incremental_impact 的结构对比(章节增删重组才能被真实检测)。
-            if not self.task.get("incremental_added_material_ids"):
+            if self.task.get("intervention_force_final_plan"):
+                with self._token_context("final_planning"):
+                    self.finalize_report_structure()
+            elif not self.task.get("incremental_added_material_ids"):
                 self._update(stage=str(Stage.PLANNING), resume={"stage": "final_plan", "status": "reused"})
             else:
                 with self._token_context("final_planning"):
@@ -341,6 +383,9 @@ class WorkflowController:
                     str(self.task.get("run_id") or ""),
                     candidate_version_id=version.version_id,
                 )
+                if self.task.get("run_mode") == "interaction_revision":
+                    from app.interaction import complete_recompute_for_run
+                    complete_recompute_for_run(str(self.task.get("run_id") or ""), version.version_id)
                 if self.task.get("incremental_delta_id"):
                     attach_delta_version(int(self.task["incremental_delta_id"]), version.version_id, status="applied")
             except Exception as exc:
@@ -618,16 +663,22 @@ class WorkflowController:
         variant = self._selected_variant()
         policy = build_report_policy(self.task, variant, profile)
         self._update(report_policy=policy)
+        requirements = self.task.get("user_requirements", "")
+        if self.task.get("intervention_recompute_from"):
+            requirements = (
+                f"{requirements}\n\n本轮经用户批准的调整：\n"
+                f"{self.task.get('incremental_update_reason', '')}"
+            ).strip()
         context_block = cm.for_planner(
             self.task.get("theme", ""),
-            self.task.get("user_requirements", ""),
+            requirements,
             self.task.get("material_insights", []),
-            variant.to_prompt_block() if variant else self._style_block(),
+            variant.planner_prompt_block() if variant else self._style_block(),
             business_block(profile),
             policy_prompt_block(policy),
         )
         try:
-            plan = planner.plan(context_block, user_requirements=self.task.get("user_requirements", ""))
+            plan = planner.plan(context_block, user_requirements=requirements)
         except Exception:
             raise
         self._update(plan_id=plan.id, plan_title=plan.title)
@@ -654,7 +705,7 @@ class WorkflowController:
             facts,
             inferences,
             self.task.get("material_insights", []),
-            variant.to_prompt_block() if variant else self._style_block(),
+            variant.planner_prompt_block() if variant else self._style_block(),
             policy_prompt_block(policy),
         )
         final_plan = planner.finalize_report_plan(int(plan["id"]), context_block)
@@ -959,10 +1010,25 @@ class WorkflowController:
         new_ids = [int(c.id) for c in conflicts if c.id is not None]
         self._update(conflict_ids=list(dict.fromkeys(inherited_ids + new_ids)))
         # Conflict 融入 FactRelation(contradicts 语义落库,供 Ledger/分析引用)
+        claim_fact_ids = {
+            int(claim.get("id")): int(claim.get("fact_id"))
+            for claim in claims
+            if str(claim.get("id") or "").isdigit()
+            and str(claim.get("fact_id") or "").isdigit()
+            and int(claim.get("fact_id") or 0) > 0
+        }
         for conflict in conflicts:
-            for claim_id in conflict.claim_ids or []:
-                save_fact_relation(int(claim_id), int(conflict.fact_key or 0),
-                                   "contradicts", self.task_id)
+            fact_ids = list(dict.fromkeys(
+                claim_fact_ids[claim_id]
+                for claim_id in (conflict.claim_ids or [])
+                if claim_id in claim_fact_ids
+            ))
+            for index, source_id in enumerate(fact_ids):
+                for target_id in fact_ids[index + 1:]:
+                    save_fact_relation(
+                        source_id, target_id, "contradicts", self.task_id,
+                        evidence_quote=conflict.fact_key,
+                    )
 
     def analyze(self, facts: list[dict]) -> None:
         self._update(stage=str(Stage.ANALYSIS))
@@ -1190,7 +1256,10 @@ class WorkflowController:
             str(title) for title in instruction_policy.get("rewrite_sections") or [] if str(title).strip()
         ]
         target_chapters = list(dict.fromkeys([*impact_chapters, *instruction_chapters]))
-        if not target_chapters:
+        if self.task.get("intervention_rewrite_all"):
+            target_chapters = [str(title) for title in (plan.get("structure") or []) if str(title).strip()]
+            impact["rewrite_scope_reason"] = "approved_upstream_change_rewrite_all"
+        elif not target_chapters:
             target_chapters = [str(title) for title in (plan.get("structure") or []) if str(title).strip()]
             impact["rewrite_scope_reason"] = "instruction_scope_uncertain_rewrite_all"
         elif impact_chapters and instruction_chapters:
@@ -1273,7 +1342,10 @@ class WorkflowController:
         facts = self._facts()
         inferences = self._inferences()
         variant = self._selected_variant()
-        style_block = variant.to_prompt_block() if variant else ""
+        # Editorial examples are selected after Narrative Plan exists, where
+        # chapter/subsection purpose is known. Keep only non-style runtime
+        # context here to avoid injecting one generic example set everywhere.
+        style_block = ""
         timeline_block = self._timeline_block()
         if timeline_block:
             style_block = f"{style_block}\n\n事件时间线(供时间线章节引用):\n{timeline_block}"
@@ -1681,11 +1753,14 @@ class WorkflowController:
     def _sink_knowledge(self, facts: list[dict]) -> None:
         """Publish reviewed task assertions into the workspace graph.
 
-        The graph was already built from Facts before Analysis. Post-review
-        work only promotes its validated assertions; it must not perform a
-        second unbounded material extraction that can diverge from Evidence.
+        Build the evidence-grounded graph after TTFR when it was intentionally
+        kept off the critical path, then project its validated assertions.
         """
         from app.graph import graph_service
+
+        if not settings.graph_build_before_analysis and not graph_service.has_task_graph(self.task_id):
+            with self._token_context("graph_build"):
+                self._build_task_graph(facts)
 
         # Review has not yet been accepted by a human. Keep assertions
         # validated and projectable for this task, but do not publish them into
