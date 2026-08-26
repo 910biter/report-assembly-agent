@@ -1,7 +1,7 @@
 from contextlib import contextmanager
 from unittest.mock import patch
 
-from app.evidence.extractor import save_claim
+from app.evidence.extractor import _positive_unit_id, save_claim
 from app.models.material import Claim
 
 
@@ -48,6 +48,13 @@ def test_save_pending_claim_keeps_fact_id_null():
     assert claim_id == 123
     assert recorded[0]["fact_id"] is None
     assert recorded[0]["status"] == "pending"
+
+
+def test_missing_or_invalid_unit_id_is_normalized_before_comparison():
+    assert _positive_unit_id(None) is None
+    assert _positive_unit_id("") is None
+    assert _positive_unit_id(0) is None
+    assert _positive_unit_id("42") == 42
 
 
 def test_save_pending_claim_normalizes_legacy_zero_to_null():
