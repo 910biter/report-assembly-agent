@@ -23,6 +23,54 @@ def _fit_with_meta(text: str, budget_chars: int) -> tuple[str, dict]:
     }
 
 
+def _text_similarity(left: str, right: str, n: int = 2) -> float:
+    """Symmetric character n-gram overlap for deterministic near-duplicate control."""
+    import re as _re
+
+    a = _re.sub(r"\s+|[，。；：、,.!?！？:;]", "", left or "")
+    b = _re.sub(r"\s+|[，。；：、,.!?！？:;]", "", right or "")
+    if not a or not b:
+        return 0.0
+    if a == b:
+        return 1.0
+    if len(a) < n or len(b) < n:
+        return 0.0
+    grams_a = {a[index:index + n] for index in range(len(a) - n + 1)}
+    grams_b = {b[index:index + n] for index in range(len(b) - n + 1)}
+    union = grams_a | grams_b
+    return len(grams_a & grams_b) / max(len(union), 1)
+
+
+def _pack_complete_lines(lines: list[str], budget_chars: int, omitted_label: str) -> list[str]:
+    """Pack complete semantic records; never cut the final prompt mid-record."""
+    budget = max(0, int(budget_chars or 0))
+    packed: list[str] = []
+    used = 0
+    omitted = 0
+    for raw_line in lines:
+        line = str(raw_line or "").strip()
+        if not line:
+            continue
+        cost = len(line) + 1
+        if used + cost <= budget:
+            packed.append(line)
+            used += cost
+        else:
+            omitted += 1
+    if omitted:
+        marker = f"[覆盖说明] 另有 {omitted} {omitted_label}因当前物理上下文预算未展开，原始数据仍完整保留。"
+        marker_cost = len(marker) + 1
+        while packed and used + marker_cost > budget:
+            removed = packed.pop()
+            used -= len(removed) + 1
+            omitted += 1
+            marker = f"[覆盖说明] 另有 {omitted} {omitted_label}因当前物理上下文预算未展开，原始数据仍完整保留。"
+            marker_cost = len(marker) + 1
+        if marker_cost <= budget:
+            packed.append(marker)
+    return packed
+
+
 def _unit_relevance(unit, query: str, keywords: list[str],
                     query_vector=None, unit_vectors: dict | None = None) -> float:
     """材料内 Unit 相关度:语义余弦(有向量时)+ 关键词 + 2-gram(确定性回退)。
@@ -576,7 +624,7 @@ class ContextManager:
                           facts: list[dict], inferences: list[dict],
                           insights: list[dict], style_block: str,
                           policy_block: str = "") -> str:
-        lines = [
+        header_lines = [
             f"用户主题:{theme}",
             f"用户要求:{user_requirements or '无'}",
             "初步分析规划(仅为分析假设与检索重点,可被后续事实推翻,不是最终目录):",
@@ -592,38 +640,22 @@ class ContextManager:
             }),
         ]
         if insights:
-            lines.append("材料理解摘要:")
+            header_lines.append("材料理解摘要:")
             for item in insights[:10]:
-                lines.append(
+                header_lines.append(
                     f"- {item.get('filename','')}: {item.get('doc_type','')} / {item.get('topic','')} / "
                     f"角色:{item.get('material_role','')} / 边界:{item.get('claim_support','unknown')}"
                 )
         analysis_meta = plan.get("analysis_global_meta") or {}
         if analysis_meta:
-            lines.append("综合分析摘要:")
-            lines.append(json_dumps({
+            header_lines.append("综合分析摘要:")
+            header_lines.append(json_dumps({
                 "critical_fact_ids": analysis_meta.get("critical_fact_ids") or [],
                 "coverage_status": analysis_meta.get("coverage_status") or {},
                 "unresolved_conflicts": analysis_meta.get("unresolved_conflicts") or [],
                 "uncertainty": analysis_meta.get("uncertainty") or [],
             }))
 
-        # Final structure must see a coverage-driven sample rather than the
-        # first rows in database order. Critical facts are mandatory; the rest
-        # are retrieved across user intent, analysis dimensions and evidence needs.
-        fact_by_id = {int(f.get("id")): f for f in facts if f.get("id") is not None}
-        selected_facts: list[dict] = []
-        selected_ids: set[int] = set()
-
-        def add_fact(fact: dict) -> None:
-            fact_id = int(fact.get("id") or 0)
-            if fact_id and fact_id not in selected_ids:
-                selected_ids.add(fact_id)
-                selected_facts.append(fact)
-
-        for fact_id in analysis_meta.get("critical_fact_ids") or []:
-            if str(fact_id).isdigit() and int(fact_id) in fact_by_id:
-                add_fact(fact_by_id[int(fact_id)])
         queries = [theme, user_requirements, plan.get("core_question", ""), plan.get("core_judgment", "")]
         queries.extend(str(key) for key in (analysis_meta.get("coverage_status") or {}).keys())
         queries.extend(
@@ -632,44 +664,165 @@ class ContextManager:
             if isinstance(item, dict)
         )
         queries = list(dict.fromkeys(str(query).strip() for query in queries if str(query).strip()))
-        average_fact_chars = max(1, sum(len(str(f.get("content") or "")) for f in facts) // max(len(facts), 1))
-        fact_char_budget = max(1000, int(self.budget_chars("final_planner") * 0.55))
-        estimated_capacity = max(1, fact_char_budget // average_fact_chars)
-        per_query = max(1, estimated_capacity // max(len(queries), 1))
-        for query in queries:
-            for fact in self._retrieve_facts(query, facts, per_query, used_fact_ids=set()):
-                add_fact(fact)
-        if not selected_facts:
-            selected_facts = list(facts)
+        total_budget = self.budget_chars("final_planner")
+        budgets = {
+            "header": int(total_budget * 0.22),
+            "facts": int(total_budget * 0.43),
+            "inferences": int(total_budget * 0.23),
+            "style": int(total_budget * 0.06),
+        }
+        budgets["policy"] = total_budget - sum(budgets.values())
+        critical_ids = {
+            int(value) for value in (analysis_meta.get("critical_fact_ids") or [])
+            if str(value).isdigit()
+        }
+        selected_facts = self._select_final_planner_facts(facts, queries, critical_ids, budgets["facts"])
+        selected_fact_ids = {int(item.get("id") or 0) for item in selected_facts}
+        selected_inferences = self._select_final_planner_inferences(
+            inferences, selected_fact_ids, critical_ids, queries, budgets["inferences"]
+        )
 
-        lines.append("已抽取事实(关键事实 + 多查询覆盖召回):")
-        used_fact_chars = 0
-        included_fact_count = 0
-        for fact in selected_facts:
-            fact_line = f"- fact_id={fact.get('id')}: {fact.get('content')}"
-            if used_fact_chars + len(fact_line) > fact_char_budget and included_fact_count:
-                break
-            lines.append(fact_line)
-            used_fact_chars += len(fact_line)
-            included_fact_count += 1
-        if len(facts) > included_fact_count:
-            lines.append(
-                f"[覆盖说明] Facts 共 {len(facts)} 条,本次按关键事实和多查询覆盖召回 {included_fact_count} 条用于结构规划;"
-                "完整事实由后续章节检索继续使用。"
+        fact_lines = ["已抽取事实(关键事实 + 多问题/来源覆盖 + 语义去冗余):"]
+        fact_lines.extend(
+            f"- fact_id={fact.get('id')}; dimension={fact.get('dimension') or '未分类'}; "
+            f"sources={fact.get('source_files') or []}: {fact.get('content')}"
+            for fact in selected_facts
+        )
+        if len(selected_facts) < len(facts):
+            fact_lines.append(
+                f"[覆盖说明] Facts 共 {len(facts)} 条，本次展开 {len(selected_facts)} 条；"
+                "后续 Narrative Plan 与 Writer 仍会按章检索完整事实库。"
             )
-        lines.append("已形成分析判断:")
-        for inf in inferences[:40]:
-            lines.append(
-                f"- inference_id={inf.get('id')}: {inf.get('content')} "
-                f"(based_fact_ids={inf.get('based_fact_ids')})"
+        inference_lines = ["已形成分析判断(按关键事实关联、维度覆盖、置信度与去冗余选择):"]
+        inference_lines.extend(
+            f"- inference_id={inf.get('id')}; dimension={inf.get('dimension') or '未分类'}; "
+            f"confidence={inf.get('confidence_level') or 'unknown'}; "
+            f"based_fact_ids={inf.get('based_fact_ids')}: {inf.get('content')}"
+            for inf in selected_inferences
+        )
+        if len(selected_inferences) < len(inferences):
+            inference_lines.append(
+                f"[覆盖说明] Inferences 共 {len(inferences)} 条，本次展开 {len(selected_inferences)} 条；"
+                "未展开推论不会从任务中删除。"
             )
-        if style_block:
-            lines.append("模板/风格信息(格式优先,结构按策略处理):")
-            lines.append(style_block)
-        if policy_block:
-            lines.append(policy_block)
-        fitted, _meta = _fit_with_meta("\n".join(lines), self.budget_chars("final_planner"))
-        return fitted
+
+        sections = [
+            _pack_complete_lines(header_lines, budgets["header"], "任务与分析摘要条目"),
+            _pack_complete_lines(fact_lines, budgets["facts"], "事实条目"),
+            _pack_complete_lines(inference_lines, budgets["inferences"], "推论条目"),
+            _pack_complete_lines(
+                ["模板/风格信息(格式优先,结构按策略处理):", *(style_block.splitlines() if style_block else ["无"])],
+                budgets["style"], "模板风格条目",
+            ),
+            _pack_complete_lines(
+                ["报告策略:", *(policy_block.splitlines() if policy_block else ["无"])],
+                budgets["policy"], "报告策略条目",
+            ),
+        ]
+        return "\n".join(line for section in sections for line in section)
+
+    def _select_final_planner_facts(self, facts: list[dict], queries: list[str],
+                                    critical_ids: set[int], budget_chars: int) -> list[dict]:
+        """Select mandatory, source-diverse and topic-diverse facts under one budget."""
+        if not facts:
+            return []
+        by_id = {int(item.get("id")): item for item in facts if item.get("id") is not None}
+        average_size = max(1, sum(len(str(item.get("content") or "")) + 80 for item in facts) // len(facts))
+        capacity = max(1, int(budget_chars) // average_size)
+        per_query = max(2, (capacity + max(len(queries), 1) - 1) // max(len(queries), 1) + 1)
+        ranked_groups = [self._retrieve_facts(query, facts, per_query) for query in queries]
+        selected: list[dict] = []
+        selected_ids: set[int] = set()
+        selected_sources: set[str] = set()
+        used_chars = 0
+
+        def add(item: dict, mandatory: bool = False) -> bool:
+            nonlocal used_chars
+            item_id = int(item.get("id") or 0)
+            content = str(item.get("content") or "")
+            if not item_id or not content or item_id in selected_ids:
+                return False
+            size = len(content) + 80
+            if not mandatory and used_chars + size > budget_chars:
+                return False
+            if not mandatory and any(_text_similarity(content, str(old.get("content") or "")) >= 0.82 for old in selected):
+                return False
+            selected.append(item)
+            selected_ids.add(item_id)
+            selected_sources.update(str(value) for value in item.get("source_files") or [] if str(value))
+            used_chars += size
+            return True
+
+        for item_id in sorted(critical_ids):
+            if item_id in by_id:
+                add(by_id[item_id], mandatory=True)
+        max_rank = max((len(group) for group in ranked_groups), default=0)
+        for rank in range(max_rank):
+            for group in ranked_groups:
+                if rank >= len(group):
+                    continue
+                item = group[rank]
+                sources = {str(value) for value in item.get("source_files") or [] if str(value)}
+                if sources - selected_sources:
+                    add(item)
+        for rank in range(max_rank):
+            for group in ranked_groups:
+                if rank < len(group):
+                    add(group[rank])
+        if not selected:
+            for item in facts:
+                add(item)
+        return selected
+
+    def _select_final_planner_inferences(self, inferences: list[dict], selected_fact_ids: set[int],
+                                         critical_fact_ids: set[int], queries: list[str],
+                                         budget_chars: int) -> list[dict]:
+        """Select judgments with visible evidence links and runtime dimension coverage."""
+        if not inferences:
+            return []
+        query_chars = set("".join(queries))
+        confidence_score = {"high": 3, "medium": 2, "low": 1}
+
+        def based_ids(item: dict) -> set[int]:
+            return {int(value) for value in item.get("based_fact_ids") or [] if str(value).isdigit()}
+
+        def score(item: dict) -> tuple[float, int]:
+            based = based_ids(item)
+            overlap = based & selected_fact_ids
+            critical = based & critical_fact_ids
+            lexical = len(set(str(item.get("content") or "")) & query_chars)
+            confidence = confidence_score.get(str(item.get("confidence_level") or "").lower(), 0)
+            return (len(critical) * 20 + len(overlap) * 5 + confidence + lexical / 100, len(based))
+
+        ranked = sorted(inferences, key=score, reverse=True)
+        linked = [item for item in ranked if based_ids(item) & selected_fact_ids]
+        candidates = linked or ranked
+        selected: list[dict] = []
+        selected_ids: set[int] = set()
+        used_chars = 0
+
+        def add(item: dict) -> bool:
+            nonlocal used_chars
+            item_id = int(item.get("id") or 0)
+            content = str(item.get("content") or "")
+            size = len(content) + len(str(item.get("based_fact_ids") or [])) + 100
+            if not item_id or not content or item_id in selected_ids or used_chars + size > budget_chars:
+                return False
+            if any(_text_similarity(content, str(old.get("content") or "")) >= 0.82 for old in selected):
+                return False
+            selected.append(item)
+            selected_ids.add(item_id)
+            used_chars += size
+            return True
+
+        seen_dimensions: set[str] = set()
+        for item in candidates:
+            dimension = str(item.get("dimension") or "未分类")
+            if dimension not in seen_dimensions and add(item):
+                seen_dimensions.add(dimension)
+        for item in candidates:
+            add(item)
+        return selected
 
     def for_writer_section(self, chapter: str, facts: list[dict],
                            inferences: list[dict], style_block: str,
