@@ -105,7 +105,7 @@ class Settings(BaseSettings):
     final_planner_output_tokens: int = 6144  # 8K 输入下容纳完整章节/小节契约
     writer_output_tokens: int = 3072  # 单个 Narrative subsection 的正文输出预算
     writer_visible_word_token_ratio: float = 0.30  # JSON+引用绑定后的保守可见正文容量
-    evidence_output_tokens: int = 5120  # Evidence 高密度批次需要比普通结构化阶段更大的输出空间
+    evidence_output_tokens: int = 6144  # Evidence 高密度批次需要比普通结构化阶段更大的输出空间
     evidence_first_pass_input_tokens: int = 160000  # 首轮 Evidence 总输入资源边界
     evidence_gap_input_tokens: int = 60000  # 单轮缺口检索输入资源边界
     # Exact model tokenization is available in production. Keep a measured

@@ -18,6 +18,8 @@ class RuntimeProfilesAndConflictTests(unittest.TestCase):
             )
             self.assertLessEqual(total, settings.model_context_window_tokens)
         self.assertGreater(profiles["evidence"]["output_tokens"], profiles["conflict"]["output_tokens"])
+        self.assertEqual(profiles["evidence"]["input_tokens"], 15872)
+        self.assertEqual(profiles["evidence"]["output_tokens"], 6144)
         self.assertEqual(profiles["writer"]["batch_policy"], "subsection")
         self.assertNotEqual(profiles["analysis"]["workload"], profiles["writer"]["workload"])
         self.assertEqual(profiles["interaction"]["input_tokens"], settings.interactive_input_tokens)
