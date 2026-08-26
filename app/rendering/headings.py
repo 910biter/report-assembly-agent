@@ -62,10 +62,8 @@ def detect_numbering_strategy(schema: dict[str, Any] | None) -> HeadingNumbering
 
 
 def format_heading(level: int, path: list[int], title: str, strategy: HeadingNumbering) -> str:
-    """Render a heading with deterministic numbering, preserving existing prefixes."""
+    """Render a semantic heading with one deterministic numbering strategy."""
     clean_title = strip_heading_prefix(title)
-    if has_heading_prefix(title):
-        return title.strip()
     fmt = strategy.level_formats.get(level)
     prefix = _prefix_for(fmt, path)
     return f"{prefix}{clean_title}" if prefix else clean_title

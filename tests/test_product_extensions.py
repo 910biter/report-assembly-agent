@@ -1,10 +1,25 @@
 import unittest
 import inspect
+from unittest.mock import patch
 
 from app.evidence.extractor import EvidenceAgent
 from app.infrastructure.orm import Base
 from app.interaction import _artifact_summary, _proposal_instruction
-from app.material_comparison import _candidate_sets, _fallback_decision, _lineage_impacts
+from app.graph.service import (
+    GraphExtractionAgent,
+    _extract_adaptive,
+    _fact_batches,
+    _visualization_nodes,
+)
+from app.context import ContextManager
+from app.material_comparison import (
+    CHANGE_TYPES,
+    _candidate_sets,
+    _comparison_document,
+    _comparison_metrics,
+    _fallback_decision,
+    _lineage_impacts,
+)
 from app.memory.style import _editorial_confidence, _normalize_profile_label, _validate_profile_payload
 from app.memory.style_profile import (
     aggregate_style_metrics,
@@ -16,10 +31,91 @@ from app.memory.style_jobs import create_job as create_style_job
 from app.memory.style_jobs import get_job as get_style_job
 from app.memory.style_jobs import run_job as run_style_job
 from app.models.memory import StyleVariant
-from app.writing.writer import _style_sample_type
+from app.rendering.headings import HeadingNumbering, format_heading, strip_heading_prefix
+from app.writing.writer import _clean_generated_subheading, _style_sample_type
+from app.workflow.controller import _graph_artifact_status
 
 
 class ProductExtensionTests(unittest.TestCase):
+    def test_graph_truncation_splits_instead_of_repeating_the_same_batch(self):
+        calls = []
+
+        def extract(batch):
+            calls.append([item["id"] for item in batch])
+            if len(batch) > 2:
+                raise RuntimeError("MODEL_OUTPUT_TRUNCATED")
+            return {"entities": [], "assertions": []}
+
+        outcome = _extract_adaptive([{"id": value} for value in range(1, 6)], extract)
+        self.assertEqual(len(outcome.payloads), 3)
+        self.assertEqual(outcome.failures, [])
+        self.assertEqual(outcome.split_count, 2)
+        self.assertEqual(calls[0], [1, 2, 3, 4, 5])
+        self.assertNotEqual(calls[1], calls[0])
+
+    def test_graph_terminal_failure_reports_affected_fact_ids(self):
+        outcome = _extract_adaptive(
+            [{"id": 7}], lambda _batch: (_ for _ in ()).throw(RuntimeError("MODEL_OUTPUT_TRUNCATED")),
+        )
+        self.assertEqual(outcome.payloads, [])
+        self.assertEqual(outcome.failures[0]["fact_ids"], [7])
+        self.assertFalse(GraphExtractionAgent().should_retry(RuntimeError("MODEL_OUTPUT_TRUNCATED")))
+
+    def test_graph_batch_limit_is_a_resource_setting_not_semantic_selection(self):
+        facts = [{"id": value, "content": f"事实 {value}"} for value in range(25)]
+        with patch("app.graph.service.settings.graph_facts_per_batch", 8):
+            batches = _fact_batches(facts)
+        self.assertEqual(sum(len(batch) for batch in batches), len(facts))
+        self.assertLessEqual(max(len(batch) for batch in batches), 8)
+
+    def test_graph_artifact_status_never_marks_degraded_or_queued_as_done(self):
+        self.assertEqual(_graph_artifact_status({"status": "pending"}), "pending")
+        self.assertEqual(_graph_artifact_status({"status": "queued"}), "pending")
+        self.assertEqual(_graph_artifact_status({"status": "degraded"}), "failed")
+        self.assertEqual(_graph_artifact_status({"status": "partial_ready"}), "partial")
+
+    def test_context_budget_tracks_serving_window_and_stage_reserves(self):
+        with (
+            patch("app.context.settings.model_context_window_tokens", 16000),
+            patch("app.context.settings.structured_output_tokens", 3000),
+            patch("app.context.settings.prompt_overhead_tokens", 2000),
+            patch("app.context.settings.safety_margin_tokens", 1000),
+            patch("app.context.settings.max_context_chars", 20000),
+        ):
+            self.assertEqual(ContextManager({}).budget_chars(), 10000)
+
+    def test_graph_visualization_materializes_literal_value_targets(self):
+        records = {
+            "entities": [{"key": "entity-a", "name": "机构甲", "entity_type": "机构"}],
+            "assertions": [{
+                "subject_key": "entity-a",
+                "target_key": "value-2027",
+                "target_name": "2027年",
+                "object_value": "2027年",
+                "workspace_id": "default",
+                "status": "validated",
+            }],
+        }
+        nodes = _visualization_nodes(records)
+        self.assertEqual({item["key"] for item in nodes}, {"entity-a", "value-2027"})
+        self.assertEqual(nodes[-1]["entity_type"], "value")
+
+    def test_heading_renderer_replaces_existing_prefix_with_template_numbering(self):
+        strategy = HeadingNumbering({1: "cjk_comma", 2: "cjk_parenthesized"})
+        self.assertEqual(
+            format_heading(2, [1, 1], "1. 从概念提出到战略确立", strategy),
+            "（一）从概念提出到战略确立",
+        )
+        self.assertEqual(
+            format_heading(2, [2, 2], "2.3 关键技术支撑", strategy),
+            "（二）关键技术支撑",
+        )
+
+    def test_all_heading_boundaries_strip_simple_arabic_prefixes(self):
+        self.assertEqual(strip_heading_prefix("1. 法规体系构建"), "法规体系构建")
+        self.assertEqual(_clean_generated_subheading("2. 法规体系构建"), "法规体系构建")
+        self.assertEqual(strip_heading_prefix("2024年度工作安排"), "2024年度工作安排")
+
     def test_style_profile_name_rejects_prompt_schema_text(self):
         prompt_text = "报告类型,用 2-4 字简称,如:政策研究/情报快报/专题分析/风险研判/其他"
         self.assertEqual(_normalize_profile_label(prompt_text), "综合报告风格")
@@ -115,6 +211,36 @@ class ProductExtensionTests(unittest.TestCase):
         }]})
         self.assertEqual(impacts[3][0]["section"], "风险分析")
         self.assertEqual(impacts[3][0]["reason"], "lineage")
+
+    def test_comparison_document_maps_changes_to_stable_report_sentences(self):
+        document = _comparison_document(
+            {"sentence_snapshot": [{
+                "id": 8, "section": "风险分析", "paragraph": 2,
+                "position": 1, "content": "原报告事实。", "source_refs": {"fact_ids": [3]},
+            }]},
+            [{
+                "id": 21, "change_type": "conflict", "status": "pending_review",
+                "confidence": "high", "impact": {"report_locations": [{"sentence_id": 8}]},
+            }],
+        )
+        self.assertEqual(document["sentences"][0]["changes"][0]["item_id"], 21)
+        self.assertEqual(document["sentences"][0]["changes"][0]["change_type"], "conflict")
+        self.assertEqual(document["unmapped_item_ids"], [])
+
+    def test_comparison_can_retain_related_material_without_calling_it_irrelevant(self):
+        self.assertIn("related", CHANGE_TYPES)
+
+    def test_comparison_metrics_separate_sentence_impacts_from_independent_findings(self):
+        metrics = _comparison_metrics([
+            {"change_type": "conflict", "impact_json": '{"report_locations":[{"sentence_id":8}]}'},
+            {"change_type": "corroboration", "impact_json": '{"report_locations":[{"sentence_id":8}]}'},
+            {"change_type": "addition", "impact_json": '{"report_locations":[]}'},
+            {"change_type": "irrelevant", "impact_json": '{"report_locations":[]}'},
+        ])
+        self.assertEqual(metrics["reviewable_change_count"], 3)
+        self.assertEqual(metrics["mapped_change_count"], 2)
+        self.assertEqual(metrics["affected_sentence_count"], 1)
+        self.assertEqual(metrics["independent_finding_count"], 1)
 
     def test_structure_policy_separates_layout_from_content_planning(self):
         variant = StyleVariant(library_id=1, structure={"sections": [{"title": "模板示例目录"}]})

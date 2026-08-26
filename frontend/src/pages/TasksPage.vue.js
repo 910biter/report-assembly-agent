@@ -17,6 +17,10 @@ const templateNames = computed(() => new Map((templates.data.value || []).map(it
 function inView(task, target) {
     if (target === "all")
         return true;
+    if (target === "comparison")
+        return task.run_mode === "material_comparison";
+    if (task.run_mode === "material_comparison")
+        return false;
     if (target === "pending")
         return task.stage === "created";
     if (target === "paused")
@@ -49,6 +53,7 @@ function timestamp(task) {
 }
 const viewItems = computed(() => [
     { key: "all", label: "全部", count: (tasks.data.value || []).length },
+    { key: "comparison", label: "材料对比", count: (tasks.data.value || []).filter(item => inView(item, "comparison")).length },
     { key: "pending", label: "待运行", count: (tasks.data.value || []).filter(item => inView(item, "pending")).length },
     { key: "active", label: "进行中", count: (tasks.data.value || []).filter(item => inView(item, "active")).length },
     { key: "paused", label: "已暂停", count: (tasks.data.value || []).filter(item => inView(item, "paused")).length },
@@ -130,6 +135,7 @@ let __VLS_directives;
 /** @type {__VLS_StyleScopedClasses['task-row']} */ ;
 /** @type {__VLS_StyleScopedClasses['table-head']} */ ;
 /** @type {__VLS_StyleScopedClasses['task-row']} */ ;
+/** @type {__VLS_StyleScopedClasses['task-name']} */ ;
 __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
     ...{ class: "page-stack tasks-page" },
 });
@@ -329,7 +335,14 @@ if (__VLS_ctx.filtered.length) {
         /** @type {__VLS_StyleScopedClasses['task-name']} */ ;
         __VLS_asFunctionalElement1(__VLS_intrinsics.strong, __VLS_intrinsics.strong)({});
         (task.theme);
-        __VLS_asFunctionalElement1(__VLS_intrinsics.small, __VLS_intrinsics.small)({
+        __VLS_asFunctionalElement1(__VLS_intrinsics.small, __VLS_intrinsics.small)({});
+        if (task.run_mode === 'material_comparison') {
+            __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({
+                ...{ class: "task-kind" },
+            });
+            /** @type {__VLS_StyleScopedClasses['task-kind']} */ ;
+        }
+        __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({
             ...{ class: "mono" },
         });
         /** @type {__VLS_StyleScopedClasses['mono']} */ ;
@@ -348,7 +361,7 @@ if (__VLS_ctx.filtered.length) {
             ...{ class: "truncate" },
         });
         /** @type {__VLS_StyleScopedClasses['truncate']} */ ;
-        (task.variant_id ? __VLS_ctx.templateNames.get(Number(task.variant_id)) || `模板 ${task.variant_id}` : '默认模板');
+        (task.run_mode === 'material_comparison' ? '基线报告' : task.variant_id ? __VLS_ctx.templateNames.get(Number(task.variant_id)) || `模板 ${task.variant_id}` : '默认模板');
         __VLS_asFunctionalElement1(__VLS_intrinsics.time, __VLS_intrinsics.time)({});
         (__VLS_ctx.formatDate(task.updated_at || task.created_at));
         let __VLS_21;
@@ -372,6 +385,7 @@ if (__VLS_ctx.filtered.length) {
         };
         /** @type {__VLS_StyleScopedClasses['open-link']} */ ;
         const { default: __VLS_28 } = __VLS_24.slots;
+        (task.run_mode === 'material_comparison' ? '审阅' : '打开');
         // @ts-ignore
         [selectedId, templateNames, formatDate,];
         var __VLS_24;

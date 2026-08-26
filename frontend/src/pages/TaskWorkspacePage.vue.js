@@ -1,9 +1,10 @@
-import { computed, defineAsyncComponent, ref } from "vue";
+import { computed, defineAsyncComponent, ref, watch } from "vue";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/vue-query";
 import { useRoute, RouterLink } from "vue-router";
 import { api } from "@/api/http";
 import StatusBadge from "@/components/StatusBadge.vue";
 import ArtifactReviewWorkspace from "@/components/ArtifactReviewWorkspace.vue";
+import MaterialComparisonWorkspace from "@/components/MaterialComparisonWorkspace.vue";
 const GraphNetwork = defineAsyncComponent(() => import("@/components/GraphNetwork.vue"));
 const route = useRoute();
 const qc = useQueryClient();
@@ -19,6 +20,11 @@ const task = useQuery({
         ? 15000
         : 4000,
 });
+const isComparison = computed(() => task.data.value?.run_mode === "material_comparison");
+watch(() => task.data.value?.run_mode, mode => {
+    if (mode === "material_comparison" && !route.query.tab)
+        active.value = "comparison";
+}, { immediate: true });
 const materials = useQuery({
     queryKey: ["task-materials", taskId],
     queryFn: () => api(`/api/tasks/${taskId}/materials`),
@@ -36,6 +42,7 @@ const graph = useQuery({
     queryFn: () => api(`/api/tasks/${taskId}/graph`),
     enabled: computed(() => active.value === "analysis" && analysisType.value === "graph"),
     staleTime: 30000,
+    refetchInterval: (q) => (q.state.data?.build_active ? 4000 : false),
 });
 const graphChanges = useQuery({
     queryKey: ["task-graph-changes", taskId],
@@ -51,6 +58,34 @@ const versions = useQuery({
 const command = useMutation({
     mutationFn: ({ path }) => api(path, { method: "POST" }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["task", taskId] }),
+});
+const rebuildGraph = useMutation({
+    mutationFn: () => api(`/api/tasks/${taskId}/graph/rebuild`, { method: "POST" }),
+    onSuccess: async () => {
+        await Promise.all([
+            qc.invalidateQueries({ queryKey: ["task", taskId] }),
+            qc.invalidateQueries({ queryKey: ["task-graph", taskId] }),
+            qc.invalidateQueries({ queryKey: ["task-graph-changes", taskId] }),
+        ]);
+    },
+});
+const graphBuildStatus = computed(() => String(graph.data.value?.build_status?.status || "unknown"));
+const graphBuildActive = computed(() => Boolean(graph.data.value?.build_active));
+const graphAssertionCount = computed(() => Number(graph.data.value?.stats?.assertion_count
+    ?? task.data.value?.graph_status?.assertion_count
+    ?? 0));
+const graphBuildMessage = computed(() => {
+    const status = graph.data.value?.build_status || {};
+    if (status.status === "partial_ready") {
+        const failedFacts = Number(status.failed_fact_ids?.length || 0);
+        return failedFacts
+            ? `已有关系可用，另有 ${failedFacts} 条事实尚未完成关系抽取。`
+            : "已有部分关系可用，仍有批次需要重新构建。";
+    }
+    if (status.error === "MODEL_OUTPUT_TRUNCATED" || String(status.error || "").includes("terminal batch")) {
+        return "关系抽取输出超过当前模型容量，可使用自适应拆批重新构建。";
+    }
+    return status.error || "构图只保留可回查事实的关系。";
 });
 const stages = computed(() => task.data.value?.run_mode === "material_comparison"
     ? [
@@ -82,6 +117,9 @@ const stages = computed(() => task.data.value?.run_mode === "material_comparison
         { name: "报告生成", keys: ["writing", "knowledge"] },
         { name: "审核完成", keys: ["review", "done"] },
     ]);
+const taskTabs = computed(() => isComparison.value
+    ? [["comparison", "对比结果"], ["materials", "新增材料"], ["runtime", "运行详情"]]
+    : [["overview", "概览"], ["materials", "材料"], ["analysis", "分析"], ["report", "报告"], ["versions", "版本"], ["collaboration", "协作审阅"]]);
 const stageIndex = computed(() => Math.max(0, stages.value.findIndex((x) => x.keys.includes(task.data.value?.stage || ""))));
 const running = computed(() => !["created", "review", "done", "failed", "paused"].includes(task.data.value?.stage || "created"));
 const facts = computed(() => analysis.data.value?.facts || []);
@@ -96,6 +134,31 @@ function control(op) {
 function confidence(x) {
     return ({ high: "高", medium: "中", low: "低" }[String(x.confidence_level || "").toLowerCase()] || "需人工复核");
 }
+const conflictTypeLabels = {
+    direct_contradiction: "直接矛盾",
+    temporal_difference: "时间变化",
+    scope_difference: "适用范围不同",
+    metric_difference: "统计口径不同",
+    qualification: "补充限定",
+    needs_verification: "待核验",
+};
+function conflictType(item) {
+    return conflictTypeLabels[item.conflict_type] || "待核验";
+}
+function conflictConfidence(item) {
+    return { high: "高置信", medium: "中置信", low: "低置信" }[item.confidence] || "置信度未定";
+}
+function sourceLocation(entry) {
+    const location = [
+        entry.file || "来源文件未记录",
+        entry.page ? `第 ${entry.page} 页` : "",
+        entry.paragraph ? `第 ${entry.paragraph} 段` : "",
+    ].filter(Boolean);
+    return location.join(" · ");
+}
+function isPairwiseConflict(item) {
+    return (item.entries || []).length === 2 && (item.claim_ids || []).length === 2;
+}
 function versionsList() {
     const data = versions.data.value;
     return Array.isArray(data) ? data : data?.versions || [];
@@ -108,6 +171,7 @@ let __VLS_components;
 let __VLS_intrinsics;
 let __VLS_directives;
 /** @type {__VLS_StyleScopedClasses['task-head']} */ ;
+/** @type {__VLS_StyleScopedClasses['progress-rail']} */ ;
 /** @type {__VLS_StyleScopedClasses['progress-step']} */ ;
 /** @type {__VLS_StyleScopedClasses['progress-step']} */ ;
 /** @type {__VLS_StyleScopedClasses['progress-step']} */ ;
@@ -141,6 +205,37 @@ let __VLS_directives;
 /** @type {__VLS_StyleScopedClasses['knowledge-item']} */ ;
 /** @type {__VLS_StyleScopedClasses['inference']} */ ;
 /** @type {__VLS_StyleScopedClasses['knowledge-item']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-review']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-review']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-review']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-review']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-type']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-type']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-type']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-pair']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-pair']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-pair']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-relation']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-relation']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-side']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-side']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-review']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-pair']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-pair']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-ambiguous']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-ambiguous']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-candidates']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-candidates']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-candidates']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-candidates']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-candidates']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-pair']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-pair']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-pair']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-relation']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-pair']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-relation']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-pair']} */ ;
 /** @type {__VLS_StyleScopedClasses['graph-summary']} */ ;
 /** @type {__VLS_StyleScopedClasses['graph-summary']} */ ;
 /** @type {__VLS_StyleScopedClasses['graph-edge']} */ ;
@@ -209,14 +304,24 @@ if (__VLS_ctx.task.data.value) {
         ...{ class: "button-row" },
     });
     /** @type {__VLS_StyleScopedClasses['button-row']} */ ;
-    const __VLS_6 = StatusBadge;
-    // @ts-ignore
-    const __VLS_7 = __VLS_asFunctionalComponent1(__VLS_6, new __VLS_6({
-        stage: (__VLS_ctx.task.data.value.stage),
-    }));
-    const __VLS_8 = __VLS_7({
-        stage: (__VLS_ctx.task.data.value.stage),
-    }, ...__VLS_functionalComponentArgsRest(__VLS_7));
+    if (__VLS_ctx.isComparison) {
+        __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({
+            ...{ class: "badge" },
+            ...{ class: (__VLS_ctx.task.data.value.stage === 'failed' ? 'danger' : __VLS_ctx.task.data.value.stage === 'review' ? 'warning' : __VLS_ctx.task.data.value.stage === 'done' ? 'success' : '') },
+        });
+        /** @type {__VLS_StyleScopedClasses['badge']} */ ;
+        (__VLS_ctx.task.data.value.stage === 'failed' ? '对比异常' : __VLS_ctx.task.data.value.stage === 'review' ? '等待审阅' : __VLS_ctx.task.data.value.stage === 'done' ? '审阅完成' : '对比中');
+    }
+    else {
+        const __VLS_6 = StatusBadge;
+        // @ts-ignore
+        const __VLS_7 = __VLS_asFunctionalComponent1(__VLS_6, new __VLS_6({
+            stage: (__VLS_ctx.task.data.value.stage),
+        }));
+        const __VLS_8 = __VLS_7({
+            stage: (__VLS_ctx.task.data.value.stage),
+        }, ...__VLS_functionalComponentArgsRest(__VLS_7));
+    }
     if (['created', 'failed'].includes(__VLS_ctx.task.data.value.stage)) {
         __VLS_asFunctionalElement1(__VLS_intrinsics.button, __VLS_intrinsics.button)({
             ...{ onClick: (__VLS_ctx.run) },
@@ -236,7 +341,7 @@ if (__VLS_ctx.task.data.value) {
                         throw 0;
                     return (__VLS_ctx.control('pause'));
                     // @ts-ignore
-                    [task, task, task, task, task, task, task, task, run, command, running, control,];
+                    [task, task, task, task, task, task, task, task, task, task, task, task, task, task, isComparison, run, command, running, control,];
                 } },
             ...{ class: "btn" },
         });
@@ -277,6 +382,25 @@ if (__VLS_ctx.task.data.value) {
         [task, task,];
         var __VLS_14;
     }
+    else if (__VLS_ctx.isComparison && __VLS_ctx.task.data.value.comparison_report_id) {
+        let __VLS_17;
+        /** @ts-ignore @type { | typeof __VLS_components.RouterLink | typeof __VLS_components.RouterLink} */
+        RouterLink;
+        // @ts-ignore
+        const __VLS_18 = __VLS_asFunctionalComponent1(__VLS_17, new __VLS_17({
+            ...{ class: "btn" },
+            to: (`/reports/${__VLS_ctx.task.data.value.comparison_report_id}`),
+        }));
+        const __VLS_19 = __VLS_18({
+            ...{ class: "btn" },
+            to: (`/reports/${__VLS_ctx.task.data.value.comparison_report_id}`),
+        }, ...__VLS_functionalComponentArgsRest(__VLS_18));
+        /** @type {__VLS_StyleScopedClasses['btn']} */ ;
+        const { default: __VLS_22 } = __VLS_20.slots;
+        // @ts-ignore
+        [task, task, isComparison,];
+        var __VLS_20;
+    }
     __VLS_asFunctionalElement1(__VLS_intrinsics.section, __VLS_intrinsics.section)({
         ...{ class: "surface progress-block" },
     });
@@ -284,8 +408,10 @@ if (__VLS_ctx.task.data.value) {
     /** @type {__VLS_StyleScopedClasses['progress-block']} */ ;
     __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
         ...{ class: "progress-rail" },
+        ...{ class: ({ compact: __VLS_ctx.isComparison }) },
     });
     /** @type {__VLS_StyleScopedClasses['progress-rail']} */ ;
+    /** @type {__VLS_StyleScopedClasses['compact']} */ ;
     for (const [item, index] of __VLS_vFor((__VLS_ctx.stages))) {
         __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
             key: (item.name),
@@ -305,11 +431,11 @@ if (__VLS_ctx.task.data.value) {
             ? "已完成"
             : index === __VLS_ctx.stageIndex
                 ? __VLS_ctx.task.data.value.stage === "review"
-                    ? "待审核"
+                    ? __VLS_ctx.isComparison ? "待审阅" : "待审核"
                     : "正在进行"
                 : "等待中");
         // @ts-ignore
-        [task, stages, stageIndex, stageIndex, stageIndex, stageIndex,];
+        [task, isComparison, isComparison, stages, stageIndex, stageIndex, stageIndex, stageIndex,];
     }
     __VLS_asFunctionalElement1(__VLS_intrinsics.button, __VLS_intrinsics.button)({
         ...{ onClick: (...[$event]) => {
@@ -352,21 +478,14 @@ if (__VLS_ctx.task.data.value) {
     });
     /** @type {__VLS_StyleScopedClasses['tabs']} */ ;
     /** @type {__VLS_StyleScopedClasses['workspace-tabs']} */ ;
-    for (const [tab] of __VLS_vFor(([
-        ['overview', '概览'],
-        ['materials', '材料'],
-        ['analysis', '分析'],
-        ['report', '报告'],
-        ['versions', '版本'],
-        ['collaboration', '协作审阅'],
-    ]))) {
+    for (const [tab] of __VLS_vFor((__VLS_ctx.taskTabs))) {
         __VLS_asFunctionalElement1(__VLS_intrinsics.button, __VLS_intrinsics.button)({
             ...{ onClick: (...[$event]) => {
                     if (!(__VLS_ctx.task.data.value))
                         throw 0;
                     return (__VLS_ctx.active = tab[0]);
                     // @ts-ignore
-                    [task, task, task, task, task, task, detailsOpen, detailsOpen, active,];
+                    [task, task, task, task, task, task, detailsOpen, detailsOpen, taskTabs, active,];
                 } },
             key: (tab[0]),
             ...{ class: "tab" },
@@ -378,7 +497,55 @@ if (__VLS_ctx.task.data.value) {
         // @ts-ignore
         [active,];
     }
-    if (__VLS_ctx.active === 'overview') {
+    if (__VLS_ctx.active === 'comparison' && __VLS_ctx.isComparison) {
+        const __VLS_23 = MaterialComparisonWorkspace;
+        // @ts-ignore
+        const __VLS_24 = __VLS_asFunctionalComponent1(__VLS_23, new __VLS_23({
+            embedded: true,
+            reportId: (Number(__VLS_ctx.task.data.value.comparison_report_id)),
+            comparisonId: (Number(__VLS_ctx.task.data.value.comparison_id)),
+        }));
+        const __VLS_25 = __VLS_24({
+            embedded: true,
+            reportId: (Number(__VLS_ctx.task.data.value.comparison_report_id)),
+            comparisonId: (Number(__VLS_ctx.task.data.value.comparison_id)),
+        }, ...__VLS_functionalComponentArgsRest(__VLS_24));
+    }
+    else if (__VLS_ctx.active === 'runtime' && __VLS_ctx.isComparison) {
+        __VLS_asFunctionalElement1(__VLS_intrinsics.section, __VLS_intrinsics.section)({
+            ...{ class: "surface section-block" },
+        });
+        /** @type {__VLS_StyleScopedClasses['surface']} */ ;
+        /** @type {__VLS_StyleScopedClasses['section-block']} */ ;
+        __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
+            ...{ class: "section-head" },
+        });
+        /** @type {__VLS_StyleScopedClasses['section-head']} */ ;
+        __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({});
+        __VLS_asFunctionalElement1(__VLS_intrinsics.h2, __VLS_intrinsics.h2)({});
+        __VLS_asFunctionalElement1(__VLS_intrinsics.p, __VLS_intrinsics.p)({
+            ...{ class: "muted" },
+        });
+        /** @type {__VLS_StyleScopedClasses['muted']} */ ;
+        __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
+            ...{ class: "status-summary" },
+        });
+        /** @type {__VLS_StyleScopedClasses['status-summary']} */ ;
+        __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({});
+        __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({});
+        __VLS_asFunctionalElement1(__VLS_intrinsics.b, __VLS_intrinsics.b)({});
+        (__VLS_ctx.task.data.value.stage);
+        __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({});
+        __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({});
+        __VLS_asFunctionalElement1(__VLS_intrinsics.b, __VLS_intrinsics.b)({});
+        (__VLS_ctx.task.data.value.queue_status?.status || "—");
+        __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({});
+        __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({});
+        __VLS_asFunctionalElement1(__VLS_intrinsics.b, __VLS_intrinsics.b)({});
+        (__VLS_ctx.task.data.value.parse_progress?.done || 0);
+        (__VLS_ctx.task.data.value.parse_progress?.total || "—");
+    }
+    else if (__VLS_ctx.active === 'overview') {
         __VLS_asFunctionalElement1(__VLS_intrinsics.section, __VLS_intrinsics.section)({
             ...{ class: "workspace-grid" },
         });
@@ -502,24 +669,24 @@ if (__VLS_ctx.task.data.value) {
                 (__VLS_ctx.task.data.value.material_comparison.summary.new_fact_count || 0);
                 (__VLS_ctx.task.data.value.material_comparison.summary.affected_sections
                     ?.length || 0);
-                let __VLS_17;
+                let __VLS_28;
                 /** @ts-ignore @type { | typeof __VLS_components.RouterLink | typeof __VLS_components.RouterLink} */
                 RouterLink;
                 // @ts-ignore
-                const __VLS_18 = __VLS_asFunctionalComponent1(__VLS_17, new __VLS_17({
+                const __VLS_29 = __VLS_asFunctionalComponent1(__VLS_28, new __VLS_28({
                     ...{ class: "btn primary" },
                     to: (`/reports/${__VLS_ctx.task.data.value.comparison_report_id}`),
                 }));
-                const __VLS_19 = __VLS_18({
+                const __VLS_30 = __VLS_29({
                     ...{ class: "btn primary" },
                     to: (`/reports/${__VLS_ctx.task.data.value.comparison_report_id}`),
-                }, ...__VLS_functionalComponentArgsRest(__VLS_18));
+                }, ...__VLS_functionalComponentArgsRest(__VLS_29));
                 /** @type {__VLS_StyleScopedClasses['btn']} */ ;
                 /** @type {__VLS_StyleScopedClasses['primary']} */ ;
-                const { default: __VLS_22 } = __VLS_20.slots;
+                const { default: __VLS_33 } = __VLS_31.slots;
                 // @ts-ignore
-                [task, task, task, task, task, task, task, task, task, task, task, task, task, running, stages, stageIndex, active, materials, facts, inferences, conflicts,];
-                var __VLS_20;
+                [task, task, task, task, task, task, task, task, task, task, task, task, task, task, task, task, task, task, task, isComparison, isComparison, running, stages, stageIndex, active, active, active, materials, facts, inferences, conflicts,];
+                var __VLS_31;
             }
             else {
                 __VLS_asFunctionalElement1(__VLS_intrinsics.p, __VLS_intrinsics.p)({
@@ -535,20 +702,20 @@ if (__VLS_ctx.task.data.value) {
         /** @type {__VLS_StyleScopedClasses['section-block']} */ ;
         __VLS_asFunctionalElement1(__VLS_intrinsics.h2, __VLS_intrinsics.h2)({});
         if (__VLS_ctx.task.data.value.report_id) {
-            let __VLS_23;
+            let __VLS_34;
             /** @ts-ignore @type { | typeof __VLS_components.RouterLink | typeof __VLS_components.RouterLink} */
             RouterLink;
             // @ts-ignore
-            const __VLS_24 = __VLS_asFunctionalComponent1(__VLS_23, new __VLS_23({
+            const __VLS_35 = __VLS_asFunctionalComponent1(__VLS_34, new __VLS_34({
                 to: (`/reports/${__VLS_ctx.task.data.value.report_id}`),
                 ...{ class: "artifact-link" },
             }));
-            const __VLS_25 = __VLS_24({
+            const __VLS_36 = __VLS_35({
                 to: (`/reports/${__VLS_ctx.task.data.value.report_id}`),
                 ...{ class: "artifact-link" },
-            }, ...__VLS_functionalComponentArgsRest(__VLS_24));
+            }, ...__VLS_functionalComponentArgsRest(__VLS_35));
             /** @type {__VLS_StyleScopedClasses['artifact-link']} */ ;
-            const { default: __VLS_28 } = __VLS_26.slots;
+            const { default: __VLS_39 } = __VLS_37.slots;
             __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({});
             __VLS_asFunctionalElement1(__VLS_intrinsics.b, __VLS_intrinsics.b)({});
             __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({});
@@ -558,11 +725,15 @@ if (__VLS_ctx.task.data.value) {
             __VLS_asFunctionalElement1(__VLS_intrinsics.strong, __VLS_intrinsics.strong)({});
             // @ts-ignore
             [task, task, task,];
-            var __VLS_26;
+            var __VLS_37;
         }
         __VLS_asFunctionalElement1(__VLS_intrinsics.button, __VLS_intrinsics.button)({
             ...{ onClick: (...[$event]) => {
                     if (!(__VLS_ctx.task.data.value))
+                        throw 0;
+                    if (!!(__VLS_ctx.active === 'comparison' && __VLS_ctx.isComparison))
+                        throw 0;
+                    if (!!(__VLS_ctx.active === 'runtime' && __VLS_ctx.isComparison))
                         throw 0;
                     if (!(__VLS_ctx.active === 'overview'))
                         throw 0;
@@ -582,6 +753,10 @@ if (__VLS_ctx.task.data.value) {
         __VLS_asFunctionalElement1(__VLS_intrinsics.button, __VLS_intrinsics.button)({
             ...{ onClick: (...[$event]) => {
                     if (!(__VLS_ctx.task.data.value))
+                        throw 0;
+                    if (!!(__VLS_ctx.active === 'comparison' && __VLS_ctx.isComparison))
+                        throw 0;
+                    if (!!(__VLS_ctx.active === 'runtime' && __VLS_ctx.isComparison))
                         throw 0;
                     if (!(__VLS_ctx.active === 'overview'))
                         throw 0;
@@ -671,7 +846,7 @@ if (__VLS_ctx.task.data.value) {
             ['inferences', `分析判断 ${__VLS_ctx.inferences.length}`],
             [
                 'graph',
-                `关系网络 ${__VLS_ctx.graph.data.value?.stats?.assertion_count || 0}`,
+                `关系网络 ${__VLS_ctx.graphAssertionCount}`,
             ],
             ['conflicts', `冲突与待核验 ${__VLS_ctx.conflicts.length}`],
             ['qa', `质量检查 ${__VLS_ctx.task.data.value.qa_notes?.length || 0}`],
@@ -679,6 +854,10 @@ if (__VLS_ctx.task.data.value) {
             __VLS_asFunctionalElement1(__VLS_intrinsics.button, __VLS_intrinsics.button)({
                 ...{ onClick: (...[$event]) => {
                         if (!(__VLS_ctx.task.data.value))
+                            throw 0;
+                        if (!!(__VLS_ctx.active === 'comparison' && __VLS_ctx.isComparison))
+                            throw 0;
+                        if (!!(__VLS_ctx.active === 'runtime' && __VLS_ctx.isComparison))
                             throw 0;
                         if (!!(__VLS_ctx.active === 'overview'))
                             throw 0;
@@ -688,7 +867,7 @@ if (__VLS_ctx.task.data.value) {
                             throw 0;
                         return (__VLS_ctx.analysisType = item[0]);
                         // @ts-ignore
-                        [task, active, facts, inferences, conflicts, graph, analysisType,];
+                        [task, active, facts, inferences, conflicts, graphAssertionCount, analysisType,];
                     } },
                 key: (item[0]),
                 ...{ class: ({ active: __VLS_ctx.analysisType === item[0] }) },
@@ -770,26 +949,51 @@ if (__VLS_ctx.task.data.value) {
                 ? "Graph RAG 已启用"
                 : "图谱观测模式");
             __VLS_asFunctionalElement1(__VLS_intrinsics.small, __VLS_intrinsics.small)({});
+            if (__VLS_ctx.graphBuildActive) {
+                __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({
+                    ...{ class: "badge warning" },
+                });
+                /** @type {__VLS_StyleScopedClasses['badge']} */ ;
+                /** @type {__VLS_StyleScopedClasses['warning']} */ ;
+            }
+            else if (__VLS_ctx.graphBuildStatus === 'partial_ready') {
+                __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({
+                    ...{ class: "badge warning" },
+                });
+                /** @type {__VLS_StyleScopedClasses['badge']} */ ;
+                /** @type {__VLS_StyleScopedClasses['warning']} */ ;
+            }
+            else if (__VLS_ctx.graphBuildStatus === 'degraded') {
+                __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({
+                    ...{ class: "badge danger" },
+                });
+                /** @type {__VLS_StyleScopedClasses['badge']} */ ;
+                /** @type {__VLS_StyleScopedClasses['danger']} */ ;
+            }
             if (__VLS_ctx.graph.data.value?.edges?.length) {
-                let __VLS_29;
+                let __VLS_40;
                 /** @ts-ignore @type { | typeof __VLS_components.GraphNetwork} */
                 GraphNetwork;
                 // @ts-ignore
-                const __VLS_30 = __VLS_asFunctionalComponent1(__VLS_29, new __VLS_29({
+                const __VLS_41 = __VLS_asFunctionalComponent1(__VLS_40, new __VLS_40({
                     ...{ 'onSelect': {} },
                     nodes: (__VLS_ctx.graph.data.value.nodes),
                     edges: (__VLS_ctx.graph.data.value.edges),
                 }));
-                const __VLS_31 = __VLS_30({
+                const __VLS_42 = __VLS_41({
                     ...{ 'onSelect': {} },
                     nodes: (__VLS_ctx.graph.data.value.nodes),
                     edges: (__VLS_ctx.graph.data.value.edges),
-                }, ...__VLS_functionalComponentArgsRest(__VLS_30));
-                let __VLS_34;
-                const __VLS_35 = {
-                    /** @type {typeof __VLS_34.select} */
+                }, ...__VLS_functionalComponentArgsRest(__VLS_41));
+                let __VLS_45;
+                const __VLS_46 = {
+                    /** @type {typeof __VLS_45.select} */
                     onSelect: (...[$event]) => {
                         if (!(__VLS_ctx.task.data.value))
+                            throw 0;
+                        if (!!(__VLS_ctx.active === 'comparison' && __VLS_ctx.isComparison))
+                            throw 0;
+                        if (!!(__VLS_ctx.active === 'runtime' && __VLS_ctx.isComparison))
                             throw 0;
                         if (!!(__VLS_ctx.active === 'overview'))
                             throw 0;
@@ -807,11 +1011,11 @@ if (__VLS_ctx.task.data.value) {
                             throw 0;
                         return (__VLS_ctx.selectedGraphEdge = $event);
                         // @ts-ignore
-                        [graph, graph, graph, graph, graph, analysisType, selectedGraphEdge,];
+                        [analysisType, graph, graph, graph, graph, graph, graphBuildActive, graphBuildStatus, graphBuildStatus, selectedGraphEdge,];
                     },
                 };
-                var __VLS_32;
-                var __VLS_33;
+                var __VLS_43;
+                var __VLS_44;
             }
             if (__VLS_ctx.selectedGraphEdge) {
                 __VLS_asFunctionalElement1(__VLS_intrinsics.article, __VLS_intrinsics.article)({
@@ -857,26 +1061,131 @@ if (__VLS_ctx.task.data.value) {
                 /** @type {__VLS_StyleScopedClasses['empty']} */ ;
                 __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({});
                 __VLS_asFunctionalElement1(__VLS_intrinsics.strong, __VLS_intrinsics.strong)({});
+                __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({});
+                (__VLS_ctx.graphBuildMessage);
+                if (__VLS_ctx.graph.data.value?.mode !== 'off') {
+                    __VLS_asFunctionalElement1(__VLS_intrinsics.button, __VLS_intrinsics.button)({
+                        ...{ onClick: (...[$event]) => {
+                                if (!(__VLS_ctx.task.data.value))
+                                    throw 0;
+                                if (!!(__VLS_ctx.active === 'comparison' && __VLS_ctx.isComparison))
+                                    throw 0;
+                                if (!!(__VLS_ctx.active === 'runtime' && __VLS_ctx.isComparison))
+                                    throw 0;
+                                if (!!(__VLS_ctx.active === 'overview'))
+                                    throw 0;
+                                if (!!(__VLS_ctx.active === 'materials'))
+                                    throw 0;
+                                if (!(__VLS_ctx.active === 'analysis'))
+                                    throw 0;
+                                if (!!(__VLS_ctx.analysisType === 'facts'))
+                                    throw 0;
+                                if (!!(__VLS_ctx.analysisType === 'inferences'))
+                                    throw 0;
+                                if (!(__VLS_ctx.analysisType === 'graph'))
+                                    throw 0;
+                                if (!(!__VLS_ctx.graph.data.value?.edges?.length))
+                                    throw 0;
+                                if (!(__VLS_ctx.graph.data.value?.mode !== 'off'))
+                                    throw 0;
+                                return (__VLS_ctx.rebuildGraph.mutate());
+                                // @ts-ignore
+                                [graph, graph, graphBuildMessage, rebuildGraph,];
+                            } },
+                        ...{ class: "btn" },
+                        disabled: (__VLS_ctx.rebuildGraph.isPending.value || __VLS_ctx.graphBuildActive),
+                    });
+                    /** @type {__VLS_StyleScopedClasses['btn']} */ ;
+                    (__VLS_ctx.graphBuildActive ? '正在重建' : '重新构建关系网络');
+                }
             }
         }
         else if (__VLS_ctx.analysisType === 'conflicts') {
             for (const [item] of __VLS_vFor((__VLS_ctx.conflicts))) {
                 __VLS_asFunctionalElement1(__VLS_intrinsics.article, __VLS_intrinsics.article)({
                     key: (item.id),
-                    ...{ class: "knowledge-item conflict" },
+                    ...{ class: "conflict-review" },
                 });
-                /** @type {__VLS_StyleScopedClasses['knowledge-item']} */ ;
-                /** @type {__VLS_StyleScopedClasses['conflict']} */ ;
+                /** @type {__VLS_StyleScopedClasses['conflict-review']} */ ;
+                __VLS_asFunctionalElement1(__VLS_intrinsics.header, __VLS_intrinsics.header)({});
+                __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({});
+                __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({
+                    ...{ class: "conflict-type" },
+                    ...{ class: (item.conflict_type) },
+                });
+                /** @type {__VLS_StyleScopedClasses['conflict-type']} */ ;
+                (__VLS_ctx.conflictType(item));
+                __VLS_asFunctionalElement1(__VLS_intrinsics.small, __VLS_intrinsics.small)({});
+                (__VLS_ctx.conflictConfidence(item));
                 __VLS_asFunctionalElement1(__VLS_intrinsics.b, __VLS_intrinsics.b)({});
                 (item.fact_key);
-                for (const [entry] of __VLS_vFor((item.entries || []))) {
-                    __VLS_asFunctionalElement1(__VLS_intrinsics.p, __VLS_intrinsics.p)({
-                        key: (entry.statement),
+                if (__VLS_ctx.isPairwiseConflict(item)) {
+                    __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
+                        ...{ class: "conflict-pair" },
                     });
-                    (entry.file);
-                    (entry.statement);
-                    // @ts-ignore
-                    [conflicts, graph, analysisType,];
+                    /** @type {__VLS_StyleScopedClasses['conflict-pair']} */ ;
+                    for (const [entry, index] of __VLS_vFor((item.entries || []))) {
+                        __VLS_asFunctionalElement1(__VLS_intrinsics.section, __VLS_intrinsics.section)({
+                            key: (entry.claim_id || index),
+                        });
+                        __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
+                            ...{ class: "conflict-side" },
+                        });
+                        /** @type {__VLS_StyleScopedClasses['conflict-side']} */ ;
+                        __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({});
+                        (index === 0 ? 'A' : 'B');
+                        __VLS_asFunctionalElement1(__VLS_intrinsics.small, __VLS_intrinsics.small)({});
+                        (entry.fact_id || '—');
+                        (entry.claim_id || '—');
+                        __VLS_asFunctionalElement1(__VLS_intrinsics.strong, __VLS_intrinsics.strong)({});
+                        (entry.statement);
+                        if (entry.quote) {
+                            __VLS_asFunctionalElement1(__VLS_intrinsics.blockquote, __VLS_intrinsics.blockquote)({});
+                            (entry.quote);
+                        }
+                        __VLS_asFunctionalElement1(__VLS_intrinsics.footer, __VLS_intrinsics.footer)({});
+                        (__VLS_ctx.sourceLocation(entry));
+                        if (entry.unit_id) {
+                            __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({});
+                            (entry.unit_id);
+                        }
+                        // @ts-ignore
+                        [conflicts, analysisType, graphBuildActive, graphBuildActive, rebuildGraph, conflictType, conflictConfidence, isPairwiseConflict, sourceLocation,];
+                    }
+                    __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
+                        ...{ class: "conflict-relation" },
+                    });
+                    /** @type {__VLS_StyleScopedClasses['conflict-relation']} */ ;
+                    __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({});
+                    (__VLS_ctx.conflictType(item));
+                    __VLS_asFunctionalElement1(__VLS_intrinsics.b, __VLS_intrinsics.b)({});
+                    (item.reason || '模型未提供明确的比较说明');
+                }
+                else {
+                    __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
+                        ...{ class: "conflict-ambiguous" },
+                    });
+                    /** @type {__VLS_StyleScopedClasses['conflict-ambiguous']} */ ;
+                    __VLS_asFunctionalElement1(__VLS_intrinsics.strong, __VLS_intrinsics.strong)({});
+                    __VLS_asFunctionalElement1(__VLS_intrinsics.p, __VLS_intrinsics.p)({});
+                    __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
+                        ...{ class: "conflict-candidates" },
+                    });
+                    /** @type {__VLS_StyleScopedClasses['conflict-candidates']} */ ;
+                    for (const [entry, index] of __VLS_vFor((item.entries || []))) {
+                        __VLS_asFunctionalElement1(__VLS_intrinsics.section, __VLS_intrinsics.section)({
+                            key: (entry.claim_id || index),
+                        });
+                        __VLS_asFunctionalElement1(__VLS_intrinsics.small, __VLS_intrinsics.small)({});
+                        (Number(index) + 1);
+                        (entry.fact_id || '—');
+                        __VLS_asFunctionalElement1(__VLS_intrinsics.b, __VLS_intrinsics.b)({});
+                        (entry.statement);
+                        __VLS_asFunctionalElement1(__VLS_intrinsics.footer, __VLS_intrinsics.footer)({});
+                        (__VLS_ctx.sourceLocation(entry));
+                        // @ts-ignore
+                        [conflictType, sourceLocation,];
+                    }
                 }
                 // @ts-ignore
                 [];
@@ -916,18 +1225,18 @@ if (__VLS_ctx.task.data.value) {
         }
     }
     else if (__VLS_ctx.active === 'collaboration') {
-        const __VLS_36 = ArtifactReviewWorkspace;
+        const __VLS_47 = ArtifactReviewWorkspace;
         // @ts-ignore
-        const __VLS_37 = __VLS_asFunctionalComponent1(__VLS_36, new __VLS_36({
+        const __VLS_48 = __VLS_asFunctionalComponent1(__VLS_47, new __VLS_47({
             taskId: (__VLS_ctx.taskId),
             reportId: (__VLS_ctx.task.data.value.report_id),
             runRevision: (__VLS_ctx.task.data.value.run_revision || 1),
         }));
-        const __VLS_38 = __VLS_37({
+        const __VLS_49 = __VLS_48({
             taskId: (__VLS_ctx.taskId),
             reportId: (__VLS_ctx.task.data.value.report_id),
             runRevision: (__VLS_ctx.task.data.value.run_revision || 1),
-        }, ...__VLS_functionalComponentArgsRest(__VLS_37));
+        }, ...__VLS_functionalComponentArgsRest(__VLS_48));
     }
     else if (__VLS_ctx.active === 'report') {
         __VLS_asFunctionalElement1(__VLS_intrinsics.section, __VLS_intrinsics.section)({
@@ -950,24 +1259,24 @@ if (__VLS_ctx.task.data.value) {
                 ...{ class: "button-row" },
             });
             /** @type {__VLS_StyleScopedClasses['button-row']} */ ;
-            let __VLS_41;
+            let __VLS_52;
             /** @ts-ignore @type { | typeof __VLS_components.RouterLink | typeof __VLS_components.RouterLink} */
             RouterLink;
             // @ts-ignore
-            const __VLS_42 = __VLS_asFunctionalComponent1(__VLS_41, new __VLS_41({
+            const __VLS_53 = __VLS_asFunctionalComponent1(__VLS_52, new __VLS_52({
                 ...{ class: "btn primary" },
                 to: (`/reports/${__VLS_ctx.task.data.value.report_id}`),
             }));
-            const __VLS_43 = __VLS_42({
+            const __VLS_54 = __VLS_53({
                 ...{ class: "btn primary" },
                 to: (`/reports/${__VLS_ctx.task.data.value.report_id}`),
-            }, ...__VLS_functionalComponentArgsRest(__VLS_42));
+            }, ...__VLS_functionalComponentArgsRest(__VLS_53));
             /** @type {__VLS_StyleScopedClasses['btn']} */ ;
             /** @type {__VLS_StyleScopedClasses['primary']} */ ;
-            const { default: __VLS_46 } = __VLS_44.slots;
+            const { default: __VLS_57 } = __VLS_55.slots;
             // @ts-ignore
             [task, task, task, task, task, task, active, active, taskId,];
-            var __VLS_44;
+            var __VLS_55;
             if (['review', 'done'].includes(__VLS_ctx.task.data.value.stage)) {
                 __VLS_asFunctionalElement1(__VLS_intrinsics.a, __VLS_intrinsics.a)({
                     ...{ class: "btn" },
@@ -1020,24 +1329,24 @@ if (__VLS_ctx.task.data.value) {
                 (item.change_summary || "报告版本快照");
                 __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({});
                 (item.created_at || "—");
-                let __VLS_47;
+                let __VLS_58;
                 /** @ts-ignore @type { | typeof __VLS_components.RouterLink | typeof __VLS_components.RouterLink} */
                 RouterLink;
                 // @ts-ignore
-                const __VLS_48 = __VLS_asFunctionalComponent1(__VLS_47, new __VLS_47({
+                const __VLS_59 = __VLS_asFunctionalComponent1(__VLS_58, new __VLS_58({
                     ...{ class: "btn tertiary" },
                     to: (`/reports/${__VLS_ctx.task.data.value.report_id}?version=${item.id}`),
                 }));
-                const __VLS_49 = __VLS_48({
+                const __VLS_60 = __VLS_59({
                     ...{ class: "btn tertiary" },
                     to: (`/reports/${__VLS_ctx.task.data.value.report_id}?version=${item.id}`),
-                }, ...__VLS_functionalComponentArgsRest(__VLS_48));
+                }, ...__VLS_functionalComponentArgsRest(__VLS_59));
                 /** @type {__VLS_StyleScopedClasses['btn']} */ ;
                 /** @type {__VLS_StyleScopedClasses['tertiary']} */ ;
-                const { default: __VLS_52 } = __VLS_50.slots;
+                const { default: __VLS_63 } = __VLS_61.slots;
                 // @ts-ignore
                 [task, task, task, versionsList, versionsList,];
-                var __VLS_50;
+                var __VLS_61;
                 // @ts-ignore
                 [];
             }

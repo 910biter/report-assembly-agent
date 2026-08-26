@@ -1,11 +1,12 @@
 <script setup lang="ts">
-import { computed, defineAsyncComponent, ref } from "vue";
+import { computed, defineAsyncComponent, ref, watch } from "vue";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/vue-query";
 import { useRoute, RouterLink } from "vue-router";
 import { api } from "@/api/http";
 import type { TaskSummary } from "@/api/types";
 import StatusBadge from "@/components/StatusBadge.vue";
 import ArtifactReviewWorkspace from "@/components/ArtifactReviewWorkspace.vue";
+import MaterialComparisonWorkspace from "@/components/MaterialComparisonWorkspace.vue";
 const GraphNetwork = defineAsyncComponent(
   () => import("@/components/GraphNetwork.vue"),
 );
@@ -24,6 +25,10 @@ const task = useQuery({
       ? 15000
       : 4000,
 });
+const isComparison = computed(() => task.data.value?.run_mode === "material_comparison");
+watch(() => task.data.value?.run_mode, mode => {
+  if (mode === "material_comparison" && !route.query.tab) active.value = "comparison";
+}, { immediate: true });
 const materials = useQuery({
   queryKey: ["task-materials", taskId],
   queryFn: () => api<any[]>(`/api/tasks/${taskId}/materials`),
@@ -43,6 +48,7 @@ const graph = useQuery({
     () => active.value === "analysis" && analysisType.value === "graph",
   ),
   staleTime: 30000,
+  refetchInterval: (q) => (q.state.data?.build_active ? 4000 : false),
 });
 const graphChanges = useQuery({
   queryKey: ["task-graph-changes", taskId],
@@ -63,6 +69,40 @@ const versions = useQuery({
 const command = useMutation({
   mutationFn: ({ path }: { path: string }) => api(path, { method: "POST" }),
   onSuccess: () => qc.invalidateQueries({ queryKey: ["task", taskId] }),
+});
+const rebuildGraph = useMutation({
+  mutationFn: () => api(`/api/tasks/${taskId}/graph/rebuild`, { method: "POST" }),
+  onSuccess: async () => {
+    await Promise.all([
+      qc.invalidateQueries({ queryKey: ["task", taskId] }),
+      qc.invalidateQueries({ queryKey: ["task-graph", taskId] }),
+      qc.invalidateQueries({ queryKey: ["task-graph-changes", taskId] }),
+    ]);
+  },
+});
+const graphBuildStatus = computed(() =>
+  String(graph.data.value?.build_status?.status || "unknown"),
+);
+const graphBuildActive = computed(() => Boolean(graph.data.value?.build_active));
+const graphAssertionCount = computed(() =>
+  Number(
+    graph.data.value?.stats?.assertion_count
+      ?? task.data.value?.graph_status?.assertion_count
+      ?? 0,
+  ),
+);
+const graphBuildMessage = computed(() => {
+  const status = graph.data.value?.build_status || {};
+  if (status.status === "partial_ready") {
+    const failedFacts = Number(status.failed_fact_ids?.length || 0);
+    return failedFacts
+      ? `已有关系可用，另有 ${failedFacts} 条事实尚未完成关系抽取。`
+      : "已有部分关系可用，仍有批次需要重新构建。";
+  }
+  if (status.error === "MODEL_OUTPUT_TRUNCATED" || String(status.error || "").includes("terminal batch")) {
+    return "关系抽取输出超过当前模型容量，可使用自适应拆批重新构建。";
+  }
+  return status.error || "构图只保留可回查事实的关系。";
 });
 const stages = computed(() =>
   task.data.value?.run_mode === "material_comparison"
@@ -96,6 +136,9 @@ const stages = computed(() =>
         { name: "审核完成", keys: ["review", "done"] },
       ],
 );
+const taskTabs = computed(() => isComparison.value
+  ? [["comparison", "对比结果"], ["materials", "新增材料"], ["runtime", "运行详情"]]
+  : [["overview", "概览"], ["materials", "材料"], ["analysis", "分析"], ["report", "报告"], ["versions", "版本"], ["collaboration", "协作审阅"]]);
 const stageIndex = computed(() =>
   Math.max(
     0,
@@ -130,6 +173,31 @@ function confidence(x: any) {
     ] || "需人工复核"
   );
 }
+const conflictTypeLabels: Record<string, string> = {
+  direct_contradiction: "直接矛盾",
+  temporal_difference: "时间变化",
+  scope_difference: "适用范围不同",
+  metric_difference: "统计口径不同",
+  qualification: "补充限定",
+  needs_verification: "待核验",
+};
+function conflictType(item: any) {
+  return conflictTypeLabels[item.conflict_type] || "待核验";
+}
+function conflictConfidence(item: any) {
+  return ({ high: "高置信", medium: "中置信", low: "低置信" } as Record<string, string>)[item.confidence] || "置信度未定";
+}
+function sourceLocation(entry: any) {
+  const location = [
+    entry.file || "来源文件未记录",
+    entry.page ? `第 ${entry.page} 页` : "",
+    entry.paragraph ? `第 ${entry.paragraph} 段` : "",
+  ].filter(Boolean);
+  return location.join(" · ");
+}
+function isPairwiseConflict(item: any) {
+  return (item.entries || []).length === 2 && (item.claim_ids || []).length === 2;
+}
 function versionsList() {
   const data = versions.data.value;
   return Array.isArray(data) ? data : data?.versions || [];
@@ -152,7 +220,7 @@ function versionsList() {
         </p>
       </div>
       <div class="button-row">
-        <StatusBadge :stage="task.data.value.stage" /><button
+        <span v-if="isComparison" class="badge" :class="task.data.value.stage === 'failed' ? 'danger' : task.data.value.stage === 'review' ? 'warning' : task.data.value.stage === 'done' ? 'success' : ''">{{ task.data.value.stage === 'failed' ? '对比异常' : task.data.value.stage === 'review' ? '等待审阅' : task.data.value.stage === 'done' ? '审阅完成' : '对比中' }}</span><StatusBadge v-else :stage="task.data.value.stage" /><button
           v-if="['created', 'failed'].includes(task.data.value.stage)"
           class="btn primary"
           :disabled="command.isPending.value"
@@ -174,11 +242,16 @@ function versionsList() {
           class="btn"
           :to="`/reports/${task.data.value.report_id}`"
           >打开报告</RouterLink
+        ><RouterLink
+          v-else-if="isComparison && task.data.value.comparison_report_id"
+          class="btn"
+          :to="`/reports/${task.data.value.comparison_report_id}`"
+          >查看基线报告</RouterLink
         >
       </div>
     </header>
     <section class="surface progress-block">
-      <div class="progress-rail">
+      <div class="progress-rail" :class="{ compact: isComparison }">
         <div
           v-for="(item, index) in stages"
           :key="item.name"
@@ -193,7 +266,7 @@ function versionsList() {
                 ? "已完成"
                 : index === stageIndex
                   ? task.data.value.stage === "review"
-                    ? "待审核"
+                    ? isComparison ? "待审阅" : "待审核"
                     : "正在进行"
                   : "等待中"
             }}</small>
@@ -229,14 +302,7 @@ function versionsList() {
     </section>
     <nav class="tabs workspace-tabs">
       <button
-        v-for="tab in [
-          ['overview', '概览'],
-          ['materials', '材料'],
-          ['analysis', '分析'],
-          ['report', '报告'],
-          ['versions', '版本'],
-          ['collaboration', '协作审阅'],
-        ]"
+        v-for="tab in taskTabs"
         :key="tab[0]"
         class="tab"
         :class="{ active: active === tab[0] }"
@@ -245,7 +311,17 @@ function versionsList() {
         {{ tab[1] }}
       </button>
     </nav>
-    <section v-if="active === 'overview'" class="workspace-grid">
+    <MaterialComparisonWorkspace
+      v-if="active === 'comparison' && isComparison"
+      embedded
+      :report-id="Number(task.data.value.comparison_report_id)"
+      :comparison-id="Number(task.data.value.comparison_id)"
+    />
+    <section v-else-if="active === 'runtime' && isComparison" class="surface section-block">
+      <div class="section-head"><div><h2>运行详情</h2><p class="muted">对比任务只执行新增材料解析、事实提取和变化核验，不生成或改写报告。</p></div></div>
+      <div class="status-summary"><div><span>内部阶段</span><b>{{ task.data.value.stage }}</b></div><div><span>队列状态</span><b>{{ task.data.value.queue_status?.status || "—" }}</b></div><div><span>解析进度</span><b>{{ task.data.value.parse_progress?.done || 0 }} / {{ task.data.value.parse_progress?.total || "—" }}</b></div></div>
+    </section>
+    <section v-else-if="active === 'overview'" class="workspace-grid">
       <div class="main-column">
         <div v-if="task.data.value.stage === 'failed'" class="notice warning">
           <b>任务运行异常</b><br />{{
@@ -437,7 +513,7 @@ function versionsList() {
             ['inferences', `分析判断 ${inferences.length}`],
             [
               'graph',
-              `关系网络 ${graph.data.value?.stats?.assertion_count || 0}`,
+              `关系网络 ${graphAssertionCount}`,
             ],
             ['conflicts', `冲突与待核验 ${conflicts.length}`],
             ['qa', `质量检查 ${task.data.value.qa_notes?.length || 0}`],
@@ -492,7 +568,20 @@ function versionsList() {
                   ? "Graph RAG 已启用"
                   : "图谱观测模式"
               }}</span
-            ><small>关系只保存有事实依据的实体联系。</small>
+            ><small>关系只保存有事实依据的实体联系。</small
+            ><span
+              v-if="graphBuildActive"
+              class="badge warning"
+              >正在构建</span
+            ><span
+              v-else-if="graphBuildStatus === 'partial_ready'"
+              class="badge warning"
+              >部分完成</span
+            ><span
+              v-else-if="graphBuildStatus === 'degraded'"
+              class="badge danger"
+              >构建失败</span
+            >
           </div>
           <GraphNetwork
             v-if="graph.data.value?.edges?.length"
@@ -536,23 +625,55 @@ function versionsList() {
           <div v-if="!graph.data.value?.edges?.length" class="empty">
             <div>
               <strong>尚未形成可展示的关系网络</strong
-              >构图只保留可回查事实的关系。
+              ><span>{{ graphBuildMessage }}</span
+              ><button
+                v-if="graph.data.value?.mode !== 'off'"
+                class="btn"
+                :disabled="rebuildGraph.isPending.value || graphBuildActive"
+                @click="rebuildGraph.mutate()"
+              >{{ graphBuildActive ? '正在重建' : '重新构建关系网络' }}</button>
             </div>
           </div></template
         ><template v-else-if="analysisType === 'conflicts'"
           ><article
             v-for="item in conflicts"
             :key="item.id"
-            class="knowledge-item conflict"
+            class="conflict-review"
           >
-            <b>{{ item.fact_key }}</b>
-            <p v-for="entry in item.entries || []" :key="entry.statement">
-              {{ entry.file }}：{{ entry.statement }}
-            </p>
+            <header>
+              <div>
+                <span class="conflict-type" :class="item.conflict_type">{{ conflictType(item) }}</span>
+                <small>{{ conflictConfidence(item) }}</small>
+              </div>
+              <b>{{ item.fact_key }}</b>
+            </header>
+            <div v-if="isPairwiseConflict(item)" class="conflict-pair">
+              <section v-for="(entry, index) in item.entries || []" :key="entry.claim_id || index">
+                <div class="conflict-side"><span>说法 {{ index === 0 ? 'A' : 'B' }}</span><small>Fact {{ entry.fact_id || '—' }} · Claim {{ entry.claim_id || '—' }}</small></div>
+                <strong>{{ entry.statement }}</strong>
+                <blockquote v-if="entry.quote">{{ entry.quote }}</blockquote>
+                <footer>{{ sourceLocation(entry) }}<span v-if="entry.unit_id"> · Unit {{ entry.unit_id }}</span></footer>
+              </section>
+              <div class="conflict-relation">
+                <span>{{ conflictType(item) }}</span>
+                <b>{{ item.reason || '模型未提供明确的比较说明' }}</b>
+              </div>
+            </div>
+            <div v-else class="conflict-ambiguous">
+              <strong>历史记录未保存两两配对关系</strong>
+              <p>以下内容只是同一候选组，无法判断其中哪两条构成矛盾。系统不会将其解释为“其余说法与某一条矛盾”。重新运行冲突核验后才会形成明确的 A/B 对照。</p>
+              <div class="conflict-candidates">
+                <section v-for="(entry, index) in item.entries || []" :key="entry.claim_id || index">
+                  <small>候选 {{ Number(index) + 1 }} · Fact {{ entry.fact_id || '—' }}</small>
+                  <b>{{ entry.statement }}</b>
+                  <footer>{{ sourceLocation(entry) }}</footer>
+                </section>
+              </div>
+            </div>
           </article>
           <div v-if="!conflicts.length" class="empty">
             <div>
-              <strong>未发现明确冲突</strong>冲突核验不会因为结果为空而删除。
+              <strong>未发现需要核验的来源差异</strong>系统仅将可比口径下不能同时成立的说法标为直接矛盾。
             </div>
           </div></template
         ><template v-else
@@ -670,6 +791,9 @@ function versionsList() {
 .progress-rail {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
+}
+.progress-rail.compact {
+  grid-template-columns: repeat(3, 1fr);
 }
 .progress-step {
   position: relative;
@@ -872,6 +996,104 @@ function versionsList() {
 .knowledge-item.conflict {
   border-left: 2px solid #d39a48;
   padding-left: 14px;
+}
+.conflict-review {
+  margin-bottom: 18px;
+  border: 1px solid var(--color-border);
+  background: var(--color-surface);
+}
+.conflict-review > header {
+  padding: 16px 18px;
+  border-bottom: 1px solid var(--color-border);
+}
+.conflict-review > header > div,
+.conflict-side {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.conflict-review > header b {
+  display: block;
+  margin-top: 10px;
+  font-size: 16px;
+}
+.conflict-review > header p {
+  margin: 7px 0 0;
+  color: var(--color-muted);
+}
+.conflict-type {
+  padding: 3px 7px;
+  border-radius: 3px;
+  background: #edf1f5;
+  color: #4e6072;
+  font-size: 12px;
+  font-weight: 650;
+}
+.conflict-type.direct_contradiction {
+  background: #f8e7e4;
+  color: #91483f;
+}
+.conflict-type.qualification,
+.conflict-type.temporal_difference {
+  background: #fff1d8;
+  color: #7d5a24;
+}
+.conflict-pair {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 190px minmax(0, 1fr);
+  align-items: stretch;
+}
+.conflict-pair > section {
+  min-width: 0;
+  padding: 16px 18px;
+}
+.conflict-pair > section:first-child { grid-column: 1; }
+.conflict-pair > section:nth-child(2) { grid-column: 3; }
+.conflict-relation {
+  grid-column: 2;
+  grid-row: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 16px;
+  border-inline: 1px solid var(--color-border);
+  background: var(--color-surface-soft);
+  text-align: center;
+}
+.conflict-relation span { color: var(--color-primary); font-size: 12px; font-weight: 650; }
+.conflict-relation b { font-size: 13px; line-height: 1.6; }
+.conflict-side span { color: var(--color-primary); font-weight: 650; }
+.conflict-side small,
+.conflict-review footer { color: var(--color-muted); font-size: 12px; }
+.conflict-pair section > strong { display: block; margin-top: 12px; line-height: 1.65; }
+.conflict-pair blockquote {
+  margin: 12px 0;
+  padding: 10px 12px;
+  border-left: 2px solid var(--color-border-strong);
+  background: var(--color-surface-soft);
+  color: var(--color-muted);
+  line-height: 1.6;
+}
+.conflict-ambiguous { padding: 18px; background: #fffaf0; }
+.conflict-ambiguous > strong { color: #7d5a24; }
+.conflict-ambiguous > p { color: var(--color-muted); line-height: 1.65; }
+.conflict-candidates { display: grid; gap: 8px; }
+.conflict-candidates section { padding: 10px 12px; border-left: 2px solid #c8a86b; background: #fff; }
+.conflict-candidates section small,
+.conflict-candidates section b,
+.conflict-candidates section footer { display: block; }
+.conflict-candidates section b { margin: 5px 0; line-height: 1.55; }
+@media (max-width: 900px) {
+  .conflict-pair { grid-template-columns: 1fr; }
+  .conflict-pair > section:first-child,
+  .conflict-pair > section:nth-child(2),
+  .conflict-relation { grid-column: 1; }
+  .conflict-pair > section:first-child { grid-row: 1; }
+  .conflict-relation { grid-row: 2; border: 1px solid var(--color-border); border-inline: 0; }
+  .conflict-pair > section:nth-child(2) { grid-row: 3; }
 }
 .graph-summary,
 .graph-changes,

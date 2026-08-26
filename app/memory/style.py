@@ -174,7 +174,7 @@ def analyze_library(
                 f"报告文本:\n{text[:_MAX_CHARS_PER_REPORT]}",
                 system=_FEATURE_PROMPT,
                 think=False,
-                max_tokens=256,
+                max_tokens=settings.style_probe_output_tokens,
             )
             topic_type = _normalize_profile_label(payload.get("topic_type"))
         except Exception:
@@ -363,7 +363,7 @@ def _build_variant(library_id: int, topic_type: str, members: list[dict]) -> Sty
         + _STYLE_SAMPLE_NOTE.replace("{style_samples}", sample_packet),
         system="你是机构报告风格分析师。每个字段只写可由样例支持的简洁结论，不输出空泛解释。",
         think=False,
-        max_tokens=4096,
+        max_tokens=settings.style_profile_output_tokens,
     )
     _validate_profile_payload(payload)
     structure = payload.get("structure") if isinstance(payload.get("structure"), dict) else {}

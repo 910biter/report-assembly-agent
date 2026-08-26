@@ -47,6 +47,7 @@ class Claim:
 
     material_id: int
     content: str
+    unit_id: int | None = None
     quote: str = ""
     source: str = ""
     fact_type: str = "STATEMENT"  # EVENT / PERSON / LOCATION / TIME / NUMBER / STATEMENT

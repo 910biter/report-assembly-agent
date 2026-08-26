@@ -39,6 +39,55 @@ _STATS = {
     "max_queue_wait_seconds": 0.0,
 }
 
+_ACTIVE_QUEUE_STATES = {"queued", "running", "pause_requested"}
+
+
+def reconcile_interrupted_tasks() -> int:
+    """Pause persisted in-process jobs that cannot survive a service restart."""
+    reconciled = 0
+    now = round(time.time(), 1)
+    for task_id, task in short_term.list_tasks():
+        queue_state = str((task.get("queue_status") or {}).get("status") or "")
+        if queue_state not in _ACTIVE_QUEUE_STATES:
+            continue
+        stage = str(task.get("stage") or "")
+        if stage in {"review", "done"}:
+            short_term.update_task(task_id, control_request="", queue_status={
+                "status": "completed", "finished_at": now,
+                "note": "status reconciled after service restart",
+            })
+            continue
+        if stage == "failed":
+            short_term.update_task(task_id, control_request="", queue_status={
+                "status": "failed", "finished_at": now,
+                "note": "status reconciled after service restart",
+            })
+            continue
+        short_term.update_task(
+            task_id,
+            stage="paused",
+            control_request="",
+            queue_status={
+                "status": "paused",
+                "finished_at": now,
+                "note": "task paused because the service restarted",
+            },
+        )
+        run_id = str(task.get("run_id") or "")
+        if run_id:
+            try:
+                from app.task_runs import update_task_run
+                update_task_run(
+                    run_id,
+                    status="paused",
+                    metadata={"reason": "service_restart"},
+                    finished=False,
+                )
+            except Exception:
+                pass
+        reconciled += 1
+    return reconciled
+
 
 def enqueue_task(task_id: str, priority: int = TASK_PRIORITY_NORMAL) -> dict:
     """Queue a task if it is not already queued/running."""
@@ -68,19 +117,21 @@ def request_control(task_id: str, action: str) -> dict:
         return {"status": "not_found"}
     state = task.get("queue_status") or {}
     if action == "pause":
-        if state.get("status") != "running":
-            return {"status": "not_running"}
-        short_term.update_task(task_id, control_request="pause", control_requested_at=round(time.time(), 1))
-        from app import task_control
-        task_control.request_pause(task_id)
         with _LOCK:
             worker_owns_task = task_id == _RUNNING_TASK_ID
             queued = task_id in _QUEUED_TASK_IDS
         if not worker_owns_task and not queued:
+            if str(state.get("status") or "") not in _ACTIVE_QUEUE_STATES:
+                return {"status": "not_running"}
             return short_term.update_task(
                 task_id, stage="paused", control_request="",
                 queue_status={"status": "paused", "finished_at": round(time.time(), 1)},
             ) | {"status": "paused"}
+        if not worker_owns_task:
+            return {"status": "not_running"}
+        short_term.update_task(task_id, control_request="pause", control_requested_at=round(time.time(), 1))
+        from app import task_control
+        task_control.request_pause(task_id)
         short_term.update_task(task_id, queue_status={"status": "pause_requested"})
         return {"status": "pause_requested"}
     if action == "resume":

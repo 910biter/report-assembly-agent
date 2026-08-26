@@ -22,10 +22,10 @@ from app.infrastructure.orm import Base, ORMReport, ORMSentence, ORMTaskArtifact
 from sqlalchemy import select, update, delete
 from app.models import Report
 from app.policy import policy_prompt_block
-from app.context import BUDGET_TOKENS, _CHARS_PER_TOKEN
 from app.planning.structure import serializable_memory
 from app.planning.structure import order_chapters
 from app.planning.scale import normalize_execution_plan
+from app.rendering.headings import has_heading_prefix, strip_heading_prefix
 from app.task_artifacts import latest_task_artifact, save_task_artifact
 from app.token_monitor import update_call_funnel, update_call_metrics, update_call_products
 from app.config import settings
@@ -257,15 +257,10 @@ def _normalize_report_sentence(text: str) -> str:
     return value
 
 
-_SUBHEADING_PREFIX_RE = re.compile(
-    r"^\s*(?:\d+(?:\.\d+)+|[（(][一二三四五六七八九十]+[）)]|[一二三四五六七八九十]+[、.])\s*"
-)
-
-
 def _planned_subsection_titles(narrative_plan: dict) -> list[str]:
     titles = []
     for item in (narrative_plan or {}).get("subsections") or []:
-        title = str(item.get("title") or "").strip()
+        title = strip_heading_prefix(str(item.get("title") or ""))
         if title:
             titles.append(title)
     return titles
@@ -335,7 +330,7 @@ def _subsection_generation_units(narrative_plan: dict, chapter_target: int,
         result.append({
             "index": index,
             "count": len(subsections),
-            "title": str(subsection.get("title") or "").strip(),
+            "title": strip_heading_prefix(str(subsection.get("title") or "")),
             "target_words": target,
             "minimum_words": round(target * max(0.0, minimum_ratio)),
             "plan": subsection,
@@ -404,14 +399,13 @@ def _split_embedded_subheading(text: str, allowed_titles: list[str] | None = Non
 
 
 def _clean_generated_subheading(text: str) -> str:
-    value = str(text or "").strip()
-    value = _SUBHEADING_PREFIX_RE.sub("", value)
+    value = strip_heading_prefix(text)
     value = re.split(r"[。！？!?；;\n]", value, maxsplit=1)[0].strip()
     return value
 
 
 def _extract_embedded_subheading(text: str) -> tuple[str, str] | None:
-    if not _SUBHEADING_PREFIX_RE.match(text):
+    if not has_heading_prefix(text):
         return None
     for mark in ("。", "；", "！", "？"):
         index = text.find(mark)
@@ -481,13 +475,8 @@ def _fit_block(text: str, budget_chars: int, overhead_chars: int = 800) -> str:
 
 def _writer_prompt_char_budget() -> int:
     """Conservative user-prompt budget derived from the serving context."""
-    token_budget = (
-        int(settings.model_context_window_tokens)
-        - int(settings.writer_output_tokens)
-        - int(settings.safety_margin_tokens)
-        - len(_SYSTEM)
-    )
-    return max(4000, min(int(settings.max_context_chars), token_budget))
+    from app.runtime_profiles import stage_input_budget_chars
+    return max(4000, stage_input_budget_chars("writer"))
 
 
 def _pack_writer_evidence(
@@ -1535,9 +1524,9 @@ class WriterAgent(BaseAgent):
         )
         tids = {int(fid) for fid in (topic.get("fact_ids") or []) if str(fid).isdigit()}
         support_facts = [f for f in chapter_facts if f.get("id") in tids] or chapter_facts
-        from app.config import settings
+        from app.runtime_profiles import stage_input_budget_chars
 
-        budget = getattr(settings, "max_context_chars", 12000)
+        budget = stage_input_budget_chars("writer")
         topic_block = json.dumps(topic, ensure_ascii=False)
         fact_block = "\n".join(f"{f['id']}. {f.get('content', '')}" for f in support_facts)
         missing = "、".join(qa_item.get("missing_aspects") or []) or "按 Topic 计划完善表达"

@@ -17,8 +17,11 @@ class Fact:
 @dataclass
 class Conflict:
     fact_key: str
-    entries: list[dict] = field(default_factory=list)  # [{source_file, quote, statement}]
+    entries: list[dict] = field(default_factory=list)
     claim_ids: list[int] = field(default_factory=list)
+    conflict_type: str = "needs_verification"
+    reason: str = ""
+    confidence: str = "medium"
     status: str = "unresolved"
     id: int | None = None
 

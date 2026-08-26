@@ -14,6 +14,8 @@ _WEB_DIR = Path(__file__).resolve().parent.parent.parent / "web"
 
 def create_app() -> FastAPI:
     init_db()
+    from app.workflow.queue import reconcile_interrupted_tasks
+    reconcile_interrupted_tasks()
     application = FastAPI(title="报告整编 Agent")
     application.include_router(api_router)
     application.include_router(web_router)

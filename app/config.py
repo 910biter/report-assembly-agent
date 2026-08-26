@@ -74,6 +74,17 @@ class Settings(BaseSettings):
     benchmark_capture_sample_interval_seconds: float = 0.5
     benchmark_capture_metrics_url: str = ""  # optional vLLM Prometheus endpoint
     benchmark_capture_accelerator_probe_command: str = ""  # optional local JSON probe for NPU/other accelerators
+    comparison_output_tokens: int = 3200
+    style_probe_output_tokens: int = 256
+    style_profile_output_tokens: int = 4096
+    material_analysis_input_chars: int = 4000
+    material_analysis_output_tokens: int = 2048
+    planner_output_tokens: int = 3072
+    analysis_output_tokens: int = 3072
+    narrative_output_tokens: int = 3072
+    narrative_qa_output_tokens: int = 2048
+    qa_output_tokens: int = 2048
+    conflict_output_tokens: int = 2048
     # Parser and multimodal extraction are Docling-only. The project no longer
     # maintains a separate OCR/ASR/Vision provider path.
     docling_ocr_engine: str = "rapidocr"  # rapidocr(PP-OCRv6,满血)/ auto / easyocr / tesseract
@@ -113,6 +124,7 @@ class Settings(BaseSettings):
     graph_build_before_analysis: bool = False
     graph_max_hops: int = 2
     graph_output_tokens: int = 4096
+    graph_facts_per_batch: int = 12
     graph_batch_concurrency: int = 2
     neo4j_uri: str = ""  # e.g. bolt://127.0.0.1:7687
     neo4j_user: str = "neo4j"

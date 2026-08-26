@@ -17,7 +17,7 @@ from app.agents.base import BaseAgent
 from app.cache import stable_hash
 from app.config import settings
 from app.db import session_scope
-from app.infrastructure.orm import ORMFact, ORMEvidence, ORMClaim
+from app.infrastructure.orm import ORMFact, ORMEvidence, ORMClaim, ORMConflict
 from sqlalchemy import select, update
 from app.models import Claim, Conflict, Evidence, Fact, Unit
 from app.retrieval import vector_store
@@ -56,11 +56,31 @@ _SYSTEM = """你是情报事实提取员。从材料中提取可溯源的陈述(
 7. 面向综述或多材料任务时,同一维度应覆盖主要机制、标准、平台、时间线、威胁模型和比较要素;不要只抽取少数摘要性陈述
 8. 不要输出 file/page/完整原文,系统会根据 unit_id 回查来源"""
 
-_CONFLICT_SYSTEM = """你是情报冲突检测员。扫描陈述(Claim)清单,识别同一主题在不同来源中的矛盾
-(如:同一数字口径不同、同一事件描述相反)。只标注冲突,不判断谁对谁错。
+_CONFLICT_SYSTEM = """你是证据关系核验员。只比较给定 Claim 编号,判断同一事项的说法属于哪种关系。
 严格输出 JSON,不要任何解释:
-{"conflicts": [{"fact_key": "矛盾主题", "claim_ids": [涉及陈述的编号], "entries": [{"file": "来源文件", "quote": "原文片段", "statement": "该来源的说法"}, ...]}, ...]}
-没有冲突时输出 {"conflicts": []}"""
+{"conflicts": [{"fact_key": "核验主题", "claim_ids": [说法A编号, 说法B编号], "conflict_type": "direct_contradiction/temporal_difference/scope_difference/metric_difference/qualification/needs_verification", "reason": "明确说明A与B在哪个事实点上相同或不同", "confidence": "high/medium/low"}]}
+判定规则:
+1. direct_contradiction 仅限主体、事项、时间、范围和指标口径可比,且结论不能同时成立。
+2. 不同时间的变化是 temporal_difference;不同范围/对象是 scope_difference;不同统计定义是 metric_difference。
+3. 总体可用与局部限制、原则与例外、结论与适用条件并存时是 qualification,不是直接矛盾。
+4. 条件不足以确认可比性时标 needs_verification;没有任何需要核验的关系时输出空数组。
+5. 每个结果必须且只能包含两个 Claim 编号。一个候选组存在多组关系时,拆成多个两两比较结果,禁止把3条以上说法放进同一结果。
+6. 只能返回输入中真实存在的 Claim 编号;不要生成来源、页码、引文或改写陈述,这些由系统按编号回查。"""
+
+_CONFLICT_TYPES = {
+    "direct_contradiction", "temporal_difference", "scope_difference",
+    "metric_difference", "qualification", "needs_verification",
+}
+
+
+def _normalize_conflict_type(value: str) -> str:
+    value = str(value or "").strip().lower()
+    return value if value in _CONFLICT_TYPES else "needs_verification"
+
+
+def _normalize_confidence(value: str) -> str:
+    value = str(value or "").strip().lower()
+    return value if value in {"high", "medium", "low"} else "medium"
 
 _AUDIT_SYSTEM = """你是证据覆盖审计员。判断每个 Evidence Need 是否已被列出的已提取事实充分证实。
 判定标准:事实能直接回答该需求(明确、具体、有支撑);若事实缺失、仅侧面提及、过于概括或无法回答该需求,视为未证实。
@@ -283,6 +303,50 @@ def _conflict_candidate_groups(claims: list[dict], limit: int = 12) -> list[dict
     return result[:limit]
 
 
+def _conflict_entries(claim_ids: list[int], claims_by_id: dict[int, dict]) -> list[dict]:
+    """Rebuild source data from persisted Claim -> Fact -> Evidence lineage."""
+    fact_ids = {
+        int(claims_by_id[claim_id].get("fact_id") or 0)
+        for claim_id in claim_ids if claim_id in claims_by_id
+    }
+    fact_ids.discard(0)
+    evidence_by_fact: dict[int, list[dict]] = {}
+    if fact_ids:
+        with session_scope() as session:
+            rows = session.execute(
+                select(ORMEvidence).where(ORMEvidence.c.fact_id.in_(fact_ids))
+                .order_by(ORMEvidence.c.id)
+            ).mappings().all()
+        for row in rows:
+            evidence_by_fact.setdefault(int(row["fact_id"]), []).append(dict(row))
+    entries: list[dict] = []
+    for claim_id in claim_ids:
+        claim = claims_by_id.get(claim_id)
+        if not claim:
+            continue
+        fact_id = int(claim.get("fact_id") or 0)
+        evidence_rows = evidence_by_fact.get(fact_id) or []
+        preferred_unit = int(claim.get("unit_id") or 0)
+        evidence = next(
+            (row for row in evidence_rows if int(row.get("unit_id") or 0) == preferred_unit),
+            evidence_rows[0] if evidence_rows else None,
+        )
+        if evidence is None:
+            continue
+        entries.append({
+            "claim_id": claim_id,
+            "fact_id": fact_id,
+            "material_id": int(evidence.get("material_id") or claim.get("material_id") or 0),
+            "unit_id": int(evidence.get("unit_id") or preferred_unit or 0),
+            "file": str(evidence.get("source_file") or claim.get("source") or ""),
+            "page": evidence.get("page"),
+            "paragraph": evidence.get("paragraph"),
+            "quote": str(evidence.get("quote") or claim.get("quote") or ""),
+            "statement": str(claim.get("content") or ""),
+        })
+    return entries
+
+
 class EvidenceAgent(BaseAgent):
     output_token_limit = settings.evidence_output_tokens
     name = "evidence"
@@ -503,6 +567,7 @@ class EvidenceAgent(BaseAgent):
             evidence_list = bind_sources(quote, units_by_material, filenames, unit_id=unit_id)
             claim = Claim(
                 material_id=evidence_list[0].material_id if evidence_list else 0,
+                unit_id=unit_id if unit_id > 0 else None,
                 content=content, quote=quote,
                 source=filenames.get(evidence_list[0].material_id, "") if evidence_list else "",
                 fact_type=fact_type, dimension=dimension, need_id=need_idx,
@@ -621,7 +686,11 @@ class EvidenceAgent(BaseAgent):
             "若全部充分,输出 {\"uncovered\": []}"
         )
         try:
-            payload = self.generate_json(prompt, system=_AUDIT_SYSTEM)
+            from app.runtime_profiles import stage_profile
+            payload = self.generate_json(
+                prompt, system=_AUDIT_SYSTEM,
+                max_tokens=stage_profile("qa").output_tokens,
+            )
             uncovered = payload.get("uncovered") or []
             return [needs[int(i) - 1] for i in uncovered if str(i).isdigit() and 0 < int(i) <= len(needs)]
         except Exception:
@@ -667,11 +736,17 @@ class EvidenceAgent(BaseAgent):
         规则预筛:仅当存在候选冲突组(共享数字/共享文本片段)才调用 LLM,
         避免无条件消耗模型调用。
         """
-        candidate_claims = _conflict_candidate_claims(claims)
+        # Only promoted Claims may enter quality decisions. Pending Claims have
+        # not passed quote binding and therefore cannot be shown as evidence.
+        verified_claims = [
+            claim for claim in claims
+            if claim.get("status") == "promoted" and int(claim.get("fact_id") or 0) > 0
+        ]
+        candidate_claims = _conflict_candidate_claims(verified_claims)
         if len(candidate_claims) < 2:
             log_pipeline_event(
                 "evidence",
-                candidate_total=len(claims),
+                candidate_total=len(verified_claims),
                 candidate_count=len(candidate_claims),
                 candidate_groups=0,
                 llm_skipped_calls=1,
@@ -682,7 +757,7 @@ class EvidenceAgent(BaseAgent):
         if not candidate_groups:
             log_pipeline_event(
                 "evidence",
-                candidate_total=len(claims),
+                candidate_total=len(verified_claims),
                 candidate_count=len(candidate_claims),
                 candidate_groups=0,
                 llm_skipped_calls=1,
@@ -700,38 +775,53 @@ class EvidenceAgent(BaseAgent):
             for g in candidate_groups
         ]
         prompt = (
-            "以下是材料中提取的陈述清单(编号 + 来源 + 类型):\n"
+            "以下是已通过原文绑定的陈述清单(编号 + 来源 + 类型):\n"
             + "\n".join(claim_lines)
             + "\n\n规则预筛得到的疑似冲突组:\n"
             + "\n".join(group_lines)
-            + "\n\n请检测同一主题在不同来源中的矛盾,输出 JSON。"
+            + "\n\n请按可比口径分类这些关系,输出 JSON。"
         )
         try:
-            payload = self.generate_json(prompt, system=_CONFLICT_SYSTEM)
+            from app.runtime_profiles import stage_profile
+            payload = self.generate_json(
+                prompt, system=_CONFLICT_SYSTEM,
+                max_tokens=stage_profile("conflict").output_tokens,
+            )
         except Exception:
             return []
         call_id = self.last_call_id
-        update_call_metrics(call_id, candidate_total=len(claims), candidate_count=len(candidate_claims))
+        update_call_metrics(call_id, candidate_total=len(verified_claims), candidate_count=len(candidate_claims))
         update_call_funnel(
             call_id,
-            candidate_total=len(claims),
+            candidate_total=len(verified_claims),
             candidate_count=len(candidate_claims),
             candidate_groups=len(candidate_groups),
             quality_guardrail_calls=1,
         )
         conflicts: list[Conflict] = []
+        claims_by_id = {int(claim["id"]): claim for claim in candidate_claims}
         for item in payload.get("conflicts", []):
-            entries = []
-            for entry in item.get("entries", []):
-                entries.append({
-                    "file": str(entry.get("file", "")),
-                    "quote": str(entry.get("quote", "")),
-                    "statement": str(entry.get("statement", "")),
-                })
+            claim_ids = list(dict.fromkeys(
+                int(value) for value in item.get("claim_ids", [])
+                if str(value).isdigit() and int(value) in claims_by_id
+            ))
+            # A review item is a pairwise proposition. Multi-claim bags do not
+            # state who differs from whom and therefore cannot be persisted as
+            # an explainable conflict.
+            if len(claim_ids) != 2:
+                continue
+            entries = _conflict_entries(claim_ids, claims_by_id)
+            if len(entries) < 2:
+                continue
+            conflict_type = _normalize_conflict_type(item.get("conflict_type"))
             conflict = Conflict(
                 fact_key=str(item.get("fact_key", "")),
                 entries=entries,
-                claim_ids=[int(i) for i in item.get("claim_ids", []) if str(i).isdigit()],
+                claim_ids=claim_ids,
+                conflict_type=conflict_type,
+                reason=str(item.get("reason", "")).strip(),
+                confidence=_normalize_confidence(item.get("confidence")),
+                status="unresolved" if conflict_type == "direct_contradiction" else "needs_review",
             )
             conflict.id = save_conflict(conflict, origin_call_id=call_id, task_id=task_id)
             conflicts.append(conflict)
@@ -760,11 +850,11 @@ class EvidenceAgent(BaseAgent):
 
     @staticmethod
     def _build_material_text(units_by_material: dict[int, list[Unit]], filenames: dict[int, str]) -> str:
-        from app.config import settings
+        from app.runtime_profiles import stage_input_budget_chars
 
         blocks: list[str] = []
         total = 0
-        budget = max(1000, int(settings.max_context_chars or 12000))
+        budget = stage_input_budget_chars("evidence")
         omitted = 0
         for material_id, units in units_by_material.items():
             for unit in units:
@@ -800,9 +890,9 @@ def _build_unit_batches(
     pass_name: str,
     known_contents: set[str] | None = None,
 ) -> list[tuple[str, dict]]:
-    from app.config import settings
+    from app.runtime_profiles import stage_input_budget_chars
 
-    budget = max(2000, int(settings.max_context_chars or 12000))
+    budget = stage_input_budget_chars("evidence")
     batches: list[tuple[str, dict]] = []
     current: list[str] = []
     current_chars = 0
@@ -892,10 +982,15 @@ def save_fact_with_evidence(fact: Fact, evidence_list: list[Evidence], task_id: 
 
 def save_claim(claim: Claim, status: str, origin_call_id: str = "", task_id: str = "") -> int:
     fact_id = int(claim.fact_id) if claim.fact_id is not None else None
+    if fact_id is not None and fact_id <= 0:
+        fact_id = None
+    if status == "promoted" and fact_id is None:
+        raise ValueError("A promoted claim must reference a persisted fact")
     with session_scope() as s:
         result = s.execute(
             ORMClaim.insert().values(
                 fact_id=fact_id, material_id=claim.material_id,
+                unit_id=claim.unit_id,
                 content=claim.content, quote=claim.quote, source=claim.source,
                 fact_type=claim.fact_type, dimension=claim.dimension, need_id=claim.need_id,
                 status=status, task_id=task_id, origin_call_id=origin_call_id,
@@ -923,17 +1018,64 @@ def load_claims_for_tasks(task_ids: list[str]) -> list[dict]:
 
 
 def save_conflict(conflict: Conflict, origin_call_id: str = "", task_id: str = "") -> int:
-    from app.infrastructure.orm import ORMConflict
     with session_scope() as s:
         result = s.execute(
             ORMConflict.insert().values(
                 fact_key=conflict.fact_key,
                 entries=json.dumps(conflict.entries, ensure_ascii=False),
                 claim_ids=json.dumps(conflict.claim_ids),
+                conflict_type=conflict.conflict_type,
+                reason=conflict.reason,
+                confidence=conflict.confidence,
                 status=conflict.status, task_id=task_id, origin_call_id=origin_call_id,
             )
         )
         return int(result.inserted_primary_key[0])
+
+
+def load_conflict_records(conflict_ids: list[int]) -> list[dict]:
+    """Load conflicts with deterministic, current provenance for API display."""
+    ids = [int(value) for value in conflict_ids if str(value).isdigit()]
+    if not ids:
+        return []
+    with session_scope() as session:
+        rows = session.execute(
+            select(ORMConflict).where(ORMConflict.c.id.in_(ids)).order_by(ORMConflict.c.id)
+        ).mappings().all()
+        all_claim_ids: set[int] = set()
+        parsed_ids: dict[int, list[int]] = {}
+        for row in rows:
+            try:
+                values = [int(value) for value in json.loads(row.get("claim_ids") or "[]")]
+            except (TypeError, ValueError, json.JSONDecodeError):
+                values = []
+            parsed_ids[int(row["id"])] = values
+            all_claim_ids.update(values)
+        claim_rows = session.execute(
+            select(ORMClaim).where(ORMClaim.c.id.in_(all_claim_ids))
+        ).mappings().all() if all_claim_ids else []
+    claims_by_id = {int(row["id"]): dict(row) for row in claim_rows}
+    records: list[dict] = []
+    for row in rows:
+        item = dict(row)
+        claim_ids = parsed_ids.get(int(row["id"]), [])
+        entries = _conflict_entries(claim_ids, claims_by_id) if claim_ids else []
+        if not entries:
+            try:
+                entries = json.loads(row.get("entries") or "[]")
+            except (TypeError, json.JSONDecodeError):
+                entries = []
+        records.append({
+            "id": int(row["id"]),
+            "fact_key": str(row.get("fact_key") or ""),
+            "claim_ids": claim_ids,
+            "entries": entries,
+            "conflict_type": _normalize_conflict_type(row.get("conflict_type")),
+            "reason": str(row.get("reason") or ""),
+            "confidence": _normalize_confidence(row.get("confidence")),
+            "status": str(row.get("status") or "unresolved"),
+        })
+    return records
 
 
 def load_evidence_quotes(fact_id: int) -> str:
@@ -943,4 +1085,4 @@ def load_evidence_quotes(fact_id: int) -> str:
         ).all()
     return ", ".join(str(row[0]) for row in rows)
 
-__all__ = ['bind_sources', 'EvidenceAgent', 'fact_exists', 'save_fact_with_evidence', 'save_claim', 'load_claims', 'load_claims_for_tasks', 'save_conflict', 'load_evidence_quotes']
+__all__ = ['bind_sources', 'EvidenceAgent', 'fact_exists', 'save_fact_with_evidence', 'save_claim', 'load_claims', 'load_claims_for_tasks', 'save_conflict', 'load_conflict_records', 'load_evidence_quotes']

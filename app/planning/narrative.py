@@ -6,6 +6,7 @@ import re
 
 from app.agents.base import BaseAgent
 from app.planning.structure import normalize_topic, serializable_memory
+from app.rendering.headings import strip_heading_prefix
 from app.task_artifacts import save_task_artifact
 
 _SYSTEM = """你是报告章节叙事规划师。你的任务不是写正文,而是在 Writer 写作前组织事实。
@@ -175,9 +176,9 @@ class NarrativeAgent(BaseAgent):
         action, target_paragraph}], "structure_note": ...};失败返回空 topics。
         """
         plan_for_qa = _strip_plan_for_qa(narrative_plan)
-        from app.config import settings
+        from app.runtime_profiles import stage_input_budget_chars
 
-        budget = getattr(settings, "max_context_chars", 12000)
+        budget = stage_input_budget_chars("narrative_qa")
         draft_block = "\n".join(f"[P{i + 1}] {p}" for i, p in enumerate(draft_paragraphs))
         fact_block = "\n".join(f"{f['id']}. {f.get('content', '')}" for f in facts)
         plan_block = json.dumps(plan_for_qa, ensure_ascii=False)
@@ -192,7 +193,11 @@ class NarrativeAgent(BaseAgent):
             + "\n\n请输出各 Topic 完成度判断 JSON。"
         )
         try:
-            payload = self.generate_json(prompt, system=_QA_SYSTEM)
+            from app.runtime_profiles import stage_profile
+            payload = self.generate_json(
+                prompt, system=_QA_SYSTEM,
+                max_tokens=stage_profile("narrative_qa").output_tokens,
+            )
         except Exception:
             return {"topics": [], "structure_note": ""}
         topics = []
@@ -475,7 +480,7 @@ def _normalize_subsection_targets(items: list[dict], chapter_target: int) -> lis
 
 
 def _clean_subsection_title(text: str) -> str:
-    value = re.sub(r"^\s*(?:\d+(?:\.\d+)+|[（(][一二三四五六七八九十]+[）)]|[一二三四五六七八九十]+[、.])\s*", "", text or "").strip()
+    value = strip_heading_prefix(text)
     value = re.split(r"[。！？!?；;\n]", value, maxsplit=1)[0].strip()
     return value
 
