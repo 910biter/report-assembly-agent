@@ -5,7 +5,12 @@ from unittest.mock import patch
 from app.evidence.extractor import EvidenceAgent
 from app.infrastructure.orm import Base
 from app.interaction import _artifact_summary, _proposal_instruction
-from app.graph.service import GraphExtractionAgent, _extract_adaptive, _fact_batches
+from app.graph.service import (
+    GraphExtractionAgent,
+    _extract_adaptive,
+    _fact_batches,
+    _visualization_nodes,
+)
 from app.context import ContextManager
 from app.material_comparison import (
     CHANGE_TYPES,
@@ -78,6 +83,22 @@ class ProductExtensionTests(unittest.TestCase):
             patch("app.context.settings.max_context_chars", 20000),
         ):
             self.assertEqual(ContextManager({}).budget_chars(), 10000)
+
+    def test_graph_visualization_materializes_literal_value_targets(self):
+        records = {
+            "entities": [{"key": "entity-a", "name": "机构甲", "entity_type": "机构"}],
+            "assertions": [{
+                "subject_key": "entity-a",
+                "target_key": "value-2027",
+                "target_name": "2027年",
+                "object_value": "2027年",
+                "workspace_id": "default",
+                "status": "validated",
+            }],
+        }
+        nodes = _visualization_nodes(records)
+        self.assertEqual({item["key"] for item in nodes}, {"entity-a", "value-2027"})
+        self.assertEqual(nodes[-1]["entity_type"], "value")
 
     def test_heading_renderer_replaces_existing_prefix_with_template_numbering(self):
         strategy = HeadingNumbering({1: "cjk_comma", 2: "cjk_parenthesized"})

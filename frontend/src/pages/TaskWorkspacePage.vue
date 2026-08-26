@@ -84,6 +84,13 @@ const graphBuildStatus = computed(() =>
   String(graph.data.value?.build_status?.status || "unknown"),
 );
 const graphBuildActive = computed(() => Boolean(graph.data.value?.build_active));
+const graphAssertionCount = computed(() =>
+  Number(
+    graph.data.value?.stats?.assertion_count
+      ?? task.data.value?.graph_status?.assertion_count
+      ?? 0,
+  ),
+);
 const graphBuildMessage = computed(() => {
   const status = graph.data.value?.build_status || {};
   if (status.status === "partial_ready") {
@@ -481,7 +488,7 @@ function versionsList() {
             ['inferences', `分析判断 ${inferences.length}`],
             [
               'graph',
-              `关系网络 ${graph.data.value?.stats?.assertion_count || 0}`,
+              `关系网络 ${graphAssertionCount}`,
             ],
             ['conflicts', `冲突与待核验 ${conflicts.length}`],
             ['qa', `质量检查 ${task.data.value.qa_notes?.length || 0}`],

@@ -71,6 +71,9 @@ const rebuildGraph = useMutation({
 });
 const graphBuildStatus = computed(() => String(graph.data.value?.build_status?.status || "unknown"));
 const graphBuildActive = computed(() => Boolean(graph.data.value?.build_active));
+const graphAssertionCount = computed(() => Number(graph.data.value?.stats?.assertion_count
+    ?? task.data.value?.graph_status?.assertion_count
+    ?? 0));
 const graphBuildMessage = computed(() => {
     const status = graph.data.value?.build_status || {};
     if (status.status === "partial_ready") {
@@ -787,7 +790,7 @@ if (__VLS_ctx.task.data.value) {
             ['inferences', `分析判断 ${__VLS_ctx.inferences.length}`],
             [
                 'graph',
-                `关系网络 ${__VLS_ctx.graph.data.value?.stats?.assertion_count || 0}`,
+                `关系网络 ${__VLS_ctx.graphAssertionCount}`,
             ],
             ['conflicts', `冲突与待核验 ${__VLS_ctx.conflicts.length}`],
             ['qa', `质量检查 ${__VLS_ctx.task.data.value.qa_notes?.length || 0}`],
@@ -808,7 +811,7 @@ if (__VLS_ctx.task.data.value) {
                             throw 0;
                         return (__VLS_ctx.analysisType = item[0]);
                         // @ts-ignore
-                        [task, active, facts, inferences, conflicts, graph, analysisType,];
+                        [task, active, facts, inferences, conflicts, graphAssertionCount, analysisType,];
                     } },
                 key: (item[0]),
                 ...{ class: ({ active: __VLS_ctx.analysisType === item[0] }) },
@@ -952,7 +955,7 @@ if (__VLS_ctx.task.data.value) {
                             throw 0;
                         return (__VLS_ctx.selectedGraphEdge = $event);
                         // @ts-ignore
-                        [graph, graph, graph, graph, graph, analysisType, graphBuildActive, graphBuildStatus, graphBuildStatus, selectedGraphEdge,];
+                        [analysisType, graph, graph, graph, graph, graph, graphBuildActive, graphBuildStatus, graphBuildStatus, selectedGraphEdge,];
                     },
                 };
                 var __VLS_43;

@@ -251,6 +251,26 @@ def _projection_records(task_id: str) -> dict:
     }
 
 
+def _visualization_nodes(records: dict) -> list[dict]:
+    """Complete the UI node set for assertions whose object is a literal value."""
+    nodes = [dict(item) for item in records.get("entities") or []]
+    known = {str(item.get("key") or "") for item in nodes}
+    for edge in records.get("assertions") or []:
+        target_key = str(edge.get("target_key") or "")
+        if not target_key or target_key in known:
+            continue
+        nodes.append({
+            "key": target_key,
+            "name": str(edge.get("target_name") or edge.get("object_value") or "明确值"),
+            "entity_type": "value",
+            "workspace_id": str(edge.get("workspace_id") or ""),
+            "aliases": [],
+            "status": str(edge.get("status") or "validated"),
+        })
+        known.add(target_key)
+    return nodes
+
+
 class GraphService:
     def __init__(self) -> None:
         self.extractor = GraphExtractionAgent()
@@ -575,12 +595,13 @@ class GraphService:
 
     def task_graph(self, task_id: str) -> dict:
         records = _projection_records(task_id)
+        nodes = _visualization_nodes(records)
         return {
             "mode": self.mode,
             "neo4j_configured": self.projector.available(),
-            "nodes": records["entities"],
+            "nodes": nodes,
             "edges": records["assertions"],
-            "stats": {"entity_count": len(records["entities"]), "assertion_count": len(records["assertions"])},
+            "stats": {"entity_count": len(nodes), "assertion_count": len(records["assertions"])},
         }
 
     def has_task_graph(self, task_id: str) -> bool:

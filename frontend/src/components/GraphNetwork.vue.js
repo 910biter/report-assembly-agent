@@ -8,10 +8,15 @@ function render() {
     graph?.destroy();
     if (!host.value)
         return;
+    const nodeKeys = new Set((props.nodes || []).map((node) => String(node.key || "")));
     const visible = new Set();
     const edges = (props.edges || [])
         .filter((edge) => {
         if (!edge.subject_key || !edge.target_key)
+            return false;
+        // The API contract should provide both endpoints. Keep visualization
+        // resilient while a task is being rebuilt or against older projections.
+        if (!nodeKeys.has(edge.subject_key) || !nodeKeys.has(edge.target_key))
             return false;
         visible.add(edge.subject_key);
         visible.add(edge.target_key);
