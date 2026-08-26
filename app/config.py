@@ -91,7 +91,7 @@ class Settings(BaseSettings):
     model_context_window_tokens: int = 24576  # 必须与 vLLM max-model-len 保持一致
     generation_reserve_tokens: int = 8192  # 单次模型输出上限/预留，覆盖 Evidence 与小节成文
     structured_output_tokens: int = 3072  # Planner/Analysis/QA 等结构化阶段默认输出预算
-    final_planner_output_tokens: int = 4096  # 最终结构需容纳完整章节/小节契约
+    final_planner_output_tokens: int = 6144  # 8K 输入下容纳完整章节/小节契约
     writer_output_tokens: int = 3072  # 单个 Narrative subsection 的正文输出预算
     writer_visible_word_token_ratio: float = 0.30  # JSON+引用绑定后的保守可见正文容量
     evidence_output_tokens: int = 4096  # Evidence 结构化输出预算；与 Writer 长文预算分离
