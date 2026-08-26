@@ -26,6 +26,7 @@ from app.context import BUDGET_TOKENS, _CHARS_PER_TOKEN
 from app.planning.structure import serializable_memory
 from app.planning.structure import order_chapters
 from app.planning.scale import normalize_execution_plan
+from app.rendering.headings import has_heading_prefix, strip_heading_prefix
 from app.task_artifacts import latest_task_artifact, save_task_artifact
 from app.token_monitor import update_call_funnel, update_call_metrics, update_call_products
 from app.config import settings
@@ -257,15 +258,10 @@ def _normalize_report_sentence(text: str) -> str:
     return value
 
 
-_SUBHEADING_PREFIX_RE = re.compile(
-    r"^\s*(?:\d+(?:\.\d+)+|[（(][一二三四五六七八九十]+[）)]|[一二三四五六七八九十]+[、.])\s*"
-)
-
-
 def _planned_subsection_titles(narrative_plan: dict) -> list[str]:
     titles = []
     for item in (narrative_plan or {}).get("subsections") or []:
-        title = str(item.get("title") or "").strip()
+        title = strip_heading_prefix(str(item.get("title") or ""))
         if title:
             titles.append(title)
     return titles
@@ -335,7 +331,7 @@ def _subsection_generation_units(narrative_plan: dict, chapter_target: int,
         result.append({
             "index": index,
             "count": len(subsections),
-            "title": str(subsection.get("title") or "").strip(),
+            "title": strip_heading_prefix(str(subsection.get("title") or "")),
             "target_words": target,
             "minimum_words": round(target * max(0.0, minimum_ratio)),
             "plan": subsection,
@@ -404,14 +400,13 @@ def _split_embedded_subheading(text: str, allowed_titles: list[str] | None = Non
 
 
 def _clean_generated_subheading(text: str) -> str:
-    value = str(text or "").strip()
-    value = _SUBHEADING_PREFIX_RE.sub("", value)
+    value = strip_heading_prefix(text)
     value = re.split(r"[。！？!?；;\n]", value, maxsplit=1)[0].strip()
     return value
 
 
 def _extract_embedded_subheading(text: str) -> tuple[str, str] | None:
-    if not _SUBHEADING_PREFIX_RE.match(text):
+    if not has_heading_prefix(text):
         return None
     for mark in ("。", "；", "！", "？"):
         index = text.find(mark)

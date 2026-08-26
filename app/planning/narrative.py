@@ -6,6 +6,7 @@ import re
 
 from app.agents.base import BaseAgent
 from app.planning.structure import normalize_topic, serializable_memory
+from app.rendering.headings import strip_heading_prefix
 from app.task_artifacts import save_task_artifact
 
 _SYSTEM = """你是报告章节叙事规划师。你的任务不是写正文,而是在 Writer 写作前组织事实。
@@ -475,7 +476,7 @@ def _normalize_subsection_targets(items: list[dict], chapter_target: int) -> lis
 
 
 def _clean_subsection_title(text: str) -> str:
-    value = re.sub(r"^\s*(?:\d+(?:\.\d+)+|[（(][一二三四五六七八九十]+[）)]|[一二三四五六七八九十]+[、.])\s*", "", text or "").strip()
+    value = strip_heading_prefix(text)
     value = re.split(r"[。！？!?；;\n]", value, maxsplit=1)[0].strip()
     return value
 

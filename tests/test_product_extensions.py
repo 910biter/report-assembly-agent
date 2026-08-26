@@ -23,10 +23,27 @@ from app.memory.style_jobs import create_job as create_style_job
 from app.memory.style_jobs import get_job as get_style_job
 from app.memory.style_jobs import run_job as run_style_job
 from app.models.memory import StyleVariant
-from app.writing.writer import _style_sample_type
+from app.rendering.headings import HeadingNumbering, format_heading, strip_heading_prefix
+from app.writing.writer import _clean_generated_subheading, _style_sample_type
 
 
 class ProductExtensionTests(unittest.TestCase):
+    def test_heading_renderer_replaces_existing_prefix_with_template_numbering(self):
+        strategy = HeadingNumbering({1: "cjk_comma", 2: "cjk_parenthesized"})
+        self.assertEqual(
+            format_heading(2, [1, 1], "1. 从概念提出到战略确立", strategy),
+            "（一）从概念提出到战略确立",
+        )
+        self.assertEqual(
+            format_heading(2, [2, 2], "2.3 关键技术支撑", strategy),
+            "（二）关键技术支撑",
+        )
+
+    def test_all_heading_boundaries_strip_simple_arabic_prefixes(self):
+        self.assertEqual(strip_heading_prefix("1. 法规体系构建"), "法规体系构建")
+        self.assertEqual(_clean_generated_subheading("2. 法规体系构建"), "法规体系构建")
+        self.assertEqual(strip_heading_prefix("2024年度工作安排"), "2024年度工作安排")
+
     def test_style_profile_name_rejects_prompt_schema_text(self):
         prompt_text = "报告类型,用 2-4 字简称,如:政策研究/情报快报/专题分析/风险研判/其他"
         self.assertEqual(_normalize_profile_label(prompt_text), "综合报告风格")
