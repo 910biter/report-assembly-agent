@@ -204,9 +204,15 @@ def _worker_loop() -> None:
             daemon=True, name=f"heartbeat-{item.task_id}",
         )
         heartbeat.start()
+        benchmark_started = False
         try:
             from app import task_control
             task_control.begin_task(item.task_id)
+            try:
+                from app.benchmark_capture import start_task_capture
+                benchmark_started = start_task_capture(item.task_id)
+            except Exception:
+                benchmark_started = False
             starting_task = short_term.load_task(item.task_id) or {}
             if str(starting_task.get("run_mode") or "") == "interaction_revision":
                 try:
@@ -247,6 +253,12 @@ def _worker_loop() -> None:
                 "error": "" if paused else str(exc),
             })
         finally:
+            if benchmark_started:
+                try:
+                    from app.benchmark_capture import stop_task_capture
+                    stop_task_capture(item.task_id)
+                except Exception:
+                    pass
             from app import task_control
             task_control.end_task(item.task_id)
             heartbeat_stop.set()

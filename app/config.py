@@ -71,7 +71,7 @@ class Settings(BaseSettings):
     benchmark_capture_task_ids: str = ""
     benchmark_capture_dir: Path = _PROJECT_ROOT / "runtime" / "benchmarks" / "captures"
     benchmark_capture_queue_size: int = 256
-    benchmark_capture_sample_interval_seconds: float = 0.5
+    benchmark_capture_sample_interval_seconds: float = 2.0
     benchmark_capture_metrics_url: str = ""  # optional vLLM Prometheus endpoint
     benchmark_capture_accelerator_probe_command: str = ""  # optional local JSON probe for NPU/other accelerators
     comparison_output_tokens: int = 3200

@@ -151,6 +151,32 @@ class BenchmarkDatasetTests(unittest.TestCase):
             self.assertEqual(calls[0].baseline["token_funnel"]["promoted_facts"], 2)
             self.assertEqual(calls[0].baseline["correlation"]["attempt"], 1)
 
+    def test_resource_capture_is_task_scoped_and_metrics_are_bounded(self):
+        metrics = {
+            'vllm:prompt_tokens_total{model_name="m"}': 10.0,
+            'vllm:time_to_first_token_seconds_sum{model_name="m"}': 1.2,
+            'python_gc_objects_collected_total{generation="0"}': 999.0,
+        }
+        selected = benchmark_capture._select_server_metrics(metrics)
+        self.assertEqual(len(selected), 2)
+        self.assertNotIn('python_gc_objects_collected_total{generation="0"}', selected)
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            settings, "benchmark_capture_enabled", True
+        ), patch.object(settings, "benchmark_capture_all", True), patch.object(
+            settings, "benchmark_capture_dir", Path(tmp)
+        ), patch.object(benchmark_capture.CaptureResourceSampler, "start") as start, patch.object(
+            benchmark_capture.CaptureResourceSampler, "close"
+        ) as close:
+            benchmark_capture.close_capture_sink()
+            self.assertTrue(benchmark_capture.start_task_capture("task-one"))
+            self.assertEqual(benchmark_capture._resource_sampler.task_id, "task-one")
+            benchmark_capture.stop_task_capture("task-one")
+            self.assertIsNone(benchmark_capture._resource_sampler)
+            start.assert_called_once()
+            close.assert_called_once()
+            benchmark_capture.close_capture_sink()
+
     def test_builder_selects_p50_p95_max_and_failure_per_stage(self):
         with tempfile.TemporaryDirectory() as tmp:
             capture_path = Path(tmp) / "capture.jsonl"

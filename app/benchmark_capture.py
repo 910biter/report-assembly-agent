@@ -115,11 +115,12 @@ class CaptureResourceSampler:
     """Sample test-session resources without participating in model calls."""
 
     def __init__(self, sink: BenchmarkCaptureSink, interval_seconds: float, metrics_url: str = "",
-                 accelerator_probe_command: str = "") -> None:
+                 accelerator_probe_command: str = "", task_id: str = "") -> None:
         self.sink = sink
         self.interval_seconds = max(0.1, float(interval_seconds))
         self.metrics_url = str(metrics_url or "")
         self.accelerator_probe_command = str(accelerator_probe_command or "")
+        self.task_id = str(task_id or "")
         self.stop_event = threading.Event()
         self.thread = threading.Thread(target=self._run, name="benchmark-capture-resource", daemon=True)
 
@@ -140,8 +141,9 @@ class CaptureResourceSampler:
                 "schema_version": "1.0",
                 "event_type": "resource_sample",
                 "captured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "context": {"task_id": self.task_id},
                 "resource": _resource_sample(self.accelerator_probe_command),
-                "server_metrics": fetch_prometheus_snapshot(self.metrics_url),
+                "server_metrics": _select_server_metrics(fetch_prometheus_snapshot(self.metrics_url)),
             }
             self.sink.submit(event)
             self.stop_event.wait(self.interval_seconds)
@@ -160,21 +162,71 @@ def _task_is_allowed(task_id: str) -> bool:
 
 
 def _capture_sink() -> BenchmarkCaptureSink:
-    global _sink, _resource_sampler
+    global _sink
     with _sink_lock:
         if _sink is None:
             _sink = BenchmarkCaptureSink(
                 Path(settings.benchmark_capture_dir),
                 max_queue_size=int(settings.benchmark_capture_queue_size),
             )
-            _resource_sampler = CaptureResourceSampler(
-                _sink,
-                interval_seconds=float(settings.benchmark_capture_sample_interval_seconds),
-                metrics_url=str(settings.benchmark_capture_metrics_url or ""),
-                accelerator_probe_command=str(settings.benchmark_capture_accelerator_probe_command or ""),
-            )
-            _resource_sampler.start()
         return _sink
+
+
+_SERVER_METRIC_PREFIXES = (
+    "vllm:prompt_tokens_total",
+    "vllm:generation_tokens_total",
+    "vllm:num_requests_",
+    "vllm:gpu_cache_usage_perc",
+    "vllm:kv_cache_usage_perc",
+    "vllm:prefix_cache_",
+    "vllm:time_to_first_token_seconds",
+    "vllm:time_per_output_token_seconds",
+    "vllm:e2e_request_latency_seconds",
+    "vllm:request_prompt_tokens",
+    "vllm:request_generation_tokens",
+    "process_resident_memory_bytes",
+    "process_cpu_seconds_total",
+)
+
+
+def _select_server_metrics(metrics: dict[str, float]) -> dict[str, float]:
+    """Retain only counters needed by the portable benchmark."""
+    return {
+        key: value
+        for key, value in metrics.items()
+        if key.startswith(_SERVER_METRIC_PREFIXES)
+    }
+
+
+def start_task_capture(task_id: str) -> bool:
+    """Start resource sampling for one allowed queued workflow task."""
+    global _resource_sampler
+    if not _task_is_allowed(task_id):
+        return False
+    sink = _capture_sink()
+    with _sink_lock:
+        if _resource_sampler is not None:
+            return False
+        _resource_sampler = CaptureResourceSampler(
+            sink,
+            interval_seconds=float(settings.benchmark_capture_sample_interval_seconds),
+            metrics_url=str(settings.benchmark_capture_metrics_url or ""),
+            accelerator_probe_command=str(settings.benchmark_capture_accelerator_probe_command or ""),
+            task_id=task_id,
+        )
+        _resource_sampler.start()
+    return True
+
+
+def stop_task_capture(task_id: str) -> None:
+    """Stop sampling at the workflow boundary; never record idle service time."""
+    global _resource_sampler
+    with _sink_lock:
+        sampler = _resource_sampler
+        if sampler is None or sampler.task_id != str(task_id or ""):
+            return
+        _resource_sampler = None
+    sampler.close()
 
 
 def capture_llm_call(*, backend: str, endpoint: str, request: dict[str, Any],
