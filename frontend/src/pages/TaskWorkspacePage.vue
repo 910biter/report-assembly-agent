@@ -195,6 +195,9 @@ function sourceLocation(entry: any) {
   ].filter(Boolean);
   return location.join(" · ");
 }
+function isPairwiseConflict(item: any) {
+  return (item.entries || []).length === 2 && (item.claim_ids || []).length === 2;
+}
 function versionsList() {
   const data = versions.data.value;
   return Array.isArray(data) ? data : data?.versions || [];
@@ -643,15 +646,29 @@ function versionsList() {
                 <small>{{ conflictConfidence(item) }}</small>
               </div>
               <b>{{ item.fact_key }}</b>
-              <p v-if="item.reason">{{ item.reason }}</p>
             </header>
-            <div class="conflict-compare">
+            <div v-if="isPairwiseConflict(item)" class="conflict-pair">
               <section v-for="(entry, index) in item.entries || []" :key="entry.claim_id || index">
-                <div class="conflict-side"><span>说法 {{ Number(index) + 1 }}</span><small>Fact {{ entry.fact_id || '—' }} · Claim {{ entry.claim_id || '—' }}</small></div>
+                <div class="conflict-side"><span>说法 {{ index === 0 ? 'A' : 'B' }}</span><small>Fact {{ entry.fact_id || '—' }} · Claim {{ entry.claim_id || '—' }}</small></div>
                 <strong>{{ entry.statement }}</strong>
                 <blockquote v-if="entry.quote">{{ entry.quote }}</blockquote>
                 <footer>{{ sourceLocation(entry) }}<span v-if="entry.unit_id"> · Unit {{ entry.unit_id }}</span></footer>
               </section>
+              <div class="conflict-relation">
+                <span>{{ conflictType(item) }}</span>
+                <b>{{ item.reason || '模型未提供明确的比较说明' }}</b>
+              </div>
+            </div>
+            <div v-else class="conflict-ambiguous">
+              <strong>历史记录未保存两两配对关系</strong>
+              <p>以下内容只是同一候选组，无法判断其中哪两条构成矛盾。系统不会将其解释为“其余说法与某一条矛盾”。重新运行冲突核验后才会形成明确的 A/B 对照。</p>
+              <div class="conflict-candidates">
+                <section v-for="(entry, index) in item.entries || []" :key="entry.claim_id || index">
+                  <small>候选 {{ Number(index) + 1 }} · Fact {{ entry.fact_id || '—' }}</small>
+                  <b>{{ entry.statement }}</b>
+                  <footer>{{ sourceLocation(entry) }}</footer>
+                </section>
+              </div>
             </div>
           </article>
           <div v-if="!conflicts.length" class="empty">
@@ -1022,22 +1039,37 @@ function versionsList() {
   background: #fff1d8;
   color: #7d5a24;
 }
-.conflict-compare {
+.conflict-pair {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: minmax(0, 1fr) 190px minmax(0, 1fr);
+  align-items: stretch;
 }
-.conflict-compare > section {
+.conflict-pair > section {
   min-width: 0;
   padding: 16px 18px;
-  border-right: 1px solid var(--color-border);
-  border-bottom: 1px solid var(--color-border);
 }
-.conflict-compare > section:nth-child(2n) { border-right: 0; }
+.conflict-pair > section:first-child { grid-column: 1; }
+.conflict-pair > section:nth-child(2) { grid-column: 3; }
+.conflict-relation {
+  grid-column: 2;
+  grid-row: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 16px;
+  border-inline: 1px solid var(--color-border);
+  background: var(--color-surface-soft);
+  text-align: center;
+}
+.conflict-relation span { color: var(--color-primary); font-size: 12px; font-weight: 650; }
+.conflict-relation b { font-size: 13px; line-height: 1.6; }
 .conflict-side span { color: var(--color-primary); font-weight: 650; }
 .conflict-side small,
 .conflict-review footer { color: var(--color-muted); font-size: 12px; }
-.conflict-compare strong { display: block; margin-top: 12px; line-height: 1.65; }
-.conflict-compare blockquote {
+.conflict-pair section > strong { display: block; margin-top: 12px; line-height: 1.65; }
+.conflict-pair blockquote {
   margin: 12px 0;
   padding: 10px 12px;
   border-left: 2px solid var(--color-border-strong);
@@ -1045,9 +1077,23 @@ function versionsList() {
   color: var(--color-muted);
   line-height: 1.6;
 }
+.conflict-ambiguous { padding: 18px; background: #fffaf0; }
+.conflict-ambiguous > strong { color: #7d5a24; }
+.conflict-ambiguous > p { color: var(--color-muted); line-height: 1.65; }
+.conflict-candidates { display: grid; gap: 8px; }
+.conflict-candidates section { padding: 10px 12px; border-left: 2px solid #c8a86b; background: #fff; }
+.conflict-candidates section small,
+.conflict-candidates section b,
+.conflict-candidates section footer { display: block; }
+.conflict-candidates section b { margin: 5px 0; line-height: 1.55; }
 @media (max-width: 900px) {
-  .conflict-compare { grid-template-columns: 1fr; }
-  .conflict-compare > section { border-right: 0; }
+  .conflict-pair { grid-template-columns: 1fr; }
+  .conflict-pair > section:first-child,
+  .conflict-pair > section:nth-child(2),
+  .conflict-relation { grid-column: 1; }
+  .conflict-pair > section:first-child { grid-row: 1; }
+  .conflict-relation { grid-row: 2; border: 1px solid var(--color-border); border-inline: 0; }
+  .conflict-pair > section:nth-child(2) { grid-row: 3; }
 }
 .graph-summary,
 .graph-changes,

@@ -156,6 +156,9 @@ function sourceLocation(entry) {
     ].filter(Boolean);
     return location.join(" · ");
 }
+function isPairwiseConflict(item) {
+    return (item.entries || []).length === 2 && (item.claim_ids || []).length === 2;
+}
 function versionsList() {
     const data = versions.data.value;
     return Array.isArray(data) ? data : data?.versions || [];
@@ -209,15 +212,30 @@ let __VLS_directives;
 /** @type {__VLS_StyleScopedClasses['conflict-type']} */ ;
 /** @type {__VLS_StyleScopedClasses['conflict-type']} */ ;
 /** @type {__VLS_StyleScopedClasses['conflict-type']} */ ;
-/** @type {__VLS_StyleScopedClasses['conflict-compare']} */ ;
-/** @type {__VLS_StyleScopedClasses['conflict-compare']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-pair']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-pair']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-pair']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-relation']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-relation']} */ ;
 /** @type {__VLS_StyleScopedClasses['conflict-side']} */ ;
 /** @type {__VLS_StyleScopedClasses['conflict-side']} */ ;
 /** @type {__VLS_StyleScopedClasses['conflict-review']} */ ;
-/** @type {__VLS_StyleScopedClasses['conflict-compare']} */ ;
-/** @type {__VLS_StyleScopedClasses['conflict-compare']} */ ;
-/** @type {__VLS_StyleScopedClasses['conflict-compare']} */ ;
-/** @type {__VLS_StyleScopedClasses['conflict-compare']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-pair']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-pair']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-ambiguous']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-ambiguous']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-candidates']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-candidates']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-candidates']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-candidates']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-candidates']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-pair']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-pair']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-pair']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-relation']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-pair']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-relation']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-pair']} */ ;
 /** @type {__VLS_StyleScopedClasses['graph-summary']} */ ;
 /** @type {__VLS_StyleScopedClasses['graph-summary']} */ ;
 /** @type {__VLS_StyleScopedClasses['graph-edge']} */ ;
@@ -1101,41 +1119,73 @@ if (__VLS_ctx.task.data.value) {
                 (__VLS_ctx.conflictConfidence(item));
                 __VLS_asFunctionalElement1(__VLS_intrinsics.b, __VLS_intrinsics.b)({});
                 (item.fact_key);
-                if (item.reason) {
-                    __VLS_asFunctionalElement1(__VLS_intrinsics.p, __VLS_intrinsics.p)({});
-                    (item.reason);
-                }
-                __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
-                    ...{ class: "conflict-compare" },
-                });
-                /** @type {__VLS_StyleScopedClasses['conflict-compare']} */ ;
-                for (const [entry, index] of __VLS_vFor((item.entries || []))) {
-                    __VLS_asFunctionalElement1(__VLS_intrinsics.section, __VLS_intrinsics.section)({
-                        key: (entry.claim_id || index),
-                    });
+                if (__VLS_ctx.isPairwiseConflict(item)) {
                     __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
-                        ...{ class: "conflict-side" },
+                        ...{ class: "conflict-pair" },
                     });
-                    /** @type {__VLS_StyleScopedClasses['conflict-side']} */ ;
-                    __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({});
-                    (Number(index) + 1);
-                    __VLS_asFunctionalElement1(__VLS_intrinsics.small, __VLS_intrinsics.small)({});
-                    (entry.fact_id || '—');
-                    (entry.claim_id || '—');
-                    __VLS_asFunctionalElement1(__VLS_intrinsics.strong, __VLS_intrinsics.strong)({});
-                    (entry.statement);
-                    if (entry.quote) {
-                        __VLS_asFunctionalElement1(__VLS_intrinsics.blockquote, __VLS_intrinsics.blockquote)({});
-                        (entry.quote);
-                    }
-                    __VLS_asFunctionalElement1(__VLS_intrinsics.footer, __VLS_intrinsics.footer)({});
-                    (__VLS_ctx.sourceLocation(entry));
-                    if (entry.unit_id) {
+                    /** @type {__VLS_StyleScopedClasses['conflict-pair']} */ ;
+                    for (const [entry, index] of __VLS_vFor((item.entries || []))) {
+                        __VLS_asFunctionalElement1(__VLS_intrinsics.section, __VLS_intrinsics.section)({
+                            key: (entry.claim_id || index),
+                        });
+                        __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
+                            ...{ class: "conflict-side" },
+                        });
+                        /** @type {__VLS_StyleScopedClasses['conflict-side']} */ ;
                         __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({});
-                        (entry.unit_id);
+                        (index === 0 ? 'A' : 'B');
+                        __VLS_asFunctionalElement1(__VLS_intrinsics.small, __VLS_intrinsics.small)({});
+                        (entry.fact_id || '—');
+                        (entry.claim_id || '—');
+                        __VLS_asFunctionalElement1(__VLS_intrinsics.strong, __VLS_intrinsics.strong)({});
+                        (entry.statement);
+                        if (entry.quote) {
+                            __VLS_asFunctionalElement1(__VLS_intrinsics.blockquote, __VLS_intrinsics.blockquote)({});
+                            (entry.quote);
+                        }
+                        __VLS_asFunctionalElement1(__VLS_intrinsics.footer, __VLS_intrinsics.footer)({});
+                        (__VLS_ctx.sourceLocation(entry));
+                        if (entry.unit_id) {
+                            __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({});
+                            (entry.unit_id);
+                        }
+                        // @ts-ignore
+                        [conflicts, analysisType, graphBuildActive, graphBuildActive, rebuildGraph, conflictType, conflictConfidence, isPairwiseConflict, sourceLocation,];
                     }
-                    // @ts-ignore
-                    [conflicts, analysisType, graphBuildActive, graphBuildActive, rebuildGraph, conflictType, conflictConfidence, sourceLocation,];
+                    __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
+                        ...{ class: "conflict-relation" },
+                    });
+                    /** @type {__VLS_StyleScopedClasses['conflict-relation']} */ ;
+                    __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({});
+                    (__VLS_ctx.conflictType(item));
+                    __VLS_asFunctionalElement1(__VLS_intrinsics.b, __VLS_intrinsics.b)({});
+                    (item.reason || '模型未提供明确的比较说明');
+                }
+                else {
+                    __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
+                        ...{ class: "conflict-ambiguous" },
+                    });
+                    /** @type {__VLS_StyleScopedClasses['conflict-ambiguous']} */ ;
+                    __VLS_asFunctionalElement1(__VLS_intrinsics.strong, __VLS_intrinsics.strong)({});
+                    __VLS_asFunctionalElement1(__VLS_intrinsics.p, __VLS_intrinsics.p)({});
+                    __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
+                        ...{ class: "conflict-candidates" },
+                    });
+                    /** @type {__VLS_StyleScopedClasses['conflict-candidates']} */ ;
+                    for (const [entry, index] of __VLS_vFor((item.entries || []))) {
+                        __VLS_asFunctionalElement1(__VLS_intrinsics.section, __VLS_intrinsics.section)({
+                            key: (entry.claim_id || index),
+                        });
+                        __VLS_asFunctionalElement1(__VLS_intrinsics.small, __VLS_intrinsics.small)({});
+                        (Number(index) + 1);
+                        (entry.fact_id || '—');
+                        __VLS_asFunctionalElement1(__VLS_intrinsics.b, __VLS_intrinsics.b)({});
+                        (entry.statement);
+                        __VLS_asFunctionalElement1(__VLS_intrinsics.footer, __VLS_intrinsics.footer)({});
+                        (__VLS_ctx.sourceLocation(entry));
+                        // @ts-ignore
+                        [conflictType, sourceLocation,];
+                    }
                 }
                 // @ts-ignore
                 [];

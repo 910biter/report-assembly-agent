@@ -58,13 +58,14 @@ _SYSTEM = """你是情报事实提取员。从材料中提取可溯源的陈述(
 
 _CONFLICT_SYSTEM = """你是证据关系核验员。只比较给定 Claim 编号,判断同一事项的说法属于哪种关系。
 严格输出 JSON,不要任何解释:
-{"conflicts": [{"fact_key": "核验主题", "claim_ids": [编号], "conflict_type": "direct_contradiction/temporal_difference/scope_difference/metric_difference/qualification/needs_verification", "reason": "一句话说明比较口径", "confidence": "high/medium/low"}]}
+{"conflicts": [{"fact_key": "核验主题", "claim_ids": [说法A编号, 说法B编号], "conflict_type": "direct_contradiction/temporal_difference/scope_difference/metric_difference/qualification/needs_verification", "reason": "明确说明A与B在哪个事实点上相同或不同", "confidence": "high/medium/low"}]}
 判定规则:
 1. direct_contradiction 仅限主体、事项、时间、范围和指标口径可比,且结论不能同时成立。
 2. 不同时间的变化是 temporal_difference;不同范围/对象是 scope_difference;不同统计定义是 metric_difference。
 3. 总体可用与局部限制、原则与例外、结论与适用条件并存时是 qualification,不是直接矛盾。
 4. 条件不足以确认可比性时标 needs_verification;没有任何需要核验的关系时输出空数组。
-5. 只能返回输入中真实存在的 Claim 编号;不要生成来源、页码、引文或改写陈述,这些由系统按编号回查。"""
+5. 每个结果必须且只能包含两个 Claim 编号。一个候选组存在多组关系时,拆成多个两两比较结果,禁止把3条以上说法放进同一结果。
+6. 只能返回输入中真实存在的 Claim 编号;不要生成来源、页码、引文或改写陈述,这些由系统按编号回查。"""
 
 _CONFLICT_TYPES = {
     "direct_contradiction", "temporal_difference", "scope_difference",
@@ -804,7 +805,10 @@ class EvidenceAgent(BaseAgent):
                 int(value) for value in item.get("claim_ids", [])
                 if str(value).isdigit() and int(value) in claims_by_id
             ))
-            if len(claim_ids) < 2:
+            # A review item is a pairwise proposition. Multi-claim bags do not
+            # state who differs from whom and therefore cannot be persisted as
+            # an explainable conflict.
+            if len(claim_ids) != 2:
                 continue
             entries = _conflict_entries(claim_ids, claims_by_id)
             if len(entries) < 2:
