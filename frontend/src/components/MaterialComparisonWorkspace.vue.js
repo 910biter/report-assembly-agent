@@ -12,6 +12,7 @@ const baseVersionId = ref(props.versions?.[0]?.id || null);
 const selectedId = ref(props.comparisonId || null);
 const selectedItemId = ref(null);
 const relationFilter = ref("all");
+const contentMode = ref("report");
 const pending = ref(false);
 const error = ref("");
 watch(() => props.comparisonId, value => { if (value)
@@ -44,6 +45,17 @@ const relationCounts = computed(() => {
         counts[item.change_type] = (counts[item.change_type] || 0) + 1;
     return counts;
 });
+const mappedItemIds = computed(() => new Set((detail.data.value?.document?.sentences || []).flatMap((sentence) => (sentence.changes || []).map((change) => Number(change.item_id)))));
+const mappedItems = computed(() => items.value.filter(item => item.change_type !== "irrelevant" && mappedItemIds.value.has(Number(item.id))));
+const independentItems = computed(() => items.value.filter(item => item.change_type !== "irrelevant" && !mappedItemIds.value.has(Number(item.id))));
+const visibleIndependentItems = computed(() => relationFilter.value === "all"
+    ? independentItems.value
+    : independentItems.value.filter(item => item.change_type === relationFilter.value));
+const affectedSentenceCount = computed(() => (detail.data.value?.document?.sentences || [])
+    .filter((sentence) => (sentence.changes || []).some((change) => {
+    const item = items.value.find(candidate => candidate.id === change.item_id);
+    return item && item.change_type !== "irrelevant";
+})).length);
 const documentSections = computed(() => {
     const sections = [];
     const sectionMap = new Map();
@@ -68,14 +80,19 @@ watch(items, value => {
     }
 }, { immediate: true });
 function changesFor(sentence) {
-    const changes = sentence.changes || [];
+    const changes = (sentence.changes || []).filter((item) => item.change_type !== "irrelevant");
     return relationFilter.value === "all" ? changes : changes.filter((item) => item.change_type === relationFilter.value);
 }
 function selectSentence(sentence) { const changes = changesFor(sentence); if (changes.length)
     selectedItemId.value = changes[0].item_id; }
 function selectItem(item) {
     selectedItemId.value = item.id;
-    requestAnimationFrame(() => document.querySelector(`[data-change-item="${item.id}"]`)?.scrollIntoView({ block: "center", behavior: "smooth" }));
+    const sentence = (detail.data.value?.document?.sentences || []).find((entry) => (entry.changes || []).some((change) => change.item_id === item.id));
+    contentMode.value = sentence ? "report" : "findings";
+    requestAnimationFrame(() => {
+        const selector = sentence ? `[data-sentence-id="${sentence.id}"]` : `[data-finding-id="${item.id}"]`;
+        document.querySelector(selector)?.scrollIntoView({ block: "center", behavior: "smooth" });
+    });
 }
 function evidenceLabel(item) { return [item.source_file, item.page ? `第 ${item.page} 页` : "", item.paragraph ? `第 ${item.paragraph} 段` : ""].filter(Boolean).join(" · "); }
 async function create() {
@@ -198,6 +215,36 @@ let __VLS_directives;
 /** @type {__VLS_StyleScopedClasses['relation-panel']} */ ;
 /** @type {__VLS_StyleScopedClasses['evidence-panel']} */ ;
 /** @type {__VLS_StyleScopedClasses['summary-strip']} */ ;
+/** @type {__VLS_StyleScopedClasses['comparison-workspace']} */ ;
+/** @type {__VLS_StyleScopedClasses['embedded']} */ ;
+/** @type {__VLS_StyleScopedClasses['comparison-workspace']} */ ;
+/** @type {__VLS_StyleScopedClasses['embedded']} */ ;
+/** @type {__VLS_StyleScopedClasses['comparison-shell']} */ ;
+/** @type {__VLS_StyleScopedClasses['comparison-workspace']} */ ;
+/** @type {__VLS_StyleScopedClasses['embedded']} */ ;
+/** @type {__VLS_StyleScopedClasses['result-workspace']} */ ;
+/** @type {__VLS_StyleScopedClasses['result-workspace']} */ ;
+/** @type {__VLS_StyleScopedClasses['review-layout']} */ ;
+/** @type {__VLS_StyleScopedClasses['content-switch']} */ ;
+/** @type {__VLS_StyleScopedClasses['content-switch']} */ ;
+/** @type {__VLS_StyleScopedClasses['active']} */ ;
+/** @type {__VLS_StyleScopedClasses['content-switch']} */ ;
+/** @type {__VLS_StyleScopedClasses['content-workspace']} */ ;
+/** @type {__VLS_StyleScopedClasses['baseline-document']} */ ;
+/** @type {__VLS_StyleScopedClasses['finding-document']} */ ;
+/** @type {__VLS_StyleScopedClasses['finding-row']} */ ;
+/** @type {__VLS_StyleScopedClasses['finding-row']} */ ;
+/** @type {__VLS_StyleScopedClasses['selected']} */ ;
+/** @type {__VLS_StyleScopedClasses['finding-row']} */ ;
+/** @type {__VLS_StyleScopedClasses['finding-row']} */ ;
+/** @type {__VLS_StyleScopedClasses['finding-row']} */ ;
+/** @type {__VLS_StyleScopedClasses['finding-row']} */ ;
+/** @type {__VLS_StyleScopedClasses['relation-panel']} */ ;
+/** @type {__VLS_StyleScopedClasses['evidence-panel']} */ ;
+/** @type {__VLS_StyleScopedClasses['baseline-document']} */ ;
+/** @type {__VLS_StyleScopedClasses['finding-document']} */ ;
+/** @type {__VLS_StyleScopedClasses['relation-panel']} */ ;
+/** @type {__VLS_StyleScopedClasses['evidence-panel']} */ ;
 __VLS_asFunctionalElement1(__VLS_intrinsics.section, __VLS_intrinsics.section)({
     ...{ class: "comparison-workspace" },
     ...{ class: ({ embedded: __VLS_ctx.embedded }) },
@@ -315,15 +362,19 @@ if (__VLS_ctx.detail.data.value) {
     /** @type {__VLS_StyleScopedClasses['summary-strip']} */ ;
     __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({});
     __VLS_asFunctionalElement1(__VLS_intrinsics.strong, __VLS_intrinsics.strong)({});
-    (__VLS_ctx.detail.data.value.summary?.new_fact_count || 0);
+    (__VLS_ctx.items.filter(x => x.change_type !== 'irrelevant').length);
     __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({});
     __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({});
     __VLS_asFunctionalElement1(__VLS_intrinsics.strong, __VLS_intrinsics.strong)({});
-    (__VLS_ctx.detail.data.value.summary?.change_counts?.conflict || 0);
+    (__VLS_ctx.mappedItems.length);
     __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({});
     __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({});
     __VLS_asFunctionalElement1(__VLS_intrinsics.strong, __VLS_intrinsics.strong)({});
-    (__VLS_ctx.detail.data.value.summary?.affected_sections?.length || 0);
+    (__VLS_ctx.affectedSentenceCount);
+    __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({});
+    __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({});
+    __VLS_asFunctionalElement1(__VLS_intrinsics.strong, __VLS_intrinsics.strong)({});
+    (__VLS_ctx.independentItems.length);
     __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({});
     if (__VLS_ctx.detail.data.value.status !== 'ready') {
         __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
@@ -352,7 +403,7 @@ if (__VLS_ctx.detail.data.value) {
                         throw 0;
                     return (__VLS_ctx.relationFilter = 'all');
                     // @ts-ignore
-                    [detail, detail, detail, detail, detail, detail, detail, detail, detail, detail, detail, relationFilter,];
+                    [detail, detail, detail, detail, detail, detail, detail, detail, items, mappedItems, affectedSentenceCount, independentItems, relationFilter,];
                 } },
             ...{ class: ({ active: __VLS_ctx.relationFilter === 'all' }) },
         });
@@ -369,7 +420,7 @@ if (__VLS_ctx.detail.data.value) {
                             throw 0;
                         return (__VLS_ctx.relationFilter = type);
                         // @ts-ignore
-                        [relationFilter, relationFilter, items, filterOrder, relationCounts,];
+                        [items, relationFilter, relationFilter, filterOrder, relationCounts,];
                     } },
                 key: (type),
                 ...{ class: ([type, { active: __VLS_ctx.relationFilter === type }]) },
@@ -437,65 +488,165 @@ if (__VLS_ctx.detail.data.value) {
             [selectedItemId,];
         }
         __VLS_asFunctionalElement1(__VLS_intrinsics.article, __VLS_intrinsics.article)({
-            ...{ class: "baseline-document" },
+            ...{ class: "content-workspace" },
         });
-        /** @type {__VLS_StyleScopedClasses['baseline-document']} */ ;
+        /** @type {__VLS_StyleScopedClasses['content-workspace']} */ ;
         __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
-            ...{ class: "document-note" },
+            ...{ class: "content-switch" },
         });
-        /** @type {__VLS_StyleScopedClasses['document-note']} */ ;
-        __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({});
-        __VLS_asFunctionalElement1(__VLS_intrinsics.small, __VLS_intrinsics.small)({});
-        for (const [section] of __VLS_vFor((__VLS_ctx.documentSections))) {
-            __VLS_asFunctionalElement1(__VLS_intrinsics.section, __VLS_intrinsics.section)({
-                key: (section.title),
+        /** @type {__VLS_StyleScopedClasses['content-switch']} */ ;
+        __VLS_asFunctionalElement1(__VLS_intrinsics.button, __VLS_intrinsics.button)({
+            ...{ onClick: (...[$event]) => {
+                    if (!(__VLS_ctx.detail.data.value))
+                        throw 0;
+                    if (!!(__VLS_ctx.detail.data.value.status !== 'ready'))
+                        throw 0;
+                    return (__VLS_ctx.contentMode = 'report');
+                    // @ts-ignore
+                    [contentMode,];
+                } },
+            ...{ class: ({ active: __VLS_ctx.contentMode === 'report' }) },
+        });
+        /** @type {__VLS_StyleScopedClasses['active']} */ ;
+        __VLS_asFunctionalElement1(__VLS_intrinsics.b, __VLS_intrinsics.b)({});
+        (__VLS_ctx.mappedItems.length);
+        __VLS_asFunctionalElement1(__VLS_intrinsics.button, __VLS_intrinsics.button)({
+            ...{ onClick: (...[$event]) => {
+                    if (!(__VLS_ctx.detail.data.value))
+                        throw 0;
+                    if (!!(__VLS_ctx.detail.data.value.status !== 'ready'))
+                        throw 0;
+                    return (__VLS_ctx.contentMode = 'findings');
+                    // @ts-ignore
+                    [mappedItems, contentMode, contentMode,];
+                } },
+            ...{ class: ({ active: __VLS_ctx.contentMode === 'findings' }) },
+        });
+        /** @type {__VLS_StyleScopedClasses['active']} */ ;
+        __VLS_asFunctionalElement1(__VLS_intrinsics.b, __VLS_intrinsics.b)({});
+        (__VLS_ctx.independentItems.length);
+        if (__VLS_ctx.contentMode === 'report') {
+            __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
+                ...{ class: "baseline-document" },
             });
-            __VLS_asFunctionalElement1(__VLS_intrinsics.h2, __VLS_intrinsics.h2)({});
-            (section.title);
-            for (const [paragraph] of __VLS_vFor((section.paragraphs))) {
-                __VLS_asFunctionalElement1(__VLS_intrinsics.p, __VLS_intrinsics.p)({
-                    key: (paragraph.id),
+            /** @type {__VLS_StyleScopedClasses['baseline-document']} */ ;
+            __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
+                ...{ class: "document-note" },
+            });
+            /** @type {__VLS_StyleScopedClasses['document-note']} */ ;
+            __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({});
+            __VLS_asFunctionalElement1(__VLS_intrinsics.small, __VLS_intrinsics.small)({});
+            (__VLS_ctx.mappedItems.length);
+            (__VLS_ctx.affectedSentenceCount);
+            for (const [section] of __VLS_vFor((__VLS_ctx.documentSections))) {
+                __VLS_asFunctionalElement1(__VLS_intrinsics.section, __VLS_intrinsics.section)({
+                    key: (section.title),
                 });
-                for (const [sentence] of __VLS_vFor((paragraph.sentences))) {
-                    __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({
-                        ...{ onClick: (...[$event]) => {
-                                if (!(__VLS_ctx.detail.data.value))
-                                    throw 0;
-                                if (!!(__VLS_ctx.detail.data.value.status !== 'ready'))
-                                    throw 0;
-                                return (__VLS_ctx.selectSentence(sentence));
-                                // @ts-ignore
-                                [documentSections, selectSentence,];
-                            } },
-                        key: (sentence.id),
-                        ...{ class: "report-sentence" },
-                        ...{ class: ([__VLS_ctx.changesFor(sentence)[0]?.change_type, { affected: __VLS_ctx.changesFor(sentence).length, selected: __VLS_ctx.changesFor(sentence).some((x) => x.item_id === __VLS_ctx.selectedItemId) }]) },
-                        'data-change-item': (__VLS_ctx.changesFor(sentence)[0]?.item_id),
+                __VLS_asFunctionalElement1(__VLS_intrinsics.h2, __VLS_intrinsics.h2)({});
+                (section.title);
+                for (const [paragraph] of __VLS_vFor((section.paragraphs))) {
+                    __VLS_asFunctionalElement1(__VLS_intrinsics.p, __VLS_intrinsics.p)({
+                        key: (paragraph.id),
                     });
-                    /** @type {__VLS_StyleScopedClasses['report-sentence']} */ ;
-                    /** @type {__VLS_StyleScopedClasses['affected']} */ ;
-                    /** @type {__VLS_StyleScopedClasses['selected']} */ ;
-                    (sentence.text);
-                    if (__VLS_ctx.changesFor(sentence).length) {
-                        __VLS_asFunctionalElement1(__VLS_intrinsics.sup, __VLS_intrinsics.sup)({});
-                        (__VLS_ctx.changesFor(sentence).length);
+                    for (const [sentence] of __VLS_vFor((paragraph.sentences))) {
+                        __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({
+                            ...{ onClick: (...[$event]) => {
+                                    if (!(__VLS_ctx.detail.data.value))
+                                        throw 0;
+                                    if (!!(__VLS_ctx.detail.data.value.status !== 'ready'))
+                                        throw 0;
+                                    if (!(__VLS_ctx.contentMode === 'report'))
+                                        throw 0;
+                                    return (__VLS_ctx.selectSentence(sentence));
+                                    // @ts-ignore
+                                    [mappedItems, affectedSentenceCount, independentItems, contentMode, contentMode, documentSections, selectSentence,];
+                                } },
+                            key: (sentence.id),
+                            ...{ class: "report-sentence" },
+                            ...{ class: ([__VLS_ctx.changesFor(sentence)[0]?.change_type, { affected: __VLS_ctx.changesFor(sentence).length, selected: __VLS_ctx.changesFor(sentence).some((x) => x.item_id === __VLS_ctx.selectedItemId) }]) },
+                            'data-sentence-id': (sentence.id),
+                        });
+                        /** @type {__VLS_StyleScopedClasses['report-sentence']} */ ;
+                        /** @type {__VLS_StyleScopedClasses['affected']} */ ;
+                        /** @type {__VLS_StyleScopedClasses['selected']} */ ;
+                        (sentence.text);
+                        if (__VLS_ctx.changesFor(sentence).length) {
+                            __VLS_asFunctionalElement1(__VLS_intrinsics.sup, __VLS_intrinsics.sup)({});
+                            (__VLS_ctx.changesFor(sentence).length);
+                        }
+                        // @ts-ignore
+                        [selectedItemId, changesFor, changesFor, changesFor, changesFor, changesFor,];
                     }
                     // @ts-ignore
-                    [selectedItemId, changesFor, changesFor, changesFor, changesFor, changesFor, changesFor,];
+                    [];
                 }
                 // @ts-ignore
                 [];
             }
-            // @ts-ignore
-            [];
+            if (!__VLS_ctx.documentSections.length) {
+                __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
+                    ...{ class: "empty" },
+                });
+                /** @type {__VLS_StyleScopedClasses['empty']} */ ;
+                __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({});
+                __VLS_asFunctionalElement1(__VLS_intrinsics.strong, __VLS_intrinsics.strong)({});
+            }
         }
-        if (!__VLS_ctx.documentSections.length) {
+        else {
             __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
-                ...{ class: "empty" },
+                ...{ class: "finding-document" },
             });
-            /** @type {__VLS_StyleScopedClasses['empty']} */ ;
-            __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({});
-            __VLS_asFunctionalElement1(__VLS_intrinsics.strong, __VLS_intrinsics.strong)({});
+            /** @type {__VLS_StyleScopedClasses['finding-document']} */ ;
+            __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
+                ...{ class: "document-note" },
+            });
+            /** @type {__VLS_StyleScopedClasses['document-note']} */ ;
+            __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({});
+            __VLS_asFunctionalElement1(__VLS_intrinsics.small, __VLS_intrinsics.small)({});
+            for (const [item] of __VLS_vFor((__VLS_ctx.visibleIndependentItems))) {
+                __VLS_asFunctionalElement1(__VLS_intrinsics.button, __VLS_intrinsics.button)({
+                    ...{ onClick: (...[$event]) => {
+                            if (!(__VLS_ctx.detail.data.value))
+                                throw 0;
+                            if (!!(__VLS_ctx.detail.data.value.status !== 'ready'))
+                                throw 0;
+                            if (!!(__VLS_ctx.contentMode === 'report'))
+                                throw 0;
+                            return (__VLS_ctx.selectItem(item));
+                            // @ts-ignore
+                            [selectItem, documentSections, visibleIndependentItems,];
+                        } },
+                    key: (item.id),
+                    ...{ class: "finding-row" },
+                    ...{ class: ({ selected: __VLS_ctx.selectedItemId === item.id }) },
+                    'data-finding-id': (item.id),
+                });
+                /** @type {__VLS_StyleScopedClasses['finding-row']} */ ;
+                /** @type {__VLS_StyleScopedClasses['selected']} */ ;
+                __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({
+                    ...{ class: "relation-badge" },
+                    ...{ class: (item.change_type) },
+                });
+                /** @type {__VLS_StyleScopedClasses['relation-badge']} */ ;
+                (__VLS_ctx.labels[item.change_type]);
+                __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({});
+                __VLS_asFunctionalElement1(__VLS_intrinsics.b, __VLS_intrinsics.b)({});
+                (item.title);
+                __VLS_asFunctionalElement1(__VLS_intrinsics.p, __VLS_intrinsics.p)({});
+                (item.evidence?.new_fact?.content);
+                __VLS_asFunctionalElement1(__VLS_intrinsics.small, __VLS_intrinsics.small)({});
+                ((item.evidence?.new_fact?.evidence || []).map((x) => __VLS_ctx.evidenceLabel(x)).filter(Boolean).join('；') || '来源定位待核验');
+                // @ts-ignore
+                [labels, selectedItemId, evidenceLabel,];
+            }
+            if (!__VLS_ctx.visibleIndependentItems.length) {
+                __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
+                    ...{ class: "empty" },
+                });
+                /** @type {__VLS_StyleScopedClasses['empty']} */ ;
+                __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({});
+                __VLS_asFunctionalElement1(__VLS_intrinsics.strong, __VLS_intrinsics.strong)({});
+            }
         }
         __VLS_asFunctionalElement1(__VLS_intrinsics.aside, __VLS_intrinsics.aside)({
             ...{ class: "evidence-panel" },
@@ -553,7 +704,7 @@ if (__VLS_ctx.detail.data.value) {
                 __VLS_asFunctionalElement1(__VLS_intrinsics.small, __VLS_intrinsics.small)({});
                 (source.unit_id);
                 // @ts-ignore
-                [labels, documentSections, selectedItem, selectedItem, selectedItem, selectedItem, selectedItem, selectedItem, selectedItem, selectedItem, selectedItem, selectedItem, selectedItem, evidenceLabel,];
+                [labels, visibleIndependentItems, evidenceLabel, selectedItem, selectedItem, selectedItem, selectedItem, selectedItem, selectedItem, selectedItem, selectedItem, selectedItem, selectedItem, selectedItem,];
             }
             if (!__VLS_ctx.selectedItem.evidence?.new_fact?.evidence?.length) {
                 __VLS_asFunctionalElement1(__VLS_intrinsics.p, __VLS_intrinsics.p)({

@@ -8,6 +8,7 @@ from app.material_comparison import (
     CHANGE_TYPES,
     _candidate_sets,
     _comparison_document,
+    _comparison_metrics,
     _fallback_decision,
     _lineage_impacts,
 )
@@ -139,6 +140,18 @@ class ProductExtensionTests(unittest.TestCase):
 
     def test_comparison_can_retain_related_material_without_calling_it_irrelevant(self):
         self.assertIn("related", CHANGE_TYPES)
+
+    def test_comparison_metrics_separate_sentence_impacts_from_independent_findings(self):
+        metrics = _comparison_metrics([
+            {"change_type": "conflict", "impact_json": '{"report_locations":[{"sentence_id":8}]}'},
+            {"change_type": "corroboration", "impact_json": '{"report_locations":[{"sentence_id":8}]}'},
+            {"change_type": "addition", "impact_json": '{"report_locations":[]}'},
+            {"change_type": "irrelevant", "impact_json": '{"report_locations":[]}'},
+        ])
+        self.assertEqual(metrics["reviewable_change_count"], 3)
+        self.assertEqual(metrics["mapped_change_count"], 2)
+        self.assertEqual(metrics["affected_sentence_count"], 1)
+        self.assertEqual(metrics["independent_finding_count"], 1)
 
     def test_structure_policy_separates_layout_from_content_planning(self):
         variant = StyleVariant(library_id=1, structure={"sections": [{"title": "模板示例目录"}]})

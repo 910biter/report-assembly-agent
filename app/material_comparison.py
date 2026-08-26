@@ -209,11 +209,13 @@ def complete_comparison_task(task_id: str) -> dict[str, Any]:
     # a fabricated one-to-one fact relation.
     inference_summary = _inference_impact_summary(new_inferences, baseline.get("inference_snapshot") or [])
     counts = Counter(record["change_type"] for record in records)
+    comparison_metrics = _comparison_metrics(records)
     summary = {
         "new_material_count": len(_load(run["material_ids_json"], [])),
         "new_fact_count": len(new_facts),
         "new_inference_count": len(new_inferences),
         "change_counts": dict(counts),
+        **comparison_metrics,
         "affected_sections": sorted({
             impact.get("section", "")
             for record in records
@@ -521,6 +523,30 @@ def _comparison_document(baseline: dict, items: list[dict[str, Any]]) -> dict[st
     return {
         "sentences": sentences,
         "unmapped_item_ids": [int(item["id"]) for item in items if int(item["id"]) not in mapped_item_ids],
+    }
+
+
+def _comparison_metrics(records: list[dict[str, Any]]) -> dict[str, int]:
+    reviewable = [record for record in records if record.get("change_type") != "irrelevant"]
+    mapped_records = []
+    sentence_ids: set[int] = set()
+    for record in reviewable:
+        locations = _load(record.get("impact_json"), {}).get("report_locations", [])
+        exact_ids = []
+        for location in locations:
+            try:
+                if location.get("sentence_id") is not None:
+                    exact_ids.append(int(location["sentence_id"]))
+            except (TypeError, ValueError):
+                continue
+        if exact_ids:
+            mapped_records.append(record)
+            sentence_ids.update(exact_ids)
+    return {
+        "reviewable_change_count": len(reviewable),
+        "mapped_change_count": len(mapped_records),
+        "affected_sentence_count": len(sentence_ids),
+        "independent_finding_count": len(reviewable) - len(mapped_records),
     }
 
 
