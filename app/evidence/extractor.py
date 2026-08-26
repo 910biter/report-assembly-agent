@@ -102,6 +102,14 @@ def _normalize(text: str) -> str:
     return _WHITESPACE.sub("", (text or "").translate(_FULLWIDTH))
 
 
+def _positive_unit_id(value) -> int | None:
+    try:
+        parsed = int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed is not None and parsed > 0 else None
+
+
 def _split_quotes(quote: str) -> list[str]:
     parts = re.split(r"(?<=[。！？!?；;])", quote)
     return [p.strip() for p in parts if p.strip()]
@@ -546,10 +554,7 @@ class EvidenceAgent(BaseAgent):
         for item in items:
             content = str(item.get("content", "")).strip()
             quote = str(item.get("short_quote") or item.get("quote") or "").strip()
-            try:
-                unit_id = int(item.get("unit_id")) if item.get("unit_id") is not None else None
-            except (TypeError, ValueError):
-                unit_id = None
+            unit_id = _positive_unit_id(item.get("unit_id"))
             if not content or not quote:
                 continue
             valid_field_claims += 1
@@ -567,7 +572,7 @@ class EvidenceAgent(BaseAgent):
             evidence_list = bind_sources(quote, units_by_material, filenames, unit_id=unit_id)
             claim = Claim(
                 material_id=evidence_list[0].material_id if evidence_list else 0,
-                unit_id=unit_id if unit_id > 0 else None,
+                unit_id=unit_id,
                 content=content, quote=quote,
                 source=filenames.get(evidence_list[0].material_id, "") if evidence_list else "",
                 fact_type=fact_type, dimension=dimension, need_id=need_idx,
