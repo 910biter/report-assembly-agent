@@ -8,6 +8,7 @@ from app.agents.base import BaseAgent
 from app.planning.structure import normalize_topic, serializable_memory
 from app.rendering.headings import strip_heading_prefix
 from app.task_artifacts import save_task_artifact
+from app.context_budget import ContextSection, build_prompt_from_sections
 
 _SYSTEM = """你是报告章节叙事规划师。你的任务不是写正文,而是在 Writer 写作前组织事实。
 严格输出 JSON,不要任何解释:
@@ -176,21 +177,22 @@ class NarrativeAgent(BaseAgent):
         action, target_paragraph}], "structure_note": ...};失败返回空 topics。
         """
         plan_for_qa = _strip_plan_for_qa(narrative_plan)
-        from app.runtime_profiles import stage_input_budget_chars
+        from app.runtime_profiles import stage_input_budget_tokens
 
-        budget = stage_input_budget_chars("narrative_qa")
-        draft_block = "\n".join(f"[P{i + 1}] {p}" for i, p in enumerate(draft_paragraphs))
-        fact_block = "\n".join(f"{f['id']}. {f.get('content', '')}" for f in facts)
-        plan_block = json.dumps(plan_for_qa, ensure_ascii=False)
-        draft_block, fact_block = _fit_to_context_budget([draft_block, fact_block], budget)
-        prompt = (
-            f"章节:{chapter_title}\n\n"
-            "章节草稿(按段落编号):\n"
-            + draft_block
-            + "\n\nNarrative Plan:\n"
-            + plan_block
-            + "\n\n支撑 Facts:\n" + (fact_block or "无")
-            + "\n\n请输出各 Topic 完成度判断 JSON。"
+        budget = stage_input_budget_tokens("narrative_qa")
+        prompt, _audit = build_prompt_from_sections(
+            "narrative_qa",
+            [
+                ContextSection("任务", [f"章节:{chapter_title}", "请输出各 Topic 完成度判断 JSON。"], weight=3, required_items=2),
+                ContextSection("Narrative Plan", ["Narrative Plan:", json.dumps(plan_for_qa, ensure_ascii=False)], weight=5, required_items=2),
+                ContextSection("章节草稿", ["章节草稿(按段落编号):", *[
+                    f"[P{i + 1}] {paragraph}" for i, paragraph in enumerate(draft_paragraphs)
+                ]], weight=5),
+                ContextSection("支撑 Facts", ["支撑 Facts:", *[
+                    f"{fact['id']}. {fact.get('content', '')}" for fact in facts
+                ]], weight=4),
+            ],
+            budget,
         )
         try:
             from app.runtime_profiles import stage_profile
@@ -222,26 +224,6 @@ class NarrativeAgent(BaseAgent):
             "topics": topics,
             "structure_note": str(payload.get("structure_note") or "")[:300],
         }
-
-
-def _fit_to_context_budget(blocks: list[str], budget_chars: int, overhead_chars: int = 800) -> list[str]:
-    """按剩余上下文容量动态截取各文本块(不预设业务阈值)。
-
-    超长块截断到剩余容量;预算耗尽后剩余块置空。
-    """
-    remaining = max(0, budget_chars - overhead_chars)
-    result: list[str] = []
-    for block in blocks:
-        if remaining <= 0:
-            result.append("")
-            continue
-        if len(block) <= remaining:
-            result.append(block)
-            remaining -= len(block)
-        else:
-            result.append(block[:remaining])
-            remaining = 0
-    return result
 
 
 def _safe_paragraph(value, paragraph_count: int) -> int:

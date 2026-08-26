@@ -16,11 +16,11 @@ class RuntimeProfilesAndConflictTests(unittest.TestCase):
                 + settings.prompt_overhead_tokens
                 + settings.safety_margin_tokens
             )
-            self.assertEqual(total, settings.model_context_window_tokens)
-            self.assertLessEqual(profile["input_chars"], profile["input_tokens"])
+            self.assertLessEqual(total, settings.model_context_window_tokens)
         self.assertGreater(profiles["evidence"]["output_tokens"], profiles["conflict"]["output_tokens"])
         self.assertEqual(profiles["writer"]["batch_policy"], "subsection")
         self.assertNotEqual(profiles["analysis"]["workload"], profiles["writer"]["workload"])
+        self.assertEqual(profiles["interaction"]["input_tokens"], settings.interactive_input_tokens)
 
     def test_conflict_type_is_closed_protocol_not_free_text(self):
         self.assertEqual(_normalize_conflict_type("direct_contradiction"), "direct_contradiction")

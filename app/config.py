@@ -49,6 +49,8 @@ class Settings(BaseSettings):
     generation_url: str = ""  # OpenAI-compatible base URL, e.g. http://127.0.0.1:8100/v1
     generation_api_key: str = ""
     generation_model: str = "qwen-agent:latest"
+    generation_tokenizer_path: str = ""  # 本地生成模型 tokenizer 目录；用于精确上下文装箱
+    context_tokenizer_local_only: bool = True  # 禁止上下文计量在运行时访问外网
     embedding_backend: str = "transformers-cpu"
     embedding_model: str = "Qwen3-Embedding-0.6B"
     embedding_model_path: str = "/home/nas511/zhangruqi/models/Qwen3-Embedding-0.6B"
@@ -77,7 +79,7 @@ class Settings(BaseSettings):
     comparison_output_tokens: int = 3200
     style_probe_output_tokens: int = 256
     style_profile_output_tokens: int = 4096
-    material_analysis_input_chars: int = 4000
+    material_analysis_input_tokens: int = 4000
     material_analysis_output_tokens: int = 2048
     planner_output_tokens: int = 3072
     analysis_output_tokens: int = 3072
@@ -95,7 +97,6 @@ class Settings(BaseSettings):
     asr_model: str = "medium"  # ASR whisper 档位: tiny/base/small/medium/large(默认 medium:中文质量高且 CPU 可跑)
     asr_language: str = "zh"  # ASR 转写语言(默认中文;空=whisper 自动检测)
     gateway_timeout_seconds: int = 900
-    max_context_chars: int = 18000  # 24K 服务窗口下的保守文本装箱上限
     # 上下文容量配置(物理上限派生,非内容决策):
     # 单批可用 tokens = 窗口 - 输出预留 - 固定 prompt 开销 - 安全余量
     model_context_window_tokens: int = 24576  # 必须与 vLLM max-model-len 保持一致

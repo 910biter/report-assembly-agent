@@ -19,6 +19,7 @@ from sqlalchemy import and_, delete, select, update
 
 from app.agents.base import BaseAgent
 from app.config import settings
+from app.context_budget import count_tokens
 from app.db import session_scope
 from app.infrastructure.orm import (
     ORMGraphOutbox,
@@ -646,10 +647,9 @@ def _extract_adaptive(facts: list[dict], extractor) -> GraphExtractionOutcome:
 
 
 def _fact_batches(facts: list[dict]) -> list[list[dict]]:
-    """Partition facts by both prompt capacity and estimated JSON capacity."""
+    """Partition facts by exact prompt tokens and output-capacity guardrails."""
     from app.runtime_profiles import stage_profile
     prompt_tokens = stage_profile("graph").input_tokens
-    max_chars = max(4_000, int(prompt_tokens * 2.2))
     # Entity + assertion JSON is output-heavy. This is a protocol/resource
     # estimate, not a semantic selection rule: every Fact remains included.
     max_facts = max(1, int(settings.graph_facts_per_batch or 1))
@@ -657,8 +657,8 @@ def _fact_batches(facts: list[dict]) -> list[list[dict]]:
     current: list[dict] = []
     size = 0
     for fact in facts:
-        text_size = len(str(fact.get("content") or "")) + 32
-        if current and (size + text_size > max_chars or len(current) >= max_facts):
+        text_size = count_tokens(str(fact.get("content") or "")) + 12
+        if current and (size + text_size > prompt_tokens or len(current) >= max_facts):
             batches.append(current)
             current, size = [], 0
         current.append(fact)

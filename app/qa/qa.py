@@ -10,6 +10,8 @@ QA 只发现问题;修复动作由 Repair Router 决定(程序路由,不编造)�
 from __future__ import annotations
 
 from app.agents.base import BaseAgent
+from app.context_budget import ContextSection, build_prompt_from_sections
+from app.runtime_profiles import stage_input_budget_tokens
 
 _QA_SYSTEM = """你是报告质检员。对给定报告段落进行四类质检,一次输出全部结果。
 严格输出 JSON,不要任何解释:
@@ -42,13 +44,29 @@ class ReportQA(BaseAgent):
     def check(self, section: dict, topic: dict | None = None,
               facts: list[dict] | None = None) -> dict:
         """质检报告片段。facts 供 evidence QA 核对引用真实性。"""
-        payload = self.generate_json(
-            f"报告段落:\n{section.get('content', '')}\n"
-            f"引用:facts={section.get('fact_ids', [])} inferences={section.get('inference_ids', [])}\n"
-            f"Topic:{topic.get('topic', '') if topic else ''} 完成条件:{topic.get('completion_criteria', '') if topic else ''}\n"
-            f"可用事实:{[(f.get('id'), f.get('content', '')[:80]) for f in (facts or [])][:40]}\n"
-            f"请输出四类质检 JSON。"
+        cited_ids = {int(value) for value in section.get("fact_ids", []) if str(value).isdigit()}
+        ordered_facts = sorted(
+            facts or [], key=lambda item: 0 if int(item.get("id") or 0) in cited_ids else 1,
         )
+        prompt, _audit = build_prompt_from_sections(
+            "qa",
+            [
+                ContextSection("检查任务", [
+                    "请输出四类质检 JSON。",
+                    f"引用:facts={section.get('fact_ids', [])} inferences={section.get('inference_ids', [])}",
+                ], weight=4, required_items=2),
+                ContextSection("报告段落", ["报告段落:", section.get("content", "")], weight=6, required_items=2),
+                ContextSection("Topic", [
+                    f"Topic:{topic.get('topic', '') if topic else ''}",
+                    f"完成条件:{topic.get('completion_criteria', '') if topic else ''}",
+                ], weight=4),
+                ContextSection("可用事实", ["可用事实:", *[
+                    f"fact_id={fact.get('id')}: {fact.get('content', '')}" for fact in ordered_facts
+                ]], weight=5),
+            ],
+            stage_input_budget_tokens("qa"),
+        )
+        payload = self.generate_json(prompt)
         return {
             "evidence": payload.get("evidence", {"ok": True, "issues": []}),
             "coverage": payload.get("coverage", {"ok": True, "issues": [], "missing_fact_ids": []}),

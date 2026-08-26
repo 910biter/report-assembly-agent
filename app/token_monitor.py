@@ -70,11 +70,14 @@ def new_call_id() -> str:
 def log_llm_call(call_id: str, agent: str, input_chars: int, stats_delta: dict,
                  latency_seconds: float, retry_count: int = 0,
                  success: bool = True, error: str = "",
-                 returned_chars: int = 0, valid_json_chars: int = 0) -> None:
+                 returned_chars: int = 0, valid_json_chars: int = 0,
+                 context_audit: dict | None = None) -> None:
     ctx = current_context()
     prompt_tokens = int(stats_delta.get("prompt_tokens") or 0)
     output_tokens = int(stats_delta.get("output_tokens") or 0)
-    context_tokens = prompt_tokens or max(1, int(input_chars / 4))
+    context_tokens = prompt_tokens or int((context_audit or {}).get("actual_tokens") or 0)
+    if not context_tokens:
+        context_tokens = max(1, int(input_chars or 0))  # conservative legacy fallback
     returned_tokens = output_tokens
     parsed_tokens = _estimate_sub_tokens(valid_json_chars, returned_chars, returned_tokens)
     timing = {
@@ -112,7 +115,10 @@ def log_llm_call(call_id: str, agent: str, input_chars: int, stats_delta: dict,
         )
         s.execute(
             update(ORMLLMCall).where(ORMLLMCall.c.call_id == call_id)
-            .values(funnel_json=json.dumps({"model_timing": timing}, ensure_ascii=False))
+            .values(funnel_json=json.dumps({
+                "model_timing": timing,
+                "context_audit": _json_safe(context_audit or {}),
+            }, ensure_ascii=False))
         )
     _capture_baseline_enrichment(call_id, "call_log", {
         "agent": agent or "base",
@@ -357,6 +363,7 @@ def build_token_efficiency(task_id: str, report_id: int | None = None, run_id: s
 
     detailed_funnel = _aggregate_funnel(calls, final_text)
     evidence_detail = _aggregate_evidence_detail(calls, used_fact_ids)
+    context_capacity = _aggregate_context_capacity(calls)
 
     knowledge_used_tokens_est = 0
     knowledge_unused_tokens_est = 0
@@ -465,6 +472,7 @@ def build_token_efficiency(task_id: str, report_id: int | None = None, run_id: s
         "token_buckets": token_buckets,
         "detailed_funnel": detailed_funnel,
         "evidence_detail": evidence_detail,
+        "context_capacity": context_capacity,
         "scale_drivers": scale_drivers,
         "call_count": len(calls),
     }
@@ -844,11 +852,92 @@ def build_workload_profile(task_id: str, run_id: str = "") -> dict:
         },
         "by_stage_workload": finalized,
         "by_workload": summary_by_workload,
+        "context_capacity": _aggregate_context_capacity(calls),
         "notes": [
             "CPU侧主要承载Docling解析、Unit入库、Embedding前处理、检索与JSON校验。",
             "NPU/GPU侧主要承载LLM prefill与decode；输入长的阶段更考验prefill/带宽，输出长的阶段更考验decode吞吐。",
         ],
     }
+
+
+def _aggregate_context_capacity(calls: list) -> dict:
+    """Summarize pre-call packing decisions against serving-token reality."""
+    stages: dict[str, dict] = {}
+    for call in calls:
+        raw_funnel = call.get("funnel_json") if hasattr(call, "get") else {}
+        if isinstance(raw_funnel, str):
+            try:
+                raw_funnel = json.loads(raw_funnel or "{}")
+            except (TypeError, ValueError):
+                raw_funnel = {}
+        audit = (raw_funnel or {}).get("context_audit") or {}
+        if not audit:
+            continue
+        stage = str(audit.get("stage") or call.get("stage") or call.get("agent") or "unknown")
+        item = stages.setdefault(stage, {
+            "calls": 0,
+            "tokenizer_methods": {},
+            "budget_tokens": [],
+            "packed_tokens": [],
+            "final_user_prompt_tokens": [],
+            "estimated_request_tokens": [],
+            "serving_input_tokens": [],
+            "utilizations": [],
+            "truncated_calls": 0,
+            "sections": {},
+        })
+        item["calls"] += 1
+        method = str(audit.get("tokenizer_method") or "unknown")
+        item["tokenizer_methods"][method] = int(item["tokenizer_methods"].get(method, 0)) + 1
+        item["budget_tokens"].append(int(audit.get("budget_tokens") or 0))
+        item["packed_tokens"].append(int(audit.get("actual_tokens") or 0))
+        item["final_user_prompt_tokens"].append(int(audit.get("final_user_prompt_tokens") or audit.get("actual_tokens") or 0))
+        item["estimated_request_tokens"].append(int(audit.get("estimated_request_tokens") or 0))
+        item["serving_input_tokens"].append(int(call.get("input_tokens") or 0))
+        item["utilizations"].append(float(audit.get("utilization") or 0))
+        item["truncated_calls"] += 1 if audit.get("truncated") else 0
+        for name, section in (audit.get("sections") or {}).items():
+            bucket = item["sections"].setdefault(str(name), {
+                "candidate_items": 0, "selected_items": 0, "omitted_items": 0,
+                "candidate_tokens": 0, "selected_tokens": 0,
+            })
+            for key in bucket:
+                bucket[key] += int((section or {}).get(key) or 0)
+    result = []
+    for stage, item in stages.items():
+        serving = item.pop("serving_input_tokens")
+        packed = item.pop("packed_tokens")
+        final_prompts = item.pop("final_user_prompt_tokens")
+        estimated_requests = item.pop("estimated_request_tokens")
+        budgets = item.pop("budget_tokens")
+        utilizations = item.pop("utilizations")
+        estimate_errors = [
+            round((estimated - actual) / max(actual, 1), 4)
+            for estimated, actual in zip(estimated_requests, serving) if estimated and actual
+        ]
+        item.update({
+            "stage": stage,
+            "budget_tokens_p50": _p(budgets, 50),
+            "budget_tokens_p95": _p(budgets, 95),
+            "packed_tokens_p50": _p(packed, 50),
+            "packed_tokens_p95": _p(packed, 95),
+            "final_user_prompt_tokens_p50": _p(final_prompts, 50),
+            "final_user_prompt_tokens_p95": _p(final_prompts, 95),
+            "serving_input_tokens_p50": _p(serving, 50),
+            "serving_input_tokens_p95": _p(serving, 95),
+            "utilization_p50": _p(utilizations, 50),
+            "utilization_p95": _p(utilizations, 95),
+            "truncation_rate": round(item["truncated_calls"] / max(item["calls"], 1), 4),
+            "prompt_overhead_tokens_p50": _p([
+                max(0, actual - planned) for actual, planned in zip(serving, final_prompts)
+            ], 50),
+            "token_estimate_error_rate_p50": _p(estimate_errors, 50),
+            "token_estimate_error_rate_p95": _p(estimate_errors, 95),
+            "token_estimate_absolute_error_rate_p95": _p([abs(value) for value in estimate_errors], 95),
+        })
+        result.append(item)
+    result.sort(key=lambda value: value["stage"])
+    return {"by_stage": result, "audited_calls": sum(item["calls"] for item in result)}
 
 
 def _workload_kind(stage: str, agent: str) -> str:

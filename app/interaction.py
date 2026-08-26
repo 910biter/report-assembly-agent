@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 import contextlib
-import math
 import re
 import time
 import uuid
@@ -13,7 +12,12 @@ from typing import Any
 from sqlalchemy import insert, select, update
 
 from app.db import session_scope
-from app.gateway import model_gateway
+from app.gateway import (
+    last_generation_meta,
+    last_generation_stats,
+    model_gateway,
+    reset_last_generation_call,
+)
 from app.infrastructure.orm import (
     ORMChangeProposal,
     ORMEvidence,
@@ -32,7 +36,14 @@ from app.llm_scheduler import invoke
 from app.llm_queue import PRIORITY_INTERACTIVE, llm_priority
 from app.config import settings
 from app.report_versions import ensure_report_version
-from app.token_monitor import new_call_id, token_context
+from app.context_budget import (
+    ContextSection,
+    build_prompt_from_sections,
+    consume_context_audit,
+    count_tokens,
+    truncate_tokens,
+)
+from app.token_monitor import log_llm_call, new_call_id, token_context
 
 EDITABLE_ARTIFACTS = {
     "task_draft", "task_brief", "material_role", "analysis_plan", "fact", "inference",
@@ -303,22 +314,43 @@ def _generate_interaction_reply(thread_id: int, content: str, request_id: str = 
     # Do not submit this request to the long-running workflow queue. Sending it
     # directly lets vLLM observe its priority and preempt/reorder queued work.
     capture_scope = contextlib.nullcontext()
+    call_id = new_call_id()
     if settings.benchmark_capture_enabled:
         from app.benchmark_capture import benchmark_call_context
-        call_id = new_call_id()
         capture_scope = benchmark_call_context(
             call_id=call_id, logical_call_id=call_id,
             agent="review_copilot", attempt=0,
         )
-    with token_context(task_id=str(thread.get("task_id") or ""), stage="interaction"), capture_scope, llm_priority(PRIORITY_INTERACTIVE):
-        result = invoke(
-            "review_copilot",
-            model_gateway.generate_json,
-            prompt,
-            system=_COPILOT_SYSTEM,
-            think=False,
-            max_tokens=int(settings.interactive_output_tokens),
-        )
+    context_audit = consume_context_audit()
+    context_audit["final_user_prompt_tokens"] = count_tokens(prompt)
+    context_audit["estimated_request_tokens"] = count_tokens(f"{_COPILOT_SYSTEM}\n{prompt}")
+    reset_last_generation_call()
+    started = time.time()
+    task_id = str(thread.get("task_id") or "")
+    try:
+        with token_context(task_id=task_id, stage="interaction"), capture_scope:
+            with llm_priority(PRIORITY_INTERACTIVE):
+                result = invoke(
+                    "review_copilot",
+                    model_gateway.generate_json,
+                    prompt,
+                    system=_COPILOT_SYSTEM,
+                    think=False,
+                    max_tokens=int(settings.interactive_output_tokens),
+                )
+            log_llm_call(
+                call_id, "interaction", len(prompt), last_generation_stats(),
+                time.time() - started, success=True, context_audit=context_audit,
+                **last_generation_meta(),
+            )
+    except Exception as exc:
+        with token_context(task_id=task_id, stage="interaction"):
+            log_llm_call(
+                call_id, "interaction", len(prompt), last_generation_stats(),
+                time.time() - started, success=False, error=str(exc), context_audit=context_audit,
+                **last_generation_meta(),
+            )
+        raise
     reply = str(result.get("reply") or "已记录你的意见。")
     metadata = {"status": "completed", "intent": str(result.get("intent") or "answer")}
     if request_id:
@@ -598,31 +630,34 @@ def _build_interaction_prompt(thread: dict, current: dict, message: str) -> str:
     if messages and messages[-1].get("role") == "user" and messages[-1].get("content") == message:
         messages = messages[:-1]
 
-    from app.runtime_profiles import stage_input_budget_chars
-    total_budget = stage_input_budget_chars("interaction")
-    allocations = {
-        "message": min(1400, total_budget // 4),
-        "current": min(1700, total_budget // 3),
-        "task": min(500, total_budget // 10),
-        "grounding": min(1700, total_budget // 3),
-        "accepted": min(500, total_budget // 12),
-    }
+    from app.runtime_profiles import stage_input_budget_tokens
+    total_budget = stage_input_budget_tokens("interaction")
     history_budget = min(
         int(settings.interactive_history_tokens or 1536),
-        max(300, total_budget - sum(allocations.values()) - 180),
+        max(300, total_budget // 3),
     )
     history = _bounded_history(messages, history_budget)
-    prompt = "\n".join((
-        f"用户消息：{_truncate_tokens(message, allocations['message'])}",
-        f"当前作用域：{_truncate_tokens(_dump(thread.get('scope') or {}), 280)}",
-        f"任务边界：{_truncate_tokens(_dump(task_context), allocations['task'])}",
-        f"当前对象：{_truncate_tokens(_dump(current), allocations['current'])}",
-        f"允许修改字段：{_dump(_editable_fields(thread, current))}",
-        f"直接依据：{_truncate_tokens(_dump(grounding), allocations['grounding'])}",
-        f"已确认变更：{_truncate_tokens(_dump(accepted), allocations['accepted'])}",
-        f"最近完整对话：{_dump(history)}",
-    ))
-    return _truncate_tokens(prompt, total_budget)
+    prompt, _audit = build_prompt_from_sections(
+        "interaction",
+        [
+            ContextSection("用户消息", [
+                f"用户消息：{_truncate_tokens(message, max(256, total_budget // 3))}",
+                f"允许修改字段：{_dump(_editable_fields(thread, current))}",
+            ], weight=6, required_items=2),
+            ContextSection("当前对象", [
+                f"当前作用域：{_dump(thread.get('scope') or {})}",
+                f"当前对象：{_dump(current)}",
+            ], weight=5),
+            ContextSection("直接依据", [f"直接依据：{_dump(grounding)}"], weight=5),
+            ContextSection("任务边界", [f"任务边界：{_dump(task_context)}"], weight=3),
+            ContextSection("已确认变更", [f"已确认变更：{_dump(accepted)}"], weight=2),
+            ContextSection("最近对话", [
+                f"{item.get('role', '')}：{item.get('content', '')}" for item in history
+            ], weight=3),
+        ],
+        total_budget,
+    )
+    return prompt
 
 
 def _editable_fields(thread: dict, current: dict) -> list[str]:
@@ -855,23 +890,11 @@ def _bounded_history(messages: list[dict], token_budget: int) -> list[dict[str, 
 
 
 def _estimate_tokens(text: str) -> int:
-    value = str(text or "")
-    cjk = len(re.findall(r"[\u3400-\u9fff]", value))
-    return cjk + math.ceil(max(0, len(value) - cjk) / 4)
+    return count_tokens(text)
 
 
 def _truncate_tokens(text: str, token_budget: int) -> str:
-    value = str(text or "")
-    if _estimate_tokens(value) <= token_budget:
-        return value
-    low, high = 0, len(value)
-    while low < high:
-        middle = (low + high + 1) // 2
-        if _estimate_tokens(value[:middle]) <= max(1, token_budget - 4):
-            low = middle
-        else:
-            high = middle - 1
-    return value[:low].rstrip() + "…"
+    return truncate_tokens(text, token_budget)
 
 
 def _resolve_current(thread: dict) -> dict:

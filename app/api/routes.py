@@ -1510,6 +1510,7 @@ def health():
     """网关连通与模型在位状态(系统设置页使用)。"""
     from app.gateway import model_gateway
     from app.runtime_profiles import runtime_profile_manifest
+    from app.context_budget import tokenizer_method
 
     generation_url = (
         settings.generation_url
@@ -1536,6 +1537,11 @@ def health():
                 "neo4j_configured": graph_service.projector.available(),
             },
             "runtime_profiles": runtime_profile_manifest(),
+            "context_tokenizer": {
+                "method": tokenizer_method(),
+                "configured_path": settings.generation_tokenizer_path,
+                "exact": tokenizer_method().startswith("tokenizer:"),
+            },
         }
     except Exception as exc:
         return {

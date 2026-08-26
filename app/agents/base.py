@@ -19,6 +19,7 @@ from app.gateway import (
 from app.llm_queue import submit_llm_call
 from app.llm_scheduler import invoke
 from app.token_monitor import log_llm_call, new_call_id
+from app.context_budget import audit_plain_prompt, consume_context_audit, count_tokens
 
 
 class BaseAgent:
@@ -38,27 +39,39 @@ class BaseAgent:
 
     def generate(self, prompt: str, system: str | None = None) -> str:
         output_tokens = stage_profile(self.name).output_tokens
+        audit = consume_context_audit()
+        if not audit:
+            audit_plain_prompt(self.name, prompt, stage_profile(self.name).input_tokens)
+            audit = consume_context_audit()
+        audit["final_user_prompt_tokens"] = count_tokens(prompt)
+        audit["estimated_request_tokens"] = count_tokens(f"{system or self.role}\n{prompt}")
         return self._with_retry(
             lambda: submit_llm_call(lambda: invoke(
                 "agent", model_gateway.generate, prompt,
                 system=system or self.role, max_tokens=output_tokens,
             )),
-            len(prompt),
+            len(prompt), audit,
         )
 
     def generate_json(self, prompt: str, system: str | None = None,
                       max_tokens: int | None = None) -> dict:
         output_tokens = int(max_tokens or stage_profile(self.name).output_tokens)
+        audit = consume_context_audit()
+        if not audit:
+            audit_plain_prompt(self.name, prompt, stage_profile(self.name).input_tokens)
+            audit = consume_context_audit()
+        audit["final_user_prompt_tokens"] = count_tokens(prompt)
+        audit["estimated_request_tokens"] = count_tokens(f"{system or self.role}\n{prompt}")
         return self._with_retry(
             lambda: submit_llm_call(lambda: invoke(
                 "agent", model_gateway.generate_json, prompt,
                 system=system or self.role, think=self.thinking,
                 max_tokens=output_tokens,
             )),
-            len(prompt),
+            len(prompt), audit,
         )
 
-    def _with_retry(self, fn, chars: int):
+    def _with_retry(self, fn, chars: int, context_audit: dict | None = None):
         last_error = None
         # A logical call may have several transport attempts.  The identifier is
         # only observational and never enters the model prompt or business data.
@@ -85,6 +98,7 @@ class BaseAgent:
                         call_id, self.name, chars,
                         last_generation_stats(),
                         elapsed, retry_count=attempt, success=True,
+                        context_audit=context_audit,
                         **last_generation_meta(),
                     )
                     return result
@@ -97,6 +111,7 @@ class BaseAgent:
                         call_id, self.name, chars,
                         last_generation_stats(),
                         elapsed, retry_count=attempt, success=False, error=str(exc),
+                        context_audit=context_audit,
                         **last_generation_meta(),
                     )
                     last_error = exc

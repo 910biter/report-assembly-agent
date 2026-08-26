@@ -11,13 +11,19 @@ LLM 检查:逻辑跳跃、引用与内容一致性。结果统一为 qa_notes �
 import json
 import re
 
+from app.agents.base import BaseAgent
+from app.context_budget import ContextSection, build_prompt_from_sections
 from app.db import session_scope
-from app.gateway import model_gateway
-from app.llm_scheduler import invoke
+from app.runtime_profiles import stage_input_budget_tokens
 
 _QA_SYSTEM = """你是报告质量检查员。检查报告是否存在以下问题,严格输出 JSON:
 {"issues": [{"type": "LOGIC_GAP|CITATION_MISMATCH|REDUNDANT", "section": "章节", "quote": "问题句片段", "note": "问题说明"}]}
 没有问题时输出 {"issues": []}"""
+
+
+class _QualityAgent(BaseAgent):
+    name = "qa"
+    role = _QA_SYSTEM
 
 _VAGUE_TERMS = (
     "相关文件", "有关文件", "有关要求", "相关材料", "规定时间", "指定时间",
@@ -273,14 +279,15 @@ def run_quality_check(report_id: int, plan_structure: list[str],
     # 6. 逻辑与引用一致性:LLM 检查
     if rows:
         try:
-            block = "\n".join(
+            sentence_lines = [
                 f"[{row['section']}] ({row['source_level']}) {row['content']}"
-                for row in rows[:40]
-            )
-            payload = invoke(
-                "qa", model_gateway.generate_json,
-                f"报告句子清单:\n{block}", system=_QA_SYSTEM
-            )
+                for row in rows
+            ]
+            prompt, _audit = build_prompt_from_sections("qa", [
+                ContextSection("instruction", ["检查以下报告句子清单。"], weight=5, required_items=1),
+                ContextSection("report_sentences", sentence_lines, weight=4, required_items=1),
+            ], stage_input_budget_tokens("qa"))
+            payload = _QualityAgent().generate_json(prompt)
             for item in payload.get("issues", []):
                 issues.append({
                     "type": str(item.get("type", "LOGIC_GAP")),
