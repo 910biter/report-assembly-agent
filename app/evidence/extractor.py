@@ -356,10 +356,74 @@ def _conflict_entries(claim_ids: list[int], claims_by_id: dict[int, dict]) -> li
     return entries
 
 
+def _split_unit_blocks(material_text: str, max_tokens: int) -> list[str]:
+    """Pack complete labelled Units into token-bounded chunks.
+
+    Evidence quotes are bound back to Unit ids, so a Unit is the smallest safe
+    split boundary. A single oversized Unit is deliberately kept intact.
+    """
+    original = str(material_text or "")
+    text = original.strip()
+    if not text or count_tokens(text) <= max_tokens:
+        return [original]
+    prefix = ""
+    marker = "相关材料片段:\n"
+    if text.startswith(marker):
+        prefix, text = marker, text[len(marker):]
+    blocks = [block.strip() for block in text.split("\n\n") if block.strip()]
+    if len(blocks) < 2:
+        return [original]
+    separator_tokens = count_tokens("\n\n")
+    prefix_tokens = count_tokens(prefix)
+    chunks: list[str] = []
+    current: list[str] = []
+    current_tokens = prefix_tokens
+    for block in blocks:
+        block_tokens = count_tokens(block)
+        extra_tokens = separator_tokens if current else 0
+        if current and current_tokens + extra_tokens + block_tokens > max_tokens:
+            chunks.append(prefix + "\n\n".join(current))
+            current = []
+            current_tokens = prefix_tokens
+            extra_tokens = 0
+        current.append(block)
+        current_tokens += extra_tokens + block_tokens
+    if current:
+        chunks.append(prefix + "\n\n".join(current))
+    return chunks or [original]
+
+
+def _split_batch_meta(batch_meta: dict, part: str, **split_fields) -> dict:
+    """Keep retrieval metrics truthful after an adaptive source split."""
+    meta = dict(batch_meta)
+    unit_count = len(re.findall(r"(?m)^\[U(?:\d+|\?)\s*\|", part))
+    material_ids = list(dict.fromkeys(meta.get("batch_material_ids") or []))
+    meta.update({
+        "retrieved_unit_count": unit_count,
+        "retrieved_chars": len(part),
+        "context_chars": len(part),
+        **split_fields,
+    })
+    if len(material_ids) == 1:
+        meta["batch_material_units"] = {material_ids[0]: unit_count}
+    else:
+        meta["batch_material_units"] = {}
+    return meta
+
+
 class EvidenceAgent(BaseAgent):
     output_token_limit = settings.evidence_output_tokens
     name = "evidence"
     role = _SYSTEM
+
+    def should_retry(self, exc: Exception) -> bool:
+        """Let extraction split a truncated batch instead of retrying it unchanged."""
+        if (
+            str(exc) == "MODEL_OUTPUT_TRUNCATED"
+            and getattr(self, "_split_truncated_batch", False)
+        ):
+            return False
+        return super().should_retry(exc)
 
     def extract_facts(
         self,
@@ -471,6 +535,7 @@ class EvidenceAgent(BaseAgent):
         """Run independent extraction calls concurrently and merge by batch order."""
         if not batches:
             return []
+        batches = self._fit_material_batches(batches, needs)
         concurrency = max(1, int(settings.evidence_batch_concurrency or 1))
         if str(settings.generation_backend).lower() != "vllm":
             concurrency = 1
@@ -493,6 +558,33 @@ class EvidenceAgent(BaseAgent):
             for index, future in futures:
                 results[index - 1] = future.result()
         return [item or [] for item in results]
+
+    def _fit_material_batches(
+        self, batches: list[tuple[str, dict]], needs: list[dict],
+    ) -> list[tuple[str, dict]]:
+        """Split only source batches that cannot fit without dropping whole Units."""
+        from app.runtime_profiles import stage_input_budget_tokens
+
+        need_tokens = count_tokens(self._build_need_block(needs))
+        material_budget = max(
+            2048,
+            stage_input_budget_tokens("evidence") - need_tokens - 768,
+        )
+        fitted: list[tuple[str, dict]] = []
+        for material_text, batch_meta in batches:
+            parts = _split_unit_blocks(material_text, material_budget)
+            if len(parts) == 1:
+                fitted.append((material_text, batch_meta))
+                continue
+            for part_index, part in enumerate(parts, start=1):
+                meta = _split_batch_meta(
+                    batch_meta, part,
+                    adaptive_split="input_capacity",
+                    split_part=part_index,
+                    split_total=len(parts),
+                )
+                fitted.append((part, meta))
+        return fitted
 
     def _process_batch(self, needs: list[dict], material_text: str, batch_meta: dict,
                        units_by_material: dict[int, list[Unit]], filenames: dict[int, str],
@@ -525,6 +617,7 @@ class EvidenceAgent(BaseAgent):
         }
         context_meta = dict(batch_meta)
         try:
+            self._split_truncated_batch = True
             payload = self.generate_json(prompt)
         except Exception as exc:
             call_id = self.last_call_id
@@ -541,7 +634,35 @@ class EvidenceAgent(BaseAgent):
                 promoted_facts=0,
                 extraction_error=str(exc)[:300],
             )
+            if str(exc) == "MODEL_OUTPUT_TRUNCATED":
+                split_parts = _split_unit_blocks(
+                    material_text, max(1, count_tokens(material_text) // 2),
+                )
+                if len(split_parts) > 1:
+                    log_pipeline_event(
+                        "evidence",
+                        recovery_reason="output_truncated_split",
+                        original_call_id=call_id,
+                        split_count=len(split_parts),
+                        batch_index=batch_index,
+                    )
+                    recovered: list[Fact] = []
+                    for part_index, part in enumerate(split_parts, start=1):
+                        meta = _split_batch_meta(
+                            batch_meta, part,
+                            adaptive_split="output_truncated",
+                            parent_call_id=call_id,
+                            split_part=part_index,
+                            split_total=len(split_parts),
+                        )
+                        recovered.extend(self._process_batch(
+                            needs, part, meta, units_by_material, filenames,
+                            task_id, part_index, len(split_parts), round_tag=round_tag,
+                        ))
+                    return recovered
             return []
+        finally:
+            self._split_truncated_batch = False
         call_id = self.last_call_id
         produced_fact_ids: list[int] = []
         stored_chars = 0

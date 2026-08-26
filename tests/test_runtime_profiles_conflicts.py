@@ -2,7 +2,7 @@ import unittest
 from unittest.mock import patch
 
 from app.config import settings
-from app.evidence.extractor import EvidenceAgent, _normalize_conflict_type
+from app.evidence.extractor import EvidenceAgent, _normalize_conflict_type, _split_unit_blocks
 from app.runtime_profiles import runtime_profile_manifest, stage_profile
 
 
@@ -21,6 +21,24 @@ class RuntimeProfilesAndConflictTests(unittest.TestCase):
         self.assertEqual(profiles["writer"]["batch_policy"], "subsection")
         self.assertNotEqual(profiles["analysis"]["workload"], profiles["writer"]["workload"])
         self.assertEqual(profiles["interaction"]["input_tokens"], settings.interactive_input_tokens)
+
+    def test_evidence_split_preserves_complete_units(self):
+        source = (
+            "相关材料片段:\n"
+            "[U1 | a.pdf | 第1页]\n第一条材料内容\n\n"
+            "[U2 | a.pdf | 第2页]\n第二条材料内容\n\n"
+            "[U3 | a.pdf | 第3页]\n第三条材料内容"
+        )
+        parts = _split_unit_blocks(source, 20)
+        self.assertGreater(len(parts), 1)
+        self.assertTrue(all(part.startswith("相关材料片段:\n") for part in parts))
+        self.assertEqual("\n".join(parts).count("[U"), 3)
+
+    def test_evidence_truncation_is_split_instead_of_blind_retry(self):
+        agent = EvidenceAgent()
+        agent._split_truncated_batch = True
+        self.assertFalse(agent.should_retry(RuntimeError("MODEL_OUTPUT_TRUNCATED")))
+        self.assertTrue(agent.should_retry(RuntimeError("MODEL_HTTP_503")))
 
     def test_conflict_type_is_closed_protocol_not_free_text(self):
         self.assertEqual(_normalize_conflict_type("direct_contradiction"), "direct_contradiction")

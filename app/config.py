@@ -105,11 +105,14 @@ class Settings(BaseSettings):
     final_planner_output_tokens: int = 6144  # 8K 输入下容纳完整章节/小节契约
     writer_output_tokens: int = 3072  # 单个 Narrative subsection 的正文输出预算
     writer_visible_word_token_ratio: float = 0.30  # JSON+引用绑定后的保守可见正文容量
-    evidence_output_tokens: int = 4096  # Evidence 结构化输出预算；与 Writer 长文预算分离
+    evidence_output_tokens: int = 5120  # Evidence 高密度批次需要比普通结构化阶段更大的输出空间
     evidence_first_pass_input_tokens: int = 160000  # 首轮 Evidence 总输入资源边界
     evidence_gap_input_tokens: int = 60000  # 单轮缺口检索输入资源边界
-    prompt_overhead_tokens: int = 3000  # 固定 prompt(系统提示+维度+insights 头)
-    safety_margin_tokens: int = 2048  # 安全余量(防估算偏差)
+    # Exact model tokenization is available in production. Keep a measured
+    # guard band instead of reserving several thousand tokens twice: prompt
+    # sections are already counted by the context packer.
+    prompt_overhead_tokens: int = 1024  # chat template/system prompt allowance
+    safety_margin_tokens: int = 1536  # tokenizer drift and gateway protection
     writer_min_budget_completion_ratio: float = 0.8  # 规模 QA 阈值,不授权虚构或重复补齐
     vector_backend: str = "auto"  # auto / qdrant / off
     qdrant_url: str = ""
