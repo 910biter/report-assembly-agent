@@ -42,6 +42,7 @@ const graph = useQuery({
     queryFn: () => api(`/api/tasks/${taskId}/graph`),
     enabled: computed(() => active.value === "analysis" && analysisType.value === "graph"),
     staleTime: 30000,
+    refetchInterval: (q) => (q.state.data?.build_active ? 4000 : false),
 });
 const graphChanges = useQuery({
     queryKey: ["task-graph-changes", taskId],
@@ -57,6 +58,31 @@ const versions = useQuery({
 const command = useMutation({
     mutationFn: ({ path }) => api(path, { method: "POST" }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["task", taskId] }),
+});
+const rebuildGraph = useMutation({
+    mutationFn: () => api(`/api/tasks/${taskId}/graph/rebuild`, { method: "POST" }),
+    onSuccess: async () => {
+        await Promise.all([
+            qc.invalidateQueries({ queryKey: ["task", taskId] }),
+            qc.invalidateQueries({ queryKey: ["task-graph", taskId] }),
+            qc.invalidateQueries({ queryKey: ["task-graph-changes", taskId] }),
+        ]);
+    },
+});
+const graphBuildStatus = computed(() => String(graph.data.value?.build_status?.status || "unknown"));
+const graphBuildActive = computed(() => Boolean(graph.data.value?.build_active));
+const graphBuildMessage = computed(() => {
+    const status = graph.data.value?.build_status || {};
+    if (status.status === "partial_ready") {
+        const failedFacts = Number(status.failed_fact_ids?.length || 0);
+        return failedFacts
+            ? `已有关系可用，另有 ${failedFacts} 条事实尚未完成关系抽取。`
+            : "已有部分关系可用，仍有批次需要重新构建。";
+    }
+    if (status.error === "MODEL_OUTPUT_TRUNCATED" || String(status.error || "").includes("terminal batch")) {
+        return "关系抽取输出超过当前模型容量，可使用自适应拆批重新构建。";
+    }
+    return status.error || "构图只保留可回查事实的关系。";
 });
 const stages = computed(() => task.data.value?.run_mode === "material_comparison"
     ? [
@@ -864,6 +890,27 @@ if (__VLS_ctx.task.data.value) {
                 ? "Graph RAG 已启用"
                 : "图谱观测模式");
             __VLS_asFunctionalElement1(__VLS_intrinsics.small, __VLS_intrinsics.small)({});
+            if (__VLS_ctx.graphBuildActive) {
+                __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({
+                    ...{ class: "badge warning" },
+                });
+                /** @type {__VLS_StyleScopedClasses['badge']} */ ;
+                /** @type {__VLS_StyleScopedClasses['warning']} */ ;
+            }
+            else if (__VLS_ctx.graphBuildStatus === 'partial_ready') {
+                __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({
+                    ...{ class: "badge warning" },
+                });
+                /** @type {__VLS_StyleScopedClasses['badge']} */ ;
+                /** @type {__VLS_StyleScopedClasses['warning']} */ ;
+            }
+            else if (__VLS_ctx.graphBuildStatus === 'degraded') {
+                __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({
+                    ...{ class: "badge danger" },
+                });
+                /** @type {__VLS_StyleScopedClasses['badge']} */ ;
+                /** @type {__VLS_StyleScopedClasses['danger']} */ ;
+            }
             if (__VLS_ctx.graph.data.value?.edges?.length) {
                 let __VLS_40;
                 /** @ts-ignore @type { | typeof __VLS_components.GraphNetwork} */
@@ -905,7 +952,7 @@ if (__VLS_ctx.task.data.value) {
                             throw 0;
                         return (__VLS_ctx.selectedGraphEdge = $event);
                         // @ts-ignore
-                        [graph, graph, graph, graph, graph, analysisType, selectedGraphEdge,];
+                        [graph, graph, graph, graph, graph, analysisType, graphBuildActive, graphBuildStatus, graphBuildStatus, selectedGraphEdge,];
                     },
                 };
                 var __VLS_43;
@@ -955,6 +1002,43 @@ if (__VLS_ctx.task.data.value) {
                 /** @type {__VLS_StyleScopedClasses['empty']} */ ;
                 __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({});
                 __VLS_asFunctionalElement1(__VLS_intrinsics.strong, __VLS_intrinsics.strong)({});
+                __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({});
+                (__VLS_ctx.graphBuildMessage);
+                if (__VLS_ctx.graph.data.value?.mode !== 'off') {
+                    __VLS_asFunctionalElement1(__VLS_intrinsics.button, __VLS_intrinsics.button)({
+                        ...{ onClick: (...[$event]) => {
+                                if (!(__VLS_ctx.task.data.value))
+                                    throw 0;
+                                if (!!(__VLS_ctx.active === 'comparison' && __VLS_ctx.isComparison))
+                                    throw 0;
+                                if (!!(__VLS_ctx.active === 'runtime' && __VLS_ctx.isComparison))
+                                    throw 0;
+                                if (!!(__VLS_ctx.active === 'overview'))
+                                    throw 0;
+                                if (!!(__VLS_ctx.active === 'materials'))
+                                    throw 0;
+                                if (!(__VLS_ctx.active === 'analysis'))
+                                    throw 0;
+                                if (!!(__VLS_ctx.analysisType === 'facts'))
+                                    throw 0;
+                                if (!!(__VLS_ctx.analysisType === 'inferences'))
+                                    throw 0;
+                                if (!(__VLS_ctx.analysisType === 'graph'))
+                                    throw 0;
+                                if (!(!__VLS_ctx.graph.data.value?.edges?.length))
+                                    throw 0;
+                                if (!(__VLS_ctx.graph.data.value?.mode !== 'off'))
+                                    throw 0;
+                                return (__VLS_ctx.rebuildGraph.mutate());
+                                // @ts-ignore
+                                [graph, graph, graphBuildMessage, rebuildGraph,];
+                            } },
+                        ...{ class: "btn" },
+                        disabled: (__VLS_ctx.rebuildGraph.isPending.value || __VLS_ctx.graphBuildActive),
+                    });
+                    /** @type {__VLS_StyleScopedClasses['btn']} */ ;
+                    (__VLS_ctx.graphBuildActive ? '正在重建' : '重新构建关系网络');
+                }
             }
         }
         else if (__VLS_ctx.analysisType === 'conflicts') {
@@ -974,7 +1058,7 @@ if (__VLS_ctx.task.data.value) {
                     (entry.file);
                     (entry.statement);
                     // @ts-ignore
-                    [conflicts, graph, analysisType,];
+                    [conflicts, analysisType, graphBuildActive, graphBuildActive, rebuildGraph,];
                 }
                 // @ts-ignore
                 [];

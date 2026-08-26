@@ -736,10 +736,96 @@ def task_graph(task_id: str):
     The API intentionally exposes only this task's graph projection. Every
     edge carries Fact IDs, so the UI can return to the ordinary evidence panel.
     """
-    if short_term.load_task(task_id) is None:
+    task = short_term.load_task(task_id)
+    if task is None:
         return JSONResponse({"error": "TASK_NOT_FOUND"}, status_code=404)
     from app.graph import graph_service
-    return graph_service.task_graph(task_id)
+    result = graph_service.task_graph(task_id)
+    result["build_status"] = task.get("graph_status") or {"status": "unknown"}
+    jobs = task.get("background_jobs") or {}
+    background_job = jobs.get("graph_rebuild") or jobs.get("knowledge") or {}
+    result["background_job"] = background_job
+    result["build_active"] = _graph_job_active(background_job)
+    return result
+
+
+def _graph_job_active(job: dict) -> bool:
+    if str((job or {}).get("status") or "") not in {"queued", "running"}:
+        return False
+    try:
+        timestamp = float((job or {}).get("started_at") or (job or {}).get("queued_at") or 0)
+    except (TypeError, ValueError):
+        return False
+    # A dead process must not leave graph recovery permanently locked.
+    return bool(timestamp and time.time() - timestamp < max(1800, settings.gateway_timeout_seconds * 2))
+
+
+def _run_graph_rebuild(task_id: str) -> None:
+    """Backfill only the task graph; Evidence, Analysis and report stay intact."""
+    from app.llm_queue import PRIORITY_BACKGROUND, llm_priority
+
+    controller = WorkflowController(task_id)
+    jobs = dict(controller.task.get("background_jobs") or {})
+    jobs["graph_rebuild"] = {"status": "running", "started_at": round(time.time(), 1)}
+    controller._update(graph_status={"status": "running"}, background_jobs=jobs)
+    started = time.time()
+    try:
+        facts = controller._facts()
+        with llm_priority(PRIORITY_BACKGROUND), controller._token_context("graph_build"):
+            graph_status = controller._build_task_graph(facts)
+        artifact_status = (
+            "done" if graph_status.get("status") in {"ready", "reused"}
+            else "partial" if graph_status.get("status") == "partial_ready"
+            else "skipped" if graph_status.get("status") == "skipped"
+            else "failed"
+        )
+        controller._record_artifact(
+            "graph", {"graph_status": graph_status}, status=artifact_status,
+        )
+        jobs = dict(controller.task.get("background_jobs") or {})
+        jobs["graph_rebuild"] = {
+            "status": (
+                "done" if graph_status.get("status") in {"ready", "reused"}
+                else "partial" if graph_status.get("status") == "partial_ready"
+                else "failed"
+            ),
+            "duration_seconds": round(time.time() - started, 1),
+            "error": graph_status.get("error", ""),
+        }
+        controller._update(background_jobs=jobs)
+    except Exception as exc:
+        jobs = dict(controller.task.get("background_jobs") or {})
+        jobs["graph_rebuild"] = {
+            "status": "failed",
+            "duration_seconds": round(time.time() - started, 1),
+            "error": str(exc)[:300],
+        }
+        controller._update(
+            graph_status={"status": "degraded", "error": str(exc)[:300]},
+            background_jobs=jobs,
+        )
+
+
+@router.post("/tasks/{task_id}/graph/rebuild", status_code=202)
+def rebuild_task_graph(task_id: str, background_tasks: BackgroundTasks):
+    """Queue graph-only recovery for completed or degraded tasks."""
+    task = short_term.load_task(task_id)
+    if task is None:
+        return JSONResponse({"error": "TASK_NOT_FOUND"}, status_code=404)
+    from app.graph import graph_service
+    if graph_service.mode == "off":
+        return JSONResponse({"error": "GRAPH_MODE_OFF"}, status_code=409)
+    jobs = task.get("background_jobs") or {}
+    active_job = jobs.get("graph_rebuild") or jobs.get("knowledge") or {}
+    if _graph_job_active(active_job):
+        return {"status": "already_running", "task_id": task_id}
+    if not task.get("fact_ids"):
+        return JSONResponse({"error": "TASK_HAS_NO_FACTS"}, status_code=409)
+    jobs = dict(jobs)
+    jobs["graph_rebuild"] = {"status": "queued", "queued_at": round(time.time(), 1)}
+    short_term.update_task(task_id, graph_status={"status": "queued"}, background_jobs=jobs)
+    background_tasks.add_task(_run_graph_rebuild, task_id)
+    return {"status": "queued", "task_id": task_id, "fact_count": len(task.get("fact_ids") or [])}
 
 
 @router.get("/tasks/{task_id}/graph/changesets")

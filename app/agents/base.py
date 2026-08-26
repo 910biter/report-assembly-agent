@@ -30,6 +30,10 @@ class BaseAgent:
     output_token_limit: int | None = settings.structured_output_tokens
     last_call_id = ""
 
+    def should_retry(self, exc: Exception) -> bool:
+        """Return whether retrying the same request can reasonably recover."""
+        return True
+
     def generate(self, prompt: str, system: str | None = None) -> str:
         return self._with_retry(
             lambda: submit_llm_call(lambda: invoke(
@@ -81,9 +85,9 @@ class BaseAgent:
                     **last_generation_meta(),
                 )
                 last_error = exc
-                count_llm_retry()
-                if attempt >= self.max_retries:
+                if attempt >= self.max_retries or not self.should_retry(exc):
                     break
+                count_llm_retry()
                 time.sleep(1.5 * (attempt + 1))
         raise last_error
 

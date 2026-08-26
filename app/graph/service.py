@@ -12,7 +12,7 @@ import time
 import unicodedata
 import contextvars
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from sqlalchemy import and_, delete, select, update
@@ -76,6 +76,11 @@ class GraphBuildResult:
     changes: int = 0
     projected: int = 0
     error: str = ""
+    batch_count: int = 0
+    succeeded_batches: int = 0
+    failed_batches: int = 0
+    split_count: int = 0
+    failed_fact_ids: list[int] = field(default_factory=list)
 
     def as_dict(self) -> dict:
         return {
@@ -85,13 +90,30 @@ class GraphBuildResult:
             "changeset_count": self.changes,
             "projected_events": self.projected,
             "error": self.error,
+            "batch_count": self.batch_count,
+            "succeeded_batches": self.succeeded_batches,
+            "failed_batches": self.failed_batches,
+            "adaptive_split_count": self.split_count,
+            "failed_fact_ids": self.failed_fact_ids,
         }
+
+
+@dataclass
+class GraphExtractionOutcome:
+    payloads: list[dict]
+    failures: list[dict]
+    split_count: int = 0
 
 
 class GraphExtractionAgent(BaseAgent):
     name = "graph_extract"
     role = _GRAPH_SYSTEM
     output_token_limit = settings.graph_output_tokens
+
+    def should_retry(self, exc: Exception) -> bool:
+        # Repeating an output-limited request cannot recover. The graph service
+        # splits that batch and retries the smaller semantic units instead.
+        return str(exc) != "MODEL_OUTPUT_TRUNCATED"
 
     def extract(self, facts: list[dict]) -> dict:
         lines = []
@@ -248,13 +270,13 @@ class GraphService:
             batches = _fact_batches(facts)
             concurrency = max(1, int(settings.graph_batch_concurrency or 1))
 
-            def extract_one(batch: list[dict]) -> dict:
-                return GraphExtractionAgent().extract(batch)
+            def extract_one(batch: list[dict]) -> GraphExtractionOutcome:
+                return _extract_adaptive(batch, GraphExtractionAgent().extract)
 
             if concurrency == 1 or len(batches) <= 1:
-                payloads = [extract_one(batch) for batch in batches]
+                outcomes = [extract_one(batch) for batch in batches]
             else:
-                payloads = [None] * len(batches)
+                outcomes = [None] * len(batches)
                 with ThreadPoolExecutor(
                     max_workers=min(concurrency, len(batches)),
                     thread_name_prefix="graph-batch",
@@ -264,23 +286,59 @@ class GraphService:
                         context = contextvars.copy_context()
                         futures.append((index, pool.submit(context.run, extract_one, batch)))
                     for index, future in futures:
-                        payloads[index] = future.result()
+                        outcomes[index] = future.result()
+            payload_records = [record for outcome in outcomes for record in outcome.payloads]
+            failures = [failure for outcome in outcomes for failure in outcome.failures]
+            split_count = sum(outcome.split_count for outcome in outcomes)
             entity_count = assertion_count = changes = 0
-            with session_scope() as s:
-                valid_fact_ids = {int(item["id"]) for item in facts if item.get("id") is not None}
-                for payload in payloads:
-                    entities = self._upsert_entities(s, task_id, workspace_id, payload.get("entities") or [], valid_fact_ids)
-                    entity_count += len(entities)
-                    assertion_count += self._upsert_assertions(
-                        s, task_id, workspace_id, payload.get("assertions") or [], entities, valid_fact_ids
+            persisted_batches = 0
+            valid_fact_ids = {int(item["id"]) for item in facts if item.get("id") is not None}
+            for record in payload_records:
+                payload = record["payload"]
+                batch_fact_ids = list(record.get("fact_ids") or [])
+                try:
+                    with session_scope() as s:
+                        entities = self._upsert_entities(
+                            s, task_id, workspace_id,
+                            payload.get("entities") or [], valid_fact_ids,
+                        )
+                        entity_count += len(entities)
+                        assertion_count += self._upsert_assertions(
+                            s, task_id, workspace_id,
+                            payload.get("assertions") or [], entities, valid_fact_ids,
+                        )
+                    persisted_batches += 1
+                except Exception as exc:
+                    failures.append({
+                        "fact_ids": batch_fact_ids,
+                        "error": f"PERSISTENCE_ERROR:{str(exc)[:180]}",
+                    })
+            if persisted_batches:
+                with session_scope() as s:
+                    self._reconcile_task_assertions(
+                        s, task_id, workspace_id,
+                        active_fact_ids if active_fact_ids is not None else valid_fact_ids,
                     )
-                self._reconcile_task_assertions(
-                    s, task_id, workspace_id,
-                    active_fact_ids if active_fact_ids is not None else valid_fact_ids,
-                )
-                changes = self._enqueue_projection(s, task_id, workspace_id)
-            projected = self.project_pending(limit=1) if self.mode == "active" else 0
-            return GraphBuildResult("ready", entity_count, assertion_count, changes, projected)
+                    changes = self._enqueue_projection(s, task_id, workspace_id)
+            projected = self.project_pending(limit=1) if self.mode == "active" and persisted_batches else 0
+            status = "ready" if not failures else "partial_ready" if persisted_batches else "degraded"
+            error = ""
+            if failures:
+                failed_facts = sorted({
+                    int(fact_id) for item in failures
+                    for fact_id in item.get("fact_ids") or []
+                })
+                error = f"{len(failures)} terminal batch(es) failed; {len(failed_facts)} fact(s) not processed"
+            else:
+                failed_facts = []
+            return GraphBuildResult(
+                status, entity_count, assertion_count, changes, projected, error,
+                batch_count=persisted_batches + len(failures),
+                succeeded_batches=persisted_batches,
+                failed_batches=len(failures),
+                split_count=split_count,
+                failed_fact_ids=failed_facts,
+            )
         except Exception as exc:
             return GraphBuildResult("degraded", error=str(exc)[:300])
         finally:
@@ -540,6 +598,32 @@ class GraphService:
         return [{**dict(row), "payload": _loads(row["payload_json"], {})} for row in rows]
 
 
+def _extract_adaptive(facts: list[dict], extractor) -> GraphExtractionOutcome:
+    """Split output-limited graph batches while preserving every Fact."""
+    try:
+        return GraphExtractionOutcome(payloads=[{
+            "payload": extractor(facts),
+            "fact_ids": [int(item.get("id") or 0) for item in facts if item.get("id")],
+        }], failures=[])
+    except Exception as exc:
+        if str(exc) == "MODEL_OUTPUT_TRUNCATED" and len(facts) > 1:
+            midpoint = max(1, len(facts) // 2)
+            left = _extract_adaptive(facts[:midpoint], extractor)
+            right = _extract_adaptive(facts[midpoint:], extractor)
+            return GraphExtractionOutcome(
+                payloads=left.payloads + right.payloads,
+                failures=left.failures + right.failures,
+                split_count=left.split_count + right.split_count + 1,
+            )
+        return GraphExtractionOutcome(
+            payloads=[],
+            failures=[{
+                "fact_ids": [int(item.get("id") or 0) for item in facts if item.get("id")],
+                "error": str(exc)[:200],
+            }],
+        )
+
+
 def _fact_batches(facts: list[dict]) -> list[list[dict]]:
     """Partition facts by both prompt capacity and estimated JSON capacity."""
     prompt_tokens = max(
@@ -552,7 +636,7 @@ def _fact_batches(facts: list[dict]) -> list[list[dict]]:
     max_chars = max(4_000, int(prompt_tokens * 2.2))
     # Entity + assertion JSON is output-heavy. This is a protocol/resource
     # estimate, not a semantic selection rule: every Fact remains included.
-    max_facts = max(12, int(settings.graph_output_tokens / 80))
+    max_facts = max(1, int(settings.graph_facts_per_batch or 1))
     batches: list[list[dict]] = []
     current: list[dict] = []
     size = 0

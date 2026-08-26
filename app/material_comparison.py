@@ -15,6 +15,7 @@ from typing import Any
 
 from sqlalchemy import delete, insert, select, update
 
+from app.config import settings
 from app.db import session_scope
 from app.gateway import model_gateway
 from app.infrastructure.orm import (
@@ -366,7 +367,7 @@ def _classify_batches(candidates: dict[int, list[dict]], focus: str) -> dict[int
                 _CLASSIFY_PROMPT.replace("{focus}", focus[:1200]).replace("{payload}", _dump(batch)),
                 system="你只负责证据变化分类，不改写报告。",
                 think=False,
-                max_tokens=3200,
+                max_tokens=settings.comparison_output_tokens,
             )
         except Exception:
             payload = {}

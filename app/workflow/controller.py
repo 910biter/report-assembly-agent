@@ -99,6 +99,19 @@ def _analysis_groups(facts: list[dict], max_group_size: int = 45) -> dict[str, l
     return refined
 
 
+def _graph_artifact_status(graph_status: dict) -> str:
+    status = str((graph_status or {}).get("status") or "unknown")
+    if status in {"ready", "reused"}:
+        return "done"
+    if status == "partial_ready":
+        return "partial"
+    if status in {"pending", "queued", "running", "unknown"}:
+        return "pending"
+    if status == "skipped":
+        return "skipped"
+    return "failed"
+
+
 class WorkflowController:
     def __init__(self, task_id: str) -> None:
         self.task_id = task_id
@@ -232,7 +245,21 @@ class WorkflowController:
         if settings.graph_build_before_analysis:
             with self._token_context("graph_build"):
                 self._build_task_graph(facts)
-        self._record_artifact("graph", {"graph_status": self.task.get("graph_status", {})})
+        else:
+            from app.graph import graph_service
+
+            if graph_service.mode == "off":
+                self._update(graph_status={"status": "skipped", "reason": "graph_mode_off"})
+            elif graph_service.has_task_graph(self.task_id):
+                stats = graph_service.task_graph(self.task_id).get("stats") or {}
+                self._update(graph_status={"status": "reused", **stats})
+            else:
+                self._update(graph_status={"status": "pending", "reason": "post_review_background"})
+        graph_status = self.task.get("graph_status", {})
+        self._record_artifact(
+            "graph", {"graph_status": graph_status},
+            status=_graph_artifact_status(graph_status),
+        )
         _mark("graph")
         if self.task.get("conflict_ids"):
             self._update(stage=str(Stage.CONFLICT), resume={"stage": "conflict", "status": "reused"})
@@ -963,7 +990,7 @@ class WorkflowController:
         except Exception:
             pass  # 整编失败不阻塞主流程(evidence 本身已落库)
 
-    def _build_task_graph(self, facts: list[dict]) -> None:
+    def _build_task_graph(self, facts: list[dict]) -> dict:
         """Create an evidence-grounded task graph and publish an outbox event."""
         try:
             from app.graph import graph_service
@@ -977,8 +1004,9 @@ class WorkflowController:
                 graph_facts = [fact for fact in facts if int(fact.get("id") or 0) in new_ids]
                 if not graph_facts:
                     if graph_service.has_task_graph(self.task_id):
-                        self._update(graph_status={"status": "reused", "entity_count": 0, "assertion_count": 0})
-                        return
+                        status = {"status": "reused", **(graph_service.task_graph(self.task_id).get("stats") or {})}
+                        self._update(graph_status=status)
+                        return status
                     graph_facts = facts  # one-time backfill for pre-graph tasks
             result = graph_service.build_task_graph(
                 self.task_id,
@@ -986,9 +1014,13 @@ class WorkflowController:
                 workspace_id=str(self.task.get("workspace_id") or ""),
                 active_fact_ids={int(fact.get("id") or 0) for fact in facts if fact.get("id") is not None},
             )
-            self._update(graph_status=result.as_dict())
+            status = result.as_dict()
+            self._update(graph_status=status)
+            return status
         except Exception as exc:
-            self._update(graph_status={"status": "degraded", "error": str(exc)[:300]})
+            status = {"status": "degraded", "error": str(exc)[:300]}
+            self._update(graph_status=status)
+            return status
 
 
     def detect_conflicts(self) -> None:
@@ -1749,7 +1781,7 @@ class WorkflowController:
                     .values(position=_chapter_position(order.get(section, 999), counters[section]))
                 )
 
-    def _sink_knowledge(self, facts: list[dict]) -> None:
+    def _sink_knowledge(self, facts: list[dict]) -> dict:
         """Publish reviewed task assertions into the workspace graph.
 
         Build the evidence-grounded graph after TTFR when it was intentionally
@@ -1759,44 +1791,67 @@ class WorkflowController:
 
         if not settings.graph_build_before_analysis and not graph_service.has_task_graph(self.task_id):
             with self._token_context("graph_build"):
-                self._build_task_graph(facts)
+                graph_status = self._build_task_graph(facts)
+        else:
+            graph_status = dict(self.task.get("graph_status") or {})
+            if graph_service.has_task_graph(self.task_id) and graph_status.get("status") not in {"ready", "partial_ready"}:
+                stats = graph_service.task_graph(self.task_id).get("stats") or {}
+                graph_status = {"status": "reused", **stats}
+                self._update(graph_status=graph_status)
 
         # Review has not yet been accepted by a human. Keep assertions
         # validated and projectable for this task, but do not publish them into
         # the workspace's confirmed long-term graph until finalize().
-        projected = graph_service.project_pending()
-        self._update(knowledge_stats={"validated_task_graph": True, "projected_events": projected})
+        has_graph = graph_service.has_task_graph(self.task_id)
+        projected = graph_service.project_pending() if has_graph else 0
+        self._record_artifact(
+            "graph", {"graph_status": graph_status},
+            status=_graph_artifact_status(graph_status),
+        )
+        self._update(knowledge_stats={
+            "validated_task_graph": has_graph,
+            "graph_status": graph_status.get("status", "unknown"),
+            "projected_events": projected,
+        })
+        return graph_status
 
     def _start_background_post_review(self, facts: list[dict]) -> None:
         """Run non-critical post-review jobs without delaying TTFR."""
-        self._update(background_jobs={
-            "knowledge": {"status": "queued"},
-        })
+        import time as _time
+
+        jobs = dict(self.task.get("background_jobs") or {})
+        jobs["knowledge"] = {"status": "queued", "queued_at": round(_time.time(), 1)}
+        self._update(background_jobs=jobs)
 
         def _run() -> None:
-            import time as _time
-
             started = _time.time()
             try:
-                self._update(background_jobs={
-                    "knowledge": {"status": "running", "started_at": round(started, 1)},
-                })
+                jobs = dict(self.task.get("background_jobs") or {})
+                jobs["knowledge"] = {"status": "running", "started_at": round(started, 1)}
+                self._update(background_jobs=jobs)
                 with llm_priority(PRIORITY_BACKGROUND), self._token_context("knowledge"):
-                    self._sink_knowledge(facts)
-                self._update(background_jobs={
-                    "knowledge": {
-                        "status": "done",
-                        "duration_seconds": round(_time.time() - started, 1),
-                    },
-                })
+                    graph_status = self._sink_knowledge(facts)
+                graph_state = str(graph_status.get("status") or "unknown")
+                jobs = dict(self.task.get("background_jobs") or {})
+                jobs["knowledge"] = {
+                    "status": (
+                        "done" if graph_state in {"ready", "reused", "skipped"}
+                        else "partial" if graph_state == "partial_ready"
+                        else "failed"
+                    ),
+                    "duration_seconds": round(_time.time() - started, 1),
+                    "graph_status": graph_state,
+                    "error": graph_status.get("error", ""),
+                }
+                self._update(background_jobs=jobs)
             except Exception as exc:
-                self._update(background_jobs={
-                    "knowledge": {
-                        "status": "failed",
-                        "duration_seconds": round(_time.time() - started, 1),
-                        "error": str(exc),
-                    },
-                })
+                jobs = dict(self.task.get("background_jobs") or {})
+                jobs["knowledge"] = {
+                    "status": "failed",
+                    "duration_seconds": round(_time.time() - started, 1),
+                    "error": str(exc),
+                }
+                self._update(background_jobs=jobs)
 
         threading.Thread(target=_run, daemon=True).start()
 

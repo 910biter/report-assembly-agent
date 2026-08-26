@@ -64,6 +64,9 @@ class Settings(BaseSettings):
     interactive_input_tokens: int = 6144
     interactive_history_tokens: int = 1536
     interactive_output_tokens: int = 1024
+    comparison_output_tokens: int = 3200
+    style_probe_output_tokens: int = 256
+    style_profile_output_tokens: int = 4096
     # Parser and multimodal extraction are Docling-only. The project no longer
     # maintains a separate OCR/ASR/Vision provider path.
     docling_ocr_engine: str = "rapidocr"  # rapidocr(PP-OCRv6,满血)/ auto / easyocr / tesseract
@@ -103,6 +106,7 @@ class Settings(BaseSettings):
     graph_build_before_analysis: bool = False
     graph_max_hops: int = 2
     graph_output_tokens: int = 4096
+    graph_facts_per_batch: int = 12
     graph_batch_concurrency: int = 2
     neo4j_uri: str = ""  # e.g. bolt://127.0.0.1:7687
     neo4j_user: str = "neo4j"

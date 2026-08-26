@@ -6,10 +6,6 @@ from app.retrieval.query_compiler import QueryCompiler, RetrievalQuery
 from app.retrieval import embed_texts, vector_store
 from app.retrieval.rag import hybrid_retrieve_units
 
-BUDGET_TOKENS = 6000
-_CHARS_PER_TOKEN = 4  # Conservative estimate for Chinese text.
-
-
 def _fit(text: str, budget_chars: int) -> str:
     if len(text) <= budget_chars:
         return text
@@ -166,7 +162,16 @@ class ContextManager:
                     self._unit_index[unit.id] = (material_id, unit)
 
     def budget_chars(self) -> int:
-        return BUDGET_TOKENS * _CHARS_PER_TOKEN
+        # Chinese is conservatively treated as roughly one token per
+        # character. This retrieval budget must shrink or grow with the
+        # serving window instead of preserving the historical 24K-char cap.
+        usable_tokens = (
+            int(settings.model_context_window_tokens)
+            - int(settings.structured_output_tokens)
+            - int(settings.prompt_overhead_tokens)
+            - int(settings.safety_margin_tokens)
+        )
+        return max(1024, min(int(settings.max_context_chars), usable_tokens))
 
     def retrieve_units(self, query: str, top_k: int = 8,
                        keywords: list[str] | None = None) -> list[str]:

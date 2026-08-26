@@ -48,6 +48,7 @@ const graph = useQuery({
     () => active.value === "analysis" && analysisType.value === "graph",
   ),
   staleTime: 30000,
+  refetchInterval: (q) => (q.state.data?.build_active ? 4000 : false),
 });
 const graphChanges = useQuery({
   queryKey: ["task-graph-changes", taskId],
@@ -68,6 +69,33 @@ const versions = useQuery({
 const command = useMutation({
   mutationFn: ({ path }: { path: string }) => api(path, { method: "POST" }),
   onSuccess: () => qc.invalidateQueries({ queryKey: ["task", taskId] }),
+});
+const rebuildGraph = useMutation({
+  mutationFn: () => api(`/api/tasks/${taskId}/graph/rebuild`, { method: "POST" }),
+  onSuccess: async () => {
+    await Promise.all([
+      qc.invalidateQueries({ queryKey: ["task", taskId] }),
+      qc.invalidateQueries({ queryKey: ["task-graph", taskId] }),
+      qc.invalidateQueries({ queryKey: ["task-graph-changes", taskId] }),
+    ]);
+  },
+});
+const graphBuildStatus = computed(() =>
+  String(graph.data.value?.build_status?.status || "unknown"),
+);
+const graphBuildActive = computed(() => Boolean(graph.data.value?.build_active));
+const graphBuildMessage = computed(() => {
+  const status = graph.data.value?.build_status || {};
+  if (status.status === "partial_ready") {
+    const failedFacts = Number(status.failed_fact_ids?.length || 0);
+    return failedFacts
+      ? `已有关系可用，另有 ${failedFacts} 条事实尚未完成关系抽取。`
+      : "已有部分关系可用，仍有批次需要重新构建。";
+  }
+  if (status.error === "MODEL_OUTPUT_TRUNCATED" || String(status.error || "").includes("terminal batch")) {
+    return "关系抽取输出超过当前模型容量，可使用自适应拆批重新构建。";
+  }
+  return status.error || "构图只保留可回查事实的关系。";
 });
 const stages = computed(() =>
   task.data.value?.run_mode === "material_comparison"
@@ -508,7 +536,20 @@ function versionsList() {
                   ? "Graph RAG 已启用"
                   : "图谱观测模式"
               }}</span
-            ><small>关系只保存有事实依据的实体联系。</small>
+            ><small>关系只保存有事实依据的实体联系。</small
+            ><span
+              v-if="graphBuildActive"
+              class="badge warning"
+              >正在构建</span
+            ><span
+              v-else-if="graphBuildStatus === 'partial_ready'"
+              class="badge warning"
+              >部分完成</span
+            ><span
+              v-else-if="graphBuildStatus === 'degraded'"
+              class="badge danger"
+              >构建失败</span
+            >
           </div>
           <GraphNetwork
             v-if="graph.data.value?.edges?.length"
@@ -552,7 +593,13 @@ function versionsList() {
           <div v-if="!graph.data.value?.edges?.length" class="empty">
             <div>
               <strong>尚未形成可展示的关系网络</strong
-              >构图只保留可回查事实的关系。
+              ><span>{{ graphBuildMessage }}</span
+              ><button
+                v-if="graph.data.value?.mode !== 'off'"
+                class="btn"
+                :disabled="rebuildGraph.isPending.value || graphBuildActive"
+                @click="rebuildGraph.mutate()"
+              >{{ graphBuildActive ? '正在重建' : '重新构建关系网络' }}</button>
             </div>
           </div></template
         ><template v-else-if="analysisType === 'conflicts'"

@@ -1,9 +1,12 @@
 import unittest
 import inspect
+from unittest.mock import patch
 
 from app.evidence.extractor import EvidenceAgent
 from app.infrastructure.orm import Base
 from app.interaction import _artifact_summary, _proposal_instruction
+from app.graph.service import GraphExtractionAgent, _extract_adaptive, _fact_batches
+from app.context import ContextManager
 from app.material_comparison import (
     CHANGE_TYPES,
     _candidate_sets,
@@ -25,9 +28,57 @@ from app.memory.style_jobs import run_job as run_style_job
 from app.models.memory import StyleVariant
 from app.rendering.headings import HeadingNumbering, format_heading, strip_heading_prefix
 from app.writing.writer import _clean_generated_subheading, _style_sample_type
+from app.workflow.controller import _graph_artifact_status
 
 
 class ProductExtensionTests(unittest.TestCase):
+    def test_graph_truncation_splits_instead_of_repeating_the_same_batch(self):
+        calls = []
+
+        def extract(batch):
+            calls.append([item["id"] for item in batch])
+            if len(batch) > 2:
+                raise RuntimeError("MODEL_OUTPUT_TRUNCATED")
+            return {"entities": [], "assertions": []}
+
+        outcome = _extract_adaptive([{"id": value} for value in range(1, 6)], extract)
+        self.assertEqual(len(outcome.payloads), 3)
+        self.assertEqual(outcome.failures, [])
+        self.assertEqual(outcome.split_count, 2)
+        self.assertEqual(calls[0], [1, 2, 3, 4, 5])
+        self.assertNotEqual(calls[1], calls[0])
+
+    def test_graph_terminal_failure_reports_affected_fact_ids(self):
+        outcome = _extract_adaptive(
+            [{"id": 7}], lambda _batch: (_ for _ in ()).throw(RuntimeError("MODEL_OUTPUT_TRUNCATED")),
+        )
+        self.assertEqual(outcome.payloads, [])
+        self.assertEqual(outcome.failures[0]["fact_ids"], [7])
+        self.assertFalse(GraphExtractionAgent().should_retry(RuntimeError("MODEL_OUTPUT_TRUNCATED")))
+
+    def test_graph_batch_limit_is_a_resource_setting_not_semantic_selection(self):
+        facts = [{"id": value, "content": f"事实 {value}"} for value in range(25)]
+        with patch("app.graph.service.settings.graph_facts_per_batch", 8):
+            batches = _fact_batches(facts)
+        self.assertEqual(sum(len(batch) for batch in batches), len(facts))
+        self.assertLessEqual(max(len(batch) for batch in batches), 8)
+
+    def test_graph_artifact_status_never_marks_degraded_or_queued_as_done(self):
+        self.assertEqual(_graph_artifact_status({"status": "pending"}), "pending")
+        self.assertEqual(_graph_artifact_status({"status": "queued"}), "pending")
+        self.assertEqual(_graph_artifact_status({"status": "degraded"}), "failed")
+        self.assertEqual(_graph_artifact_status({"status": "partial_ready"}), "partial")
+
+    def test_context_budget_tracks_serving_window_and_stage_reserves(self):
+        with (
+            patch("app.context.settings.model_context_window_tokens", 16000),
+            patch("app.context.settings.structured_output_tokens", 3000),
+            patch("app.context.settings.prompt_overhead_tokens", 2000),
+            patch("app.context.settings.safety_margin_tokens", 1000),
+            patch("app.context.settings.max_context_chars", 20000),
+        ):
+            self.assertEqual(ContextManager({}).budget_chars(), 10000)
+
     def test_heading_renderer_replaces_existing_prefix_with_template_numbering(self):
         strategy = HeadingNumbering({1: "cjk_comma", 2: "cjk_parenthesized"})
         self.assertEqual(

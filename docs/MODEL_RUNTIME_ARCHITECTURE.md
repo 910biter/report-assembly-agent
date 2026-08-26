@@ -32,4 +32,42 @@ IRA_INTERACTIVE_CONCURRENCY=1
 IRA_INTERACTIVE_INPUT_TOKENS=6144
 IRA_INTERACTIVE_HISTORY_TOKENS=1536
 IRA_INTERACTIVE_OUTPUT_TOKENS=1024
+IRA_STRUCTURED_OUTPUT_TOKENS=3072
+IRA_FINAL_PLANNER_OUTPUT_TOKENS=4096
+IRA_WRITER_OUTPUT_TOKENS=3072
+IRA_EVIDENCE_OUTPUT_TOKENS=4096
+IRA_GRAPH_OUTPUT_TOKENS=4096
+IRA_GRAPH_FACTS_PER_BATCH=12
+IRA_COMPARISON_OUTPUT_TOKENS=3200
+IRA_STYLE_PROBE_OUTPUT_TOKENS=256
+IRA_STYLE_PROFILE_OUTPUT_TOKENS=4096
 ```
+
+## Stage 容量公式
+
+Evidence 与 Graph 的单批输入遵循：
+
+`stage_input <= context_window - stage_output - prompt_overhead - safety_margin`
+
+Writer 遵循：
+
+`writer_input <= min(max_context_chars, context_window - writer_output - safety_margin - system_prompt)`
+
+交互通道遵循：
+
+`interaction_input + interaction_history + interaction_output + system_prompt < context_window`
+
+Graph 的 `facts_per_batch` 是输出容量边界，不是语义 Top-K。每条 Fact 都必须进入某个批次；若仍发生 `MODEL_OUTPUT_TRUNCATED`，系统递归拆分该批次，禁止用同一批次原样重试。
+
+任何 Stage 的裁剪都必须记录 `raw/context/budget/truncated` 或等价指标。资源不足时允许缩小单批、增加批次或反馈 underfill，不允许静默丢弃 required facts、证据绑定或报告后半部分。固定 Top-K 只能作为候选召回的资源上限，最终选择应遵循“必需项保留、主题覆盖、缺口补检”。
+
+## 硬件迁移验收
+
+每次更换 GPU/NPU、量化精度、推理框架或并发配置后，使用相同 baseline 数据复测：
+
+1. 所有结构化 Stage 的 JSON 完整率为 100%，输出截断率为 0；
+2. Evidence 的 Fact/Evidence 溯源覆盖率不得下降；
+3. Writer 的目标规模完成率和最终报告质量不得下降；
+4. Graph 报告成功批次、自动拆批、终端失败 Fact 数，不允许静默空图；
+5. 记录 P50/P95 的 Context、TTFT、Prefill、Decode、E2E、显存峰值和队列等待；
+6. 在目标并发下验证 KV Cache 不触发 OOM，交互请求不会长期饿死工作流。
