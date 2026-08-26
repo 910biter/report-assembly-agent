@@ -16,7 +16,7 @@ from app.writing.scale_execution import assess_chapter_output, measure_text_word
 class NarrativeScaleTests(unittest.TestCase):
     def test_writer_retrieval_is_coverage_and_context_driven(self):
         manager = ContextManager({"id": "task"})
-        manager.budget_chars = MethodType(lambda self: 1200, manager)
+        manager.budget_chars = MethodType(lambda self, stage="structured": 1200, manager)
         facts = [
             {"id": index, "content": f"fact-{index}-" + "x" * 76}
             for index in range(1, 31)

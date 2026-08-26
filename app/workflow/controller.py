@@ -21,7 +21,6 @@ from app.config import settings
 from app.db import session_scope
 from app.infrastructure.orm import (
     Base,
-    ORMConflict,
     ORMEvidence,
     ORMFact,
     ORMInference,
@@ -793,8 +792,12 @@ class WorkflowController:
                 self._update(material_analysis_progress={"done": index, "total": total})
                 continue
             units = units_by_material.get(material_id, [])
+            from app.runtime_profiles import stage_input_budget_chars
             text, text_meta = _material_understanding_text(
-                units, budget_chars=4000, theme=self.task.get("theme") or "")
+                units,
+                budget_chars=stage_input_budget_chars("material_analyzer"),
+                theme=self.task.get("theme") or "",
+            )
             if not text:
                 continue
             effective_inputs = {
@@ -1040,7 +1043,9 @@ class WorkflowController:
         conflicts = evidence_agent.detect_conflicts(claims, task_id=self.task_id)
         new_ids = [int(c.id) for c in conflicts if c.id is not None]
         self._update(conflict_ids=list(dict.fromkeys(inherited_ids + new_ids)))
-        # Conflict 融入 FactRelation(contradicts 语义落库,供 Ledger/分析引用)
+        # Only comparable, direct contradictions become graph relations.
+        # Qualifications and scope/time differences remain review records so
+        # the graph cannot turn epistemic nuance into a false contradiction.
         claim_fact_ids = {
             int(claim.get("id")): int(claim.get("fact_id"))
             for claim in claims
@@ -1049,6 +1054,8 @@ class WorkflowController:
             and int(claim.get("fact_id") or 0) > 0
         }
         for conflict in conflicts:
+            if conflict.conflict_type != "direct_contradiction":
+                continue
             fact_ids = list(dict.fromkeys(
                 claim_fact_ids[claim_id]
                 for claim_id in (conflict.claim_ids or [])
@@ -1261,9 +1268,8 @@ class WorkflowController:
         conflict_ids = [int(value) for value in self.task.get("conflict_ids", []) if str(value).isdigit()]
         if not conflict_ids:
             return []
-        with session_scope() as s:
-            rows = s.execute(select(ORMConflict).where(ORMConflict.c.id.in_(conflict_ids))).mappings().all()
-        return [{"id": row["id"], "fact_key": row["fact_key"], "entries": row["entries"]} for row in rows]
+        from app.evidence.extractor import load_conflict_records
+        return load_conflict_records(conflict_ids)
 
     def _knowledge_block(self) -> str:
         """Graph RAG is injected per analysis group; no stale global block."""

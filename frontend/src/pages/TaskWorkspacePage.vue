@@ -173,6 +173,28 @@ function confidence(x: any) {
     ] || "需人工复核"
   );
 }
+const conflictTypeLabels: Record<string, string> = {
+  direct_contradiction: "直接矛盾",
+  temporal_difference: "时间变化",
+  scope_difference: "适用范围不同",
+  metric_difference: "统计口径不同",
+  qualification: "补充限定",
+  needs_verification: "待核验",
+};
+function conflictType(item: any) {
+  return conflictTypeLabels[item.conflict_type] || "待核验";
+}
+function conflictConfidence(item: any) {
+  return ({ high: "高置信", medium: "中置信", low: "低置信" } as Record<string, string>)[item.confidence] || "置信度未定";
+}
+function sourceLocation(entry: any) {
+  const location = [
+    entry.file || "来源文件未记录",
+    entry.page ? `第 ${entry.page} 页` : "",
+    entry.paragraph ? `第 ${entry.paragraph} 段` : "",
+  ].filter(Boolean);
+  return location.join(" · ");
+}
 function versionsList() {
   const data = versions.data.value;
   return Array.isArray(data) ? data : data?.versions || [];
@@ -613,16 +635,28 @@ function versionsList() {
           ><article
             v-for="item in conflicts"
             :key="item.id"
-            class="knowledge-item conflict"
+            class="conflict-review"
           >
-            <b>{{ item.fact_key }}</b>
-            <p v-for="entry in item.entries || []" :key="entry.statement">
-              {{ entry.file }}：{{ entry.statement }}
-            </p>
+            <header>
+              <div>
+                <span class="conflict-type" :class="item.conflict_type">{{ conflictType(item) }}</span>
+                <small>{{ conflictConfidence(item) }}</small>
+              </div>
+              <b>{{ item.fact_key }}</b>
+              <p v-if="item.reason">{{ item.reason }}</p>
+            </header>
+            <div class="conflict-compare">
+              <section v-for="(entry, index) in item.entries || []" :key="entry.claim_id || index">
+                <div class="conflict-side"><span>说法 {{ Number(index) + 1 }}</span><small>Fact {{ entry.fact_id || '—' }} · Claim {{ entry.claim_id || '—' }}</small></div>
+                <strong>{{ entry.statement }}</strong>
+                <blockquote v-if="entry.quote">{{ entry.quote }}</blockquote>
+                <footer>{{ sourceLocation(entry) }}<span v-if="entry.unit_id"> · Unit {{ entry.unit_id }}</span></footer>
+              </section>
+            </div>
           </article>
           <div v-if="!conflicts.length" class="empty">
             <div>
-              <strong>未发现明确冲突</strong>冲突核验不会因为结果为空而删除。
+              <strong>未发现需要核验的来源差异</strong>系统仅将可比口径下不能同时成立的说法标为直接矛盾。
             </div>
           </div></template
         ><template v-else
@@ -945,6 +979,75 @@ function versionsList() {
 .knowledge-item.conflict {
   border-left: 2px solid #d39a48;
   padding-left: 14px;
+}
+.conflict-review {
+  margin-bottom: 18px;
+  border: 1px solid var(--color-border);
+  background: var(--color-surface);
+}
+.conflict-review > header {
+  padding: 16px 18px;
+  border-bottom: 1px solid var(--color-border);
+}
+.conflict-review > header > div,
+.conflict-side {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.conflict-review > header b {
+  display: block;
+  margin-top: 10px;
+  font-size: 16px;
+}
+.conflict-review > header p {
+  margin: 7px 0 0;
+  color: var(--color-muted);
+}
+.conflict-type {
+  padding: 3px 7px;
+  border-radius: 3px;
+  background: #edf1f5;
+  color: #4e6072;
+  font-size: 12px;
+  font-weight: 650;
+}
+.conflict-type.direct_contradiction {
+  background: #f8e7e4;
+  color: #91483f;
+}
+.conflict-type.qualification,
+.conflict-type.temporal_difference {
+  background: #fff1d8;
+  color: #7d5a24;
+}
+.conflict-compare {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.conflict-compare > section {
+  min-width: 0;
+  padding: 16px 18px;
+  border-right: 1px solid var(--color-border);
+  border-bottom: 1px solid var(--color-border);
+}
+.conflict-compare > section:nth-child(2n) { border-right: 0; }
+.conflict-side span { color: var(--color-primary); font-weight: 650; }
+.conflict-side small,
+.conflict-review footer { color: var(--color-muted); font-size: 12px; }
+.conflict-compare strong { display: block; margin-top: 12px; line-height: 1.65; }
+.conflict-compare blockquote {
+  margin: 12px 0;
+  padding: 10px 12px;
+  border-left: 2px solid var(--color-border-strong);
+  background: var(--color-surface-soft);
+  color: var(--color-muted);
+  line-height: 1.6;
+}
+@media (max-width: 900px) {
+  .conflict-compare { grid-template-columns: 1fr; }
+  .conflict-compare > section { border-right: 0; }
 }
 .graph-summary,
 .graph-changes,

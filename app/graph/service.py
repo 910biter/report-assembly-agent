@@ -647,13 +647,8 @@ def _extract_adaptive(facts: list[dict], extractor) -> GraphExtractionOutcome:
 
 def _fact_batches(facts: list[dict]) -> list[list[dict]]:
     """Partition facts by both prompt capacity and estimated JSON capacity."""
-    prompt_tokens = max(
-        1024,
-        settings.model_context_window_tokens
-        - settings.graph_output_tokens
-        - settings.prompt_overhead_tokens
-        - settings.safety_margin_tokens,
-    )
+    from app.runtime_profiles import stage_profile
+    prompt_tokens = stage_profile("graph").input_tokens
     max_chars = max(4_000, int(prompt_tokens * 2.2))
     # Entity + assertion JSON is output-heavy. This is a protocol/resource
     # estimate, not a semantic selection rule: every Fact remains included.

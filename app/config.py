@@ -67,6 +67,14 @@ class Settings(BaseSettings):
     comparison_output_tokens: int = 3200
     style_probe_output_tokens: int = 256
     style_profile_output_tokens: int = 4096
+    material_analysis_input_chars: int = 4000
+    material_analysis_output_tokens: int = 2048
+    planner_output_tokens: int = 3072
+    analysis_output_tokens: int = 3072
+    narrative_output_tokens: int = 3072
+    narrative_qa_output_tokens: int = 2048
+    qa_output_tokens: int = 2048
+    conflict_output_tokens: int = 2048
     # Parser and multimodal extraction are Docling-only. The project no longer
     # maintains a separate OCR/ASR/Vision provider path.
     docling_ocr_engine: str = "rapidocr"  # rapidocr(PP-OCRv6,满血)/ auto / easyocr / tesseract

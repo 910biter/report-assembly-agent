@@ -1,6 +1,7 @@
 """Context Manager: build minimal context by workflow stage with hybrid retrieval."""
 
 from app.config import settings
+from app.runtime_profiles import stage_input_budget_chars, stage_profile
 from app.models import Unit
 from app.retrieval.query_compiler import QueryCompiler, RetrievalQuery
 from app.retrieval import embed_texts, vector_store
@@ -69,15 +70,7 @@ def _estimate_tokens(text: str) -> int:
 def _evidence_batch_budget() -> int:
     """单批可用 tokens = 模型窗口 - 输出预留 - 固定 prompt 开销 - 安全余量。
     额外再留 20% 余量(A 辅):防 token 估算偏差与输出抖动,确保模型有空间收尾输出完整 JSON。"""
-    from app.config import settings
-
-    usable = (
-        settings.model_context_window_tokens
-        - settings.evidence_output_tokens
-        - settings.prompt_overhead_tokens
-        - settings.safety_margin_tokens
-    )
-    return max(1024, int(usable * 0.8))
+    return max(1024, int(stage_profile("evidence").input_tokens * 0.8))
 
 
 def _dynamic_cutoff(scores: list[float]) -> int:
@@ -161,17 +154,9 @@ class ContextManager:
                 if unit.id is not None:
                     self._unit_index[unit.id] = (material_id, unit)
 
-    def budget_chars(self) -> int:
-        # Chinese is conservatively treated as roughly one token per
-        # character. This retrieval budget must shrink or grow with the
-        # serving window instead of preserving the historical 24K-char cap.
-        usable_tokens = (
-            int(settings.model_context_window_tokens)
-            - int(settings.structured_output_tokens)
-            - int(settings.prompt_overhead_tokens)
-            - int(settings.safety_margin_tokens)
-        )
-        return max(1024, min(int(settings.max_context_chars), usable_tokens))
+    def budget_chars(self, stage: str = "structured") -> int:
+        """Return the stage contract's input budget within one physical window."""
+        return stage_input_budget_chars(stage)
 
     def retrieve_units(self, query: str, top_k: int = 8,
                        keywords: list[str] | None = None) -> list[str]:
@@ -256,17 +241,13 @@ class ContextManager:
         if policy_block:
             lines.append(policy_block)
         lines.append(style_block or "")
-        # Final Planner needs a larger output contract than ordinary analysis
-        # agents. Reserve that output plus the system prompt and tokenizer
-        # variance instead of filling the whole generic context budget.
+        # Initial planning has its own structured-output contract; final report
+        # planning is budgeted separately after Evidence and Analysis.
         final_budget_chars = max(
             4000,
             min(
-                self.budget_chars(),
-                int(settings.model_context_window_tokens)
-                - int(settings.final_planner_output_tokens)
-                - int(settings.safety_margin_tokens)
-                - 4000,
+                self.budget_chars("planner"),
+                stage_input_budget_chars("planner"),
             ),
         )
         fitted, _meta = _fit_with_meta("\n".join(lines), final_budget_chars)
@@ -314,7 +295,7 @@ class ContextManager:
                 "retrieval_strategy": retrieval_strategy,
             }
         raw = "相关材料片段:\n" + "\n\n".join(blocks)
-        fitted, fit_meta = _fit_with_meta(raw, self.budget_chars() // 2)
+        fitted, fit_meta = _fit_with_meta(raw, self.budget_chars("evidence") // 2)
         return fitted, {
             "dimension": dimension,
             "open_discovery": is_open_discovery,
@@ -583,7 +564,7 @@ class ContextManager:
         if memory_block:
             lines.append(f"历史知识:\n{memory_block}")
         raw = "\n".join(lines)
-        fitted, fit_meta = _fit_with_meta(raw, self.budget_chars())
+        fitted, fit_meta = _fit_with_meta(raw, self.budget_chars("analysis"))
         if fit_meta["truncated"]:
             fitted += (
                 "\n\n[上下文预算提示] 事实过多,本次分析上下文已按当前顺序放入预算内内容;"
@@ -652,7 +633,7 @@ class ContextManager:
         )
         queries = list(dict.fromkeys(str(query).strip() for query in queries if str(query).strip()))
         average_fact_chars = max(1, sum(len(str(f.get("content") or "")) for f in facts) // max(len(facts), 1))
-        fact_char_budget = max(1000, int(self.budget_chars() * 0.55))
+        fact_char_budget = max(1000, int(self.budget_chars("final_planner") * 0.55))
         estimated_capacity = max(1, fact_char_budget // average_fact_chars)
         per_query = max(1, estimated_capacity // max(len(queries), 1))
         for query in queries:
@@ -687,7 +668,7 @@ class ContextManager:
             lines.append(style_block)
         if policy_block:
             lines.append(policy_block)
-        fitted, _meta = _fit_with_meta("\n".join(lines), self.budget_chars())
+        fitted, _meta = _fit_with_meta("\n".join(lines), self.budget_chars("final_planner"))
         return fitted
 
     def for_writer_section(self, chapter: str, facts: list[dict],
@@ -704,7 +685,7 @@ class ContextManager:
             for value in [chapter, *(coverage_queries or [])]
             if str(value or "").strip()
         ))
-        fact_budget = max(1000, int(self.budget_chars() * 0.65))
+        fact_budget = max(1000, int(self.budget_chars("writer") * 0.65))
         average_fact_size = max(
             1,
             sum(len(str(fact.get("content") or "")) + 24 for fact in facts) // max(len(facts), 1),

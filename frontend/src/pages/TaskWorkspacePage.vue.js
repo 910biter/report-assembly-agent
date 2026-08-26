@@ -134,6 +134,28 @@ function control(op) {
 function confidence(x) {
     return ({ high: "高", medium: "中", low: "低" }[String(x.confidence_level || "").toLowerCase()] || "需人工复核");
 }
+const conflictTypeLabels = {
+    direct_contradiction: "直接矛盾",
+    temporal_difference: "时间变化",
+    scope_difference: "适用范围不同",
+    metric_difference: "统计口径不同",
+    qualification: "补充限定",
+    needs_verification: "待核验",
+};
+function conflictType(item) {
+    return conflictTypeLabels[item.conflict_type] || "待核验";
+}
+function conflictConfidence(item) {
+    return { high: "高置信", medium: "中置信", low: "低置信" }[item.confidence] || "置信度未定";
+}
+function sourceLocation(entry) {
+    const location = [
+        entry.file || "来源文件未记录",
+        entry.page ? `第 ${entry.page} 页` : "",
+        entry.paragraph ? `第 ${entry.paragraph} 段` : "",
+    ].filter(Boolean);
+    return location.join(" · ");
+}
 function versionsList() {
     const data = versions.data.value;
     return Array.isArray(data) ? data : data?.versions || [];
@@ -180,6 +202,22 @@ let __VLS_directives;
 /** @type {__VLS_StyleScopedClasses['knowledge-item']} */ ;
 /** @type {__VLS_StyleScopedClasses['inference']} */ ;
 /** @type {__VLS_StyleScopedClasses['knowledge-item']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-review']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-review']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-review']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-review']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-type']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-type']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-type']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-compare']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-compare']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-side']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-side']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-review']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-compare']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-compare']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-compare']} */ ;
+/** @type {__VLS_StyleScopedClasses['conflict-compare']} */ ;
 /** @type {__VLS_StyleScopedClasses['graph-summary']} */ ;
 /** @type {__VLS_StyleScopedClasses['graph-summary']} */ ;
 /** @type {__VLS_StyleScopedClasses['graph-edge']} */ ;
@@ -1048,20 +1086,56 @@ if (__VLS_ctx.task.data.value) {
             for (const [item] of __VLS_vFor((__VLS_ctx.conflicts))) {
                 __VLS_asFunctionalElement1(__VLS_intrinsics.article, __VLS_intrinsics.article)({
                     key: (item.id),
-                    ...{ class: "knowledge-item conflict" },
+                    ...{ class: "conflict-review" },
                 });
-                /** @type {__VLS_StyleScopedClasses['knowledge-item']} */ ;
-                /** @type {__VLS_StyleScopedClasses['conflict']} */ ;
+                /** @type {__VLS_StyleScopedClasses['conflict-review']} */ ;
+                __VLS_asFunctionalElement1(__VLS_intrinsics.header, __VLS_intrinsics.header)({});
+                __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({});
+                __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({
+                    ...{ class: "conflict-type" },
+                    ...{ class: (item.conflict_type) },
+                });
+                /** @type {__VLS_StyleScopedClasses['conflict-type']} */ ;
+                (__VLS_ctx.conflictType(item));
+                __VLS_asFunctionalElement1(__VLS_intrinsics.small, __VLS_intrinsics.small)({});
+                (__VLS_ctx.conflictConfidence(item));
                 __VLS_asFunctionalElement1(__VLS_intrinsics.b, __VLS_intrinsics.b)({});
                 (item.fact_key);
-                for (const [entry] of __VLS_vFor((item.entries || []))) {
-                    __VLS_asFunctionalElement1(__VLS_intrinsics.p, __VLS_intrinsics.p)({
-                        key: (entry.statement),
+                if (item.reason) {
+                    __VLS_asFunctionalElement1(__VLS_intrinsics.p, __VLS_intrinsics.p)({});
+                    (item.reason);
+                }
+                __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
+                    ...{ class: "conflict-compare" },
+                });
+                /** @type {__VLS_StyleScopedClasses['conflict-compare']} */ ;
+                for (const [entry, index] of __VLS_vFor((item.entries || []))) {
+                    __VLS_asFunctionalElement1(__VLS_intrinsics.section, __VLS_intrinsics.section)({
+                        key: (entry.claim_id || index),
                     });
-                    (entry.file);
+                    __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
+                        ...{ class: "conflict-side" },
+                    });
+                    /** @type {__VLS_StyleScopedClasses['conflict-side']} */ ;
+                    __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({});
+                    (Number(index) + 1);
+                    __VLS_asFunctionalElement1(__VLS_intrinsics.small, __VLS_intrinsics.small)({});
+                    (entry.fact_id || '—');
+                    (entry.claim_id || '—');
+                    __VLS_asFunctionalElement1(__VLS_intrinsics.strong, __VLS_intrinsics.strong)({});
                     (entry.statement);
+                    if (entry.quote) {
+                        __VLS_asFunctionalElement1(__VLS_intrinsics.blockquote, __VLS_intrinsics.blockquote)({});
+                        (entry.quote);
+                    }
+                    __VLS_asFunctionalElement1(__VLS_intrinsics.footer, __VLS_intrinsics.footer)({});
+                    (__VLS_ctx.sourceLocation(entry));
+                    if (entry.unit_id) {
+                        __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({});
+                        (entry.unit_id);
+                    }
                     // @ts-ignore
-                    [conflicts, analysisType, graphBuildActive, graphBuildActive, rebuildGraph,];
+                    [conflicts, analysisType, graphBuildActive, graphBuildActive, rebuildGraph, conflictType, conflictConfidence, sourceLocation,];
                 }
                 // @ts-ignore
                 [];

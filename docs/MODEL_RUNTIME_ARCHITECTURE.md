@@ -15,7 +15,7 @@
 
 ## 上下文契约
 
-工作流上下文由各 Stage 按“输入证据 + 固定提示 + 输出预留 + 安全余量”计算，不允许用完整报告历史无限累积。Writer 只接收当前章节或小节所需的覆盖证据、章节关系、已使用事实标识和压缩后的 Report Memory。
+工作流共用一个物理窗口，但不共用一套输入/输出比例。`app/runtime_profiles.py` 为每个 Stage 声明 workload、输出预留、装箱方式和延迟等级，并统一按“输入证据 + 固定提示 + 阶段输出预留 + 安全余量”计算。Writer 只接收当前章节或小节所需的覆盖证据、章节关系、已使用事实标识和压缩后的 Report Memory。
 
 交互上下文只包含当前任务边界、当前产物、直接绑定的 Fact/Inference/Evidence、少量相关内容、最近完整对话和已确认变更。Fact、Inference 和 Evidence 必须通过当前任务的 ID 白名单读取。交互消息不得成为正式事实来源；只有用户接受 ChangeProposal 后，系统才按影响范围生成可审阅候选版本。
 
@@ -32,10 +32,18 @@ IRA_INTERACTIVE_CONCURRENCY=1
 IRA_INTERACTIVE_INPUT_TOKENS=6144
 IRA_INTERACTIVE_HISTORY_TOKENS=1536
 IRA_INTERACTIVE_OUTPUT_TOKENS=1024
+IRA_MATERIAL_ANALYSIS_INPUT_CHARS=4000
 IRA_STRUCTURED_OUTPUT_TOKENS=3072
+IRA_MATERIAL_ANALYSIS_OUTPUT_TOKENS=2048
+IRA_PLANNER_OUTPUT_TOKENS=3072
 IRA_FINAL_PLANNER_OUTPUT_TOKENS=4096
 IRA_WRITER_OUTPUT_TOKENS=3072
 IRA_EVIDENCE_OUTPUT_TOKENS=4096
+IRA_CONFLICT_OUTPUT_TOKENS=2048
+IRA_ANALYSIS_OUTPUT_TOKENS=3072
+IRA_NARRATIVE_OUTPUT_TOKENS=3072
+IRA_NARRATIVE_QA_OUTPUT_TOKENS=2048
+IRA_QA_OUTPUT_TOKENS=2048
 IRA_GRAPH_OUTPUT_TOKENS=4096
 IRA_GRAPH_FACTS_PER_BATCH=12
 IRA_COMPARISON_OUTPUT_TOKENS=3200
@@ -45,13 +53,11 @@ IRA_STYLE_PROFILE_OUTPUT_TOKENS=4096
 
 ## Stage 容量公式
 
-Evidence 与 Graph 的单批输入遵循：
+所有 Stage 遵循同一个物理不变量：
 
 `stage_input <= context_window - stage_output - prompt_overhead - safety_margin`
 
-Writer 遵循：
-
-`writer_input <= min(max_context_chars, context_window - writer_output - safety_margin - system_prompt)`
+但 `stage_output`、输入装箱方式、批粒度和延迟优先级按 Stage 分别定义；提高窗口时不得绕过 Profile 在局部模块自行放大。
 
 交互通道遵循：
 

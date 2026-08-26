@@ -475,13 +475,8 @@ def _fit_block(text: str, budget_chars: int, overhead_chars: int = 800) -> str:
 
 def _writer_prompt_char_budget() -> int:
     """Conservative user-prompt budget derived from the serving context."""
-    token_budget = (
-        int(settings.model_context_window_tokens)
-        - int(settings.writer_output_tokens)
-        - int(settings.safety_margin_tokens)
-        - len(_SYSTEM)
-    )
-    return max(4000, min(int(settings.max_context_chars), token_budget))
+    from app.runtime_profiles import stage_input_budget_chars
+    return max(4000, stage_input_budget_chars("writer"))
 
 
 def _pack_writer_evidence(
@@ -1529,9 +1524,9 @@ class WriterAgent(BaseAgent):
         )
         tids = {int(fid) for fid in (topic.get("fact_ids") or []) if str(fid).isdigit()}
         support_facts = [f for f in chapter_facts if f.get("id") in tids] or chapter_facts
-        from app.config import settings
+        from app.runtime_profiles import stage_input_budget_chars
 
-        budget = getattr(settings, "max_context_chars", 12000)
+        budget = stage_input_budget_chars("writer")
         topic_block = json.dumps(topic, ensure_ascii=False)
         fact_block = "\n".join(f"{f['id']}. {f.get('content', '')}" for f in support_facts)
         missing = "、".join(qa_item.get("missing_aspects") or []) or "按 Topic 计划完善表达"

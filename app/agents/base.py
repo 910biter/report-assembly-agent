@@ -6,6 +6,7 @@ import threading
 import time
 
 from app.config import settings
+from app.runtime_profiles import stage_profile
 from app.gateway import (
     generation_stats,
     last_generation_meta,
@@ -35,21 +36,23 @@ class BaseAgent:
         return True
 
     def generate(self, prompt: str, system: str | None = None) -> str:
+        output_tokens = stage_profile(self.name).output_tokens
         return self._with_retry(
             lambda: submit_llm_call(lambda: invoke(
                 "agent", model_gateway.generate, prompt,
-                system=system or self.role, max_tokens=self.output_token_limit,
+                system=system or self.role, max_tokens=output_tokens,
             )),
             len(prompt),
         )
 
     def generate_json(self, prompt: str, system: str | None = None,
                       max_tokens: int | None = None) -> dict:
+        output_tokens = int(max_tokens or stage_profile(self.name).output_tokens)
         return self._with_retry(
             lambda: submit_llm_call(lambda: invoke(
                 "agent", model_gateway.generate_json, prompt,
                 system=system or self.role, think=self.thinking,
-                max_tokens=max_tokens or self.output_token_limit,
+                max_tokens=output_tokens,
             )),
             len(prompt),
         )

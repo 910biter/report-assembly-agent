@@ -176,9 +176,9 @@ class NarrativeAgent(BaseAgent):
         action, target_paragraph}], "structure_note": ...};失败返回空 topics。
         """
         plan_for_qa = _strip_plan_for_qa(narrative_plan)
-        from app.config import settings
+        from app.runtime_profiles import stage_input_budget_chars
 
-        budget = getattr(settings, "max_context_chars", 12000)
+        budget = stage_input_budget_chars("narrative_qa")
         draft_block = "\n".join(f"[P{i + 1}] {p}" for i, p in enumerate(draft_paragraphs))
         fact_block = "\n".join(f"{f['id']}. {f.get('content', '')}" for f in facts)
         plan_block = json.dumps(plan_for_qa, ensure_ascii=False)
@@ -193,7 +193,11 @@ class NarrativeAgent(BaseAgent):
             + "\n\n请输出各 Topic 完成度判断 JSON。"
         )
         try:
-            payload = self.generate_json(prompt, system=_QA_SYSTEM)
+            from app.runtime_profiles import stage_profile
+            payload = self.generate_json(
+                prompt, system=_QA_SYSTEM,
+                max_tokens=stage_profile("narrative_qa").output_tokens,
+            )
         except Exception:
             return {"topics": [], "structure_note": ""}
         topics = []

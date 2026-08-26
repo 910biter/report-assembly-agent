@@ -588,7 +588,8 @@ def _build_interaction_prompt(thread: dict, current: dict, message: str) -> str:
     if messages and messages[-1].get("role") == "user" and messages[-1].get("content") == message:
         messages = messages[:-1]
 
-    total_budget = max(2048, int(settings.interactive_input_tokens or 6144))
+    from app.runtime_profiles import stage_input_budget_chars
+    total_budget = stage_input_budget_chars("interaction")
     allocations = {
         "message": min(1400, total_budget // 4),
         "current": min(1700, total_budget // 3),

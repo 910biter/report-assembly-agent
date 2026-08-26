@@ -19,7 +19,6 @@ from app.db import session_scope
 from app.export import export_report
 from app.infrastructure.orm import (
     Base,
-    ORMConflict,
     ORMEvidence,
     ORMFact,
     ORMInference,
@@ -716,16 +715,8 @@ def task_analysis(task_id: str):
                     "confidence_reason": row["confidence_reason"],
                     "uncertainty": row["uncertainty"],
                 })
-        conflicts = []
-        for conflict_id in task.get("conflict_ids", []):
-            row = s.execute(
-                select(ORMConflict).where(ORMConflict.c.id == conflict_id)
-            ).mappings().first()
-            if row is not None:
-                conflicts.append({
-                    "id": row["id"], "fact_key": row["fact_key"],
-                    "entries": json.loads(row["entries"]), "status": row["status"],
-                })
+        from app.evidence.extractor import load_conflict_records
+        conflicts = load_conflict_records(task.get("conflict_ids", []))
     return {"facts": facts, "inferences": inferences, "conflicts": conflicts}
 
 
@@ -1518,6 +1509,7 @@ def decide_change_proposal(proposal_id: int, payload: dict):
 def health():
     """网关连通与模型在位状态(系统设置页使用)。"""
     from app.gateway import model_gateway
+    from app.runtime_profiles import runtime_profile_manifest
 
     generation_url = (
         settings.generation_url
@@ -1543,6 +1535,7 @@ def health():
                 "mode": graph_service.mode,
                 "neo4j_configured": graph_service.projector.available(),
             },
+            "runtime_profiles": runtime_profile_manifest(),
         }
     except Exception as exc:
         return {
