@@ -16,14 +16,18 @@
 | Writer 输出 | `IRA_WRITER_OUTPUT_TOKENS` | 小节写作 | 同时限制单次可见正文规模与证据输入容量 |
 | Graph 输出 | `IRA_GRAPH_OUTPUT_TOKENS` | 关系抽取 | 与 `IRA_GRAPH_FACTS_PER_BATCH` 联动，截断时自动拆批 |
 | 固定开销与余量 | `IRA_PROMPT_OVERHEAD_TOKENS`、`IRA_SAFETY_MARGIN_TOKENS` | 所有动态装箱 | 模型/Chat Template 变化后必须复测 |
-| Writer 文本上限 | `IRA_MAX_CONTEXT_CHARS` | Writer Prompt 装箱 | 是保守字符边界，不应大于派生 Token 容量 |
+| 精确 Tokenizer | `IRA_GENERATION_TOKENIZER_PATH` | `app/context_budget.py` | 指向与 vLLM 完全相同模型的本地 tokenizer；缺失时审计明确标记 `estimated` |
 | 交互上下文 | `IRA_INTERACTIVE_*_TOKENS` | 协作审阅 | 输入、历史、输出之和必须低于物理窗口 |
 | 向量编码长度 | `IRA_EMBEDDING_MAX_LENGTH` | Embedding | 与生成模型窗口无关，受 Embedding 模型上限约束 |
 | 并发与批处理 | `IRA_LLM_CONCURRENCY`、`IRA_EVIDENCE_BATCH_CONCURRENCY`、`IRA_GRAPH_BATCH_CONCURRENCY` | vLLM 调度 | 并发提高会增加 KV Cache/显存压力，可能迫使上下文缩短 |
 
 换硬件时按以下顺序操作：先确定模型精度和单序列最大上下文，再确定最大并发；随后校准各 Stage 输出预留和批大小；最后用 P50/P95 真实 workload 验证截断率、TTFT、Decode、显存峰值和报告质量。不要只修改 `MODEL_CONTEXT_WINDOW_TOKENS`。
 
-`app/runtime_profiles.py` 是阶段容量合同的唯一入口，`/api/health` 会返回实际生效的 Profile 清单。详细公式、当前 24K 基线和验收标准见 [`docs/MODEL_RUNTIME_ARCHITECTURE.md`](docs/MODEL_RUNTIME_ARCHITECTURE.md)。
+`app/runtime_profiles.py` 是阶段容量合同的唯一入口，`app/context_budget.py` 统一负责精确 Token 计量、完整条目装箱、动态余量再分配和调用侧审计。`/api/health` 会返回实际生效的 Profile 清单。详细公式、当前 24K 基线和验收标准见 [`docs/MODEL_RUNTIME_ARCHITECTURE.md`](docs/MODEL_RUNTIME_ARCHITECTURE.md)。
+
+每次 LLM 调用会在现有 `llm_call_logs.funnel_json.context_audit` 中记录预算、实际装箱 Token、利用率、省略条目、分区覆盖和 tokenizer 方法。任务级 Token 效率与 workload 汇总会输出各 Stage 的 P50/P95、截断率和 Prompt 开销，可直接用于真实运行校准，不增加同步数据库写入或额外模型调用。
+
+生产校准以推理服务返回的真实 Prefill Token 为基准，按 Stage 比较 `estimated_request_tokens`。要求使用与 vLLM 相同的 tokenizer，Token 绝对估算误差 P95 应不高于 3%；超标时先修正 tokenizer/chat template，不用放宽业务检索或删除证据。无精确 tokenizer 时系统可运行，但会明确标记 `estimated`，仅作为保守降级，不作为正式容量基线。
 
 ### 代码中的上下文敏感点
 

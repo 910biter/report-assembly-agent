@@ -7,11 +7,13 @@ import re
 
 from app.agents.base import BaseAgent
 from app.cache import stable_hash
+from app.context_budget import ContextSection, build_prompt_from_sections
 from app.db import session_scope
 from app.infrastructure.orm import ORMInference, Base
 from sqlalchemy import select
 from app.models import Inference
 from app.token_monitor import current_context, update_call_metrics, update_call_products
+from app.runtime_profiles import stage_input_budget_tokens
 
 _ANALYSIS_TYPES = (
     "OBSERVATION", "CAUSE", "IMPACT", "RISK", "TREND", "PREDICTION",
@@ -198,15 +200,18 @@ class AnalysisAgent(BaseAgent):
             fact_lines = [f"{f['id']}. [{f['sources']}] {f['content']}" for f in facts]
             context_block = "事实清单(编号 + 来源):\n" + "\n".join(fact_lines)
         target_count = _target_local_inference_count(len(facts))
-        prompt = (
+        instruction = (
             f"分析维度:{dimension}\n"
             f"事实数量:{len(facts)}\n"
             f"建议推论数量:{target_count} 条左右;事实很少时可少于该数量,但不得为凑数重复。\n\n"
-            f"{context_block}\n\n"
             "请先按主题/问题/实体/机制/时间线在心中组织事实,再生成该维度的结构化推论层。"
             "每条推论必须表达一个清晰判断,并挂真实 based_fact_ids、confidence_level、confidence_reason、uncertainty。"
             "输出 JSON。"
         )
+        prompt, _audit = build_prompt_from_sections("analysis", [
+            ContextSection("instruction", [instruction], weight=5, required_items=1),
+            ContextSection("facts", context_block.splitlines(), weight=4, required_items=1),
+        ], stage_input_budget_tokens("analysis"))
         payload = self.generate_json(prompt)
         call_id = self.last_call_id
         inferences, _external = self._parse_payload(payload, valid_ids, call_id, facts)
@@ -224,20 +229,20 @@ class AnalysisAgent(BaseAgent):
         if not local_inferences:
             return [], [], {}
         valid_ids = {f["id"] for f in facts}
-        lines = ["各维度局部推断:"]
-        lines.extend(
+        inference_lines = ["各维度局部推断:"]
+        inference_lines.extend(
             f"- [{i.dimension or '未分类'}] {i.content} "
             f"(type={i.analysis_type or 'SYNTHESIS'}, confidence={i.confidence_level}, "
             f"based_fact_ids={i.based_fact_ids}, uncertainty={i.uncertainty or '无'})"
             for i in local_inferences
         )
-        if conflicts:
-            lines.append(f"来源冲突:{conflicts}")
-        prompt = (
-            "\n".join(lines)
-            + "\n\n请基于局部推断与关键事实做跨维度综合研判,输出 3-6 条全局推论。"
-              "每条必须挂真实 based_fact_ids、confidence_level、confidence_reason、uncertainty,输出 JSON。"
-        )
+        instruction = ("请基于局部推断与关键事实做跨维度综合研判,输出 3-6 条全局推论。"
+                       "每条必须挂真实 based_fact_ids、confidence_level、confidence_reason、uncertainty,输出 JSON。")
+        prompt, _audit = build_prompt_from_sections("analysis", [
+            ContextSection("instruction", [instruction], weight=5, required_items=1),
+            ContextSection("local_inferences", inference_lines, weight=4, required_items=1),
+            ContextSection("conflicts", [f"来源冲突:{conflicts}"] if conflicts else [], weight=4, required_items=1),
+        ], stage_input_budget_tokens("analysis"))
         payload = self.generate_json(prompt, system=_GLOBAL_SYSTEM)
         call_id = self.last_call_id
         inferences, external = self._parse_payload(payload, valid_ids, call_id, facts)

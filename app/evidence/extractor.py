@@ -16,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 from app.agents.base import BaseAgent
 from app.cache import stable_hash
 from app.config import settings
+from app.context_budget import ContextSection, build_prompt_from_sections, count_tokens
 from app.db import session_scope
 from app.infrastructure.orm import ORMFact, ORMEvidence, ORMClaim, ORMConflict
 from sqlalchemy import select, update
@@ -505,14 +506,18 @@ class EvidenceAgent(BaseAgent):
         _assert_not_paused(task_id)
         need_block = self._build_need_block(needs_list)
         insight_block = self._build_insight_block([])
-        prompt = (
-            f"{need_block}\n"
-            f"{insight_block}\n"
-            f"材料文本(按来源标注):\n{material_text}\n\n"
-            f"请提取与上述任一 Evidence Need 相关的陈述;每条必须标注属于哪个 need_id。"
+        instruction = (
+            "请提取与上述任一 Evidence Need 相关的陈述;每条必须标注属于哪个 need_id。"
             f"若发现与用户目标明显相关但不属于任何 need 的高价值事实,也提取并标注 need_id=0。"
             f"如果材料覆盖多个平台/标准/攻击/机制,请分别抽取,不要合并成过度概括的一条。输出 JSON。"
         )
+        from app.runtime_profiles import stage_input_budget_tokens
+        prompt, _audit = build_prompt_from_sections("evidence", [
+            ContextSection("instruction", [instruction], weight=5, required_items=1),
+            ContextSection("evidence_needs", need_block.splitlines(), weight=5, required_items=1),
+            ContextSection("material_insight", insight_block.splitlines(), weight=2, required_items=0),
+            ContextSection("material_units", material_text.split("\n\n"), weight=4, required_items=1),
+        ], stage_input_budget_tokens("evidence"))
         prompt_parts = {
             "needs": sum(len(n.get("need", "")) for n in needs_list),
             "material_context": len(material_text or ""),
@@ -855,11 +860,11 @@ class EvidenceAgent(BaseAgent):
 
     @staticmethod
     def _build_material_text(units_by_material: dict[int, list[Unit]], filenames: dict[int, str]) -> str:
-        from app.runtime_profiles import stage_input_budget_chars
+        from app.runtime_profiles import stage_input_budget_tokens
 
         blocks: list[str] = []
         total = 0
-        budget = stage_input_budget_chars("evidence")
+        budget = stage_input_budget_tokens("evidence")
         omitted = 0
         for material_id, units in units_by_material.items():
             for unit in units:
@@ -870,11 +875,12 @@ class EvidenceAgent(BaseAgent):
                     label += f" 第{unit.page}页"
                 label += "]"
                 block = f"{label}\n{unit.content}"
-                if total + len(block) > budget:
+                block_tokens = count_tokens(block)
+                if total + block_tokens > budget:
                     omitted += 1
                     continue
                 blocks.append(block)
-                total += len(block)
+                total += block_tokens
         if omitted:
             blocks.append(
                 f"[上下文预算提示] 另有 {omitted} 个材料单元未进入本次 LLM prompt;"
@@ -895,12 +901,12 @@ def _build_unit_batches(
     pass_name: str,
     known_contents: set[str] | None = None,
 ) -> list[tuple[str, dict]]:
-    from app.runtime_profiles import stage_input_budget_chars
+    from app.runtime_profiles import stage_input_budget_tokens
 
-    budget = stage_input_budget_chars("evidence")
+    budget = stage_input_budget_tokens("evidence")
     batches: list[tuple[str, dict]] = []
     current: list[str] = []
-    current_chars = 0
+    current_tokens = 0
     current_materials: list[int] = []
     current_units: dict[int, int] = {}
     known = sorted(known_contents or set())[:20]
@@ -916,11 +922,12 @@ def _build_unit_batches(
             if unit.page is not None:
                 label += f" | 第{unit.page}页"
             label += f"]\n{text}"
-            if current and current_chars + len(label) > budget:
+            label_tokens = count_tokens(label)
+            if current and current_tokens + label_tokens > budget:
                 batches.append(_finish_unit_batch(prefix, current, current_materials, current_units, pass_name))
-                current, current_chars, current_materials, current_units = [], 0, [], {}
+                current, current_tokens, current_materials, current_units = [], 0, [], {}
             current.append(label)
-            current_chars += len(label)
+            current_tokens += label_tokens
             if material_id not in current_materials:
                 current_materials.append(material_id)
             current_units[material_id] = current_units.get(material_id, 0) + 1

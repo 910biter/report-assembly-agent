@@ -29,6 +29,14 @@ from app.rendering.headings import has_heading_prefix, strip_heading_prefix
 from app.task_artifacts import latest_task_artifact, save_task_artifact
 from app.token_monitor import update_call_funnel, update_call_metrics, update_call_products
 from app.config import settings
+from app.context_budget import (
+    ContextSection,
+    build_prompt_from_sections,
+    count_tokens,
+    publish_context_audit,
+    tokenizer_method,
+    truncate_tokens,
+)
 from app.writing.scale_execution import (
     assess_chapter_output,
     measure_text_words,
@@ -140,7 +148,7 @@ def _int_ids(values) -> list[int]:
 
 def _json_dumps(value, limit: int | None = None) -> str:
     text = json.dumps(value, ensure_ascii=False)
-    return text[:limit] + ("…" if limit and len(text) > limit else "")
+    return truncate_tokens(text, limit) if limit else text
 
 
 def _text_length(text: str) -> int:
@@ -467,31 +475,25 @@ def _writer_policy_only(policy: dict) -> dict:
     }
 
 
-def _fit_block(text: str, budget_chars: int, overhead_chars: int = 800) -> str:
-    """按剩余上下文容量截取单个文本块(预算来自模型上下文物理上限)。"""
-    remaining = max(0, budget_chars - overhead_chars)
-    return text[:remaining] if len(text) > remaining else text
-
-
-def _writer_prompt_char_budget() -> int:
-    """Conservative user-prompt budget derived from the serving context."""
-    from app.runtime_profiles import stage_input_budget_chars
-    return max(4000, stage_input_budget_chars("writer"))
+def _writer_prompt_token_budget() -> int:
+    """Serving-derived Writer input budget in tokens."""
+    from app.runtime_profiles import stage_input_budget_tokens
+    return stage_input_budget_tokens("writer")
 
 
 def _pack_writer_evidence(
     fact_lines: list[str],
     inference_lines: list[str],
-    available_chars: int,
+    available_tokens: int,
 ) -> tuple[list[str], list[str]]:
     """Pack complete traceable lines, preserving both facts and inferences."""
-    available = max(0, int(available_chars or 0))
+    available = max(0, int(available_tokens or 0))
 
     def take(lines: list[str], budget: int) -> tuple[list[str], int]:
         selected: list[str] = []
         used = 0
         for line in lines:
-            cost = len(line) + 1
+            cost = count_tokens(line + "\n")
             if selected and used + cost > budget:
                 break
             if cost > budget:
@@ -1370,11 +1372,31 @@ class WriterAgent(BaseAgent):
             )
 
         empty_prompt = build_prompt([], [])
-        evidence_chars = max(0, _writer_prompt_char_budget() - len(empty_prompt))
+        prompt_budget = _writer_prompt_token_budget()
+        evidence_tokens = max(0, prompt_budget - count_tokens(empty_prompt))
         fact_lines, inference_lines = _pack_writer_evidence(
-            fact_lines, inference_lines, evidence_chars,
+            fact_lines, inference_lines, evidence_tokens,
         )
         prompt = build_prompt(fact_lines, inference_lines)
+        prompt_tokens = count_tokens(prompt)
+        publish_context_audit({
+            "stage": "writer",
+            "tokenizer_method": tokenizer_method(),
+            "budget_tokens": prompt_budget,
+            "actual_tokens": prompt_tokens,
+            "utilization": round(prompt_tokens / max(prompt_budget, 1), 4),
+            "truncated": len(fact_lines) < len(ordered_facts) or len(inference_lines) < len(ordered_inferences),
+            "sections": {
+                "事实": {
+                    "candidate_items": len(ordered_facts), "selected_items": len(fact_lines),
+                    "omitted_items": max(0, len(ordered_facts) - len(fact_lines)),
+                },
+                "推论": {
+                    "candidate_items": len(ordered_inferences), "selected_items": len(inference_lines),
+                    "omitted_items": max(0, len(ordered_inferences) - len(inference_lines)),
+                },
+            },
+        })
         try:
             payload = self.generate_json(prompt)
         except Exception:
@@ -1524,21 +1546,28 @@ class WriterAgent(BaseAgent):
         )
         tids = {int(fid) for fid in (topic.get("fact_ids") or []) if str(fid).isdigit()}
         support_facts = [f for f in chapter_facts if f.get("id") in tids] or chapter_facts
-        from app.runtime_profiles import stage_input_budget_chars
+        from app.runtime_profiles import stage_input_budget_tokens
 
-        budget = stage_input_budget_chars("writer")
+        budget = stage_input_budget_tokens("writer")
         topic_block = json.dumps(topic, ensure_ascii=False)
-        fact_block = "\n".join(f"{f['id']}. {f.get('content', '')}" for f in support_facts)
         missing = "、".join(qa_item.get("missing_aspects") or []) or "按 Topic 计划完善表达"
-        prompt = (
-            f"章节:{chapter_title}(局部重写第 {target} 段,保持与前后段衔接)\n"
-            f"Narrative Topic 计划:{_fit_block(topic_block, budget)}\n"
-            f"待改进方面:{missing}\n"
-            f"原段落:{_fit_block(original, budget)}\n"
-            f"支撑事实:\n{_fit_block(fact_block, budget)}\n"
-            "请重写该段落:解决待改进方面,用支撑事实展开,不要罗列事实编号,"
-            "不要重复段落外的内容。输出 JSON,优先只包含 paragraphs 字段"
-            "(一个自然段对象,内部 sentences 每项含 text/fact_ids/inference_ids)。"
+        prompt, _audit = build_prompt_from_sections(
+            "writer",
+            [
+                ContextSection("任务", [
+                    f"章节:{chapter_title}(局部重写第 {target} 段,保持与前后段衔接)",
+                    f"待改进方面:{missing}",
+                    "请重写该段落:解决待改进方面,用支撑事实展开,不要罗列事实编号,"
+                    "不要重复段落外的内容。输出 JSON,优先只包含 paragraphs 字段"
+                    "(一个自然段对象,内部 sentences 每项含 text/fact_ids/inference_ids)。",
+                ], weight=4, required_items=3),
+                ContextSection("Narrative Topic", ["Narrative Topic 计划:", topic_block], weight=4, required_items=2),
+                ContextSection("原段落", ["原段落:", original], weight=4, required_items=2),
+                ContextSection("支撑事实", ["支撑事实:", *[
+                    f"{fact['id']}. {fact.get('content', '')}" for fact in support_facts
+                ]], weight=5),
+            ],
+            budget,
         )
         try:
             payload = self.generate_json(prompt)

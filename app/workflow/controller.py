@@ -47,6 +47,7 @@ from app.report_versions import (
 from app.task_artifacts import save_task_artifact
 from app.task_runs import update_task_run
 from app.token_monitor import build_token_efficiency, build_workload_profile, token_context
+from app.context_budget import count_tokens, publish_context_audit, tokenizer_method
 
 _MATERIAL_ANALYSIS_PROMPT = """你是材料分析师。理解一份情报材料,输出 JSON:
 {
@@ -792,10 +793,10 @@ class WorkflowController:
                 self._update(material_analysis_progress={"done": index, "total": total})
                 continue
             units = units_by_material.get(material_id, [])
-            from app.runtime_profiles import stage_input_budget_chars
+            from app.runtime_profiles import stage_input_budget_tokens
             text, text_meta = _material_understanding_text(
                 units,
-                budget_chars=stage_input_budget_chars("material_analyzer"),
+                budget_tokens=stage_input_budget_tokens("material_analyzer"),
                 theme=self.task.get("theme") or "",
             )
             if not text:
@@ -837,6 +838,19 @@ class WorkflowController:
                 self._update(material_analysis_progress={"done": index, "total": total})
                 continue
             try:
+                publish_context_audit({
+                    "stage": "material_analyzer",
+                    "tokenizer_method": tokenizer_method(),
+                    "budget_tokens": text_meta.get("budget_tokens", 0),
+                    "actual_tokens": text_meta.get("context_tokens", 0),
+                    "utilization": text_meta.get("utilization", 0),
+                    "truncated": text_meta.get("truncated", False),
+                    "sections": {"材料单元": {
+                        "candidate_items": text_meta.get("total_units", 0),
+                        "selected_items": text_meta.get("selected_units", 0),
+                        "omitted_items": max(0, text_meta.get("total_units", 0) - text_meta.get("selected_units", 0)),
+                    }},
+                })
                 payload = analyzer.generate_json(f"材料文本:\n{text}")
             except Exception:
                 continue
@@ -2365,7 +2379,7 @@ def _report_word_estimate(text: str) -> int:
     return len(re.findall(r"[\u4e00-\u9fff]", raw)) + len(re.findall(r"[A-Za-z0-9]+", raw))
 
 
-def _material_understanding_text(units: list[Unit], budget_chars: int = 4000,
+def _material_understanding_text(units: list[Unit], budget_tokens: int = 4000,
                                  theme: str = "") -> tuple[str, dict]:
     """Select a bounded prompt view without truncating stored Units.
 
@@ -2376,28 +2390,33 @@ def _material_understanding_text(units: list[Unit], budget_chars: int = 4000,
     """
     non_empty = [u for u in units if (u.content or "").strip()]
     raw_chars = sum(len(u.content or "") for u in non_empty)
-    if raw_chars <= budget_chars:
+    raw_tokens = sum(count_tokens(u.content or "") for u in non_empty)
+    if raw_tokens <= budget_tokens:
         text = "\n".join(u.content for u in non_empty)
         return text, {
             "raw_chars": raw_chars,
             "context_chars": len(text),
+            "raw_tokens": raw_tokens,
+            "context_tokens": count_tokens(text),
+            "budget_tokens": budget_tokens,
+            "utilization": round(count_tokens(text) / max(budget_tokens, 1), 4),
             "truncated": False,
             "selected_units": len(non_empty),
             "total_units": len(units),
         }
     anchors = [u for u in non_empty if u.kind in ("heading", "table")]
     body = [u for u in non_empty if u.kind not in ("heading", "table")]
-    selected: list[Unit] = list(anchors)
-    total = sum(len(u.content or "") for u in selected)
+    selected: list[Unit] = []
+    total = 0
     # 任务相关性:正文按主题相关度降序(相关度高的先进入预算)
     if theme:
         body = sorted(body, key=lambda u: _text_relevance(theme, u.content or ""), reverse=True)
-    for unit in body:
-        block_len = len(unit.content or "")
-        if total + block_len > budget_chars:
+    for unit in [*anchors, *body]:
+        block_tokens = count_tokens(unit.content or "")
+        if total + block_tokens > budget_tokens:
             continue
         selected.append(unit)
-        total += block_len
+        total += block_tokens
     seen: set[int] = set()
     blocks: list[str] = []
     for unit in selected:
@@ -2416,6 +2435,10 @@ def _material_understanding_text(units: list[Unit], budget_chars: int = 4000,
     return text, {
         "raw_chars": raw_chars,
         "context_chars": len(text),
+        "raw_tokens": raw_tokens,
+        "context_tokens": count_tokens(text),
+        "budget_tokens": budget_tokens,
+        "utilization": round(count_tokens(text) / max(budget_tokens, 1), 4),
         "truncated": True,
         "selected_units": len(blocks),
         "total_units": len(units),

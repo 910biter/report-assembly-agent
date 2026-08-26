@@ -91,7 +91,7 @@ class VllmGatewayTests(unittest.TestCase):
         facts = ["1. " + "f" * 30, "2. " + "f" * 30, "3. " + "f" * 30]
         inferences = ["10. " + "i" * 20, "11. " + "i" * 20]
         selected_facts, selected_inferences = _pack_writer_evidence(
-            facts, inferences, available_chars=100,
+            facts, inferences, available_tokens=100,
         )
         self.assertTrue(selected_facts)
         self.assertTrue(selected_inferences)
@@ -110,7 +110,7 @@ class VllmGatewayTests(unittest.TestCase):
         for material_id in range(1, 4):
             ranked = []
             for score in (0.9, 0.8, 0.7):
-                ranked.append((score, SimpleNamespace(id=unit_id, content="x" * 100)))
+                ranked.append((score, SimpleNamespace(id=unit_id, content="证" * 100)))
                 unit_id += 1
             candidates.append((material_id, ranked))
         selected = _select_evidence_candidates(candidates, token_budget=400)

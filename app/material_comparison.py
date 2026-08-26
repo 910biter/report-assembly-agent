@@ -15,9 +15,10 @@ from typing import Any
 
 from sqlalchemy import delete, insert, select, update
 
+from app.agents.base import BaseAgent
 from app.config import settings
+from app.context_budget import ContextSection, build_prompt_from_sections
 from app.db import session_scope
-from app.gateway import model_gateway
 from app.infrastructure.orm import (
     ORMEvidence,
     ORMFact,
@@ -26,13 +27,18 @@ from app.infrastructure.orm import (
     ORMMaterialComparisonRun,
     ORMShortMemory,
 )
-from app.llm_scheduler import invoke
+from app.runtime_profiles import stage_input_budget_tokens
 from app.report_versions import get_report_version
 
 CHANGE_TYPES = {
     "addition", "corroboration", "refinement", "update", "conflict",
     "weakening", "related", "irrelevant", "uncertain",
 }
+
+
+class _ComparisonAgent(BaseAgent):
+    name = "comparison"
+    role = "你只负责证据变化分类，不改写报告。"
 
 _CLASSIFY_PROMPT = """你是新增材料变化核验员。请比较“新增事实”和候选基线事实，判断它对基线报告的真实影响。
 只输出 JSON：
@@ -361,13 +367,13 @@ def _classify_batches(candidates: dict[int, list[dict]], focus: str) -> dict[int
     for start in range(0, len(entries), 16):
         batch = entries[start:start + 16]
         try:
-            payload = invoke(
-                "material_comparison",
-                model_gateway.generate_json,
-                _CLASSIFY_PROMPT.replace("{focus}", focus[:1200]).replace("{payload}", _dump(batch)),
-                system="你只负责证据变化分类，不改写报告。",
-                think=False,
-                max_tokens=settings.comparison_output_tokens,
+            instruction = _CLASSIFY_PROMPT.replace("{focus}", focus).replace("{payload}", "")
+            prompt, _audit = build_prompt_from_sections("comparison", [
+                ContextSection("instruction", [instruction], weight=5, required_items=1),
+                ContextSection("candidate_changes", [_dump(item) for item in batch], weight=4, required_items=1),
+            ], stage_input_budget_tokens("comparison"))
+            payload = _ComparisonAgent().generate_json(
+                prompt, max_tokens=settings.comparison_output_tokens,
             )
         except Exception:
             payload = {}

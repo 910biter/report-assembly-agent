@@ -10,13 +10,14 @@ import re
 import shutil
 from pathlib import Path
 
+from app.agents.base import BaseAgent
 from app.config import settings
+from app.context_budget import ContextSection, build_prompt_from_sections
 from app.db import session_scope
 from app.infrastructure.orm import ORMVariant, Base
 from sqlalchemy import select
-from app.gateway import model_gateway
-from app.llm_scheduler import invoke
 from app.models import StyleVariant
+from app.runtime_profiles import stage_input_budget_tokens
 from app.memory.style_profile import (
     aggregate_style_metrics,
     annotate_exemplars,
@@ -25,7 +26,6 @@ from app.memory.style_profile import (
 )
 from app.template_engine import compile_template
 
-_MAX_CHARS_PER_REPORT = 3000
 _SAMPLE_LENGTH = 150
 _STYLE_LEARNER_VERSION = "editorial-v3"
 _DEFAULT_PROFILE_NAME = "综合报告风格"
@@ -33,6 +33,7 @@ _REALIZATION_KEYS = (
     "fact_expression", "judgment_expression", "fact_judgment_transition",
     "information_compression", "attribution_style",
 )
+
 
 # ---------- 风格库(v2):逐份分析 → 聚类 → 变体 ----------
 
@@ -44,6 +45,16 @@ _FEATURE_PROMPT = """分析以下报告的体裁与风格特征,严格输出 JSO
   "structure_notes": "章节组织特点(是否先结论后展开、典型章节顺序)",
   "language_notes": "语言特点(正式程度、句式、数据使用)"
 }"""
+
+
+class _StyleProbeAgent(BaseAgent):
+    name = "style_probe"
+    role = _FEATURE_PROMPT
+
+
+class _StyleProfileAgent(BaseAgent):
+    name = "style_profile"
+    role = "你是机构报告风格分析师。每个字段只写可由样例支持的简洁结论，不输出空泛解释。"
 
 
 def _normalize_profile_label(value, fallback: str = _DEFAULT_PROFILE_NAME) -> str:
@@ -169,12 +180,12 @@ def analyze_library(
         headings = _extract_headings(text, report.get("path"))
         samples = _sample_report(text)
         try:
-            payload = invoke(
-                "template", model_gateway.generate_json,
-                f"报告文本:\n{text[:_MAX_CHARS_PER_REPORT]}",
-                system=_FEATURE_PROMPT,
-                think=False,
-                max_tokens=settings.style_probe_output_tokens,
+            prompt, _audit = build_prompt_from_sections("style_probe", [
+                ContextSection("instruction", ["分析以下报告的体裁与风格特征。"], weight=5, required_items=1),
+                ContextSection("report_paragraphs", [item for item in text.splitlines() if item.strip()], weight=3, required_items=1),
+            ], stage_input_budget_tokens("style_probe"))
+            payload = _StyleProbeAgent().generate_json(
+                prompt, max_tokens=settings.style_probe_output_tokens,
             )
             topic_type = _normalize_profile_label(payload.get("topic_type"))
         except Exception:
@@ -355,15 +366,15 @@ def _build_variant(library_id: int, topic_type: str, members: list[dict]) -> Sty
         f"位置={item.get('structural_role')}\n{str(item.get('content') or '')[:700]}"
         for item in compact_exemplar_bank(all_exemplars, limit=24)
     ) or "(没有可用的自然段样例)"
-    payload = invoke(
-        "template", model_gateway.generate_json,
-        _VARIANT_PROMPT.replace("{type}", topic_type)
-        .replace("{reports}", "\n\n---\n\n".join(report_blocks))
-        + "\n\n"
-        + _STYLE_SAMPLE_NOTE.replace("{style_samples}", sample_packet),
-        system="你是机构报告风格分析师。每个字段只写可由样例支持的简洁结论，不输出空泛解释。",
-        think=False,
-        max_tokens=settings.style_profile_output_tokens,
+    instruction = (_VARIANT_PROMPT.replace("{type}", topic_type).replace("{reports}", "")
+                   + "\n\n" + _STYLE_SAMPLE_NOTE.replace("{style_samples}", ""))
+    prompt, _audit = build_prompt_from_sections("style_profile", [
+        ContextSection("instruction", [instruction], weight=5, required_items=1),
+        ContextSection("report_summaries", report_blocks, weight=3, required_items=1),
+        ContextSection("style_exemplars", sample_packet.split("\n\n"), weight=4, required_items=1),
+    ], stage_input_budget_tokens("style_profile"))
+    payload = _StyleProfileAgent().generate_json(
+        prompt, max_tokens=settings.style_profile_output_tokens,
     )
     _validate_profile_payload(payload)
     structure = payload.get("structure") if isinstance(payload.get("structure"), dict) else {}

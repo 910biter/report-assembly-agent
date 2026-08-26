@@ -20,31 +20,29 @@ class StageRuntimeProfile:
         return max(1, int(getattr(settings, self.output_setting)))
 
     @property
-    def input_tokens(self) -> int:
-        available = (
+    def physical_input_tokens(self) -> int:
+        return (
             int(settings.model_context_window_tokens)
             - self.output_tokens
             - int(settings.prompt_overhead_tokens)
             - int(settings.safety_margin_tokens)
         )
+
+    @property
+    def input_tokens(self) -> int:
+        available = self.physical_input_tokens
         if available < 1024:
             raise ValueError(
                 f"Stage {self.name} leaves only {available} input tokens; "
                 "increase the physical window or reduce output/overhead reserves"
             )
-        return available
-
-    @property
-    def input_chars(self) -> int:
-        caps = [int(settings.max_context_chars), self.input_tokens]
         if self.input_cap_setting:
-            caps.append(int(getattr(settings, self.input_cap_setting)))
-        return max(1024, min(caps))
-
+            available = min(available, int(getattr(settings, self.input_cap_setting)))
+        return available
 
 _PROFILES = {
     "structured": StageRuntimeProfile("structured", "balanced_structured", "structured_output_tokens", "single", "normal"),
-    "material_analyzer": StageRuntimeProfile("material_analyzer", "representative_document_input", "material_analysis_output_tokens", "document_batches", "background", "material_analysis_input_chars"),
+    "material_analyzer": StageRuntimeProfile("material_analyzer", "representative_document_input", "material_analysis_output_tokens", "document_batches", "background", "material_analysis_input_tokens"),
     "planner": StageRuntimeProfile("planner", "medium_input_structured_output", "planner_output_tokens", "single", "normal"),
     "final_planner": StageRuntimeProfile("final_planner", "medium_input_structured_output", "final_planner_output_tokens", "single", "normal"),
     "evidence": StageRuntimeProfile("evidence", "long_input_structured_output", "evidence_output_tokens", "coverage_batches", "throughput"),
@@ -69,8 +67,8 @@ def stage_profile(name: str) -> StageRuntimeProfile:
     return _PROFILES.get(_ALIASES.get(raw, raw), _PROFILES["structured"])
 
 
-def stage_input_budget_chars(name: str) -> int:
-    return stage_profile(name).input_chars
+def stage_input_budget_tokens(name: str) -> int:
+    return stage_profile(name).input_tokens
 
 
 def runtime_profile_manifest() -> list[dict]:
@@ -78,7 +76,8 @@ def runtime_profile_manifest() -> list[dict]:
         "stage": profile.name,
         "workload": profile.workload,
         "input_tokens": profile.input_tokens,
-        "input_chars": profile.input_chars,
+        "physical_input_tokens": profile.physical_input_tokens,
+        "reserved_unused_tokens": profile.physical_input_tokens - profile.input_tokens,
         "output_tokens": profile.output_tokens,
         "batch_policy": profile.batch_policy,
         "latency_class": profile.latency_class,

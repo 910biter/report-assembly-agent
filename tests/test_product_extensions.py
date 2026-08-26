@@ -80,9 +80,8 @@ class ProductExtensionTests(unittest.TestCase):
             patch("app.context.settings.structured_output_tokens", 3000),
             patch("app.context.settings.prompt_overhead_tokens", 2000),
             patch("app.context.settings.safety_margin_tokens", 1000),
-            patch("app.context.settings.max_context_chars", 20000),
         ):
-            self.assertEqual(ContextManager({}).budget_chars(), 10000)
+            self.assertEqual(ContextManager({}).budget_tokens(), 10000)
 
     def test_graph_visualization_materializes_literal_value_targets(self):
         records = {

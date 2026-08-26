@@ -1,25 +1,28 @@
 """Context Manager: build minimal context by workflow stage with hybrid retrieval."""
 
 from app.config import settings
-from app.runtime_profiles import stage_input_budget_chars, stage_profile
+from app.runtime_profiles import stage_input_budget_tokens, stage_profile
+from app.context_budget import ContextSection, build_prompt_from_sections, count_tokens, truncate_tokens
 from app.models import Unit
 from app.retrieval.query_compiler import QueryCompiler, RetrievalQuery
 from app.retrieval import embed_texts, vector_store
 from app.retrieval.rag import hybrid_retrieve_units
 
-def _fit(text: str, budget_chars: int) -> str:
-    if len(text) <= budget_chars:
-        return text
-    return text[:budget_chars]
+def _fit(text: str, budget_tokens: int) -> str:
+    return truncate_tokens(text, budget_tokens)
 
 
-def _fit_with_meta(text: str, budget_chars: int) -> tuple[str, dict]:
-    fitted = _fit(text, budget_chars)
+def _fit_with_meta(text: str, budget_tokens: int) -> tuple[str, dict]:
+    raw_tokens = count_tokens(text)
+    fitted = _fit(text, budget_tokens)
+    context_tokens = count_tokens(fitted)
     return fitted, {
         "raw_chars": len(text or ""),
         "context_chars": len(fitted or ""),
-        "truncated": len(text or "") > len(fitted or ""),
-        "budget_chars": int(budget_chars),
+        "raw_tokens": raw_tokens,
+        "context_tokens": context_tokens,
+        "truncated": raw_tokens > context_tokens,
+        "budget_tokens": int(budget_tokens),
     }
 
 
@@ -39,36 +42,6 @@ def _text_similarity(left: str, right: str, n: int = 2) -> float:
     grams_b = {b[index:index + n] for index in range(len(b) - n + 1)}
     union = grams_a | grams_b
     return len(grams_a & grams_b) / max(len(union), 1)
-
-
-def _pack_complete_lines(lines: list[str], budget_chars: int, omitted_label: str) -> list[str]:
-    """Pack complete semantic records; never cut the final prompt mid-record."""
-    budget = max(0, int(budget_chars or 0))
-    packed: list[str] = []
-    used = 0
-    omitted = 0
-    for raw_line in lines:
-        line = str(raw_line or "").strip()
-        if not line:
-            continue
-        cost = len(line) + 1
-        if used + cost <= budget:
-            packed.append(line)
-            used += cost
-        else:
-            omitted += 1
-    if omitted:
-        marker = f"[覆盖说明] 另有 {omitted} {omitted_label}因当前物理上下文预算未展开，原始数据仍完整保留。"
-        marker_cost = len(marker) + 1
-        while packed and used + marker_cost > budget:
-            removed = packed.pop()
-            used -= len(removed) + 1
-            omitted += 1
-            marker = f"[覆盖说明] 另有 {omitted} {omitted_label}因当前物理上下文预算未展开，原始数据仍完整保留。"
-            marker_cost = len(marker) + 1
-        if marker_cost <= budget:
-            packed.append(marker)
-    return packed
 
 
 def _unit_relevance(unit, query: str, keywords: list[str],
@@ -109,10 +82,7 @@ def _ngram_similarity(left: str, right: str, n: int = 2) -> float:
 
 
 def _estimate_tokens(text: str) -> int:
-    """token 估算:中文按 1 字符≈1 token(纠正此前 2 字符/token 的严重低估——
-    那会导致装箱以为批次不大、实际却塞满窗口、把模型输出区挤没,提取出不了 JSON)。
-    保守偏安全,让装箱后实际批次留在模型窗口内。"""
-    return max(1, len(text or ""))
+    return count_tokens(text)
 
 
 def _evidence_batch_budget() -> int:
@@ -202,9 +172,8 @@ class ContextManager:
                 if unit.id is not None:
                     self._unit_index[unit.id] = (material_id, unit)
 
-    def budget_chars(self, stage: str = "structured") -> int:
-        """Return the stage contract's input budget within one physical window."""
-        return stage_input_budget_chars(stage)
+    def budget_tokens(self, stage: str = "structured") -> int:
+        return stage_input_budget_tokens(stage)
 
     def retrieve_units(self, query: str, top_k: int = 8,
                        keywords: list[str] | None = None) -> list[str]:
@@ -273,33 +242,30 @@ class ContextManager:
     def for_planner(self, theme: str, user_requirements: str,
                     insights: list[dict], style_block: str, business_block: str = "",
                     policy_block: str = "") -> str:
-        lines = [f"用户主题:{theme}", f"用户要求:{user_requirements or '无'}"]
+        header = [f"用户主题:{theme}", f"用户要求:{user_requirements or '无'}"]
+        insight_lines: list[str] = []
         if insights:
-            lines.append("材料摘要(按价值排序,含候选事实要点):")
+            insight_lines.append("材料摘要(按价值排序,含候选事实要点):")
             for insight in insights[:10]:
                 points = " / ".join(insight.get("key_points", [])[:3])
-                lines.append(
+                insight_lines.append(
                     f"- [{insight.get('value_rank', '?')}级] {insight.get('doc_type', '')} "
                     f"{insight.get('topic', '')} 候选事实:{points or '无'} "
                     f"关键实体:{'、'.join(insight.get('entities', [])[:5])} "
                     f"时间:{'、'.join(insight.get('times', [])[:3])}"
                 )
-        if business_block:
-            lines.append(business_block)
-        if policy_block:
-            lines.append(policy_block)
-        lines.append(style_block or "")
-        # Initial planning has its own structured-output contract; final report
-        # planning is budgeted separately after Evidence and Analysis.
-        final_budget_chars = max(
-            4000,
-            min(
-                self.budget_chars("planner"),
-                stage_input_budget_chars("planner"),
-            ),
+        prompt, _audit = build_prompt_from_sections(
+            "planner",
+            [
+                ContextSection("用户目标", header, weight=4, required_items=len(header)),
+                ContextSection("材料摘要", insight_lines, weight=4),
+                ContextSection("业务边界", business_block.splitlines(), weight=2),
+                ContextSection("报告策略", policy_block.splitlines(), weight=2),
+                ContextSection("模板风格", style_block.splitlines(), weight=1.5),
+            ],
+            self.budget_tokens("planner"),
         )
-        fitted, _meta = _fit_with_meta("\n".join(lines), final_budget_chars)
-        return fitted
+        return prompt
 
     def for_evidence(self, dimension: str, insights: list[dict],
                      required_facts: list[str] | None = None) -> str:
@@ -343,7 +309,7 @@ class ContextManager:
                 "retrieval_strategy": retrieval_strategy,
             }
         raw = "相关材料片段:\n" + "\n\n".join(blocks)
-        fitted, fit_meta = _fit_with_meta(raw, self.budget_chars("evidence") // 2)
+        fitted, fit_meta = _fit_with_meta(raw, self.budget_tokens("evidence") // 2)
         return fitted, {
             "dimension": dimension,
             "open_discovery": is_open_discovery,
@@ -603,22 +569,20 @@ class ContextManager:
 
     def for_analysis(self, facts: list[dict], conflicts: list[dict],
                      timeline_block: str, memory_block: str) -> str:
-        lines = ["事实清单(编号 + 来源):"]
-        lines.extend(f"{fact['id']}. [{fact['sources']}] {fact['content']}" for fact in facts)
-        lines.append("来源冲突:")
-        lines.append(json_dumps(conflicts) if conflicts else "无")
-        if timeline_block:
-            lines.append(f"事件时间线:\n{timeline_block}")
-        if memory_block:
-            lines.append(f"历史知识:\n{memory_block}")
-        raw = "\n".join(lines)
-        fitted, fit_meta = _fit_with_meta(raw, self.budget_chars("analysis"))
-        if fit_meta["truncated"]:
-            fitted += (
-                "\n\n[上下文预算提示] 事实过多,本次分析上下文已按当前顺序放入预算内内容;"
-                "完整事实仍保留在数据库,后续写作与溯源不会删除原始数据。"
-            )
-        return fitted
+        fact_lines = ["事实清单(编号 + 来源):"] + [
+            f"{fact['id']}. [{fact['sources']}] {fact['content']}" for fact in facts
+        ]
+        prompt, _audit = build_prompt_from_sections(
+            "analysis",
+            [
+                ContextSection("事实", fact_lines, weight=6),
+                ContextSection("来源冲突", ["来源冲突:", json_dumps(conflicts) if conflicts else "无"], weight=3),
+                ContextSection("事件时间线", ["事件时间线:", *timeline_block.splitlines()], weight=2),
+                ContextSection("历史知识", ["历史知识:", *memory_block.splitlines()], weight=1),
+            ],
+            self.budget_tokens("analysis"),
+        )
+        return prompt
 
     def for_final_planner(self, theme: str, user_requirements: str, plan: dict,
                           facts: list[dict], inferences: list[dict],
@@ -664,22 +628,15 @@ class ContextManager:
             if isinstance(item, dict)
         )
         queries = list(dict.fromkeys(str(query).strip() for query in queries if str(query).strip()))
-        total_budget = self.budget_chars("final_planner")
-        budgets = {
-            "header": int(total_budget * 0.22),
-            "facts": int(total_budget * 0.43),
-            "inferences": int(total_budget * 0.23),
-            "style": int(total_budget * 0.06),
-        }
-        budgets["policy"] = total_budget - sum(budgets.values())
+        total_budget = self.budget_tokens("final_planner")
         critical_ids = {
             int(value) for value in (analysis_meta.get("critical_fact_ids") or [])
             if str(value).isdigit()
         }
-        selected_facts = self._select_final_planner_facts(facts, queries, critical_ids, budgets["facts"])
+        selected_facts = self._select_final_planner_facts(facts, queries, critical_ids, total_budget)
         selected_fact_ids = {int(item.get("id") or 0) for item in selected_facts}
         selected_inferences = self._select_final_planner_inferences(
-            inferences, selected_fact_ids, critical_ids, queries, budgets["inferences"]
+            inferences, selected_fact_ids, critical_ids, queries, total_budget
         )
 
         fact_lines = ["已抽取事实(关键事实 + 多问题/来源覆盖 + 语义去冗余):"]
@@ -706,51 +663,56 @@ class ContextManager:
                 "未展开推论不会从任务中删除。"
             )
 
-        sections = [
-            _pack_complete_lines(header_lines, budgets["header"], "任务与分析摘要条目"),
-            _pack_complete_lines(fact_lines, budgets["facts"], "事实条目"),
-            _pack_complete_lines(inference_lines, budgets["inferences"], "推论条目"),
-            _pack_complete_lines(
-                ["模板/风格信息(格式优先,结构按策略处理):", *(style_block.splitlines() if style_block else ["无"])],
-                budgets["style"], "模板风格条目",
-            ),
-            _pack_complete_lines(
-                ["报告策略:", *(policy_block.splitlines() if policy_block else ["无"])],
-                budgets["policy"], "报告策略条目",
-            ),
-        ]
-        return "\n".join(line for section in sections for line in section)
+        prompt, _audit = build_prompt_from_sections(
+            "final_planner",
+            [
+                ContextSection("任务与分析摘要", header_lines, weight=3, required_items=2),
+                ContextSection("事实", fact_lines, weight=6),
+                ContextSection("推论", inference_lines, weight=4),
+                ContextSection(
+                    "模板风格",
+                    ["模板/风格信息(格式优先,结构按策略处理):", *(style_block.splitlines() if style_block else ["无"])],
+                    weight=1.5,
+                ),
+                ContextSection(
+                    "报告策略", ["报告策略:", *(policy_block.splitlines() if policy_block else ["无"])],
+                    weight=2,
+                ),
+            ],
+            total_budget,
+        )
+        return prompt
 
     def _select_final_planner_facts(self, facts: list[dict], queries: list[str],
-                                    critical_ids: set[int], budget_chars: int) -> list[dict]:
+                                    critical_ids: set[int], budget_tokens: int) -> list[dict]:
         """Select mandatory, source-diverse and topic-diverse facts under one budget."""
         if not facts:
             return []
         by_id = {int(item.get("id")): item for item in facts if item.get("id") is not None}
-        average_size = max(1, sum(len(str(item.get("content") or "")) + 80 for item in facts) // len(facts))
-        capacity = max(1, int(budget_chars) // average_size)
+        average_size = max(1, sum(count_tokens(str(item.get("content") or "")) + 24 for item in facts) // len(facts))
+        capacity = max(1, int(budget_tokens) // average_size)
         per_query = max(2, (capacity + max(len(queries), 1) - 1) // max(len(queries), 1) + 1)
         ranked_groups = [self._retrieve_facts(query, facts, per_query) for query in queries]
         selected: list[dict] = []
         selected_ids: set[int] = set()
         selected_sources: set[str] = set()
-        used_chars = 0
+        used_tokens = 0
 
         def add(item: dict, mandatory: bool = False) -> bool:
-            nonlocal used_chars
+            nonlocal used_tokens
             item_id = int(item.get("id") or 0)
             content = str(item.get("content") or "")
             if not item_id or not content or item_id in selected_ids:
                 return False
-            size = len(content) + 80
-            if not mandatory and used_chars + size > budget_chars:
+            size = count_tokens(content) + 24
+            if not mandatory and used_tokens + size > budget_tokens:
                 return False
             if not mandatory and any(_text_similarity(content, str(old.get("content") or "")) >= 0.82 for old in selected):
                 return False
             selected.append(item)
             selected_ids.add(item_id)
             selected_sources.update(str(value) for value in item.get("source_files") or [] if str(value))
-            used_chars += size
+            used_tokens += size
             return True
 
         for item_id in sorted(critical_ids):
@@ -776,7 +738,7 @@ class ContextManager:
 
     def _select_final_planner_inferences(self, inferences: list[dict], selected_fact_ids: set[int],
                                          critical_fact_ids: set[int], queries: list[str],
-                                         budget_chars: int) -> list[dict]:
+                                         budget_tokens: int) -> list[dict]:
         """Select judgments with visible evidence links and runtime dimension coverage."""
         if not inferences:
             return []
@@ -799,20 +761,20 @@ class ContextManager:
         candidates = linked or ranked
         selected: list[dict] = []
         selected_ids: set[int] = set()
-        used_chars = 0
+        used_tokens = 0
 
         def add(item: dict) -> bool:
-            nonlocal used_chars
+            nonlocal used_tokens
             item_id = int(item.get("id") or 0)
             content = str(item.get("content") or "")
-            size = len(content) + len(str(item.get("based_fact_ids") or [])) + 100
-            if not item_id or not content or item_id in selected_ids or used_chars + size > budget_chars:
+            size = count_tokens(content) + count_tokens(str(item.get("based_fact_ids") or [])) + 32
+            if not item_id or not content or item_id in selected_ids or used_tokens + size > budget_tokens:
                 return False
             if any(_text_similarity(content, str(old.get("content") or "")) >= 0.82 for old in selected):
                 return False
             selected.append(item)
             selected_ids.add(item_id)
-            used_chars += size
+            used_tokens += size
             return True
 
         seen_dimensions: set[str] = set()
@@ -838,10 +800,10 @@ class ContextManager:
             for value in [chapter, *(coverage_queries or [])]
             if str(value or "").strip()
         ))
-        fact_budget = max(1000, int(self.budget_chars("writer") * 0.65))
+        fact_budget = max(1000, int(self.budget_tokens("writer") * 0.65))
         average_fact_size = max(
             1,
-            sum(len(str(fact.get("content") or "")) + 24 for fact in facts) // max(len(facts), 1),
+            sum(count_tokens(str(fact.get("content") or "")) + 8 for fact in facts) // max(len(facts), 1),
         )
         capacity = max(len(required_fact_ids), fact_budget // average_fact_size)
         if top_facts is not None:
@@ -858,17 +820,17 @@ class ContextManager:
             ))
         related_facts = []
         seen: set[int] = set()
-        used_chars = 0
+        used_tokens = 0
         for fact in candidates:
             fact_id = int(fact.get("id") or 0)
             if not fact_id or fact_id in seen:
                 continue
-            size = len(str(fact.get("content") or "")) + 24
-            if fact_id not in required_fact_ids and related_facts and used_chars + size > fact_budget:
+            size = count_tokens(str(fact.get("content") or "")) + 8
+            if fact_id not in required_fact_ids and related_facts and used_tokens + size > fact_budget:
                 continue
             related_facts.append(fact)
             seen.add(fact_id)
-            used_chars += size
+            used_tokens += size
         related_ids = {fact["id"] for fact in related_facts}
         related_inferences = [
             inference for inference in inferences

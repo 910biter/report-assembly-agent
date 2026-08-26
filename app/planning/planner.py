@@ -9,12 +9,14 @@ presentation unless explicitly marked as hard structure.
 import json
 
 from app.agents.base import BaseAgent
+from app.context_budget import ContextSection, build_prompt_from_sections
 from app.db import session_scope
 from app.infrastructure.orm import ORMPlan
 from sqlalchemy import select, update
 from app.models import ReportPlan
 from app.planning.scale import normalize_chapter_budgets, reconcile_scale_budget
 from app.planning.structure import normalize_contract
+from app.runtime_profiles import stage_input_budget_tokens
 
 _SYSTEM = """你是情报报告分析规划师。根据用户主题、材料摘要与机构风格,只制定分析问题与证据提取方向,不要冻结最终报告章节。
 严格输出 JSON,不要任何解释:
@@ -158,7 +160,11 @@ class PlannerAgent(BaseAgent):
 
     def plan(self, context_block: str, user_requirements: str = "") -> ReportPlan:
         """Create an analysis plan before evidence extraction."""
-        payload = self.generate_json(f"{context_block}\n\n请输出分析规划 JSON。")
+        prompt, _audit = build_prompt_from_sections("planner", [
+            ContextSection("instruction", ["请输出分析规划 JSON。"], weight=5, required_items=1),
+            ContextSection("task_context", context_block.splitlines(), weight=3, required_items=1),
+        ], stage_input_budget_tokens("planner"))
+        payload = self.generate_json(prompt)
         plan = ReportPlan(
             title=str(payload.get("title", "")),
             objective=str(payload.get("objective", "")),
@@ -198,12 +204,18 @@ class PlannerAgent(BaseAgent):
             500,
             int(settings.writer_output_tokens * settings.writer_visible_word_token_ratio),
         )
-        payload = self.generate_json(
-            f"{context_block}\n\n"
+        instruction = (
             f"执行资源边界:单个小节一次成文的安全容量约 {safe_unit_words} 字。"
             "章节与小节数量仍由内容逻辑决定，但任何小节的 target_words 不得超过该容量；"
             "较长内容应在规划阶段拆成多个各自有明确研究问题的语义小节，不得依赖 Writer 续写或事后补写。\n"
-            "请输出字段完整、闭合的最终报告结构 JSON。",
+            "请输出字段完整、闭合的最终报告结构 JSON。"
+        )
+        prompt, _audit = build_prompt_from_sections("final_planning", [
+            ContextSection("instruction", [instruction], weight=5, required_items=1),
+            ContextSection("planning_context", context_block.splitlines(), weight=3, required_items=1),
+        ], stage_input_budget_tokens("final_planner"))
+        payload = self.generate_json(
+            prompt,
             system=_FINAL_SYSTEM,
             max_tokens=settings.final_planner_output_tokens,
         )

@@ -2,6 +2,7 @@ import unittest
 from types import MethodType
 
 from app.context import ContextManager
+from app.context_budget import count_tokens
 from app.planning.narrative import _sanitize_plan
 from app.planning.scale import (
     normalize_chapter_budgets,
@@ -16,7 +17,7 @@ from app.writing.scale_execution import assess_chapter_output, measure_text_word
 class NarrativeScaleTests(unittest.TestCase):
     def test_final_planner_context_is_coverage_driven_and_not_first_40_inferences(self):
         manager = ContextManager({"id": "task"})
-        manager.budget_chars = MethodType(lambda self, stage="structured": 5000, manager)
+        manager.budget_tokens = MethodType(lambda self, stage="structured": 5000, manager)
         facts = [
             {
                 "id": index,
@@ -65,7 +66,7 @@ class NarrativeScaleTests(unittest.TestCase):
         self.assertIn("inference_id=99", context)
         self.assertIn("模板风格必须保留", context)
         self.assertIn("报告策略必须保留", context)
-        self.assertLessEqual(len(context), 5000)
+        self.assertLessEqual(count_tokens(context), 5000)
 
     def test_final_planner_fact_selection_preserves_sources_and_removes_semantic_duplicates(self):
         manager = ContextManager({"id": "task"})
@@ -89,7 +90,7 @@ class NarrativeScaleTests(unittest.TestCase):
 
     def test_writer_retrieval_is_coverage_and_context_driven(self):
         manager = ContextManager({"id": "task"})
-        manager.budget_chars = MethodType(lambda self, stage="structured": 1200, manager)
+        manager.budget_tokens = MethodType(lambda self, stage="structured": 1200, manager)
         facts = [
             {"id": index, "content": f"fact-{index}-" + "x" * 76}
             for index in range(1, 31)
