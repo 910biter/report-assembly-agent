@@ -95,6 +95,12 @@ function selectItem(item) {
     });
 }
 function evidenceLabel(item) { return [item.source_file, item.page ? `第 ${item.page} 页` : "", item.paragraph ? `第 ${item.paragraph} 段` : ""].filter(Boolean).join(" · "); }
+function quoteAddsDetail(factContent, quote) {
+    const normalize = (value) => String(value || "").toLowerCase().replace(/[\s，。；：、,.!?！？;:'"“”‘’（）()【】\[\]]/g, "");
+    const fact = normalize(factContent);
+    const source = normalize(quote);
+    return Boolean(fact && source && !fact.includes(source) && !source.includes(fact));
+}
 async function create() {
     if (!files.value?.files?.length) {
         error.value = "请选择新增材料";
@@ -245,6 +251,14 @@ let __VLS_directives;
 /** @type {__VLS_StyleScopedClasses['finding-document']} */ ;
 /** @type {__VLS_StyleScopedClasses['relation-panel']} */ ;
 /** @type {__VLS_StyleScopedClasses['evidence-panel']} */ ;
+/** @type {__VLS_StyleScopedClasses['provenance-row']} */ ;
+/** @type {__VLS_StyleScopedClasses['source-location']} */ ;
+/** @type {__VLS_StyleScopedClasses['source-location']} */ ;
+/** @type {__VLS_StyleScopedClasses['provenance-row']} */ ;
+/** @type {__VLS_StyleScopedClasses['provenance-row']} */ ;
+/** @type {__VLS_StyleScopedClasses['provenance-row']} */ ;
+/** @type {__VLS_StyleScopedClasses['provenance-row']} */ ;
+/** @type {__VLS_StyleScopedClasses['provenance-row']} */ ;
 __VLS_asFunctionalElement1(__VLS_intrinsics.section, __VLS_intrinsics.section)({
     ...{ class: "comparison-workspace" },
     ...{ class: ({ embedded: __VLS_ctx.embedded }) },
@@ -679,7 +693,45 @@ if (__VLS_ctx.detail.data.value) {
             /** @type {__VLS_StyleScopedClasses['baseline']} */ ;
             __VLS_asFunctionalElement1(__VLS_intrinsics.small, __VLS_intrinsics.small)({});
             __VLS_asFunctionalElement1(__VLS_intrinsics.p, __VLS_intrinsics.p)({});
-            (__VLS_ctx.selectedItem.evidence?.baseline_fact?.content || "报告中没有对应事实，这是独立新增信息。");
+            (__VLS_ctx.selectedItem.evidence?.baseline_fact?.content || "报告中没有对应旧事实，这是独立新增信息。");
+            if (__VLS_ctx.selectedItem.evidence?.baseline_fact) {
+                __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
+                    ...{ class: "provenance-list" },
+                });
+                /** @type {__VLS_StyleScopedClasses['provenance-list']} */ ;
+                for (const [source] of __VLS_vFor((__VLS_ctx.selectedItem.evidence?.baseline_fact?.evidence || []))) {
+                    __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
+                        key: (source.evidence_id || source.unit_id),
+                        ...{ class: "provenance-row" },
+                    });
+                    /** @type {__VLS_StyleScopedClasses['provenance-row']} */ ;
+                    __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
+                        ...{ class: "source-location" },
+                    });
+                    /** @type {__VLS_StyleScopedClasses['source-location']} */ ;
+                    __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({});
+                    __VLS_asFunctionalElement1(__VLS_intrinsics.b, __VLS_intrinsics.b)({});
+                    (__VLS_ctx.evidenceLabel(source));
+                    if (__VLS_ctx.quoteAddsDetail(__VLS_ctx.selectedItem.evidence?.baseline_fact?.content, source.quote)) {
+                        __VLS_asFunctionalElement1(__VLS_intrinsics.blockquote, __VLS_intrinsics.blockquote)({});
+                        (source.quote);
+                    }
+                    else {
+                        __VLS_asFunctionalElement1(__VLS_intrinsics.details, __VLS_intrinsics.details)({});
+                        __VLS_asFunctionalElement1(__VLS_intrinsics.summary, __VLS_intrinsics.summary)({});
+                        __VLS_asFunctionalElement1(__VLS_intrinsics.blockquote, __VLS_intrinsics.blockquote)({});
+                        (source.quote);
+                    }
+                    // @ts-ignore
+                    [labels, visibleIndependentItems, evidenceLabel, selectedItem, selectedItem, selectedItem, selectedItem, selectedItem, selectedItem, selectedItem, selectedItem, selectedItem, selectedItem, selectedItem, selectedItem, quoteAddsDetail,];
+                }
+                if (!__VLS_ctx.selectedItem.evidence?.baseline_fact?.evidence?.length) {
+                    __VLS_asFunctionalElement1(__VLS_intrinsics.p, __VLS_intrinsics.p)({
+                        ...{ class: "muted" },
+                    });
+                    /** @type {__VLS_StyleScopedClasses['muted']} */ ;
+                }
+            }
             __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
                 ...{ class: "fact-block current" },
             });
@@ -689,22 +741,34 @@ if (__VLS_ctx.detail.data.value) {
             __VLS_asFunctionalElement1(__VLS_intrinsics.p, __VLS_intrinsics.p)({});
             (__VLS_ctx.selectedItem.evidence?.new_fact?.content);
             __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
-                ...{ class: "source-list" },
+                ...{ class: "provenance-list" },
             });
-            /** @type {__VLS_StyleScopedClasses['source-list']} */ ;
-            __VLS_asFunctionalElement1(__VLS_intrinsics.h4, __VLS_intrinsics.h4)({});
+            /** @type {__VLS_StyleScopedClasses['provenance-list']} */ ;
             for (const [source] of __VLS_vFor((__VLS_ctx.selectedItem.evidence?.new_fact?.evidence || []))) {
-                __VLS_asFunctionalElement1(__VLS_intrinsics.blockquote, __VLS_intrinsics.blockquote)({
+                __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
                     key: (source.evidence_id || source.unit_id),
+                    ...{ class: "provenance-row" },
                 });
+                /** @type {__VLS_StyleScopedClasses['provenance-row']} */ ;
+                __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
+                    ...{ class: "source-location" },
+                });
+                /** @type {__VLS_StyleScopedClasses['source-location']} */ ;
+                __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({});
                 __VLS_asFunctionalElement1(__VLS_intrinsics.b, __VLS_intrinsics.b)({});
                 (__VLS_ctx.evidenceLabel(source));
-                __VLS_asFunctionalElement1(__VLS_intrinsics.p, __VLS_intrinsics.p)({});
-                (source.quote);
-                __VLS_asFunctionalElement1(__VLS_intrinsics.small, __VLS_intrinsics.small)({});
-                (source.unit_id);
+                if (__VLS_ctx.quoteAddsDetail(__VLS_ctx.selectedItem.evidence?.new_fact?.content, source.quote)) {
+                    __VLS_asFunctionalElement1(__VLS_intrinsics.blockquote, __VLS_intrinsics.blockquote)({});
+                    (source.quote);
+                }
+                else {
+                    __VLS_asFunctionalElement1(__VLS_intrinsics.details, __VLS_intrinsics.details)({});
+                    __VLS_asFunctionalElement1(__VLS_intrinsics.summary, __VLS_intrinsics.summary)({});
+                    __VLS_asFunctionalElement1(__VLS_intrinsics.blockquote, __VLS_intrinsics.blockquote)({});
+                    (source.quote);
+                }
                 // @ts-ignore
-                [labels, visibleIndependentItems, evidenceLabel, selectedItem, selectedItem, selectedItem, selectedItem, selectedItem, selectedItem, selectedItem, selectedItem, selectedItem, selectedItem, selectedItem,];
+                [evidenceLabel, selectedItem, selectedItem, selectedItem, selectedItem, quoteAddsDetail,];
             }
             if (!__VLS_ctx.selectedItem.evidence?.new_fact?.evidence?.length) {
                 __VLS_asFunctionalElement1(__VLS_intrinsics.p, __VLS_intrinsics.p)({
