@@ -10,7 +10,7 @@ from app import benchmark_capture
 from app.benchmark_capture import BenchmarkCaptureSink, benchmark_call_context, capture_enrichment, capture_llm_call
 from app.config import settings
 from app.token_monitor import token_context
-from benchmark.dataset import build_dataset, read_captures, select_representative_cases
+from benchmark.dataset import CapturedCall, build_dataset, read_captures, select_representative_cases
 from benchmark.micro import generate_micro_cases
 from benchmark.runner import execute_case, metric_delta, read_cases, run_dataset, validate_output
 
@@ -118,6 +118,21 @@ class _OpenAIHandler(BaseHTTPRequestHandler):
 
 
 class BenchmarkDatasetTests(unittest.TestCase):
+    def test_dataset_uses_agent_as_stage_when_background_call_has_no_task_stage(self):
+        call = CapturedCall(
+            Path("capture.jsonl"),
+            1,
+            {
+                "context": {"stage": ""},
+                "correlation": {"agent": "style_profile"},
+                "request": {},
+                "observed": {"usage": {}},
+            },
+            {},
+        )
+        self.assertEqual(call.stage, "style_profile")
+        self.assertEqual(call.workload, "template_style_learning")
+
     def test_capture_sink_writes_jsonl_without_workflow_dependencies(self):
         with tempfile.TemporaryDirectory() as tmp:
             sink = BenchmarkCaptureSink(Path(tmp), max_queue_size=2)

@@ -20,6 +20,10 @@ def workload_kind(stage: str, agent: str = "") -> str:
         return "post_review_quality_or_memory"
     if normalized_stage in {"interaction", "interactive", "collaboration"}:
         return "interactive_assistant"
+    if normalized_stage in {"style_probe", "style_profile", "template"}:
+        return "template_style_learning"
+    if normalized_stage in {"graph", "graph_build", "graph_extract"}:
+        return "knowledge_graph_construction"
     return "other"
 
 
@@ -30,4 +34,3 @@ def io_pattern(input_tokens: int, output_tokens: int) -> str:
     if ratio <= 0.75:
         return "short_input_long_output"
     return "balanced_input_output"
-

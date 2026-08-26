@@ -54,11 +54,13 @@ class CapturedCall:
 
     @property
     def stage(self) -> str:
-        return str(self.context.get("stage") or "unknown")
+        correlation = dict(self.payload.get("correlation") or {})
+        return str(self.context.get("stage") or correlation.get("agent") or "unknown")
 
     @property
     def workload(self) -> str:
-        return workload_kind(self.stage)
+        correlation = dict(self.payload.get("correlation") or {})
+        return workload_kind(self.stage, str(correlation.get("agent") or ""))
 
     @property
     def error(self) -> str:
