@@ -2066,6 +2066,9 @@ class WorkflowController:
             result.append({
                 "id": row["id"],
                 "content": row["content"],
+                "dimension": row.get("dimension") or "",
+                "fact_type": row.get("fact_type") or "",
+                "need_id": row.get("need_id") or 0,
                 "sources": [ev["quote"] for ev in ev_rows if ev["quote"]],
                 "source_roles": source_roles,
                 "claim_supports": claim_supports,
@@ -2104,6 +2107,11 @@ class WorkflowController:
         return [{
             "id": row["id"], "content": row["content"], "source_level": row["source_level"],
             "based_fact_ids": json.loads(row["based_fact_ids"] or "[]"),
+            "dimension": row.get("dimension") or "",
+            "analysis_type": row.get("analysis_type") or "",
+            "confidence_level": row.get("confidence_level") or "medium",
+            "confidence_reason": row.get("confidence_reason") or "",
+            "uncertainty": row.get("uncertainty") or "",
         } for row in rows if str(row.get("lifecycle_status") or "active") == "active"]
 
     def _style_block(self) -> str:

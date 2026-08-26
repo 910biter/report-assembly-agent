@@ -14,6 +14,79 @@ from app.writing.scale_execution import assess_chapter_output, measure_text_word
 
 
 class NarrativeScaleTests(unittest.TestCase):
+    def test_final_planner_context_is_coverage_driven_and_not_first_40_inferences(self):
+        manager = ContextManager({"id": "task"})
+        manager.budget_chars = MethodType(lambda self, stage="structured": 5000, manager)
+        facts = [
+            {
+                "id": index,
+                "content": f"主题{index % 3}的独立事实{index}，包含可核验数据{index}",
+                "dimension": f"维度{index % 3}",
+                "source_files": [f"source-{index % 4}.pdf"],
+            }
+            for index in range(1, 31)
+        ]
+
+        def fake_retrieve(self, query, source, top_k, used_fact_ids=None):
+            offset = sum(ord(char) for char in query) % 10
+            return (source[offset:] + source[:offset])[:top_k]
+
+        manager._retrieve_facts = MethodType(fake_retrieve, manager)
+        inferences = [{
+            "id": index,
+            "content": f"普通推论{index}",
+            "based_fact_ids": [1],
+            "dimension": "普通维度",
+            "confidence_level": "medium",
+        } for index in range(1, 46)]
+        inferences.append({
+            "id": 99,
+            "content": "关键事实支持的跨维度核心判断",
+            "based_fact_ids": [30],
+            "dimension": "关键维度",
+            "confidence_level": "high",
+        })
+        context = manager.for_final_planner(
+            "测试主题",
+            "覆盖不同来源并形成合理目录",
+            {
+                "core_question": "如何形成结构",
+                "analysis_global_meta": {"critical_fact_ids": [30], "coverage_status": {"维度A": "SUFFICIENT"}},
+                "evidence_needs": [{"need": "识别主要差异"}],
+            },
+            facts,
+            inferences,
+            [],
+            "模板风格必须保留",
+            "报告策略必须保留",
+        )
+
+        self.assertIn("fact_id=30", context)
+        self.assertIn("inference_id=99", context)
+        self.assertIn("模板风格必须保留", context)
+        self.assertIn("报告策略必须保留", context)
+        self.assertLessEqual(len(context), 5000)
+
+    def test_final_planner_fact_selection_preserves_sources_and_removes_semantic_duplicates(self):
+        manager = ContextManager({"id": "task"})
+        facts = [
+            {"id": 1, "content": "甲地区产业规模达到一百亿元", "source_files": ["a.pdf"]},
+            {"id": 2, "content": "甲地区产业规模达到一百亿元", "source_files": ["a.pdf"]},
+            {"id": 3, "content": "乙地区建立了新的监管机制", "source_files": ["b.pdf"]},
+            {"id": 4, "content": "丙地区形成了不同的应用场景", "source_files": ["c.pdf"]},
+        ]
+        manager._retrieve_facts = MethodType(
+            lambda self, query, source, top_k, used_fact_ids=None: source[:top_k], manager
+        )
+
+        selected = manager._select_final_planner_facts(facts, ["产业", "监管"], {4}, 1200)
+        ids = {item["id"] for item in selected}
+        sources = {source for item in selected for source in item["source_files"]}
+
+        self.assertIn(4, ids)
+        self.assertFalse({1, 2} <= ids)
+        self.assertEqual({"a.pdf", "b.pdf", "c.pdf"}, sources)
+
     def test_writer_retrieval_is_coverage_and_context_driven(self):
         manager = ContextManager({"id": "task"})
         manager.budget_chars = MethodType(lambda self, stage="structured": 1200, manager)
