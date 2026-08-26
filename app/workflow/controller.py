@@ -925,12 +925,23 @@ class WorkflowController:
             start_dimension=start_dimension,
             progress_callback=lambda done, total: self._update(evidence_progress={"done": done, "total": total}),
         )
-        # 断点续跑:fact_ids 保留已完成维度 + 追加新增(不覆盖丢失)
+        # A batch can persist Facts before a later batch fails. Recover those
+        # task-owned rows on resume instead of relying only on the final task
+        # payload update, which is intentionally written after extraction.
+        with session_scope() as s:
+            persisted_ids = [
+                int(value)
+                for value in s.execute(
+                    select(ORMFact.c.id).where(ORMFact.c.task_id == self.task_id)
+                ).scalars().all()
+            ]
         existing_ids = [int(x) for x in (self.task.get("fact_ids") or [])]
         new_ids = [int(f.id) for f in facts if f.id is not None]
-        self._update(fact_ids=list(dict.fromkeys(existing_ids + new_ids)))
+        recovered_ids = list(dict.fromkeys(existing_ids + persisted_ids + new_ids))
+        self._update(fact_ids=recovered_ids)
         if self.task.get("incremental_update"):
-            self._update(incremental_new_fact_ids=new_ids)
+            prior_new_ids = [int(x) for x in (self.task.get("incremental_new_fact_ids") or [])]
+            self._update(incremental_new_fact_ids=list(dict.fromkeys(prior_new_ids + persisted_ids + new_ids)))
         fact_payload = [{"id": f.id, "content": f.content, "sources": load_evidence_quotes(f.id)} for f in facts]
         # Intelligence Consolidation:Fact 聚簇(多源印证)+ Ledger 情报底稿
         self._consolidate_intelligence(facts)
