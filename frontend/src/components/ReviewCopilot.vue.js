@@ -40,7 +40,7 @@ const conversationItems = computed(() => {
 const readOnly = computed(() => thread.value?.status === "closed");
 const scopeKey = computed(() => `${props.taskId || "draft"}:${props.reportId || ""}:${props.artifactType}:${props.artifactVersion || ""}:${props.objectId || "root"}`);
 const artifactLabels = {
-    task_draft: "任务需求", task_brief: "任务需求", material_role: "材料理解",
+    task_draft: "任务需求", task_brief: "任务需求", task_control: "任务操作", material_role: "材料理解",
     analysis_plan: "分析规划", fact: "事实", inference: "分析判断",
     final_plan: "报告目录", narrative_plan: "成文组织", report_title: "报告标题",
     section_title: "章节标题", paragraph: "正文段落", sentence: "正文句子",
@@ -51,6 +51,7 @@ watch(scopeKey, async () => {
     thread.value = null;
     message.value = "";
     error.value = "";
+    historyOpen.value = false;
     await loadThreads(true);
 }, { immediate: true });
 watch(() => conversationItems.value.length, async (next, previous) => {
@@ -103,8 +104,6 @@ async function loadThreads(autoSelect) {
             const active = threads.value.find(matchesCurrentScope);
             if (active)
                 await selectThread(active, false);
-            else if (threads.value.length)
-                historyOpen.value = true;
         }
     }
     catch (e) {
@@ -164,23 +163,59 @@ function formatTime(value) {
 function diffValue(value, fallback) {
     if (value == null || value === "")
         return fallback;
-    if (typeof value === "object")
-        return JSON.stringify(value, null, 2);
+    if (Array.isArray(value)) {
+        const rows = value.map((item, index) => {
+            if (item == null)
+                return "";
+            if (typeof item !== "object")
+                return String(item);
+            const content = item.display_title || item.title || item.content || item.summary || item.instruction;
+            return content ? `${index + 1}. ${content}` : "";
+        }).filter(Boolean);
+        return rows.length ? rows.join("\n") : fallback;
+    }
+    if (typeof value === "object") {
+        const rows = Object.entries(value).flatMap(([key, item]) => {
+            const label = fieldLabels[key];
+            if (!label || item == null || typeof item === "object")
+                return [];
+            return [`${label}：${String(item)}`];
+        });
+        return rows.length ? rows.join("\n") : fallback;
+    }
     return String(value);
 }
 const fieldLabels = {
     theme: "报告主题", requirements: "报告要求", content: "内容", title: "标题",
+    tool_name: "执行能力", arguments: "执行参数", instruction: "调整要求",
     material_role: "材料角色", claim_support: "事实边界", allowed_usage: "允许用途",
     forbidden_usage: "禁止用途", missing_information: "缺失信息", chapter_plans: "章节规划",
     narrative_logic: "叙事逻辑", budget: "规模预算", confidence_level: "置信度",
 };
+const toolLabels = {
+    pause_task: "暂停任务", resume_task: "恢复任务", retry_task: "重试任务",
+    regenerate_chapter: "重新生成章节", rerun_final_plan: "重新规划报告结构",
+};
+const impactLabels = {
+    material_analysis: "材料理解", analysis_plan: "分析规划", evidence: "事实与证据",
+    conflict: "冲突核验", analysis: "综合分析", final_plan: "报告目录",
+    narrative_plan: "成文组织", writing: "报告正文", qa: "质量检查", render: "文档导出",
+    lineage_check: "溯源检查",
+};
+function impactText(proposal) {
+    const values = (proposal?.impact?.invalidates || []).map((item) => impactLabels[item]).filter(Boolean);
+    return values.length ? values.join("、") : "仅检查当前内容";
+}
+function riskLabel(value) {
+    return { low: "低", medium: "中", high: "高" }[value] || "待评估";
+}
 function proposalDiffRows(proposal) {
     const after = proposal?.after && typeof proposal.after === "object" ? proposal.after : {};
     const before = proposal?.before && typeof proposal.before === "object" ? proposal.before : {};
-    return Object.keys(after).map((key) => ({
-        key, label: fieldLabels[key] || key,
+    return Object.keys(after).filter((key) => fieldLabels[key]).map((key) => ({
+        key, label: fieldLabels[key],
         before: diffValue(before[key], "未设置"),
-        after: diffValue(after[key], "未设置"),
+        after: key === "tool_name" ? (toolLabels[String(after[key])] || String(after[key])) : diffValue(after[key], "未设置"),
     }));
 }
 async function ensureThread() {
@@ -211,6 +246,7 @@ async function send() {
         const result = await api(`/api/interactions/${active.id}/messages`, jsonInit("POST", {
             content, async: true,
             request_id: globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+            context: props.focus || {},
         }));
         thread.value = result.thread;
         message.value = "";
@@ -438,35 +474,41 @@ if (__VLS_ctx.conversationItems.length) {
                 ...{ class: (item.risk_level === 'high' ? 'danger' : item.risk_level === 'medium' ? 'warning' : '') },
             });
             /** @type {__VLS_StyleScopedClasses['badge']} */ ;
-            (item.risk_level);
-            __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
-                ...{ class: "changed-fields" },
-            });
-            /** @type {__VLS_StyleScopedClasses['changed-fields']} */ ;
-            for (const [row] of __VLS_vFor((__VLS_ctx.proposalDiffRows(item)))) {
-                __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({
-                    key: (row.key),
+            (__VLS_ctx.riskLabel(item.risk_level));
+            if (__VLS_ctx.proposalDiffRows(item).length) {
+                __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
+                    ...{ class: "changed-fields" },
                 });
-                (row.label);
-                // @ts-ignore
-                [artifactLabel, historyOpen, threads, threads, startNewConversation, conversationItems, conversationItems, proposalDiffRows,];
+                /** @type {__VLS_StyleScopedClasses['changed-fields']} */ ;
+                for (const [row] of __VLS_vFor((__VLS_ctx.proposalDiffRows(item)))) {
+                    __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({
+                        key: (row.key),
+                    });
+                    (row.label);
+                    // @ts-ignore
+                    [artifactLabel, historyOpen, threads, threads, startNewConversation, conversationItems, conversationItems, riskLabel, proposalDiffRows, proposalDiffRows,];
+                }
             }
-            __VLS_asFunctionalElement1(__VLS_intrinsics.button, __VLS_intrinsics.button)({
-                ...{ onClick: (...[$event]) => {
-                        if (!(__VLS_ctx.conversationItems.length))
-                            throw 0;
-                        if (!!(item.itemType === 'message'))
-                            throw 0;
-                        return (__VLS_ctx.toggleProposal(item));
-                        // @ts-ignore
-                        [toggleProposal,];
-                    } },
-                ...{ class: "proposal-toggle" },
-                type: "button",
-            });
-            /** @type {__VLS_StyleScopedClasses['proposal-toggle']} */ ;
-            (__VLS_ctx.proposalExpanded(item) ? "收起修改详情" : "查看修改前后");
-            if (__VLS_ctx.proposalExpanded(item)) {
+            if (__VLS_ctx.proposalDiffRows(item).length) {
+                __VLS_asFunctionalElement1(__VLS_intrinsics.button, __VLS_intrinsics.button)({
+                    ...{ onClick: (...[$event]) => {
+                            if (!(__VLS_ctx.conversationItems.length))
+                                throw 0;
+                            if (!!(item.itemType === 'message'))
+                                throw 0;
+                            if (!(__VLS_ctx.proposalDiffRows(item).length))
+                                throw 0;
+                            return (__VLS_ctx.toggleProposal(item));
+                            // @ts-ignore
+                            [proposalDiffRows, toggleProposal,];
+                        } },
+                    ...{ class: "proposal-toggle" },
+                    type: "button",
+                });
+                /** @type {__VLS_StyleScopedClasses['proposal-toggle']} */ ;
+                (__VLS_ctx.proposalExpanded(item) ? "收起修改详情" : "查看修改前后");
+            }
+            if (__VLS_ctx.proposalDiffRows(item).length && __VLS_ctx.proposalExpanded(item)) {
                 __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
                     ...{ class: "diff-preview" },
                 });
@@ -482,10 +524,10 @@ if (__VLS_ctx.conversationItems.length) {
                     __VLS_asFunctionalElement1(__VLS_intrinsics.ins, __VLS_intrinsics.ins)({});
                     (row.after);
                     // @ts-ignore
-                    [proposalDiffRows, proposalExpanded, proposalExpanded,];
+                    [proposalDiffRows, proposalDiffRows, proposalExpanded, proposalExpanded,];
                 }
                 __VLS_asFunctionalElement1(__VLS_intrinsics.small, __VLS_intrinsics.small)({});
-                (item.impact?.invalidates?.join("、") || "局部检查");
+                (__VLS_ctx.impactText(item));
             }
             if (item.status === 'proposed') {
                 __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
@@ -502,7 +544,7 @@ if (__VLS_ctx.conversationItems.length) {
                                 throw 0;
                             return (__VLS_ctx.decide(item, 'accepted'));
                             // @ts-ignore
-                            [decide,];
+                            [impactText, decide,];
                         } },
                     ...{ class: "btn primary" },
                 });
@@ -537,11 +579,9 @@ if (__VLS_ctx.conversationItems.length) {
                 (item.status === "rejected" ? "已拒绝" : __VLS_ctx.executionLabel(item));
                 if (item.candidate_version_id) {
                     __VLS_asFunctionalElement1(__VLS_intrinsics.small, __VLS_intrinsics.small)({});
-                    (item.candidate_version_id);
                 }
                 if (item.execution_error) {
                     __VLS_asFunctionalElement1(__VLS_intrinsics.small, __VLS_intrinsics.small)({});
-                    (item.execution_error);
                 }
             }
         }

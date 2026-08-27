@@ -467,10 +467,10 @@ if (__VLS_ctx.selected) {
             // @ts-ignore
             [tab, confidence, documentRoles, format,];
         }
-        __VLS_asFunctionalElement1(__VLS_intrinsics.details, __VLS_intrinsics.details)({});
-        __VLS_asFunctionalElement1(__VLS_intrinsics.summary, __VLS_intrinsics.summary)({});
-        __VLS_asFunctionalElement1(__VLS_intrinsics.pre, __VLS_intrinsics.pre)({});
-        (JSON.stringify(__VLS_ctx.schema, null, 2));
+        __VLS_asFunctionalElement1(__VLS_intrinsics.p, __VLS_intrinsics.p)({
+            ...{ class: "schema-note" },
+        });
+        /** @type {__VLS_StyleScopedClasses['schema-note']} */ ;
     }
     else if (__VLS_ctx.tab === 'editorial') {
         __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
@@ -495,7 +495,7 @@ if (__VLS_ctx.selected) {
                 __VLS_asFunctionalElement1(__VLS_intrinsics.dd, __VLS_intrinsics.dd)({});
                 (item[1]);
                 // @ts-ignore
-                [tab, confidence, schema, editorialRows, editorialRows,];
+                [tab, confidence, editorialRows, editorialRows,];
             }
         }
         else {

@@ -114,6 +114,8 @@ class OllamaGateway:
                 client.close()
             except Exception:
                 pass
+        if task_id:
+            task_control.raise_if_paused(task_id)
         response.raise_for_status()
         payload = response.json()
         _record_generation_stats(payload)
@@ -278,6 +280,8 @@ class OpenAICompatibleGateway(OllamaGateway):
             if task_id:
                 task_control.unregister_client(task_id, client)
             client.close()
+        if task_id:
+            task_control.raise_if_paused(task_id)
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:

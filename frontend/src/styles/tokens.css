@@ -3,8 +3,9 @@
   --color-surface: #ffffff;
   --color-surface-soft: #f8f9fb;
   --color-text: #20242a;
-  --color-muted: #69707a;
-  --color-faint: #9298a1;
+  --color-muted: #626a75;
+  --color-faint: #7f8792;
+  --color-text-secondary: var(--color-muted);
   --color-border: #e2e5e9;
   --color-border-strong: #d2d7de;
   --color-primary: #245b9e;

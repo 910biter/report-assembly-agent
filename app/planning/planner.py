@@ -189,7 +189,8 @@ class PlannerAgent(BaseAgent):
         plan.analysis_plan_json = _plan_snapshot(plan, "analysis")
         return save_plan(plan)
 
-    def finalize_report_plan(self, plan_id: int, context_block: str) -> ReportPlan:
+    def finalize_report_plan(self, plan_id: int, context_block: str,
+                             required_structure: list[str] | None = None) -> ReportPlan:
         """Freeze the final report structure after Evidence + Analysis."""
         with session_scope() as s:
             existing = s.execute(
@@ -204,11 +205,23 @@ class PlannerAgent(BaseAgent):
             500,
             int(settings.writer_output_tokens * settings.writer_visible_word_token_ratio),
         )
+        structure = []
+        if required_structure:
+            from app.rendering.headings import strip_heading_prefix
+            structure = [strip_heading_prefix(str(item)) for item in required_structure if strip_heading_prefix(str(item))]
+        structure_instruction = ""
+        if structure:
+            structure_instruction = (
+                f"\n用户已明确确认最终目录为 {len(structure)} 章，章节标题和顺序如下：\n"
+                + "\n".join(f"{index + 1}. {title}" for index, title in enumerate(structure))
+                + "\n请在该目录约束内完成每章问题、证据、推论、小节与篇幅规划，不要合并、删减或改名。"
+            )
         instruction = (
             f"执行资源边界:单个小节一次成文的安全容量约 {safe_unit_words} 字。"
             "章节与小节数量仍由内容逻辑决定，但任何小节的 target_words 不得超过该容量；"
             "较长内容应在规划阶段拆成多个各自有明确研究问题的语义小节，不得依赖 Writer 续写或事后补写。\n"
             "请输出字段完整、闭合的最终报告结构 JSON。"
+            + structure_instruction
         )
         prompt, _audit = build_prompt_from_sections("final_planning", [
             ContextSection("instruction", [instruction], weight=5, required_items=1),

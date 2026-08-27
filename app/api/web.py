@@ -20,7 +20,10 @@ def _spa_response():
             {"error": "FRONTEND_NOT_BUILT", "hint": "Run npm run build in frontend/"},
             status_code=503,
         )
-    return FileResponse(_SPA_INDEX)
+    return FileResponse(
+        _SPA_INDEX,
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+    )
 
 
 @web_router.get("/")

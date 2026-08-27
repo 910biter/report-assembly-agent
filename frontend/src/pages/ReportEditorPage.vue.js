@@ -1,11 +1,10 @@
-import { computed, ref } from "vue";
+import { computed, nextTick, ref, watch } from "vue";
 import { useQuery, useQueryClient } from "@tanstack/vue-query";
 import { useRoute, RouterLink } from "vue-router";
 import { api, jsonInit } from "@/api/http";
 import StatusBadge from "@/components/StatusBadge.vue";
 import VersionReviewWorkspace from "@/components/VersionReviewWorkspace.vue";
 import MaterialComparisonWorkspace from "@/components/MaterialComparisonWorkspace.vue";
-import ReviewCopilot from "@/components/ReviewCopilot.vue";
 const route = useRoute();
 const queryClient = useQueryClient();
 const reportId = Number(route.params.reportId);
@@ -21,6 +20,9 @@ const updateReason = ref("");
 const incrementalFiles = ref();
 const incrementalMaterialIds = ref([]);
 const sourceComparisonId = ref(null);
+const qaTargetSentenceId = ref(null);
+const paperRef = ref(null);
+const selectionAction = ref(null);
 const report = useQuery({
     queryKey: ["report", reportId],
     queryFn: () => api(`/api/reports/${reportId}`),
@@ -37,21 +39,169 @@ const discussionTarget = computed(() => discussionScope.value || {
     objectId: "",
     current: { title: report.data.value?.title || "" },
 });
-function choose(sentence) {
-    selected.value = sentence;
-    discussionScope.value = {
-        artifactType: "sentence",
-        objectId: sentence.id,
+function allSentences() {
+    return (report.data.value?.sections || []).flatMap((section) => (section.paragraphs || []).flatMap((paragraph) => paragraph.sentences || []));
+}
+function sentenceRefs(sentence) {
+    return {
+        fact_ids: [...new Set([
+                ...(sentence.fact_ids || []),
+                ...(sentence.sources || sentence.facts || []).map((item) => item.fact_id || item.id),
+            ].filter(Boolean))],
+        inference_ids: [...new Set([
+                ...(sentence.inference_ids || []),
+                ...(sentence.inferences || []).map((item) => item.inference_id || item.id),
+            ].filter(Boolean))],
+    };
+}
+function sentenceArtifact(sentence, quote = "") {
+    return {
+        artifact_type: "sentence",
+        object_id: sentence.id,
+        artifact_version: String(report.data.value?.versions?.[0]?.version_no || 1),
+        current: { content: sentence.content, quote: quote || sentence.content, source_refs: sentenceRefs(sentence) },
+        title: "正文句子",
+    };
+}
+function paragraphArtifact(section, paragraph, paragraphIndex, quote = "") {
+    const sentences = paragraph.sentences || [];
+    const refs = sentences.map(sentenceRefs);
+    const content = sentences.map((item) => item.content).filter(Boolean).join("");
+    return {
+        artifact_type: "paragraph",
+        object_id: `${section.title}:${paragraphIndex + 1}`,
+        artifact_version: String(report.data.value?.versions?.[0]?.version_no || 1),
         current: {
-            content: sentence.content,
+            section: section.title, paragraph: paragraphIndex + 1, content, quote: quote || content,
+            sentence_ids: sentences.map((item) => item.id),
             source_refs: {
-                fact_ids: sentence.fact_ids || [],
-                inference_ids: sentence.inference_ids || [],
+                fact_ids: [...new Set(refs.flatMap((item) => item.fact_ids))],
+                inference_ids: [...new Set(refs.flatMap((item) => item.inference_ids))],
             },
         },
+        title: `${section.display_title || section.title} · 第 ${paragraphIndex + 1} 段`,
+    };
+}
+function dispatchAssistant(artifact, reference, append = false) {
+    window.dispatchEvent(new CustomEvent("ira:assistant-focus", {
+        detail: { taskId: report.data.value?.task_id, artifact, reference, append },
+    }));
+}
+async function locateIssue(issue) {
+    sideTab.value = "qa";
+    const sentenceId = Number(issue?.sentence_id || 0);
+    if (sentenceId) {
+        qaTargetSentenceId.value = sentenceId;
+        const sentence = allSentences().find((item) => Number(item.id) === sentenceId);
+        if (sentence)
+            selected.value = sentence;
+        await nextTick();
+        document.getElementById(`sentence-${sentenceId}`)?.scrollIntoView({ behavior: "smooth", block: "center" });
+        return;
+    }
+    const section = String(issue?.section || "");
+    const sectionIndex = (report.data.value?.sections || []).findIndex((item) => item.title === section);
+    if (sectionIndex >= 0) {
+        await nextTick();
+        document.getElementById(`section-${sectionIndex}`)?.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
+}
+watch(() => report.data.value, async (value) => {
+    if (!value)
+        return;
+    if (route.query.panel === "qa")
+        sideTab.value = "qa";
+    const sentenceId = Number(route.query.qa_sentence || 0);
+    const section = String(route.query.qa_section || "");
+    if (sentenceId || section)
+        await locateIssue({ sentence_id: sentenceId || undefined, section });
+}, { immediate: true });
+function choose(sentence) {
+    selected.value = sentence;
+    const artifact = sentenceArtifact(sentence);
+    discussionScope.value = {
+        artifactType: artifact.artifact_type,
+        objectId: artifact.object_id,
+        current: artifact.current,
     };
     if (mode.value === "trace")
         sideTab.value = "evidence";
+}
+function discussParagraph(section, paragraph, paragraphIndex) {
+    const artifact = paragraphArtifact(section, paragraph, paragraphIndex);
+    discussionScope.value = { artifactType: artifact.artifact_type, objectId: artifact.object_id, current: artifact.current };
+    dispatchAssistant(artifact);
+}
+function referenceSelectedSentence() {
+    if (!currentDetails.value)
+        return;
+    const artifact = sentenceArtifact(currentDetails.value);
+    dispatchAssistant(artifact, artifact, true);
+}
+function askAboutIssue(issue) {
+    const sentence = allSentences().find((item) => Number(item.id) === Number(issue?.sentence_id || 0));
+    const target = sentence ? sentenceArtifact(sentence) : undefined;
+    const reference = {
+        artifact_type: "qa_issue", object_id: String(issue?.sentence_id || issue?.section || ""),
+        current: { section: issue?.section || "", quote: issue?.quote || "", note: issue?.note || issue?.message || "" },
+        title: "质量问题",
+    };
+    dispatchAssistant(target, reference, true);
+}
+function captureSelection(event) {
+    const selection = window.getSelection();
+    const text = String(selection?.toString() || "").replace(/\s+/g, " ").trim();
+    if (!selection || selection.rangeCount === 0 || text.length < 2 || !paperRef.value) {
+        selectionAction.value = null;
+        return;
+    }
+    const range = selection.getRangeAt(0);
+    if (!paperRef.value.contains(range.commonAncestorContainer))
+        return;
+    const elements = [...paperRef.value.querySelectorAll(".sentence")]
+        .filter((element) => { try {
+        return range.intersectsNode(element);
+    }
+    catch {
+        return false;
+    } });
+    const sentences = elements.map((element) => allSentences().find((item) => String(item.id) === element.id.replace("sentence-", ""))).filter(Boolean);
+    const firstElement = elements[0];
+    const paragraphElement = firstElement?.closest(".paragraph-block");
+    let artifact;
+    if (sentences.length === 1)
+        artifact = sentenceArtifact(sentences[0], text);
+    else if (paragraphElement && elements.every((element) => element.closest(".paragraph-block") === paragraphElement)) {
+        const sectionIndex = Number(paragraphElement.dataset.sectionIndex || 0);
+        const paragraphIndex = Number(paragraphElement.dataset.paragraphIndex || 0);
+        const section = report.data.value?.sections?.[sectionIndex];
+        if (section?.paragraphs?.[paragraphIndex]) {
+            artifact = paragraphArtifact(section, section.paragraphs[paragraphIndex], paragraphIndex, text);
+        }
+    }
+    if (!artifact) {
+        const refs = sentences.map(sentenceRefs);
+        artifact = {
+            artifact_type: "report_excerpt", object_id: "selection", title: "报告选段",
+            current: { quote: text.slice(0, 2000), sentence_ids: sentences.map((item) => item.id), source_refs: {
+                    fact_ids: [...new Set(refs.flatMap((item) => item.fact_ids))],
+                    inference_ids: [...new Set(refs.flatMap((item) => item.inference_ids))],
+                } },
+        };
+    }
+    selectionAction.value = {
+        artifact,
+        x: Math.min(window.innerWidth - 170, Math.max(12, event.clientX + 8)),
+        y: Math.min(window.innerHeight - 52, Math.max(12, event.clientY + 8)),
+    };
+}
+function sendSelectionReference() {
+    const artifact = selectionAction.value?.artifact;
+    if (!artifact)
+        return;
+    dispatchAssistant(["sentence", "paragraph"].includes(artifact.artifact_type) ? artifact : undefined, artifact, true);
+    selectionAction.value = null;
+    window.getSelection()?.removeAllRanges();
 }
 function discussTitle() {
     discussionScope.value = {
@@ -59,7 +209,7 @@ function discussTitle() {
         objectId: "",
         current: { title: report.data.value?.title || "" },
     };
-    sideTab.value = "discuss";
+    openTaskAssistant();
 }
 function discussSection(section) {
     discussionScope.value = {
@@ -67,7 +217,22 @@ function discussSection(section) {
         objectId: section.title,
         current: { title: section.title },
     };
-    sideTab.value = "discuss";
+    openTaskAssistant();
+}
+function openTaskAssistant() {
+    const target = discussionTarget.value;
+    window.dispatchEvent(new CustomEvent("ira:assistant-focus", {
+        detail: {
+            taskId: report.data.value?.task_id,
+            artifact: {
+                artifact_type: target.artifactType,
+                object_id: target.objectId,
+                artifact_version: String(report.data.value?.versions?.[0]?.version_no || 1),
+                current: target.current,
+                title: target.artifactType === "sentence" ? "当前正文句子" : target.artifactType === "section_title" ? "当前章节标题" : "报告标题",
+            },
+        },
+    }));
 }
 function comparisonHandoff(payload) {
     incrementalMaterialIds.value = payload.material_ids || [];
@@ -184,6 +349,15 @@ function sourceClass(sentence) {
 function confidence(item) {
     return ({ high: "高", medium: "中", low: "低" }[String(item.confidence_level || "").toLowerCase()] || "需人工复核");
 }
+function qaLabel(issue) {
+    const key = String(issue?.type || issue?.problem_type || "").toUpperCase();
+    return {
+        CONCRETENESS_ISSUE: "表述不够具体", DUPLICATE: "内容重复", REPETITION: "内容重复",
+        LOGIC_GAP: "论证衔接不足", EVIDENCE_GAP: "依据不足", UNSUPPORTED: "依据不足",
+        STYLE_ISSUE: "表达不够自然", STRUCTURE_ISSUE: "结构问题", FORMAT_ISSUE: "格式问题",
+        TITLE_MISMATCH: "标题与内容需复核",
+    }[key] || "质量问题";
+}
 const __VLS_ctx = {
     ...{},
     ...{},
@@ -227,6 +401,13 @@ let __VLS_directives;
 /** @type {__VLS_StyleScopedClasses['evidence-card']} */ ;
 /** @type {__VLS_StyleScopedClasses['evidence-card']} */ ;
 /** @type {__VLS_StyleScopedClasses['qa-item']} */ ;
+/** @type {__VLS_StyleScopedClasses['sentence']} */ ;
+/** @type {__VLS_StyleScopedClasses['paragraph-block']} */ ;
+/** @type {__VLS_StyleScopedClasses['paragraph-discuss']} */ ;
+/** @type {__VLS_StyleScopedClasses['paragraph-discuss']} */ ;
+/** @type {__VLS_StyleScopedClasses['selection-action']} */ ;
+/** @type {__VLS_StyleScopedClasses['selection-action']} */ ;
+/** @type {__VLS_StyleScopedClasses['selection-action']} */ ;
 /** @type {__VLS_StyleScopedClasses['editor-grid']} */ ;
 /** @type {__VLS_StyleScopedClasses['paper']} */ ;
 /** @type {__VLS_StyleScopedClasses['toolbar-actions']} */ ;
@@ -240,6 +421,7 @@ let __VLS_directives;
 /** @type {__VLS_StyleScopedClasses['editor-toolbar']} */ ;
 /** @type {__VLS_StyleScopedClasses['toolbar-left']} */ ;
 /** @type {__VLS_StyleScopedClasses['drawer-strip']} */ ;
+/** @type {__VLS_StyleScopedClasses['paragraph-discuss']} */ ;
 if (__VLS_ctx.report.data.value) {
     __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
         ...{ class: "report-editor" },
@@ -539,6 +721,8 @@ if (__VLS_ctx.report.data.value) {
     });
     /** @type {__VLS_StyleScopedClasses['mixed']} */ ;
     __VLS_asFunctionalElement1(__VLS_intrinsics.main, __VLS_intrinsics.main)({
+        ...{ onMouseup: (__VLS_ctx.captureSelection) },
+        ref: "paperRef",
         ...{ class: "paper" },
     });
     /** @type {__VLS_StyleScopedClasses['paper']} */ ;
@@ -559,7 +743,7 @@ if (__VLS_ctx.report.data.value) {
                         throw 0;
                     return (__VLS_ctx.discussSection(section));
                     // @ts-ignore
-                    [report, report, discussTitle, saveTitle, discussSection,];
+                    [report, report, captureSelection, discussTitle, saveTitle, discussSection,];
                 } },
             ...{ onBlur: (...[$event]) => {
                     if (!(__VLS_ctx.report.data.value))
@@ -574,9 +758,25 @@ if (__VLS_ctx.report.data.value) {
         });
         (section.display_title || section.title);
         for (const [paragraph, paragraphIndex] of __VLS_vFor((section.paragraphs))) {
-            __VLS_asFunctionalElement1(__VLS_intrinsics.template)({
+            __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
                 key: (paragraphIndex),
+                ...{ class: "paragraph-block" },
+                'data-section-index': (sectionIndex),
+                'data-paragraph-index': (paragraphIndex),
             });
+            /** @type {__VLS_StyleScopedClasses['paragraph-block']} */ ;
+            __VLS_asFunctionalElement1(__VLS_intrinsics.button, __VLS_intrinsics.button)({
+                ...{ onClick: (...[$event]) => {
+                        if (!(__VLS_ctx.report.data.value))
+                            throw 0;
+                        return (__VLS_ctx.discussParagraph(section, paragraph, paragraphIndex));
+                        // @ts-ignore
+                        [discussParagraph,];
+                    } },
+                ...{ class: "paragraph-discuss" },
+                type: "button",
+            });
+            /** @type {__VLS_StyleScopedClasses['paragraph-discuss']} */ ;
             for (const [sentence] of __VLS_vFor((paragraph.sentences))) {
                 __VLS_asFunctionalElement1(__VLS_intrinsics.template)({
                     key: (sentence.id),
@@ -601,10 +801,11 @@ if (__VLS_ctx.report.data.value) {
                                 // @ts-ignore
                                 [saveSentence,];
                             } },
+                        id: (`sentence-${sentence.id}`),
                         ...{ class: "sentence subheading" },
                         ...{ class: ([
                                 __VLS_ctx.sourceClass(sentence),
-                                { selected: __VLS_ctx.selected?.id === sentence.id },
+                                { selected: __VLS_ctx.selected?.id === sentence.id, 'qa-target': __VLS_ctx.qaTargetSentenceId === sentence.id },
                             ]) },
                         contenteditable: true,
                         spellcheck: "false",
@@ -612,10 +813,11 @@ if (__VLS_ctx.report.data.value) {
                     /** @type {__VLS_StyleScopedClasses['sentence']} */ ;
                     /** @type {__VLS_StyleScopedClasses['subheading']} */ ;
                     /** @type {__VLS_StyleScopedClasses['selected']} */ ;
+                    /** @type {__VLS_StyleScopedClasses['qa-target']} */ ;
                     (sentence.display_content || sentence.content);
                 }
                 // @ts-ignore
-                [sourceClass, selected,];
+                [sourceClass, selected, qaTargetSentenceId,];
             }
             if (paragraph.sentences.some((sentence) => sentence.source_level !== 'SUBHEADING')) {
                 __VLS_asFunctionalElement1(__VLS_intrinsics.p, __VLS_intrinsics.p)({});
@@ -640,11 +842,13 @@ if (__VLS_ctx.report.data.value) {
                                 [saveSentence,];
                             } },
                         key: (sentence.id),
+                        id: (`sentence-${sentence.id}`),
                         ...{ class: "sentence" },
                         ...{ class: ([
                                 __VLS_ctx.sourceClass(sentence),
                                 {
                                     selected: __VLS_ctx.selected?.id === sentence.id,
+                                    'qa-target': __VLS_ctx.qaTargetSentenceId === sentence.id,
                                     excluded: sentence.selected === false,
                                 },
                             ]) },
@@ -654,9 +858,10 @@ if (__VLS_ctx.report.data.value) {
                     /** @type {__VLS_StyleScopedClasses['sentence']} */ ;
                     /** @type {__VLS_StyleScopedClasses['selected']} */ ;
                     /** @type {__VLS_StyleScopedClasses['excluded']} */ ;
+                    /** @type {__VLS_StyleScopedClasses['qa-target']} */ ;
                     (sentence.content);
                     // @ts-ignore
-                    [sourceClass, selected,];
+                    [sourceClass, selected, qaTargetSentenceId,];
                 }
             }
             // @ts-ignore
@@ -700,13 +905,7 @@ if (__VLS_ctx.report.data.value) {
     /** @type {__VLS_StyleScopedClasses['tab']} */ ;
     /** @type {__VLS_StyleScopedClasses['active']} */ ;
     __VLS_asFunctionalElement1(__VLS_intrinsics.button, __VLS_intrinsics.button)({
-        ...{ onClick: (...[$event]) => {
-                if (!(__VLS_ctx.report.data.value))
-                    throw 0;
-                return (__VLS_ctx.sideTab = 'discuss');
-                // @ts-ignore
-                [sideTab, sideTab,];
-            } },
+        ...{ onClick: (__VLS_ctx.openTaskAssistant) },
         ...{ class: "tab" },
         ...{ class: ({ active: __VLS_ctx.sideTab === 'discuss' }) },
     });
@@ -723,6 +922,13 @@ if (__VLS_ctx.report.data.value) {
             });
             /** @type {__VLS_StyleScopedClasses['selected-quote']} */ ;
             (__VLS_ctx.currentDetails.content);
+            __VLS_asFunctionalElement1(__VLS_intrinsics.button, __VLS_intrinsics.button)({
+                ...{ onClick: (__VLS_ctx.referenceSelectedSentence) },
+                ...{ class: "btn sentence-assistant" },
+                type: "button",
+            });
+            /** @type {__VLS_StyleScopedClasses['btn']} */ ;
+            /** @type {__VLS_StyleScopedClasses['sentence-assistant']} */ ;
             for (const [source] of __VLS_vFor((__VLS_ctx.currentDetails.sources ||
                 __VLS_ctx.currentDetails.facts ||
                 []))) {
@@ -747,7 +953,7 @@ if (__VLS_ctx.report.data.value) {
                     __VLS_asFunctionalElement1(__VLS_intrinsics.br)({});
                     (evidence.quote);
                     // @ts-ignore
-                    [sideTab, sideTab, currentDetails, currentDetails, currentDetails, currentDetails,];
+                    [sideTab, sideTab, sideTab, openTaskAssistant, currentDetails, currentDetails, currentDetails, currentDetails, referenceSelectedSentence,];
                 }
                 // @ts-ignore
                 [];
@@ -815,11 +1021,48 @@ if (__VLS_ctx.report.data.value) {
             });
             /** @type {__VLS_StyleScopedClasses['badge']} */ ;
             /** @type {__VLS_StyleScopedClasses['warning']} */ ;
-            (issue.type || "质量问题");
+            (__VLS_ctx.qaLabel(issue));
             __VLS_asFunctionalElement1(__VLS_intrinsics.p, __VLS_intrinsics.p)({});
             (issue.note || issue.quote || issue.message);
+            if (issue.sentence_id || issue.section) {
+                __VLS_asFunctionalElement1(__VLS_intrinsics.button, __VLS_intrinsics.button)({
+                    ...{ onClick: (...[$event]) => {
+                            if (!(__VLS_ctx.report.data.value))
+                                throw 0;
+                            if (!!(__VLS_ctx.sideTab === 'evidence'))
+                                throw 0;
+                            if (!(__VLS_ctx.sideTab === 'qa'))
+                                throw 0;
+                            if (!(issue.sentence_id || issue.section))
+                                throw 0;
+                            return (__VLS_ctx.locateIssue(issue));
+                            // @ts-ignore
+                            [mode, sideTab, currentDetails, currentDetails, currentDetails, qaIssues, qaLabel, locateIssue,];
+                        } },
+                    type: "button",
+                    ...{ class: "qa-locate" },
+                });
+                /** @type {__VLS_StyleScopedClasses['qa-locate']} */ ;
+                (issue.sentence_id ? "定位到问题句" : "定位到章节");
+            }
+            __VLS_asFunctionalElement1(__VLS_intrinsics.button, __VLS_intrinsics.button)({
+                ...{ onClick: (...[$event]) => {
+                        if (!(__VLS_ctx.report.data.value))
+                            throw 0;
+                        if (!!(__VLS_ctx.sideTab === 'evidence'))
+                            throw 0;
+                        if (!(__VLS_ctx.sideTab === 'qa'))
+                            throw 0;
+                        return (__VLS_ctx.askAboutIssue(issue));
+                        // @ts-ignore
+                        [askAboutIssue,];
+                    } },
+                type: "button",
+                ...{ class: "qa-locate" },
+            });
+            /** @type {__VLS_StyleScopedClasses['qa-locate']} */ ;
             // @ts-ignore
-            [mode, sideTab, currentDetails, currentDetails, currentDetails, qaIssues,];
+            [];
         }
         if (!__VLS_ctx.qaIssues.length) {
             __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
@@ -832,44 +1075,44 @@ if (__VLS_ctx.report.data.value) {
     }
     else {
         __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
-            ...{ class: "panel-body" },
+            ...{ class: "panel-body assistant-handoff" },
         });
         /** @type {__VLS_StyleScopedClasses['panel-body']} */ ;
-        const __VLS_28 = ReviewCopilot;
-        // @ts-ignore
-        const __VLS_29 = __VLS_asFunctionalComponent1(__VLS_28, new __VLS_28({
-            ...{ 'onApplied': {} },
-            taskId: (__VLS_ctx.report.data.value.task_id),
-            reportId: (__VLS_ctx.reportId),
-            artifactType: (__VLS_ctx.discussionTarget.artifactType),
-            objectId: (__VLS_ctx.discussionTarget.objectId),
-            current: (__VLS_ctx.discussionTarget.current),
-        }));
-        const __VLS_30 = __VLS_29({
-            ...{ 'onApplied': {} },
-            taskId: (__VLS_ctx.report.data.value.task_id),
-            reportId: (__VLS_ctx.reportId),
-            artifactType: (__VLS_ctx.discussionTarget.artifactType),
-            objectId: (__VLS_ctx.discussionTarget.objectId),
-            current: (__VLS_ctx.discussionTarget.current),
-        }, ...__VLS_functionalComponentArgsRest(__VLS_29));
-        let __VLS_33;
-        const __VLS_34 = {
-            /** @type {typeof __VLS_33.applied} */
-            onApplied: (...[$event]) => {
-                if (!(__VLS_ctx.report.data.value))
-                    throw 0;
-                if (!!(__VLS_ctx.sideTab === 'evidence'))
-                    throw 0;
-                if (!!(__VLS_ctx.sideTab === 'qa'))
-                    throw 0;
-                return (__VLS_ctx.queryClient.invalidateQueries({ queryKey: ['report', __VLS_ctx.reportId] }));
-                // @ts-ignore
-                [report, reportId, reportId, qaIssues, discussionTarget, discussionTarget, discussionTarget, queryClient,];
-            },
-        };
-        var __VLS_31;
-        var __VLS_32;
+        /** @type {__VLS_StyleScopedClasses['assistant-handoff']} */ ;
+        __VLS_asFunctionalElement1(__VLS_intrinsics.b, __VLS_intrinsics.b)({});
+        __VLS_asFunctionalElement1(__VLS_intrinsics.p, __VLS_intrinsics.p)({});
+        __VLS_asFunctionalElement1(__VLS_intrinsics.button, __VLS_intrinsics.button)({
+            ...{ onClick: (__VLS_ctx.openTaskAssistant) },
+            ...{ class: "btn primary" },
+            type: "button",
+        });
+        /** @type {__VLS_StyleScopedClasses['btn']} */ ;
+        /** @type {__VLS_StyleScopedClasses['primary']} */ ;
+    }
+    if (__VLS_ctx.selectionAction) {
+        __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
+            ...{ class: "selection-action" },
+            ...{ style: ({ left: `${__VLS_ctx.selectionAction.x}px`, top: `${__VLS_ctx.selectionAction.y}px` }) },
+        });
+        /** @type {__VLS_StyleScopedClasses['selection-action']} */ ;
+        __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({});
+        __VLS_asFunctionalElement1(__VLS_intrinsics.button, __VLS_intrinsics.button)({
+            ...{ onClick: (__VLS_ctx.sendSelectionReference) },
+            type: "button",
+        });
+        __VLS_asFunctionalElement1(__VLS_intrinsics.button, __VLS_intrinsics.button)({
+            ...{ onClick: (...[$event]) => {
+                    if (!(__VLS_ctx.report.data.value))
+                        throw 0;
+                    if (!(__VLS_ctx.selectionAction))
+                        throw 0;
+                    return (__VLS_ctx.selectionAction = null);
+                    // @ts-ignore
+                    [openTaskAssistant, qaIssues, selectionAction, selectionAction, selectionAction, selectionAction, sendSelectionReference,];
+                } },
+            type: "button",
+            'aria-label': "取消引用",
+        });
     }
 }
 else {

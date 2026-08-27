@@ -186,6 +186,17 @@ class ProductExtensionTests(unittest.TestCase):
         self.assertIn("重新核对限定条件", instruction)
         self.assertIn("适用范围", instruction)
 
+    def test_tool_arguments_survive_into_recompute_instruction(self):
+        instruction = _proposal_instruction({
+            "artifact_type": "final_plan", "object_id": "task-a",
+            "rationale": "按用户确认重组目录",
+            "after_json": '{"instruction":"重新规划最终报告结构"}',
+            "impact_json": '{"scope":{"tool_call":{"tool_name":"rerun_final_plan","arguments":{"new_structure":["第一章","第二章","第三章","第四章","第五章"]}}}}',
+        })
+        self.assertIn("必须保持 5 章", instruction)
+        self.assertIn("第五章", instruction)
+        self.assertIn("new_structure", instruction)
+
     def test_narrative_summary_reports_semantic_units(self):
         summary = _artifact_summary("narrative_plan", {
             "subsections": [{"title": "机制"}, {"title": "挑战"}],

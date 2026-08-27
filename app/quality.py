@@ -298,6 +298,10 @@ def run_quality_check(report_id: int, plan_structure: list[str],
         except Exception:
             pass  # LLM 检查失败不阻塞;规则检查结果保留
 
+    # Bind each issue to a stable report location. Rule and LLM checks use a
+    # human-readable quote, but the UI must not have to guess where it belongs.
+    issues = attach_quality_issue_locations(report_id, issues, rows=rows)
+
     # 去重
     seen = set()
     result = []
@@ -306,6 +310,55 @@ def run_quality_check(report_id: int, plan_structure: list[str],
         if key not in seen:
             seen.add(key)
             result.append(_classify_issue(issue))
+    return result
+
+
+def attach_quality_issue_locations(report_id: int, issues: list[dict], *, rows=None) -> list[dict]:
+    """Attach sentence/section anchors without changing QA semantics.
+
+    New QA runs receive stable sentence ids. Historical QA records are resolved
+    on read from their section and quote, so existing tasks remain navigable.
+    """
+    if rows is None:
+        from app.infrastructure.orm import ORMSentence
+        from sqlalchemy import select
+        with session_scope() as s:
+            rows = s.execute(
+                select(ORMSentence.c.id, ORMSentence.c.section, ORMSentence.c.paragraph,
+                       ORMSentence.c.content, ORMSentence.c.user_edit)
+                .where(ORMSentence.c.report_id == int(report_id), ORMSentence.c.selected == 1)
+                .order_by(ORMSentence.c.position)
+            ).mappings().all()
+    candidates = [dict(row) for row in rows]
+
+    def normalized(value: str) -> str:
+        return re.sub(r"\s+", "", str(value or ""))
+
+    result = []
+    for raw in issues or []:
+        issue = dict(raw or {})
+        sentence_id = issue.get("sentence_id")
+        if sentence_id and any(int(row["id"]) == int(sentence_id) for row in candidates):
+            issue["target_type"] = "sentence"
+            result.append(issue)
+            continue
+        section = str(issue.get("section") or "").strip()
+        quote = normalized(issue.get("quote") or "")
+        ranked = [row for row in candidates if not section or str(row.get("section") or "") == section]
+        if quote:
+            matched = next((row for row in ranked if quote in normalized(row.get("user_edit") or row.get("content") or "")), None)
+            if matched is None:
+                matched = next((row for row in candidates if quote in normalized(row.get("user_edit") or row.get("content") or "")), None)
+            if matched is not None:
+                issue.update({
+                    "sentence_id": int(matched["id"]),
+                    "paragraph": int(matched.get("paragraph") or 0),
+                    "section": str(matched.get("section") or section),
+                    "target_type": "sentence",
+                })
+        if not issue.get("target_type"):
+            issue["target_type"] = "section" if section else "report"
+        result.append(issue)
     return result
 
 

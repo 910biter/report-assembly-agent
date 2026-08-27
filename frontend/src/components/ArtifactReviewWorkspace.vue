@@ -1,15 +1,13 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
-import { useQuery, useQueryClient } from "@tanstack/vue-query";
+import { useQuery } from "@tanstack/vue-query";
 import { api } from "@/api/http";
-import ReviewCopilot from "@/components/ReviewCopilot.vue";
 
 const props = defineProps<{
   taskId: string;
   reportId?: number;
   runRevision?: number;
 }>();
-const qc = useQueryClient();
 const artifactType = ref("task_brief");
 const search = ref("");
 const offset = ref(0);
@@ -23,22 +21,13 @@ const workspace = useQuery({
     ),
   staleTime: 5000,
 });
-const notifications = useQuery({
-  queryKey: ["interaction-notifications", props.taskId],
-  queryFn: () =>
-    api<any[]>(`/api/interaction-notifications?task_id=${props.taskId}`),
-  refetchInterval: 5000,
-});
 const items = computed(() => workspace.data.value?.items || []);
 watch(
   items,
   (value) => {
-    if (!value.length) selected.value = null;
-    else if (
-      !selected.value ||
-      !value.some((item: any) => item.object_id === selected.value.object_id)
-    )
-      selected.value = value[0];
+    if (!value.length || (selected.value && !value.some(
+      (item: any) => item.object_id === selected.value.object_id,
+    ))) selected.value = null;
   },
   { immediate: true },
 );
@@ -47,34 +36,69 @@ watch([artifactType, search], () => {
   selected.value = null;
 });
 
-async function readNotice(item: any) {
-  if (item.status === "unread") {
-    await api(`/api/interaction-notifications/${item.id}/read`, {
-      method: "PATCH",
-    });
-    await qc.invalidateQueries({
-      queryKey: ["interaction-notifications", props.taskId],
-    });
-  }
-  if (item.action_url) location.href = item.action_url;
-}
 function chooseType(value: string) {
   artifactType.value = value;
 }
-function pretty(value: any) {
-  if (value == null || value === "") return "—";
-  if (Array.isArray(value))
-    return (
-      value
-        .map((item: any) =>
-          typeof item === "object"
-            ? item.title || item.content || JSON.stringify(item)
-            : item,
-        )
-        .join("、") || "—"
-    );
-  if (typeof value === "object") return JSON.stringify(value, null, 2);
+function locateQualityIssue(item: any) {
+  if (!props.reportId) return;
+  const params = new URLSearchParams({ panel: "qa" });
+  if (item?.current?.sentence_id) params.set("qa_sentence", String(item.current.sentence_id));
+  else if (item?.current?.section) params.set("qa_section", String(item.current.section));
+  location.href = `/reports/${props.reportId}?${params.toString()}`;
+}
+function discussWithAssistant(item: any) {
+  window.dispatchEvent(new CustomEvent("ira:assistant-focus", {
+    detail: { taskId: props.taskId, artifact: item },
+  }));
+}
+function toggleItem(item: any) {
+  selected.value = selected.value?.object_id === item.object_id ? null : item;
+}
+const fieldLabels: Record<string, string> = {
+  theme: "报告主题", requirements: "报告要求", task_intent: "任务目标",
+  content: "内容", title: "标题", summary: "摘要", objective: "本章目的",
+  core_question: "核心问题", core_message: "核心观点", narrative_logic: "组织逻辑",
+  chapters: "章节安排", chapter_plans: "章节安排", target_words: "目标篇幅",
+  material_role: "材料角色", claim_support: "能够证明", allowed_usage: "适合用途",
+  forbidden_usage: "使用边界", missing_information: "缺失信息", dimension: "分析维度",
+  fact_type: "事实类型", confidence_level: "可信程度", reasoning_chain: "判断依据",
+  based_fact_ids: "依据事实", section: "所在章节", quote: "问题原文", note: "问题说明",
+  message: "问题说明", severity: "影响程度", problem_type: "问题类型",
+};
+const detailFields: Record<string, string[]> = {
+  task_brief: ["theme", "requirements", "task_intent"],
+  material_role: ["summary", "material_role", "claim_support", "allowed_usage", "forbidden_usage", "missing_information"],
+  analysis_plan: ["objective", "core_question", "dimensions", "required_dimensions", "narrative_logic"],
+  fact: ["content", "dimension", "fact_type"],
+  inference: ["content", "confidence_level", "reasoning_chain", "based_fact_ids"],
+  final_plan: ["objective", "core_message", "narrative_logic", "chapters", "chapter_plans", "target_words"],
+  narrative_plan: ["section", "core_message", "objective", "narrative_logic", "subsections", "paragraphs"],
+  qa_issue: ["problem_type", "severity", "section", "quote", "note", "message"],
+  comparison_item: ["content", "summary", "change_type", "relation_type", "section"],
+};
+function readable(value: any): string {
+  if (value == null || value === "") return "";
+  if (Array.isArray(value)) {
+    return value.map((item: any, index: number) => {
+      if (item == null) return "";
+      if (typeof item !== "object") return String(item);
+      const title = item.display_title || item.title || item.name || item.content || item.summary;
+      return title ? `${index + 1}. ${title}` : "";
+    }).filter(Boolean).join("\n");
+  }
+  if (typeof value === "object") {
+    return ["title", "content", "summary", "objective", "core_message"]
+      .map((key) => value[key]).filter(Boolean).join("\n");
+  }
+  if (typeof value === "boolean") return value ? "是" : "否";
   return String(value);
+}
+function detailRows(item: any) {
+  const current = item?.current || {};
+  const preferred = detailFields[item?.artifact_type] || ["title", "content", "summary", "section", "note"];
+  return preferred
+    .map((key) => ({ key, label: fieldLabels[key] || "相关内容", value: readable(current[key]) }))
+    .filter((row) => row.value);
 }
 </script>
 
@@ -87,23 +111,8 @@ function pretty(value: any) {
           随时讨论阶段产物。系统继续后台运行，批准的语义修改会生成候选版本供你比较。
         </p>
       </div>
-      <span class="badge">异步协作</span>
+      <span class="badge">阶段产物</span>
     </header>
-    <div v-if="(notifications.data.value || []).length" class="notice-strip">
-      <button
-        v-for="item in (notifications.data.value || []).slice(0, 3)"
-        :key="item.id"
-        :class="{ unread: item.status === 'unread' }"
-        @click="readNotice(item)"
-      >
-        <span></span>
-        <div>
-          <b>{{ item.title }}</b
-          ><small>{{ item.message }}</small>
-        </div>
-        <strong>查看</strong>
-      </button>
-    </div>
     <div class="collaboration-grid">
       <aside class="artifact-groups">
         <button
@@ -129,16 +138,27 @@ function pretty(value: any) {
             :key="`${item.artifact_type}:${item.object_id}`"
             :class="{ active: selected?.object_id === item.object_id }"
           >
-            <button type="button" @click="selected = item">
-              <b>{{ item.title }}</b
-              ><span>{{ item.summary || "打开查看详情" }}</span>
+            <button type="button" @click="toggleItem(item)">
+              <span class="artifact-heading"><b>{{ item.title }}</b><i>{{ selected?.object_id === item.object_id ? "收起" : "查看" }}</i></span>
+              <span v-if="selected?.object_id !== item.object_id">{{ item.summary || "打开查看详情" }}</span>
             </button>
-            <dl v-if="selected?.object_id === item.object_id" class="inline-detail">
-              <template v-for="(value, key) in item.current" :key="key">
-                <dt>{{ key }}</dt>
-                <dd>{{ pretty(value) }}</dd>
-              </template>
-            </dl>
+            <div v-if="selected?.object_id === item.object_id" class="inline-review">
+              <dl v-if="detailRows(item).length">
+                <template v-for="row in detailRows(item)" :key="row.key">
+                  <dt>{{ row.label }}</dt><dd>{{ row.value }}</dd>
+                </template>
+              </dl>
+              <p v-else>该产物已形成，可交给助手结合任务上下文解释。</p>
+              <div class="inline-actions">
+                <button
+                  v-if="item.artifact_type === 'qa_issue' && reportId && (item.current?.sentence_id || item.current?.section)"
+                  class="btn"
+                  type="button"
+                  @click="locateQualityIssue(item)"
+                >定位到报告</button>
+                <button class="btn primary" type="button" @click="discussWithAssistant(item)">引用并讨论</button>
+              </div>
+            </div>
           </article>
         </div>
         <div v-else class="empty">
@@ -166,31 +186,6 @@ function pretty(value: any) {
           </button>
         </div>
       </section>
-      <aside class="artifact-review">
-        <template v-if="selected">
-          <div class="review-target">
-            <small>讨论对象</small>
-            <b>{{ selected.title }}</b>
-          </div>
-          <ReviewCopilot
-            compact
-            :task-id="taskId"
-            :report-id="reportId"
-            :artifact-type="selected.artifact_type"
-            :artifact-version="
-              selected.artifact_version || String(runRevision || 1)
-            "
-            :object-id="selected.object_id"
-            :current="selected.current"
-            @applied="
-              qc.invalidateQueries({ queryKey: ['review-workspace', taskId] })
-            "
-          />
-        </template>
-        <div v-else class="empty">
-          <div><strong>选择一个产物</strong>查看内容并与助手讨论。</div>
-        </div>
-      </aside>
     </div>
   </section>
 </template>
@@ -198,7 +193,7 @@ function pretty(value: any) {
 <style scoped>
 .collaboration-shell {
   display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr);
   height: min(780px, calc(100vh - 190px));
   min-height: 600px;
   overflow: hidden;
@@ -220,53 +215,13 @@ function pretty(value: any) {
   margin-top: 4px;
   color: var(--color-muted);
 }
-.notice-strip {
-  display: grid;
-  border-bottom: 1px solid var(--color-border);
-}
-.notice-strip button {
-  display: grid;
-  grid-template-columns: 8px 1fr auto;
-  align-items: center;
-  gap: 10px;
-  padding: 10px 18px;
-  text-align: left;
-  border: 0;
-  border-bottom: 1px solid var(--color-border);
-  background: #fafbfd;
-}
-.notice-strip button:last-child {
-  border-bottom: 0;
-}
-.notice-strip button > span {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--color-border-strong);
-}
-.notice-strip button.unread > span {
-  background: var(--color-primary);
-}
-.notice-strip b,
-.notice-strip small {
-  display: block;
-}
-.notice-strip small {
-  margin-top: 2px;
-  color: var(--color-muted);
-}
-.notice-strip strong {
-  color: var(--color-primary);
-  font-size: 12px;
-}
 .collaboration-grid {
   display: grid;
-  grid-template-columns: 180px minmax(280px, 380px) minmax(420px, 1fr);
+  grid-template-columns: 190px minmax(0, 1fr);
   min-height: 0;
   overflow: hidden;
 }
-.artifact-groups,
-.artifact-browser {
+.artifact-groups {
   border-right: 1px solid var(--color-border);
 }
 .artifact-groups {
@@ -330,6 +285,8 @@ function pretty(value: any) {
   border-bottom: 1px solid var(--color-border);
   background: #fff;
 }
+.artifact-heading { display:flex; align-items:center; justify-content:space-between; gap:16px; }
+.artifact-heading i { color:var(--color-primary); font-size:12px; font-style:normal; font-weight:500; }
 .artifact-list article.active {
   background: #f1f6fb;
   box-shadow: inset 2px 0 var(--color-primary);
@@ -343,45 +300,32 @@ function pretty(value: any) {
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
 }
-.artifact-list .inline-detail {
-  display: grid;
-  grid-template-columns: 86px minmax(0, 1fr);
-  width: 100%;
-  margin: 0;
-  padding: 8px 14px 12px;
-  border-top: 1px solid #dbe5ef;
-  font-size: 11px;
-  cursor: text;
+.inline-review {
+  display:grid;
+  gap:14px;
+  padding:2px 18px 18px;
+  border-bottom:1px solid var(--color-border);
+  background:#f8fafc;
 }
-.inline-detail dt,
-.inline-detail dd {
+.inline-review dl {
+  display: grid;
+  grid-template-columns: 110px minmax(0, 1fr);
+  margin: 0;
+  padding:12px 0 0;
+  font-size:13px;
+}
+.inline-review dt,
+.inline-review dd {
   margin: 0;
   padding: 5px 0;
   line-height: 1.55;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
-.inline-detail dt { color: var(--color-faint); }
-.inline-detail dd { color: var(--color-text); }
-.artifact-review {
-  display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
-  min-width: 0;
-  min-height: 0;
-  padding: 20px;
-  overflow: hidden;
-}
-.review-target {
-  margin-bottom: 14px;
-  padding-bottom: 12px;
-  border-bottom: 1px solid var(--color-border);
-}
-.review-target small,
-.review-target b { display: block; }
-.review-target small {
-  color: var(--color-primary);
-}
-.review-target b { margin-top: 2px; }
+.inline-review dt { color: var(--color-faint); }
+.inline-review dd { color: var(--color-text); }
+.inline-review p { margin:0; color:var(--color-muted); }
+.inline-actions { display:flex; justify-content:flex-end; gap:8px; }
 .pager {
   display: flex;
   align-items: center;
@@ -397,14 +341,9 @@ function pretty(value: any) {
 @media (max-width: 1100px) {
   .collaboration-shell { height: auto; max-height: none; overflow: visible; }
   .collaboration-grid {
-    grid-template-columns: 160px 1fr;
+    grid-template-columns: 160px minmax(0, 1fr);
     min-height: 640px;
     overflow: visible;
-  }
-  .artifact-review {
-    grid-column: 1/-1;
-    height: 560px;
-    border-top: 1px solid var(--color-border);
   }
 }
 </style>

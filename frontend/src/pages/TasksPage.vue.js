@@ -204,9 +204,9 @@ for (const [item] of __VLS_vFor((__VLS_ctx.viewItems))) {
     /** @type {__VLS_StyleScopedClasses['active']} */ ;
     (item.label);
     __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({});
-    (item.count);
+    (__VLS_ctx.tasks.isLoading.value ? "—" : item.count);
     // @ts-ignore
-    [view,];
+    [view, tasks,];
 }
 __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
     ...{ class: "filter-bar" },
@@ -289,7 +289,7 @@ __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
 });
 /** @type {__VLS_StyleScopedClasses['result-meta']} */ ;
 __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({});
-(__VLS_ctx.filtered.length);
+(__VLS_ctx.tasks.isLoading.value ? "正在加载任务…" : `共 ${__VLS_ctx.filtered.length} 个任务`);
 if (__VLS_ctx.tasks.isFetching.value && !__VLS_ctx.tasks.isLoading.value) {
     __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({});
 }
@@ -321,7 +321,7 @@ if (__VLS_ctx.filtered.length) {
                         throw 0;
                     return (__VLS_ctx.selectedId = task.task_id);
                     // @ts-ignore
-                    [sortBy, hasFilters, resetFilters, filtered, filtered, filtered, tasks, tasks, tasks, selectedId,];
+                    [tasks, tasks, tasks, tasks, sortBy, hasFilters, resetFilters, filtered, filtered, filtered, selectedId,];
                 } },
             key: (task.task_id),
             ...{ class: "task-row" },

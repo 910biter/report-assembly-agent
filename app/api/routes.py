@@ -488,11 +488,15 @@ def list_tasks():
             "variant_id": payload.get("variant_id"),
             "run_revision": int(payload.get("run_revision") or 1),
             "run_mode": payload.get("run_mode") or "initial",
-            "run_history": payload.get("run_history") or [],
             "incremental_update": bool(payload.get("incremental_update")),
             "incremental_added_material_count": len(payload.get("incremental_added_material_ids") or []),
             "update_reason": payload.get("incremental_delta", {}).get("update_reason", "") if isinstance(payload.get("incremental_delta"), dict) else "",
-            "progress": _progress_summary(payload),
+            # Lists only need enough state to classify a task. Detailed timing,
+            # token and resource samples remain available from the task detail API.
+            "progress": {
+                "stage": payload.get("stage", ""),
+                "queue_status": payload.get("queue_status") or {},
+            },
         })
     return tasks
 
@@ -524,7 +528,36 @@ def get_task(task_id: str):
     task = short_term.load_task(task_id)
     if task is None:
         return JSONResponse({"error": "TASK_NOT_FOUND"}, status_code=404)
-    return _task_view(task)
+    view = _task_view(task)
+    comparison = view.get("material_comparison") or {}
+    return {
+        "task_id": task_id,
+        "theme": view.get("theme", ""),
+        "stage": view.get("stage", "created"),
+        "created_at": view.get("created_at", ""),
+        "updated_at": _ui_timestamp(view.get("updated_at") or view.get("last_progress_at") or view.get("created_at", "")),
+        "report_id": view.get("report_id"),
+        "material_ids": view.get("material_ids") or [],
+        "material_count": len(view.get("material_ids") or []),
+        "variant_id": view.get("variant_id"),
+        "run_revision": int(view.get("run_revision") or 1),
+        "run_mode": view.get("run_mode") or "initial",
+        "queue_status": view.get("queue_status") or {},
+        "parse_progress": view.get("parse_progress") or {},
+        "write_progress": view.get("write_progress") or {},
+        "graph_status": view.get("graph_status") or {},
+        "error": view.get("error") or "",
+        "failure_reason": view.get("failure_reason") or "",
+        "comparison_id": view.get("comparison_id"),
+        "comparison_report_id": view.get("comparison_report_id"),
+        "material_comparison": {"summary": comparison.get("summary") or {}},
+        "artifact_counts": {
+            "facts": len(view.get("fact_ids") or []),
+            "inferences": len(view.get("inference_ids") or []),
+            "conflicts": len(view.get("conflict_ids") or []),
+            "qa_issues": len(view.get("qa_notes") or []),
+        },
+    }
 
 
 @router.get("/tasks/{task_id}/assistant-context")
@@ -548,6 +581,8 @@ def report_assistant_context(report_id: int):
 
 def _assistant_task_context(task_id: str, task: dict) -> dict:
     """Small polling payload for the always-available collaboration assistant."""
+    from app.control_agent import build_task_agent_context
+    control_context = build_task_agent_context(task_id).model_dump(mode="json")
     return {
         "task_id": task_id,
         "report_id": task.get("report_id"),
@@ -562,6 +597,8 @@ def _assistant_task_context(task_id: str, task: dict) -> dict:
         "write_progress": task.get("write_progress") or {},
         "error": task.get("error") or task.get("failure_reason") or "",
         "updated_at": task.get("updated_at") or task.get("last_progress_at"),
+        "artifact_counts": control_context["artifact_counts"],
+        "available_artifacts": control_context["available_artifacts"],
     }
 
 
@@ -680,44 +717,55 @@ def task_analysis(task_id: str):
     task = short_term.load_task(task_id)
     if task is None:
         return JSONResponse({"error": "TASK_NOT_FOUND"}, status_code=404)
+    fact_ids = [int(item) for item in task.get("fact_ids", [])]
+    inference_ids = [int(item) for item in task.get("inference_ids", []) + task.get("external_ids", [])]
     with session_scope() as s:
-        facts = []
-        for fact_id in task.get("fact_ids", []):
-            row = s.execute(
-                select(ORMFact).where(ORMFact.c.id == fact_id)
-            ).mappings().first()
+        fact_rows = s.execute(
+            select(ORMFact).where(ORMFact.c.id.in_(fact_ids))
+        ).mappings().all() if fact_ids else []
+        evidence_rows = s.execute(
+            select(
+                ORMEvidence.c.fact_id, ORMEvidence.c.source_file, ORMEvidence.c.page,
+                ORMEvidence.c.paragraph, ORMEvidence.c.quote,
+            ).where(ORMEvidence.c.fact_id.in_(fact_ids))
+        ).mappings().all() if fact_ids else []
+        evidence_by_fact: dict[int, list[dict]] = {}
+        for item in evidence_rows:
+            evidence_by_fact.setdefault(int(item["fact_id"]), []).append({
+                "source_file": item["source_file"], "page": item["page"],
+                "paragraph": item["paragraph"], "quote": item["quote"],
+            })
+        fact_by_id = {int(row["id"]): row for row in fact_rows}
+        facts = [{
+            "id": row["id"], "content": row["content"], "dimension": row["dimension"],
+            "evidence": evidence_by_fact.get(fact_id, []),
+        } for fact_id in fact_ids if (row := fact_by_id.get(fact_id)) is not None]
+        inferences = []
+        inference_rows = s.execute(
+            select(ORMInference).where(ORMInference.c.id.in_(inference_ids))
+        ).mappings().all() if inference_ids else []
+        inference_by_id = {int(row["id"]): row for row in inference_rows}
+        for inference_id in inference_ids:
+            row = inference_by_id.get(inference_id)
             if row is None:
                 continue
-            evidence = s.execute(
-                select(
-                    ORMEvidence.c.source_file, ORMEvidence.c.page, ORMEvidence.c.paragraph,
-                    ORMEvidence.c.quote,
-                ).where(ORMEvidence.c.fact_id == fact_id)
-            ).mappings().all()
-            facts.append({
-                "id": row["id"], "content": row["content"], "dimension": row["dimension"],
-                "evidence": [dict(e) for e in evidence],
+            inferences.append({
+                "id": row["id"], "content": row["content"],
+                "source_level": row["source_level"],
+                "based_fact_ids": json.loads(row["based_fact_ids"]),
+                "reasoning_chain": row["reasoning_chain"],
+                "dimension": row["dimension"],
+                "analysis_type": row["analysis_type"],
+                "confidence_level": row["confidence_level"],
+                "confidence_reason": row["confidence_reason"],
+                "uncertainty": row["uncertainty"],
             })
-        inferences = []
-        for inference_id in task.get("inference_ids", []) + task.get("external_ids", []):
-            row = s.execute(
-                select(ORMInference).where(ORMInference.c.id == inference_id)
-            ).mappings().first()
-            if row is not None:
-                inferences.append({
-                    "id": row["id"], "content": row["content"],
-                    "source_level": row["source_level"],
-                    "based_fact_ids": json.loads(row["based_fact_ids"]),
-                    "reasoning_chain": row["reasoning_chain"],
-                    "dimension": row["dimension"],
-                    "analysis_type": row["analysis_type"],
-                    "confidence_level": row["confidence_level"],
-                    "confidence_reason": row["confidence_reason"],
-                    "uncertainty": row["uncertainty"],
-                })
         from app.evidence.extractor import load_conflict_records
         conflicts = load_conflict_records(task.get("conflict_ids", []))
-    return {"facts": facts, "inferences": inferences, "conflicts": conflicts}
+    return {
+        "facts": facts, "inferences": inferences, "conflicts": conflicts,
+        "qa_notes": task.get("qa_notes") or [],
+    }
 
 
 @router.get("/tasks/{task_id}/graph")
@@ -972,13 +1020,17 @@ def get_report(report_id: int):
     task_id = _find_task_by_report(report["id"])
     task_payload = short_term.load_task(task_id) if task_id else {}
     details = _sentence_details_bulk(sentences)
+    from app.quality import attach_quality_issue_locations
+    qa_issues = attach_quality_issue_locations(
+        report_id, list((task_payload or {}).get("qa_notes") or []), rows=sentences,
+    )
     result = {
         "id": report["id"],
         "title": report["title"],
         "status": report["status"],
         "task_id": task_id,
         "versions": list_report_versions(report["id"]),
-        "qa_issues": list((task_payload or {}).get("qa_notes") or []),
+        "qa_issues": qa_issues,
         "sections": [],
     }
     heading_strategy = _report_heading_strategy(report["style_profile_id"])
@@ -1489,8 +1541,12 @@ def send_interaction_message(thread_id: int, payload: dict):
                 thread_id,
                 str(payload.get("content") or ""),
                 request_id=str(payload.get("request_id") or ""),
+                context=payload.get("context") if isinstance(payload.get("context"), dict) else None,
             )
-        return post_interaction_message(thread_id, str(payload.get("content") or ""))
+        return post_interaction_message(
+            thread_id, str(payload.get("content") or ""),
+            context=payload.get("context") if isinstance(payload.get("context"), dict) else None,
+        )
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)
 

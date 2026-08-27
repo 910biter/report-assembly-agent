@@ -8,12 +8,13 @@ const route = useRoute();
 const ui = useUiStore();
 ui.ensureDraftId();
 const open = ref(false);
-const tab = ref("discuss");
+const tab = ref("progress");
 const task = ref(null);
 const report = ref(null);
 const workspace = ref(null);
 const artifactType = ref("task_brief");
 const selected = ref(null);
+const references = ref([]);
 const draft = computed(() => ui.taskDraft);
 const draftId = computed(() => ui.draftId);
 const loading = ref(false);
@@ -103,17 +104,30 @@ const activeArtifact = computed(() => {
         title: "当前任务",
     };
 });
-const prompts = computed(() => isDraft.value
-    ? [
-        "帮我判断当前需求是否清楚，还缺少哪些业务信息？",
-        "根据这个目标，建议报告重点回答哪些问题？",
-        "我应该准备哪些类型的材料？",
-    ]
-    : [
-        "当前运行到哪一步，已经完成什么，下一步是什么？",
-        "请解释当前阶段的输入、产出和必要性。",
-        "如果修改当前产物，后续哪些环节需要重新计算？",
-    ]);
+const assistantFocus = computed(() => ({
+    ...activeArtifact.value,
+    references: references.value,
+}));
+const prompts = computed(() => {
+    if (["sentence", "paragraph", "qa_issue"].includes(activeArtifact.value.artifact_type)) {
+        return [
+            "解释这段内容存在的问题及其依据。",
+            "在不改变事实含义的前提下改写这段内容。",
+            "检查这段内容的事实和引用是否匹配。",
+        ];
+    }
+    return isDraft.value
+        ? [
+            "帮我判断当前需求是否清楚，还缺少哪些业务信息？",
+            "根据这个目标，建议报告重点回答哪些问题？",
+            "我应该准备哪些类型的材料？",
+        ]
+        : [
+            "当前运行到哪一步，已经完成什么，下一步是什么？",
+            "请解释当前阶段的输入、产出和必要性。",
+            "如果修改当前产物，后续哪些环节需要重新计算？",
+        ];
+});
 const stageMeta = {
     created: { label: "等待开始", description: "任务目标和材料已登记，尚未进入处理。" },
     parsing: { label: "材料解析", description: "把文件转换为带来源位置的内容单元。" },
@@ -176,7 +190,49 @@ async function switchTab(value) {
         await loadArtifacts();
 }
 function discussArtifact(item) {
+    selected.value = selected.value?.object_id === item.object_id ? null : item;
+}
+function beginArtifactDiscussion(item) {
     selected.value = item;
+    addReference(item);
+    tab.value = "discuss";
+}
+function referenceKey(item) {
+    return `${item?.artifact_type || "reference"}:${item?.object_id || ""}:${item?.current?.quote || item?.current?.content || ""}`;
+}
+function referenceSummary(item) {
+    return String(item?.current?.quote || item?.current?.content || item?.current?.note || item?.title || "所选内容")
+        .replace(/\s+/g, " ").slice(0, 72);
+}
+function artifactPreview(item) {
+    const current = item?.current || {};
+    const value = current.requirements || current.content || current.summary || current.objective ||
+        current.core_message || current.narrative_logic || current.note || current.quote || item?.summary || "";
+    return String(value).replace(/\s+/g, " ").slice(0, 360);
+}
+function addReference(item) {
+    if (!item)
+        return;
+    const key = referenceKey(item);
+    const next = references.value.filter((entry) => referenceKey(entry) !== key);
+    references.value = [...next, item].slice(-8);
+}
+function removeReference(index) {
+    references.value = references.value.filter((_item, current) => current !== index);
+}
+function acceptExternalFocus(event) {
+    const detail = event.detail;
+    if (!detail || (detail.taskId && taskId.value && String(detail.taskId) !== taskId.value))
+        return;
+    if (detail.reference)
+        addReference(detail.reference);
+    if (detail.artifact)
+        selected.value = detail.artifact;
+    else if (!detail.reference)
+        selected.value = detail;
+    if (!detail.append && !detail.reference)
+        references.value = [];
+    open.value = true;
     tab.value = "discuss";
 }
 function proposalApplied(proposal) {
@@ -189,12 +245,14 @@ function proposalApplied(proposal) {
 }
 watch(() => route.fullPath, () => {
     open.value = false;
-    tab.value = "discuss";
+    tab.value = "progress";
     selected.value = null;
+    references.value = [];
     loadContext();
 });
 onMounted(() => {
     loadContext();
+    window.addEventListener("ira:assistant-focus", acceptExternalFocus);
     timer = window.setInterval(() => {
         if (open.value && taskId.value)
             loadContext();
@@ -204,6 +262,7 @@ onBeforeUnmount(() => {
     if (timer)
         window.clearInterval(timer);
     stopResize?.();
+    window.removeEventListener("ira:assistant-focus", acceptExternalFocus);
 });
 const __VLS_ctx = {
     ...{},
@@ -244,6 +303,13 @@ let __VLS_directives;
 /** @type {__VLS_StyleScopedClasses['artifact-types']} */ ;
 /** @type {__VLS_StyleScopedClasses['artifact-items']} */ ;
 /** @type {__VLS_StyleScopedClasses['artifact-items']} */ ;
+/** @type {__VLS_StyleScopedClasses['active']} */ ;
+/** @type {__VLS_StyleScopedClasses['artifact-items']} */ ;
+/** @type {__VLS_StyleScopedClasses['artifact-items']} */ ;
+/** @type {__VLS_StyleScopedClasses['artifact-items']} */ ;
+/** @type {__VLS_StyleScopedClasses['artifact-items']} */ ;
+/** @type {__VLS_StyleScopedClasses['assistant-artifact-detail']} */ ;
+/** @type {__VLS_StyleScopedClasses['assistant-artifact-detail']} */ ;
 /** @type {__VLS_StyleScopedClasses['discussion-scope']} */ ;
 /** @type {__VLS_StyleScopedClasses['discussion-scope']} */ ;
 /** @type {__VLS_StyleScopedClasses['discussion-scope']} */ ;
@@ -252,12 +318,18 @@ let __VLS_directives;
 /** @type {__VLS_StyleScopedClasses['discussion-view']} */ ;
 /** @type {__VLS_StyleScopedClasses['panel-actions']} */ ;
 /** @type {__VLS_StyleScopedClasses['workflow-assistant']} */ ;
-/** @type {__VLS_StyleScopedClasses['workflow-assistant']} */ ;
 /** @type {__VLS_StyleScopedClasses['assistant-panel']} */ ;
 /** @type {__VLS_StyleScopedClasses['orb-label']} */ ;
 /** @type {__VLS_StyleScopedClasses['assistant-orb']} */ ;
 /** @type {__VLS_StyleScopedClasses['assistant-panel']} */ ;
 /** @type {__VLS_StyleScopedClasses['panel-resize-handle']} */ ;
+/** @type {__VLS_StyleScopedClasses['reference-list']} */ ;
+/** @type {__VLS_StyleScopedClasses['reference-list']} */ ;
+/** @type {__VLS_StyleScopedClasses['reference-list']} */ ;
+/** @type {__VLS_StyleScopedClasses['reference-list']} */ ;
+/** @type {__VLS_StyleScopedClasses['clear-references']} */ ;
+/** @type {__VLS_StyleScopedClasses['focus-context']} */ ;
+/** @type {__VLS_StyleScopedClasses['focus-context']} */ ;
 if (__VLS_ctx.visible) {
     __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
         ...{ class: "workflow-assistant" },
@@ -282,7 +354,7 @@ if (__VLS_ctx.visible) {
         __VLS_asFunctionalElement1(__VLS_intrinsics.header, __VLS_intrinsics.header)({});
         __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({});
         __VLS_asFunctionalElement1(__VLS_intrinsics.small, __VLS_intrinsics.small)({});
-        (__VLS_ctx.isDraft ? "任务创建前" : "当前任务");
+        (__VLS_ctx.isDraft ? "任务创建前" : __VLS_ctx.currentStage.label);
         __VLS_asFunctionalElement1(__VLS_intrinsics.b, __VLS_intrinsics.b)({});
         __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
             ...{ class: "panel-actions" },
@@ -296,7 +368,7 @@ if (__VLS_ctx.visible) {
                         throw 0;
                     return (__VLS_ctx.expanded = !__VLS_ctx.expanded);
                     // @ts-ignore
-                    [visible, open, open, panelStyle, startPanelResize, isDraft, expanded, expanded,];
+                    [visible, open, open, panelStyle, startPanelResize, isDraft, currentStage, expanded, expanded,];
                 } },
             type: "button",
         });
@@ -337,7 +409,7 @@ if (__VLS_ctx.visible) {
             ...{ class: ({ active: __VLS_ctx.tab === 'progress' }) },
         });
         /** @type {__VLS_StyleScopedClasses['active']} */ ;
-        (__VLS_ctx.isDraft ? "需求" : "进度");
+        (__VLS_ctx.isDraft ? "需求" : "任务状态");
         if (!__VLS_ctx.isDraft) {
             __VLS_asFunctionalElement1(__VLS_intrinsics.button, __VLS_intrinsics.button)({
                 ...{ onClick: (...[$event]) => {
@@ -445,7 +517,7 @@ if (__VLS_ctx.visible) {
                                 throw 0;
                             return (__VLS_ctx.tab = 'discuss');
                             // @ts-ignore
-                            [tab, task, task, task, task, task, task, task, currentStage, currentStage,];
+                            [currentStage, currentStage, tab, task, task, task, task, task, task, task,];
                         } },
                     ...{ class: "ask-link" },
                 });
@@ -493,6 +565,11 @@ if (__VLS_ctx.visible) {
                 });
                 /** @type {__VLS_StyleScopedClasses['artifact-items']} */ ;
                 for (const [item] of __VLS_vFor((__VLS_ctx.workspace.items))) {
+                    __VLS_asFunctionalElement1(__VLS_intrinsics.article, __VLS_intrinsics.article)({
+                        key: (`${item.artifact_type}:${item.object_id}`),
+                        ...{ class: ({ active: __VLS_ctx.selected?.object_id === item.object_id }) },
+                    });
+                    /** @type {__VLS_StyleScopedClasses['active']} */ ;
                     __VLS_asFunctionalElement1(__VLS_intrinsics.button, __VLS_intrinsics.button)({
                         ...{ onClick: (...[$event]) => {
                                 if (!(__VLS_ctx.visible))
@@ -507,14 +584,48 @@ if (__VLS_ctx.visible) {
                                     throw 0;
                                 return (__VLS_ctx.discussArtifact(item));
                                 // @ts-ignore
-                                [workspace, workspace, discussArtifact,];
+                                [workspace, workspace, selected, discussArtifact,];
                             } },
-                        key: (`${item.artifact_type}:${item.object_id}`),
                     });
+                    __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({});
                     __VLS_asFunctionalElement1(__VLS_intrinsics.b, __VLS_intrinsics.b)({});
                     (item.title);
-                    __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({});
-                    (item.summary || "查看并讨论");
+                    __VLS_asFunctionalElement1(__VLS_intrinsics.i, __VLS_intrinsics.i)({});
+                    (__VLS_ctx.selected?.object_id === item.object_id ? "收起" : "查看");
+                    if (__VLS_ctx.selected?.object_id !== item.object_id) {
+                        __VLS_asFunctionalElement1(__VLS_intrinsics.small, __VLS_intrinsics.small)({});
+                        (item.summary || "查看内容");
+                    }
+                    if (__VLS_ctx.selected?.object_id === item.object_id) {
+                        __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
+                            ...{ class: "assistant-artifact-detail" },
+                        });
+                        /** @type {__VLS_StyleScopedClasses['assistant-artifact-detail']} */ ;
+                        __VLS_asFunctionalElement1(__VLS_intrinsics.p, __VLS_intrinsics.p)({});
+                        (__VLS_ctx.artifactPreview(item) || "该产物已形成，可交给助手结合任务上下文解释。");
+                        __VLS_asFunctionalElement1(__VLS_intrinsics.button, __VLS_intrinsics.button)({
+                            ...{ onClick: (...[$event]) => {
+                                    if (!(__VLS_ctx.visible))
+                                        throw 0;
+                                    if (!(__VLS_ctx.open))
+                                        throw 0;
+                                    if (!!(__VLS_ctx.tab === 'progress'))
+                                        throw 0;
+                                    if (!(__VLS_ctx.tab === 'artifacts'))
+                                        throw 0;
+                                    if (!(__VLS_ctx.workspace?.items?.length))
+                                        throw 0;
+                                    if (!(__VLS_ctx.selected?.object_id === item.object_id))
+                                        throw 0;
+                                    return (__VLS_ctx.beginArtifactDiscussion(item));
+                                    // @ts-ignore
+                                    [selected, selected, selected, artifactPreview, beginArtifactDiscussion,];
+                                } },
+                            ...{ class: "btn primary" },
+                        });
+                        /** @type {__VLS_StyleScopedClasses['btn']} */ ;
+                        /** @type {__VLS_StyleScopedClasses['primary']} */ ;
+                    }
                     // @ts-ignore
                     [];
                 }
@@ -538,31 +649,117 @@ if (__VLS_ctx.visible) {
             __VLS_asFunctionalElement1(__VLS_intrinsics.small, __VLS_intrinsics.small)({});
             __VLS_asFunctionalElement1(__VLS_intrinsics.b, __VLS_intrinsics.b)({});
             (__VLS_ctx.activeArtifact.title);
+            if (__VLS_ctx.selected || __VLS_ctx.isDraft) {
+                __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
+                    ...{ class: "focus-context" },
+                });
+                /** @type {__VLS_StyleScopedClasses['focus-context']} */ ;
+                __VLS_asFunctionalElement1(__VLS_intrinsics.p, __VLS_intrinsics.p)({});
+                (__VLS_ctx.artifactPreview(__VLS_ctx.activeArtifact) || "当前产物已作为对话上下文。");
+                if (__VLS_ctx.selected && !__VLS_ctx.isDraft) {
+                    __VLS_asFunctionalElement1(__VLS_intrinsics.button, __VLS_intrinsics.button)({
+                        ...{ onClick: (...[$event]) => {
+                                if (!(__VLS_ctx.visible))
+                                    throw 0;
+                                if (!(__VLS_ctx.open))
+                                    throw 0;
+                                if (!!(__VLS_ctx.tab === 'progress'))
+                                    throw 0;
+                                if (!!(__VLS_ctx.tab === 'artifacts'))
+                                    throw 0;
+                                if (!(__VLS_ctx.selected || __VLS_ctx.isDraft))
+                                    throw 0;
+                                if (!(__VLS_ctx.selected && !__VLS_ctx.isDraft))
+                                    throw 0;
+                                return (__VLS_ctx.tab = 'artifacts');
+                                // @ts-ignore
+                                [isDraft, isDraft, tab, selected, selected, artifactPreview, activeArtifact, activeArtifact,];
+                            } },
+                        type: "button",
+                    });
+                }
+            }
+            if (__VLS_ctx.references.length) {
+                __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
+                    ...{ class: "reference-list" },
+                });
+                /** @type {__VLS_StyleScopedClasses['reference-list']} */ ;
+                for (const [item, index] of __VLS_vFor((__VLS_ctx.references))) {
+                    __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({
+                        key: (__VLS_ctx.referenceKey(item)),
+                    });
+                    __VLS_asFunctionalElement1(__VLS_intrinsics.i, __VLS_intrinsics.i)({});
+                    (__VLS_ctx.referenceSummary(item));
+                    __VLS_asFunctionalElement1(__VLS_intrinsics.button, __VLS_intrinsics.button)({
+                        ...{ onClick: (...[$event]) => {
+                                if (!(__VLS_ctx.visible))
+                                    throw 0;
+                                if (!(__VLS_ctx.open))
+                                    throw 0;
+                                if (!!(__VLS_ctx.tab === 'progress'))
+                                    throw 0;
+                                if (!!(__VLS_ctx.tab === 'artifacts'))
+                                    throw 0;
+                                if (!(__VLS_ctx.references.length))
+                                    throw 0;
+                                return (__VLS_ctx.removeReference(index));
+                                // @ts-ignore
+                                [references, references, referenceKey, referenceSummary, removeReference,];
+                            } },
+                        type: "button",
+                        'aria-label': "移除引用",
+                    });
+                    // @ts-ignore
+                    [];
+                }
+                __VLS_asFunctionalElement1(__VLS_intrinsics.button, __VLS_intrinsics.button)({
+                    ...{ onClick: (...[$event]) => {
+                            if (!(__VLS_ctx.visible))
+                                throw 0;
+                            if (!(__VLS_ctx.open))
+                                throw 0;
+                            if (!!(__VLS_ctx.tab === 'progress'))
+                                throw 0;
+                            if (!!(__VLS_ctx.tab === 'artifacts'))
+                                throw 0;
+                            if (!(__VLS_ctx.references.length))
+                                throw 0;
+                            return (__VLS_ctx.references = []);
+                            // @ts-ignore
+                            [references,];
+                        } },
+                    type: "button",
+                    ...{ class: "clear-references" },
+                });
+                /** @type {__VLS_StyleScopedClasses['clear-references']} */ ;
+            }
             if (__VLS_ctx.interactionScopeReady) {
                 const __VLS_5 = ReviewCopilot;
                 // @ts-ignore
                 const __VLS_6 = __VLS_asFunctionalComponent1(__VLS_5, new __VLS_5({
                     ...{ 'onApplied': {} },
-                    key: (`${__VLS_ctx.taskId}:${__VLS_ctx.activeArtifact.artifact_type}:${__VLS_ctx.activeArtifact.object_id}`),
+                    key: (__VLS_ctx.isDraft ? `draft:${__VLS_ctx.draftId}` : `task:${__VLS_ctx.taskId}`),
                     compact: true,
                     taskId: (__VLS_ctx.taskId),
-                    reportId: (__VLS_ctx.reportId),
-                    artifactType: (__VLS_ctx.activeArtifact.artifact_type),
-                    artifactVersion: (__VLS_ctx.activeArtifact.artifact_version),
-                    objectId: (__VLS_ctx.activeArtifact.object_id),
-                    current: (__VLS_ctx.activeArtifact.current),
+                    reportId: (__VLS_ctx.isDraft ? __VLS_ctx.reportId : undefined),
+                    artifactType: (__VLS_ctx.isDraft ? 'task_draft' : 'task_control'),
+                    artifactVersion: (__VLS_ctx.isDraft ? 'draft' : ''),
+                    objectId: (__VLS_ctx.isDraft ? __VLS_ctx.draftId : ''),
+                    current: (__VLS_ctx.isDraft ? __VLS_ctx.activeArtifact.current : { task_id: __VLS_ctx.taskId, stage: __VLS_ctx.task?.stage || 'created' }),
+                    focus: (__VLS_ctx.assistantFocus),
                     suggestedPrompts: (__VLS_ctx.prompts),
                 }));
                 const __VLS_7 = __VLS_6({
                     ...{ 'onApplied': {} },
-                    key: (`${__VLS_ctx.taskId}:${__VLS_ctx.activeArtifact.artifact_type}:${__VLS_ctx.activeArtifact.object_id}`),
+                    key: (__VLS_ctx.isDraft ? `draft:${__VLS_ctx.draftId}` : `task:${__VLS_ctx.taskId}`),
                     compact: true,
                     taskId: (__VLS_ctx.taskId),
-                    reportId: (__VLS_ctx.reportId),
-                    artifactType: (__VLS_ctx.activeArtifact.artifact_type),
-                    artifactVersion: (__VLS_ctx.activeArtifact.artifact_version),
-                    objectId: (__VLS_ctx.activeArtifact.object_id),
-                    current: (__VLS_ctx.activeArtifact.current),
+                    reportId: (__VLS_ctx.isDraft ? __VLS_ctx.reportId : undefined),
+                    artifactType: (__VLS_ctx.isDraft ? 'task_draft' : 'task_control'),
+                    artifactVersion: (__VLS_ctx.isDraft ? 'draft' : ''),
+                    objectId: (__VLS_ctx.isDraft ? __VLS_ctx.draftId : ''),
+                    current: (__VLS_ctx.isDraft ? __VLS_ctx.activeArtifact.current : { task_id: __VLS_ctx.taskId, stage: __VLS_ctx.task?.stage || 'created' }),
+                    focus: (__VLS_ctx.assistantFocus),
                     suggestedPrompts: (__VLS_ctx.prompts),
                 }, ...__VLS_functionalComponentArgsRest(__VLS_6));
                 let __VLS_10;
@@ -587,7 +784,7 @@ if (__VLS_ctx.visible) {
                     throw 0;
                 return (__VLS_ctx.open = !__VLS_ctx.open);
                 // @ts-ignore
-                [open, open, activeArtifact, activeArtifact, activeArtifact, activeArtifact, activeArtifact, activeArtifact, activeArtifact, interactionScopeReady, taskId, taskId, reportId, prompts, proposalApplied,];
+                [open, open, isDraft, isDraft, isDraft, isDraft, isDraft, isDraft, task, activeArtifact, interactionScopeReady, draftId, draftId, taskId, taskId, taskId, reportId, assistantFocus, prompts, proposalApplied,];
             } },
         ...{ class: "assistant-orb" },
         'aria-label': (__VLS_ctx.open ? '关闭报告协作助手' : '打开报告协作助手'),
@@ -604,7 +801,7 @@ if (__VLS_ctx.visible) {
         ...{ class: "orb-label" },
     });
     /** @type {__VLS_StyleScopedClasses['orb-label']} */ ;
-    (__VLS_ctx.isDraft ? "先讨论" : "问进度");
+    (__VLS_ctx.isDraft ? "讨论需求" : "任务助手");
 }
 // @ts-ignore
 [open, isDraft,];

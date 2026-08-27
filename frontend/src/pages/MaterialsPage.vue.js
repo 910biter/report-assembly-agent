@@ -57,6 +57,21 @@ function selectMaterial(id) { selected.value = id; detailTab.value = "overview";
 function formatDate(value) { if (!value)
     return "尚未解析"; const date = new Date(value); return Number.isNaN(date.getTime()) ? value : date.toLocaleString("zh-CN", { year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" }); }
 function statusLabel(item) { return item.is_duplicate ? "重复" : item.parse_status === "ready" ? "已解析" : item.parse_status === "error" ? "异常" : "待解析"; }
+function unitKindLabel(value) { return { text: "正文", paragraph: "段落", table: "表格", image: "图片", picture: "图片", heading: "标题" }[String(value || "").toLowerCase()] || "内容"; }
+const metadataRows = computed(() => {
+    const metadata = detail.data.value?.units?.[0]?.metadata || {};
+    const labels = {
+        source_type: "内容来源", language: "识别语言", page_count: "页数",
+        has_ocr: "文字识别", has_tables: "表格识别", has_images: "图片识别",
+        title: "文档标题", author: "作者", created_at: "创建时间",
+    };
+    return Object.entries(metadata).flatMap(([key, value]) => {
+        if (!labels[key] || value == null || typeof value === "object")
+            return [];
+        const display = typeof value === "boolean" ? (value ? "已启用" : "未发现") : String(value);
+        return [{ key, label: labels[key], value: display }];
+    });
+});
 const __VLS_ctx = {
     ...{},
     ...{},
@@ -474,21 +489,41 @@ if (__VLS_ctx.selected !== null) {
                 });
                 __VLS_asFunctionalElement1(__VLS_intrinsics.summary, __VLS_intrinsics.summary)({});
                 __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({});
-                (unit.kind);
+                (__VLS_ctx.unitKindLabel(unit.kind));
                 __VLS_asFunctionalElement1(__VLS_intrinsics.b, __VLS_intrinsics.b)({});
-                (unit.page ? `第 ${unit.page} 页` : `单元 ${unit.id}`);
+                (unit.page ? `第 ${unit.page} 页` : '文档内容');
                 __VLS_asFunctionalElement1(__VLS_intrinsics.p, __VLS_intrinsics.p)({});
                 (unit.content || unit.image_desc || '无文本内容');
                 // @ts-ignore
-                [detail, detail, detailTab,];
+                [detail, detail, detailTab, unitKindLabel,];
             }
         }
         else {
-            __VLS_asFunctionalElement1(__VLS_intrinsics.pre, __VLS_intrinsics.pre)({
-                ...{ class: "metadata" },
+            __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
+                ...{ class: "detail-body metadata" },
             });
+            /** @type {__VLS_StyleScopedClasses['detail-body']} */ ;
             /** @type {__VLS_StyleScopedClasses['metadata']} */ ;
-            (JSON.stringify(__VLS_ctx.detail.data.value.units?.[0]?.metadata || {}, null, 2));
+            if (__VLS_ctx.metadataRows.length) {
+                __VLS_asFunctionalElement1(__VLS_intrinsics.dl, __VLS_intrinsics.dl)({});
+                for (const [row] of __VLS_vFor((__VLS_ctx.metadataRows))) {
+                    __VLS_asFunctionalElement1(__VLS_intrinsics.template)({
+                        key: (row.key),
+                    });
+                    __VLS_asFunctionalElement1(__VLS_intrinsics.dt, __VLS_intrinsics.dt)({});
+                    (row.label);
+                    __VLS_asFunctionalElement1(__VLS_intrinsics.dd, __VLS_intrinsics.dd)({});
+                    (row.value);
+                    // @ts-ignore
+                    [metadataRows, metadataRows,];
+                }
+            }
+            else {
+                __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
+                    ...{ class: "quiet-empty" },
+                });
+                /** @type {__VLS_StyleScopedClasses['quiet-empty']} */ ;
+            }
         }
     }
     else if (__VLS_ctx.detail.isLoading.value) {
@@ -511,6 +546,6 @@ if (__VLS_ctx.selected !== null) {
     }
 }
 // @ts-ignore
-[detail, detail,];
+[detail,];
 const __VLS_export = (await import('vue')).defineComponent({});
 export default {};

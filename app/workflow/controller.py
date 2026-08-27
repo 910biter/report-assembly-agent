@@ -30,6 +30,8 @@ from app.infrastructure.orm import (
     ORMMaterialScan,
     ORMPlan,
     ORMSentence,
+    ORMSentenceFact,
+    ORMSentenceInference,
     ORMTaskArtifact,
     ORMUnit,
 )
@@ -125,7 +127,7 @@ class WorkflowController:
     # ---------- 对外入口 ----------
 
     def _control_boundary(self) -> None:
-        """Pause only between workflow stages; never interrupt an LLM call."""
+        """Honor pauses here; the gateway also checks after every LLM call."""
         task = short_term.load_task(self.task_id) or self.task
         if (task.get("control_request") if task else "") == "pause":
             self._update(stage="paused", queue_status={"status": "paused"}, control_request="")
@@ -734,7 +736,10 @@ class WorkflowController:
             variant.planner_prompt_block() if variant else self._style_block(),
             policy_prompt_block(policy),
         )
-        final_plan = planner.finalize_report_plan(int(plan["id"]), context_block)
+        final_plan = planner.finalize_report_plan(
+            int(plan["id"]), context_block,
+            required_structure=list(self.task.get("intervention_required_structure") or []),
+        )
         self._update(plan_title=final_plan.title, final_plan_frozen=True)
 
     def analyze_materials(self) -> None:
@@ -1802,14 +1807,23 @@ class WorkflowController:
                 .where(ORMSentence.c.report_id == report_id)
                 .order_by(ORMSentence.c.position, ORMSentence.c.id)
             ).mappings().all()
+            stale_ids = [int(row["id"]) for row in rows if str(row["section"]) not in order]
+            if stale_ids:
+                # Historical content belongs in immutable report versions, not
+                # behind the current draft at a synthetic sort position.
+                s.execute(delete(ORMSentenceFact).where(ORMSentenceFact.c.sentence_id.in_(stale_ids)))
+                s.execute(delete(ORMSentenceInference).where(ORMSentenceInference.c.sentence_id.in_(stale_ids)))
+                s.execute(delete(ORMSentence).where(ORMSentence.c.id.in_(stale_ids)))
             counters: dict[str, int] = {}
             for row in rows:
                 section = str(row["section"])
+                if section not in order:
+                    continue
                 counters[section] = counters.get(section, 0) + 1
                 s.execute(
                     update(ORMSentence)
                     .where(ORMSentence.c.id == row["id"])
-                    .values(position=_chapter_position(order.get(section, 999), counters[section]))
+                    .values(position=_chapter_position(order[section], counters[section]))
                 )
 
     def _sink_knowledge(self, facts: list[dict]) -> dict:

@@ -34,7 +34,7 @@ const materials = useQuery({
 const analysis = useQuery({
     queryKey: ["task-analysis", taskId],
     queryFn: () => api(`/api/tasks/${taskId}/analysis`),
-    enabled: computed(() => ["analysis", "overview"].includes(active.value)),
+    enabled: computed(() => active.value === "analysis"),
     staleTime: 30000,
 });
 const graph = useQuery({
@@ -122,9 +122,16 @@ const taskTabs = computed(() => isComparison.value
     : [["overview", "概览"], ["materials", "材料"], ["analysis", "分析"], ["report", "报告"], ["versions", "版本"], ["collaboration", "协作审阅"]]);
 const stageIndex = computed(() => Math.max(0, stages.value.findIndex((x) => x.keys.includes(task.data.value?.stage || ""))));
 const running = computed(() => !["created", "review", "done", "failed", "paused"].includes(task.data.value?.stage || "created"));
+const pauseRequested = computed(() => task.data.value?.queue_status?.status === "pause_requested");
 const facts = computed(() => analysis.data.value?.facts || []);
 const inferences = computed(() => (analysis.data.value?.inferences || []).filter((x) => x.source_level === "MATERIAL_INFERENCE"));
 const conflicts = computed(() => analysis.data.value?.conflicts || []);
+const qaNotes = computed(() => analysis.data.value?.qa_notes || []);
+const artifactCounts = computed(() => task.data.value?.artifact_counts || {});
+const factCount = computed(() => analysis.data.value ? facts.value.length : Number(artifactCounts.value.facts || 0));
+const inferenceCount = computed(() => analysis.data.value ? inferences.value.length : Number(artifactCounts.value.inferences || 0));
+const conflictCount = computed(() => analysis.data.value ? conflicts.value.length : Number(artifactCounts.value.conflicts || 0));
+const qaIssueCount = computed(() => analysis.data.value ? qaNotes.value.length : Number(artifactCounts.value.qa_issues || 0));
 function run() {
     command.mutate({ path: `/api/tasks/${taskId}/run` });
 }
@@ -344,8 +351,10 @@ if (__VLS_ctx.task.data.value) {
                     [task, task, task, task, task, task, task, task, task, task, task, task, task, task, isComparison, run, command, running, control,];
                 } },
             ...{ class: "btn" },
+            disabled: (__VLS_ctx.command.isPending.value || __VLS_ctx.pauseRequested),
         });
         /** @type {__VLS_StyleScopedClasses['btn']} */ ;
+        (__VLS_ctx.pauseRequested ? "正在暂停…" : "暂停");
     }
     if (__VLS_ctx.task.data.value.stage === 'paused') {
         __VLS_asFunctionalElement1(__VLS_intrinsics.button, __VLS_intrinsics.button)({
@@ -356,7 +365,7 @@ if (__VLS_ctx.task.data.value) {
                         throw 0;
                     return (__VLS_ctx.control('resume'));
                     // @ts-ignore
-                    [task, control,];
+                    [task, command, control, pauseRequested, pauseRequested,];
                 } },
             ...{ class: "btn primary" },
         });
@@ -637,21 +646,21 @@ if (__VLS_ctx.task.data.value) {
         });
         /** @type {__VLS_StyleScopedClasses['metric']} */ ;
         __VLS_asFunctionalElement1(__VLS_intrinsics.strong, __VLS_intrinsics.strong)({});
-        (__VLS_ctx.facts.length);
+        (__VLS_ctx.factCount);
         __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({});
         __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
             ...{ class: "metric" },
         });
         /** @type {__VLS_StyleScopedClasses['metric']} */ ;
         __VLS_asFunctionalElement1(__VLS_intrinsics.strong, __VLS_intrinsics.strong)({});
-        (__VLS_ctx.inferences.length);
+        (__VLS_ctx.inferenceCount);
         __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({});
         __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
             ...{ class: "metric" },
         });
         /** @type {__VLS_StyleScopedClasses['metric']} */ ;
         __VLS_asFunctionalElement1(__VLS_intrinsics.strong, __VLS_intrinsics.strong)({});
-        (__VLS_ctx.conflicts.length + (__VLS_ctx.task.data.value.qa_notes?.length || 0));
+        (__VLS_ctx.conflictCount + __VLS_ctx.qaIssueCount);
         __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({});
         __VLS_asFunctionalElement1(__VLS_intrinsics.aside, __VLS_intrinsics.aside)({
             ...{ class: "side-column" },
@@ -685,7 +694,7 @@ if (__VLS_ctx.task.data.value) {
                 /** @type {__VLS_StyleScopedClasses['primary']} */ ;
                 const { default: __VLS_33 } = __VLS_31.slots;
                 // @ts-ignore
-                [task, task, task, task, task, task, task, task, task, task, task, task, task, task, task, task, task, task, task, isComparison, isComparison, running, stages, stageIndex, active, active, active, materials, facts, inferences, conflicts,];
+                [task, task, task, task, task, task, task, task, task, task, task, task, task, task, task, task, task, task, isComparison, isComparison, running, stages, stageIndex, active, active, active, materials, factCount, inferenceCount, conflictCount, qaIssueCount,];
                 var __VLS_31;
             }
             else {
@@ -770,8 +779,8 @@ if (__VLS_ctx.task.data.value) {
         __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({});
         __VLS_asFunctionalElement1(__VLS_intrinsics.b, __VLS_intrinsics.b)({});
         __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({});
-        (__VLS_ctx.facts.length);
-        (__VLS_ctx.inferences.length);
+        (__VLS_ctx.factCount);
+        (__VLS_ctx.inferenceCount);
         __VLS_asFunctionalElement1(__VLS_intrinsics.strong, __VLS_intrinsics.strong)({});
     }
     else if (__VLS_ctx.active === 'materials') {
@@ -828,7 +837,7 @@ if (__VLS_ctx.task.data.value) {
                         ? "解析失败"
                         : "处理中");
             // @ts-ignore
-            [active, materials, facts, inferences,];
+            [active, materials, factCount, inferenceCount,];
         }
     }
     else if (__VLS_ctx.active === 'analysis') {
@@ -849,7 +858,7 @@ if (__VLS_ctx.task.data.value) {
                 `关系网络 ${__VLS_ctx.graphAssertionCount}`,
             ],
             ['conflicts', `冲突与待核验 ${__VLS_ctx.conflicts.length}`],
-            ['qa', `质量检查 ${__VLS_ctx.task.data.value.qa_notes?.length || 0}`],
+            ['qa', `质量检查 ${__VLS_ctx.qaIssueCount}`],
         ]))) {
             __VLS_asFunctionalElement1(__VLS_intrinsics.button, __VLS_intrinsics.button)({
                 ...{ onClick: (...[$event]) => {
@@ -867,7 +876,7 @@ if (__VLS_ctx.task.data.value) {
                             throw 0;
                         return (__VLS_ctx.analysisType = item[0]);
                         // @ts-ignore
-                        [task, active, facts, inferences, conflicts, graphAssertionCount, analysisType,];
+                        [active, qaIssueCount, facts, inferences, graphAssertionCount, conflicts, analysisType,];
                     } },
                 key: (item[0]),
                 ...{ class: ({ active: __VLS_ctx.analysisType === item[0] }) },
@@ -1200,7 +1209,7 @@ if (__VLS_ctx.task.data.value) {
             }
         }
         else {
-            for (const [item, index] of __VLS_vFor((__VLS_ctx.task.data.value.qa_notes || []))) {
+            for (const [item, index] of __VLS_vFor((__VLS_ctx.qaNotes))) {
                 __VLS_asFunctionalElement1(__VLS_intrinsics.article, __VLS_intrinsics.article)({
                     key: (index),
                     ...{ class: "knowledge-item conflict" },
@@ -1212,9 +1221,9 @@ if (__VLS_ctx.task.data.value) {
                 __VLS_asFunctionalElement1(__VLS_intrinsics.p, __VLS_intrinsics.p)({});
                 (item.note || item.quote);
                 // @ts-ignore
-                [task, conflicts,];
+                [conflicts, qaNotes,];
             }
-            if (!__VLS_ctx.task.data.value.qa_notes?.length) {
+            if (!__VLS_ctx.qaNotes.length) {
                 __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
                     ...{ class: "empty" },
                 });
@@ -1275,7 +1284,7 @@ if (__VLS_ctx.task.data.value) {
             /** @type {__VLS_StyleScopedClasses['primary']} */ ;
             const { default: __VLS_57 } = __VLS_55.slots;
             // @ts-ignore
-            [task, task, task, task, task, task, active, active, taskId,];
+            [task, task, task, task, task, active, active, qaNotes, taskId,];
             var __VLS_55;
             if (['review', 'done'].includes(__VLS_ctx.task.data.value.stage)) {
                 __VLS_asFunctionalElement1(__VLS_intrinsics.a, __VLS_intrinsics.a)({

@@ -12,6 +12,9 @@ const activeSection = ref("all");
 const fineParagraph = ref("");
 const workspaceMode = ref("review");
 const applying = ref(false);
+const historicalVersion = ref(null);
+const historicalLoading = ref(false);
+const historicalError = ref("");
 const changedSections = computed(() => (diff.value?.sections || []).filter((item) => item.change_type !== "unchanged"));
 const visibleSections = computed(() => activeSection.value === "all" ? changedSections.value : changedSections.value.filter((item) => item.section === activeSection.value));
 const versionMeta = computed(() => props.versions.find(item => Number(item.id) === activeVersion.value));
@@ -26,6 +29,26 @@ const lengths = computed(() => {
     const newLength = sections.reduce((total, section) => total + (section.paragraphs || []).reduce((sum, paragraph) => sum + String(paragraph.new_text || "").length, 0), 0);
     return { oldLength, newLength, delta: newLength - oldLength };
 });
+const historicalSections = computed(() => {
+    const rows = [...(historicalVersion.value?.sentence_snapshot || [])]
+        .filter((row) => Number(row.selected ?? 1) !== 0)
+        .sort((a, b) => Number(a.position || 0) - Number(b.position || 0) || Number(a.id || 0) - Number(b.id || 0));
+    const sections = new Map();
+    rows.forEach((row) => {
+        const title = String(row.section || "未命名章节");
+        const paragraph = Number(row.paragraph || 1);
+        if (!sections.has(title))
+            sections.set(title, new Map());
+        const paragraphs = sections.get(title);
+        if (!paragraphs.has(paragraph))
+            paragraphs.set(paragraph, []);
+        paragraphs.get(paragraph).push(String(row.rendered_text || row.user_edit || row.content || ""));
+    });
+    return [...sections.entries()].map(([title, paragraphs]) => ({
+        title,
+        paragraphs: [...paragraphs.entries()].sort((a, b) => a[0] - b[0]).map(([, texts]) => texts.join("")),
+    }));
+});
 watch(() => props.versions, versions => {
     if (!activeVersion.value && versions.length)
         activeVersion.value = Number(versions[0].id);
@@ -35,6 +58,8 @@ watch(activeVersion, async (versionId) => {
     decisions.value = {};
     activeSection.value = "all";
     fineParagraph.value = "";
+    historicalVersion.value = null;
+    historicalError.value = "";
     error.value = "";
     if (!versionId)
         return;
@@ -49,7 +74,28 @@ watch(activeVersion, async (versionId) => {
     finally {
         loading.value = false;
     }
+    if (workspaceMode.value === "history")
+        await loadHistoricalVersion();
 });
+watch(workspaceMode, async (mode) => {
+    if (mode === "history")
+        await loadHistoricalVersion();
+});
+async function loadHistoricalVersion() {
+    if (!activeVersion.value || Number(historicalVersion.value?.id) === activeVersion.value || historicalLoading.value)
+        return;
+    historicalLoading.value = true;
+    historicalError.value = "";
+    try {
+        historicalVersion.value = await api(`/api/report-versions/${activeVersion.value}`);
+    }
+    catch (reason) {
+        historicalError.value = reason.message || "历史原文加载失败";
+    }
+    finally {
+        historicalLoading.value = false;
+    }
+}
 async function loadDecisions() {
     if (!activeVersion.value || !diff.value?.candidate_hash)
         return;
@@ -195,12 +241,19 @@ let __VLS_directives;
 /** @type {__VLS_StyleScopedClasses['inline-compare']} */ ;
 /** @type {__VLS_StyleScopedClasses['sentence-actions']} */ ;
 /** @type {__VLS_StyleScopedClasses['merged-preview']} */ ;
+/** @type {__VLS_StyleScopedClasses['historical-preview']} */ ;
 /** @type {__VLS_StyleScopedClasses['merged-preview']} */ ;
+/** @type {__VLS_StyleScopedClasses['historical-preview']} */ ;
 /** @type {__VLS_StyleScopedClasses['merged-preview']} */ ;
+/** @type {__VLS_StyleScopedClasses['historical-preview']} */ ;
 /** @type {__VLS_StyleScopedClasses['merged-preview']} */ ;
+/** @type {__VLS_StyleScopedClasses['historical-preview']} */ ;
 /** @type {__VLS_StyleScopedClasses['merged-preview']} */ ;
+/** @type {__VLS_StyleScopedClasses['historical-preview']} */ ;
 /** @type {__VLS_StyleScopedClasses['merged-preview']} */ ;
+/** @type {__VLS_StyleScopedClasses['historical-preview']} */ ;
 /** @type {__VLS_StyleScopedClasses['merged-preview']} */ ;
+/** @type {__VLS_StyleScopedClasses['historical-preview']} */ ;
 /** @type {__VLS_StyleScopedClasses['baseline-card']} */ ;
 /** @type {__VLS_StyleScopedClasses['baseline-card']} */ ;
 /** @type {__VLS_StyleScopedClasses['baseline-card']} */ ;
@@ -282,6 +335,15 @@ __VLS_asFunctionalElement1(__VLS_intrinsics.button, __VLS_intrinsics.button)({
             [diff, diff, diff, lengths, lengths, lengths, workspaceMode,];
         } },
     ...{ class: ({ active: __VLS_ctx.workspaceMode === 'review' }) },
+});
+/** @type {__VLS_StyleScopedClasses['active']} */ ;
+__VLS_asFunctionalElement1(__VLS_intrinsics.button, __VLS_intrinsics.button)({
+    ...{ onClick: (...[$event]) => {
+            return (__VLS_ctx.workspaceMode = 'history');
+            // @ts-ignore
+            [workspaceMode, workspaceMode,];
+        } },
+    ...{ class: ({ active: __VLS_ctx.workspaceMode === 'history' }) },
 });
 /** @type {__VLS_StyleScopedClasses['active']} */ ;
 __VLS_asFunctionalElement1(__VLS_intrinsics.button, __VLS_intrinsics.button)({
@@ -382,7 +444,66 @@ __VLS_asFunctionalElement1(__VLS_intrinsics.main, __VLS_intrinsics.main)({
     ...{ class: "review-main" },
 });
 /** @type {__VLS_StyleScopedClasses['review-main']} */ ;
-if (__VLS_ctx.loading) {
+if (__VLS_ctx.workspaceMode === 'history' && __VLS_ctx.historicalLoading) {
+    __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
+        ...{ class: "review-state" },
+    });
+    /** @type {__VLS_StyleScopedClasses['review-state']} */ ;
+    __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({
+        ...{ class: "spinner" },
+    });
+    /** @type {__VLS_StyleScopedClasses['spinner']} */ ;
+    __VLS_asFunctionalElement1(__VLS_intrinsics.p, __VLS_intrinsics.p)({});
+}
+else if (__VLS_ctx.workspaceMode === 'history' && __VLS_ctx.historicalError) {
+    __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
+        ...{ class: "review-state" },
+    });
+    /** @type {__VLS_StyleScopedClasses['review-state']} */ ;
+    __VLS_asFunctionalElement1(__VLS_intrinsics.b, __VLS_intrinsics.b)({});
+    __VLS_asFunctionalElement1(__VLS_intrinsics.p, __VLS_intrinsics.p)({});
+    (__VLS_ctx.historicalError);
+}
+else if (__VLS_ctx.workspaceMode === 'history' && __VLS_ctx.historicalVersion) {
+    __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
+        ...{ class: "historical-preview" },
+    });
+    /** @type {__VLS_StyleScopedClasses['historical-preview']} */ ;
+    __VLS_asFunctionalElement1(__VLS_intrinsics.header, __VLS_intrinsics.header)({});
+    __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({});
+    (__VLS_ctx.versionMeta?.version_label || __VLS_ctx.versionMeta?.version_no);
+    __VLS_asFunctionalElement1(__VLS_intrinsics.h1, __VLS_intrinsics.h1)({});
+    (__VLS_ctx.historicalVersion.title || __VLS_ctx.reportTitle);
+    __VLS_asFunctionalElement1(__VLS_intrinsics.p, __VLS_intrinsics.p)({});
+    (__VLS_ctx.versionMeta?.created_at);
+    (__VLS_ctx.versionMeta?.change_summary || '版本快照');
+    for (const [section] of __VLS_vFor((__VLS_ctx.historicalSections))) {
+        __VLS_asFunctionalElement1(__VLS_intrinsics.section, __VLS_intrinsics.section)({
+            key: (section.title),
+        });
+        __VLS_asFunctionalElement1(__VLS_intrinsics.h2, __VLS_intrinsics.h2)({});
+        (section.title);
+        for (const [paragraph, index] of __VLS_vFor((section.paragraphs))) {
+            __VLS_asFunctionalElement1(__VLS_intrinsics.p, __VLS_intrinsics.p)({
+                key: (index),
+            });
+            (paragraph);
+            // @ts-ignore
+            [workspaceMode, workspaceMode, workspaceMode, historicalLoading, historicalError, historicalError, historicalVersion, historicalVersion, versionMeta, versionMeta, versionMeta, versionMeta, reportTitle, historicalSections,];
+        }
+        // @ts-ignore
+        [];
+    }
+    if (!__VLS_ctx.historicalSections.length) {
+        __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
+            ...{ class: "review-state" },
+        });
+        /** @type {__VLS_StyleScopedClasses['review-state']} */ ;
+        __VLS_asFunctionalElement1(__VLS_intrinsics.b, __VLS_intrinsics.b)({});
+        __VLS_asFunctionalElement1(__VLS_intrinsics.p, __VLS_intrinsics.p)({});
+    }
+}
+else if (__VLS_ctx.loading) {
     __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
         ...{ class: "review-state" },
     });
@@ -419,6 +540,12 @@ else if (__VLS_ctx.diff) {
         for (const [item] of __VLS_vFor(([['all', '全部'], ['modified', '修改'], ['added', '新增'], ['removed', '删除']]))) {
             __VLS_asFunctionalElement1(__VLS_intrinsics.button, __VLS_intrinsics.button)({
                 ...{ onClick: (...[$event]) => {
+                        if (!!(__VLS_ctx.workspaceMode === 'history' && __VLS_ctx.historicalLoading))
+                            throw 0;
+                        if (!!(__VLS_ctx.workspaceMode === 'history' && __VLS_ctx.historicalError))
+                            throw 0;
+                        if (!!(__VLS_ctx.workspaceMode === 'history' && __VLS_ctx.historicalVersion))
+                            throw 0;
                         if (!!(__VLS_ctx.loading))
                             throw 0;
                         if (!!(__VLS_ctx.error))
@@ -429,7 +556,7 @@ else if (__VLS_ctx.diff) {
                             throw 0;
                         return (__VLS_ctx.filter = item[0]);
                         // @ts-ignore
-                        [diff, workspaceMode, loading, error, error, filter,];
+                        [diff, workspaceMode, historicalSections, loading, error, error, filter,];
                     } },
                 key: (item[0]),
                 ...{ class: ({ active: __VLS_ctx.filter === item[0] }) },
@@ -463,6 +590,12 @@ else if (__VLS_ctx.diff) {
             (__VLS_ctx.decisionLabel(section.change_key));
             __VLS_asFunctionalElement1(__VLS_intrinsics.button, __VLS_intrinsics.button)({
                 ...{ onClick: (...[$event]) => {
+                        if (!!(__VLS_ctx.workspaceMode === 'history' && __VLS_ctx.historicalLoading))
+                            throw 0;
+                        if (!!(__VLS_ctx.workspaceMode === 'history' && __VLS_ctx.historicalError))
+                            throw 0;
+                        if (!!(__VLS_ctx.workspaceMode === 'history' && __VLS_ctx.historicalVersion))
+                            throw 0;
                         if (!!(__VLS_ctx.loading))
                             throw 0;
                         if (!!(__VLS_ctx.error))
@@ -480,6 +613,12 @@ else if (__VLS_ctx.diff) {
             /** @type {__VLS_StyleScopedClasses['chosen']} */ ;
             __VLS_asFunctionalElement1(__VLS_intrinsics.button, __VLS_intrinsics.button)({
                 ...{ onClick: (...[$event]) => {
+                        if (!!(__VLS_ctx.workspaceMode === 'history' && __VLS_ctx.historicalLoading))
+                            throw 0;
+                        if (!!(__VLS_ctx.workspaceMode === 'history' && __VLS_ctx.historicalError))
+                            throw 0;
+                        if (!!(__VLS_ctx.workspaceMode === 'history' && __VLS_ctx.historicalVersion))
+                            throw 0;
                         if (!!(__VLS_ctx.loading))
                             throw 0;
                         if (!!(__VLS_ctx.error))
@@ -532,6 +671,12 @@ else if (__VLS_ctx.diff) {
                     /** @type {__VLS_StyleScopedClasses['compact']} */ ;
                     __VLS_asFunctionalElement1(__VLS_intrinsics.button, __VLS_intrinsics.button)({
                         ...{ onClick: (...[$event]) => {
+                                if (!!(__VLS_ctx.workspaceMode === 'history' && __VLS_ctx.historicalLoading))
+                                    throw 0;
+                                if (!!(__VLS_ctx.workspaceMode === 'history' && __VLS_ctx.historicalError))
+                                    throw 0;
+                                if (!!(__VLS_ctx.workspaceMode === 'history' && __VLS_ctx.historicalVersion))
+                                    throw 0;
                                 if (!!(__VLS_ctx.loading))
                                     throw 0;
                                 if (!!(__VLS_ctx.error))
@@ -551,6 +696,12 @@ else if (__VLS_ctx.diff) {
                     /** @type {__VLS_StyleScopedClasses['chosen']} */ ;
                     __VLS_asFunctionalElement1(__VLS_intrinsics.button, __VLS_intrinsics.button)({
                         ...{ onClick: (...[$event]) => {
+                                if (!!(__VLS_ctx.workspaceMode === 'history' && __VLS_ctx.historicalLoading))
+                                    throw 0;
+                                if (!!(__VLS_ctx.workspaceMode === 'history' && __VLS_ctx.historicalError))
+                                    throw 0;
+                                if (!!(__VLS_ctx.workspaceMode === 'history' && __VLS_ctx.historicalVersion))
+                                    throw 0;
                                 if (!!(__VLS_ctx.loading))
                                     throw 0;
                                 if (!!(__VLS_ctx.error))
@@ -570,6 +721,12 @@ else if (__VLS_ctx.diff) {
                     /** @type {__VLS_StyleScopedClasses['chosen']} */ ;
                     __VLS_asFunctionalElement1(__VLS_intrinsics.button, __VLS_intrinsics.button)({
                         ...{ onClick: (...[$event]) => {
+                                if (!!(__VLS_ctx.workspaceMode === 'history' && __VLS_ctx.historicalLoading))
+                                    throw 0;
+                                if (!!(__VLS_ctx.workspaceMode === 'history' && __VLS_ctx.historicalError))
+                                    throw 0;
+                                if (!!(__VLS_ctx.workspaceMode === 'history' && __VLS_ctx.historicalVersion))
+                                    throw 0;
                                 if (!!(__VLS_ctx.loading))
                                     throw 0;
                                 if (!!(__VLS_ctx.error))
@@ -658,6 +815,12 @@ else if (__VLS_ctx.diff) {
                             /** @type {__VLS_StyleScopedClasses['sentence-actions']} */ ;
                             __VLS_asFunctionalElement1(__VLS_intrinsics.button, __VLS_intrinsics.button)({
                                 ...{ onClick: (...[$event]) => {
+                                        if (!!(__VLS_ctx.workspaceMode === 'history' && __VLS_ctx.historicalLoading))
+                                            throw 0;
+                                        if (!!(__VLS_ctx.workspaceMode === 'history' && __VLS_ctx.historicalError))
+                                            throw 0;
+                                        if (!!(__VLS_ctx.workspaceMode === 'history' && __VLS_ctx.historicalVersion))
+                                            throw 0;
                                         if (!!(__VLS_ctx.loading))
                                             throw 0;
                                         if (!!(__VLS_ctx.error))
@@ -680,6 +843,12 @@ else if (__VLS_ctx.diff) {
                             (sentence.change_type === 'removed' ? '保持删除' : '保留当前');
                             __VLS_asFunctionalElement1(__VLS_intrinsics.button, __VLS_intrinsics.button)({
                                 ...{ onClick: (...[$event]) => {
+                                        if (!!(__VLS_ctx.workspaceMode === 'history' && __VLS_ctx.historicalLoading))
+                                            throw 0;
+                                        if (!!(__VLS_ctx.workspaceMode === 'history' && __VLS_ctx.historicalError))
+                                            throw 0;
+                                        if (!!(__VLS_ctx.workspaceMode === 'history' && __VLS_ctx.historicalVersion))
+                                            throw 0;
                                         if (!!(__VLS_ctx.loading))
                                             throw 0;
                                         if (!!(__VLS_ctx.error))
@@ -742,7 +911,7 @@ else if (__VLS_ctx.diff) {
                 });
                 (paragraph);
                 // @ts-ignore
-                [diff, visibleSections, reportTitle, previewSection,];
+                [diff, reportTitle, visibleSections, previewSection,];
             }
             // @ts-ignore
             [];

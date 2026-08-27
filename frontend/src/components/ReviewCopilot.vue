@@ -9,6 +9,7 @@ const props = defineProps<{
   artifactVersion?: string;
   objectId?: string | number;
   current?: Record<string, any>;
+  focus?: Record<string, any>;
   suggestedPrompts?: string[];
   compact?: boolean;
 }>();
@@ -53,7 +54,7 @@ const scopeKey = computed(() =>
   `${props.taskId || "draft"}:${props.reportId || ""}:${props.artifactType}:${props.artifactVersion || ""}:${props.objectId || "root"}`,
 );
 const artifactLabels: Record<string, string> = {
-  task_draft: "任务需求", task_brief: "任务需求", material_role: "材料理解",
+  task_draft: "任务需求", task_brief: "任务需求", task_control: "任务操作", material_role: "材料理解",
   analysis_plan: "分析规划", fact: "事实", inference: "分析判断",
   final_plan: "报告目录", narrative_plan: "成文组织", report_title: "报告标题",
   section_title: "章节标题", paragraph: "正文段落", sentence: "正文句子",
@@ -65,6 +66,7 @@ watch(scopeKey, async () => {
   thread.value = null;
   message.value = "";
   error.value = "";
+  historyOpen.value = false;
   await loadThreads(true);
 }, { immediate: true });
 watch(() => conversationItems.value.length, async (next, previous) => {
@@ -111,7 +113,6 @@ async function loadThreads(autoSelect: boolean) {
     if (autoSelect && !thread.value) {
       const active = threads.value.find(matchesCurrentScope);
       if (active) await selectThread(active, false);
-      else if (threads.value.length) historyOpen.value = true;
     }
   } catch (e: any) {
     error.value = e.message || "会话历史加载失败";
@@ -160,22 +161,56 @@ function formatTime(value: string) {
 }
 function diffValue(value: any, fallback: string) {
   if (value == null || value === "") return fallback;
-  if (typeof value === "object") return JSON.stringify(value, null, 2);
+  if (Array.isArray(value)) {
+    const rows = value.map((item: any, index: number) => {
+      if (item == null) return "";
+      if (typeof item !== "object") return String(item);
+      const content = item.display_title || item.title || item.content || item.summary || item.instruction;
+      return content ? `${index + 1}. ${content}` : "";
+    }).filter(Boolean);
+    return rows.length ? rows.join("\n") : fallback;
+  }
+  if (typeof value === "object") {
+    const rows = Object.entries(value).flatMap(([key, item]) => {
+      const label = fieldLabels[key];
+      if (!label || item == null || typeof item === "object") return [];
+      return [`${label}：${String(item)}`];
+    });
+    return rows.length ? rows.join("\n") : fallback;
+  }
   return String(value);
 }
 const fieldLabels: Record<string, string> = {
   theme: "报告主题", requirements: "报告要求", content: "内容", title: "标题",
+  tool_name: "执行能力", arguments: "执行参数", instruction: "调整要求",
   material_role: "材料角色", claim_support: "事实边界", allowed_usage: "允许用途",
   forbidden_usage: "禁止用途", missing_information: "缺失信息", chapter_plans: "章节规划",
   narrative_logic: "叙事逻辑", budget: "规模预算", confidence_level: "置信度",
 };
+const toolLabels: Record<string, string> = {
+  pause_task: "暂停任务", resume_task: "恢复任务", retry_task: "重试任务",
+  regenerate_chapter: "重新生成章节", rerun_final_plan: "重新规划报告结构",
+};
+const impactLabels: Record<string, string> = {
+  material_analysis: "材料理解", analysis_plan: "分析规划", evidence: "事实与证据",
+  conflict: "冲突核验", analysis: "综合分析", final_plan: "报告目录",
+  narrative_plan: "成文组织", writing: "报告正文", qa: "质量检查", render: "文档导出",
+  lineage_check: "溯源检查",
+};
+function impactText(proposal: any) {
+  const values = (proposal?.impact?.invalidates || []).map((item: string) => impactLabels[item]).filter(Boolean);
+  return values.length ? values.join("、") : "仅检查当前内容";
+}
+function riskLabel(value: string) {
+  return ({ low: "低", medium: "中", high: "高" } as any)[value] || "待评估";
+}
 function proposalDiffRows(proposal: any) {
   const after = proposal?.after && typeof proposal.after === "object" ? proposal.after : {};
   const before = proposal?.before && typeof proposal.before === "object" ? proposal.before : {};
-  return Object.keys(after).map((key) => ({
-    key, label: fieldLabels[key] || key,
+  return Object.keys(after).filter((key) => fieldLabels[key]).map((key) => ({
+    key, label: fieldLabels[key],
     before: diffValue(before[key], "未设置"),
-    after: diffValue(after[key], "未设置"),
+    after: key === "tool_name" ? (toolLabels[String(after[key])] || String(after[key])) : diffValue(after[key], "未设置"),
   }));
 }
 async function ensureThread() {
@@ -204,6 +239,7 @@ async function send() {
     const result = await api<any>(`/api/interactions/${active.id}/messages`, jsonInit("POST", {
       content, async: true,
       request_id: globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      context: props.focus || {},
     }));
     thread.value = result.thread;
     message.value = "";
@@ -287,17 +323,17 @@ async function archiveCurrent() {
               <small>{{ item.role === "user" ? "你" : "助手" }}</small><p>{{ item.content }}</p>
             </div>
             <article v-else class="proposal conversation-proposal">
-              <div class="proposal-head"><div><small>变更建议</small><b>{{ item.status === "proposed" ? `建议修改${artifactLabel(item)}` : "提案处理结果" }}</b><p>{{ item.rationale }}</p></div><span class="badge" :class="item.risk_level === 'high' ? 'danger' : item.risk_level === 'medium' ? 'warning' : ''">{{ item.risk_level }} 风险</span></div>
-              <div class="changed-fields"><span v-for="row in proposalDiffRows(item)" :key="row.key">{{ row.label }}</span></div>
-              <button class="proposal-toggle" type="button" @click="toggleProposal(item)">{{ proposalExpanded(item) ? "收起修改详情" : "查看修改前后" }}</button>
-              <template v-if="proposalExpanded(item)">
+              <div class="proposal-head"><div><small>变更建议</small><b>{{ item.status === "proposed" ? `建议修改${artifactLabel(item)}` : "提案处理结果" }}</b><p>{{ item.rationale }}</p></div><span class="badge" :class="item.risk_level === 'high' ? 'danger' : item.risk_level === 'medium' ? 'warning' : ''">{{ riskLabel(item.risk_level) }}风险</span></div>
+              <div v-if="proposalDiffRows(item).length" class="changed-fields"><span v-for="row in proposalDiffRows(item)" :key="row.key">{{ row.label }}</span></div>
+              <button v-if="proposalDiffRows(item).length" class="proposal-toggle" type="button" @click="toggleProposal(item)">{{ proposalExpanded(item) ? "收起修改详情" : "查看修改前后" }}</button>
+              <template v-if="proposalDiffRows(item).length && proposalExpanded(item)">
                 <div class="diff-preview">
                   <section v-for="row in proposalDiffRows(item)" :key="row.key"><b>{{ row.label }}</b><del>{{ row.before }}</del><ins>{{ row.after }}</ins></section>
                 </div>
-                <small>影响：{{ item.impact?.invalidates?.join("、") || "局部检查" }}</small>
+                <small>接受后将重新检查：{{ impactText(item) }}</small>
               </template>
               <div v-if="item.status === 'proposed'" class="button-row"><button class="btn primary" @click="decide(item, 'accepted')">接受</button><button class="btn" @click="decide(item, 'rejected')">拒绝</button></div>
-              <div v-else class="proposal-state"><span class="badge" :class="item.execution_status === 'failed' ? 'danger' : 'success'">{{ item.status === "rejected" ? "已拒绝" : executionLabel(item) }}</span><small v-if="item.candidate_version_id">候选版本 {{ item.candidate_version_id }}，请进入版本审阅决定最终保留内容。</small><small v-if="item.execution_error">{{ item.execution_error }}</small></div>
+              <div v-else class="proposal-state"><span class="badge" :class="item.execution_status === 'failed' ? 'danger' : 'success'">{{ item.status === "rejected" ? "已拒绝" : executionLabel(item) }}</span><small v-if="item.candidate_version_id">新版本已生成，请进入版本审阅决定最终保留内容。</small><small v-if="item.execution_error">后台修改未完成，请回到任务页查看异常并决定是否重试。</small></div>
             </article>
           </template>
         </div>

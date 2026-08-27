@@ -43,20 +43,40 @@ from app.context_budget import (
     truncate_tokens,
 )
 from app.token_monitor import log_llm_call, new_call_id, token_context
+from app.runtime_profiles import stage_profile
+from app.control_agent import (
+    AgentIntent,
+    AgentToolName,
+    build_task_agent_context,
+    execute_control_tool,
+    execute_read_tool,
+    format_tool_result,
+    parse_agent_decision,
+    resolve_common_read,
+    resolve_control_command,
+    tool_manifest,
+)
 
 EDITABLE_ARTIFACTS = {
-    "task_draft", "task_brief", "material_role", "analysis_plan", "fact", "inference",
+    "task_draft", "task_brief", "task_control", "material_role", "analysis_plan", "fact", "inference",
     "final_plan", "narrative_plan", "report_title", "section_title", "paragraph", "sentence",
     "qa_issue", "comparison_item",
 }
 
-_COPILOT_SYSTEM = """你是报告整编工作台中的审阅助手。用户正在讨论一个明确作用域的产物。
+_COPILOT_SYSTEM = """你是报告整编工作台中的任务协作与流程控制助手。你了解当前任务状态和用户正在查看的产物。
+你不直接生成 Planner、Evidence、Analysis、Writer 或 QA 的专业产物；需要执行这些能力时只能选择提供的工具。
 你只能解释、提出修改建议，不得声称已经修改数据库。只有用户明确要求修改当前产物时，才能输出 ChangeProposal。
 询问进度、依据、原因、影响、可行性或“应该怎么改”，均属于讨论，不得创建提案。
 严格输出 JSON：
 {
-  "intent": "answer/change",
+  "intent": "answer/read/navigate/propose/execute",
   "reply": "对用户的简洁答复",
+  "tool_call": null 或 {
+    "tool_name": "提示中允许的工具名",
+    "arguments": {},
+    "confirmation_required": true/false,
+    "reason": "调用原因"
+  },
   "proposal": null 或 {
     "operation": "replace/update/reorganize/recheck",
     "after": {"content": "建议的新内容；若当前对象有明确字段，也可保留字段结构"},
@@ -70,6 +90,8 @@ proposal.after 只能包含提示中“允许修改字段”列出的字段，�
 
 真实性和溯源是硬边界。不得凭空添加事实；事实、推论、章节结构的语义修改至少为 medium 风险。
 事实或推论存在疑问时，应提出 recheck/reorganize，而不是直接编造替代内容。
+当用户明确确认章节数量或逐章标题并要求执行时，rerun_final_plan 的 new_structure 必须完整保留这些标题及顺序；
+不得只传“重新规划目录”等泛化 instruction，也不得在执行前自行合并、删减用户已经确认的章节。
 说明建议将影响哪些下游产物，但不要要求用户等待在页面上。
 只依据本次提供的任务边界、当前对象和证据上下文作答，不得调用或猜测其他任务的信息。"""
 
@@ -108,6 +130,25 @@ def create_thread(*, task_id: str = "", report_id: int | None = None,
                     updated_at=time.strftime("%Y-%m-%d %H:%M:%S"),
                 ))
         return get_thread(int(existing["id"])) or _thread_detail(existing)
+    if artifact_type == "task_control" and task_id:
+        legacy_id = None
+        with session_scope() as s:
+            legacy = s.execute(select(ORMInteractionThread).where(
+                ORMInteractionThread.c.task_id == task_id,
+                ORMInteractionThread.c.artifact_type == "task_brief",
+                ORMInteractionThread.c.object_id == "",
+                ORMInteractionThread.c.status == "open",
+            ).order_by(ORMInteractionThread.c.id.desc())).mappings().first()
+            if legacy is not None:
+                legacy_id = int(legacy["id"])
+                s.execute(update(ORMInteractionThread).where(
+                    ORMInteractionThread.c.id == legacy_id
+                ).values(
+                    artifact_type="task_control", artifact_version="", report_id=None,
+                    scope_json=_dump(scope), updated_at=time.strftime("%Y-%m-%d %H:%M:%S"),
+                ))
+        if legacy_id is not None:
+            return get_thread(legacy_id) or {"id": legacy_id}
     thread_key = uuid.uuid4().hex
     with session_scope() as s:
         result = s.execute(insert(ORMInteractionThread).values(
@@ -229,8 +270,8 @@ def attach_draft_thread(draft_id: str, task_id: str) -> int:
         s.execute(update(ORMInteractionThread).where(
             ORMInteractionThread.c.id.in_(thread_ids)
         ).values(
-            task_id=task_id, artifact_type="task_brief", object_id="",
-            artifact_version="1", updated_at=time.strftime("%Y-%m-%d %H:%M:%S"),
+            task_id=task_id, artifact_type="task_control", object_id="",
+            artifact_version="", updated_at=time.strftime("%Y-%m-%d %H:%M:%S"),
         ))
         s.execute(update(ORMChangeProposal).where(
             ORMChangeProposal.c.thread_id.in_(thread_ids)
@@ -238,7 +279,7 @@ def attach_draft_thread(draft_id: str, task_id: str) -> int:
     return len(thread_ids)
 
 
-def post_message(thread_id: int, content: str) -> dict[str, Any]:
+def post_message(thread_id: int, content: str, context: dict | None = None) -> dict[str, Any]:
     thread = get_thread(thread_id)
     if thread is None:
         raise ValueError("INTERACTION_THREAD_NOT_FOUND")
@@ -247,6 +288,7 @@ def post_message(thread_id: int, content: str) -> dict[str, Any]:
     content = content.strip()
     if not content:
         raise ValueError("EMPTY_MESSAGE")
+    _update_thread_focus(thread_id, context)
     message_id = _save_message(thread_id, "user", content, {"status": "running"})
     try:
         result = _generate_interaction_reply(thread_id, content)
@@ -257,7 +299,8 @@ def post_message(thread_id: int, content: str) -> dict[str, Any]:
     return {**result, "thread": get_thread(thread_id)}
 
 
-def queue_message(thread_id: int, content: str, request_id: str = "") -> dict[str, Any]:
+def queue_message(thread_id: int, content: str, request_id: str = "",
+                  context: dict | None = None) -> dict[str, Any]:
     """Persist a user turn and return immediately; inference continues in background."""
     thread = get_thread(thread_id)
     if thread is None:
@@ -267,6 +310,7 @@ def queue_message(thread_id: int, content: str, request_id: str = "") -> dict[st
     content = content.strip()
     if not content:
         raise ValueError("EMPTY_MESSAGE")
+    _update_thread_focus(thread_id, context)
     request_id = str(request_id or uuid.uuid4().hex)[:80]
     for item in thread.get("messages") or []:
         if str((item.get("metadata") or {}).get("request_id") or "") == request_id:
@@ -279,6 +323,22 @@ def queue_message(thread_id: int, content: str, request_id: str = "") -> dict[st
         _run_queued_interaction, thread_id, message_id, request_id, content,
     )
     return {"status": "queued", "request_id": request_id, "thread": get_thread(thread_id)}
+
+
+def _update_thread_focus(thread_id: int, context: dict | None) -> None:
+    if not isinstance(context, dict) or not context:
+        return
+    with session_scope() as s:
+        row = s.execute(select(ORMInteractionThread.c.scope_json).where(
+            ORMInteractionThread.c.id == int(thread_id)
+        )).first()
+        if row is None:
+            return
+        scope = _load(row[0], {})
+        scope["focus"] = context
+        s.execute(update(ORMInteractionThread).where(
+            ORMInteractionThread.c.id == int(thread_id)
+        ).values(scope_json=_dump(scope), updated_at=time.strftime("%Y-%m-%d %H:%M:%S")))
 
 
 def _run_queued_interaction(thread_id: int, message_id: int, request_id: str, content: str) -> None:
@@ -302,14 +362,63 @@ def _generate_interaction_reply(thread_id: int, content: str, request_id: str = 
     if thread is None:
         raise ValueError("INTERACTION_THREAD_NOT_FOUND")
     current = _resolve_current(thread)
+    proposal_thread, proposal_current = _focused_proposal_target(thread, current)
+    proposal_decision = _pending_proposal_decision(thread, content)
+    if proposal_decision is not None:
+        proposal, decision = proposal_decision
+        result = decide_proposal(int(proposal["id"]), decision)
+        if decision == "accepted":
+            state = "已执行" if result.get("status") == "applied" else "已进入后台处理"
+            reply = f"已确认该操作，{state}。现有报告不会被静默覆盖；语义修改完成后会生成候选版本供审阅。"
+        else:
+            reply = "已取消该操作，现有任务和报告不会发生变化。"
+        metadata = {"status": "completed", "intent": "execute", "proposal_id": int(proposal["id"])}
+        if request_id:
+            metadata["request_id"] = request_id
+        _save_message(thread_id, "assistant", reply, metadata)
+        return {"reply": reply, "proposal": result}
+    task_id = str(thread.get("task_id") or "")
+    agent_context = None
+    if task_id:
+        focus = dict((thread.get("scope") or {}).get("focus") or {})
+        agent_context = build_task_agent_context(task_id, focus=focus)
+        common_read = resolve_common_read(content, agent_context)
+        if common_read is not None:
+            reply, tool_result = common_read
+            metadata = {
+                "status": "completed", "intent": "read",
+                "tool_result": tool_result,
+            }
+            if request_id:
+                metadata["request_id"] = request_id
+            _save_message(thread_id, "assistant", reply, metadata)
+            return {"reply": reply, "proposal": None}
+        command = resolve_control_command(content, agent_context)
+        if command is not None:
+            reply = f"{command.reason}。执行前请确认；系统将复用现有业务阶段，不由助手直接生成产物。"
+            metadata = {"status": "completed", "intent": "propose", "tool_call": command.model_dump(mode="json")}
+            if request_id:
+                metadata["request_id"] = request_id
+            assistant_message_id = _save_message(thread_id, "assistant", reply, metadata)
+            proposal_detail = _create_tool_action_proposal(
+                thread, current, command.model_dump(mode="json"), source_message_id=assistant_message_id,
+            )
+            return {"reply": reply, "proposal": proposal_detail}
     if _is_progress_question(content):
-        reply = _progress_reply(str(thread.get("task_id") or ""))
-        metadata = {"status": "completed", "intent": "answer"}
+        reply = _progress_reply(task_id)
+        metadata = {"status": "completed", "intent": "read"}
         if request_id:
             metadata["request_id"] = request_id
         _save_message(thread_id, "assistant", reply, metadata)
         return {"reply": reply, "proposal": None}
-    prompt = _build_interaction_prompt(thread, current, content)
+    if _is_current_plan_question(content):
+        reply = _current_plan_reply(task_id)
+        metadata = {"status": "completed", "intent": "read", "artifact_type": "final_plan"}
+        if request_id:
+            metadata["request_id"] = request_id
+        _save_message(thread_id, "assistant", reply, metadata)
+        return {"reply": reply, "proposal": None}
+    prompt = _build_interaction_prompt(proposal_thread, proposal_current, content)
     # Do not submit this request to the long-running workflow queue. Sending it
     # directly lets vLLM observe its priority and preempt/reorder queued work.
     call_id = new_call_id()
@@ -318,7 +427,6 @@ def _generate_interaction_reply(thread_id: int, content: str, request_id: str = 
     context_audit["estimated_request_tokens"] = count_tokens(f"{_COPILOT_SYSTEM}\n{prompt}")
     reset_last_generation_call()
     started = time.time()
-    task_id = str(thread.get("task_id") or "")
     try:
         with token_context(task_id=task_id, stage="interaction"):
             with llm_priority(PRIORITY_INTERACTIVE):
@@ -342,18 +450,75 @@ def _generate_interaction_reply(thread_id: int, content: str, request_id: str = 
                 time.time() - started, success=False, error=str(exc), context_audit=context_audit,
                 **last_generation_meta(),
             )
-        raise
-    reply = str(result.get("reply") or "已记录你的意见。")
-    metadata = {"status": "completed", "intent": str(result.get("intent") or "answer")}
+        if str(exc) != "MODEL_OUTPUT_TRUNCATED":
+            raise
+        # A proposal may be larger than a normal conversational answer. Retry
+        # once with only the active artifact and the immediately preceding
+        # recommendation, rather than repeating the same oversized request.
+        compact_prompt = _build_compact_interaction_retry_prompt(proposal_thread, proposal_current, content)
+        retry_tokens = max(
+            int(settings.interactive_output_tokens),
+            min(
+                int(stage_profile("final_planner").output_tokens),
+                max(1024, int(settings.model_context_window_tokens) // 3),
+            ),
+        )
+        retry_call_id = new_call_id()
+        reset_last_generation_call()
+        retry_started = time.time()
+        try:
+            with token_context(task_id=task_id, stage="interaction"):
+                with llm_priority(PRIORITY_INTERACTIVE):
+                    result = invoke(
+                        "review_copilot_retry",
+                        model_gateway.generate_json,
+                        compact_prompt,
+                        system=_COPILOT_SYSTEM,
+                        think=False,
+                        max_tokens=retry_tokens,
+                    )
+                log_llm_call(
+                    retry_call_id, "interaction", len(compact_prompt), last_generation_stats(),
+                    time.time() - retry_started, success=True,
+                    context_audit={"retry_reason": "MODEL_OUTPUT_TRUNCATED", "compact_retry": True},
+                    **last_generation_meta(),
+                )
+        except Exception as retry_exc:
+            with token_context(task_id=task_id, stage="interaction"):
+                log_llm_call(
+                    retry_call_id, "interaction", len(compact_prompt), last_generation_stats(),
+                    time.time() - retry_started, success=False, error=str(retry_exc),
+                    context_audit={"retry_reason": "MODEL_OUTPUT_TRUNCATED", "compact_retry": True},
+                    **last_generation_meta(),
+                )
+            raise
+    decision = parse_agent_decision(result)
+    reply = decision.reply or "已记录你的意见。"
+    tool_call = decision.tool_call
+    tool_result = None
+    if tool_call is not None and agent_context is not None and not tool_call.confirmation_required:
+        tool_result = execute_read_tool(tool_call.tool_name, tool_call.arguments, agent_context)
+        reply = format_tool_result(tool_call.tool_name, tool_result)
+    metadata = {
+        "status": "completed", "intent": decision.intent.value,
+        "tool_call": tool_call.model_dump(mode="json") if tool_call else None,
+        "tool_result": tool_result,
+    }
     if request_id:
         metadata["request_id"] = request_id
     assistant_message_id = _save_message(thread_id, "assistant", reply, metadata)
-    proposal = result.get("proposal") if isinstance(result, dict) else None
+    proposal = decision.proposal
     proposal_detail = None
-    normalized = _normalize_proposal(thread, current, content, proposal)
-    if normalized is not None:
+    normalized = None
+    if tool_call is not None and tool_call.confirmation_required:
+        proposal_detail = _create_tool_action_proposal(
+            thread, current, tool_call.model_dump(mode="json"), source_message_id=assistant_message_id,
+        )
+    else:
+        normalized = _normalize_proposal(proposal_thread, proposal_current, content, proposal)
+    if proposal_detail is None and normalized is not None:
         proposal_detail = _create_proposal(
-            thread, current, normalized, source_message_id=assistant_message_id,
+            proposal_thread, proposal_current, normalized, source_message_id=assistant_message_id,
         )
     return {"reply": reply, "proposal": proposal_detail}
 
@@ -428,6 +593,82 @@ def _create_proposal(thread: dict, current: dict, proposal: dict,
     return _proposal_detail(row)
 
 
+def _create_tool_action_proposal(thread: dict, current: dict, tool_call: dict,
+                                 source_message_id: int | None = None) -> dict:
+    """Represent a mutating tool call with the existing auditable proposal flow."""
+    tool_name = str(tool_call.get("tool_name") or "")
+    arguments = dict(tool_call.get("arguments") or {})
+    target = dict(thread)
+    if target.get("report_id") is None and str(thread.get("task_id") or ""):
+        from app.memory import short_term
+        task = short_term.load_task(str(thread.get("task_id") or "")) or {}
+        target["report_id"] = int(task.get("report_id") or 0) or None
+    before = dict(current)
+    after: dict[str, Any]
+    if tool_name == AgentToolName.REGENERATE_CHAPTER.value:
+        target["artifact_type"] = "narrative_plan"
+        target["object_id"] = str(arguments.get("chapter_title") or "")
+        before = _current_narrative_plan(
+            str(thread.get("task_id") or ""), str(thread.get("artifact_version") or ""),
+            target["object_id"],
+        )
+        after = {"instruction": str(arguments.get("instruction") or "重新组织并生成该章节")}
+    elif tool_name == AgentToolName.RERUN_FINAL_PLAN.value:
+        target["artifact_type"] = "final_plan"
+        target["object_id"] = str(thread.get("task_id") or "")
+        before = _current_plan(str(thread.get("task_id") or ""), "final_plan")
+        from app.rendering.headings import strip_heading_prefix
+        structure = [
+            strip_heading_prefix(str(title)) for title in arguments.get("new_structure") or []
+            if strip_heading_prefix(str(title))
+        ]
+        after = {"instruction": str(arguments.get("instruction") or arguments.get("reason") or "重新规划最终报告结构")}
+        if structure:
+            after["required_structure"] = structure
+    else:
+        target["artifact_type"] = "task_control"
+        target["object_id"] = tool_name
+        after = {"tool_name": tool_name, "arguments": arguments}
+    target["scope"] = {
+        **dict(thread.get("scope") or {}),
+        "tool_call": tool_call,
+        "focus": dict((thread.get("scope") or {}).get("focus") or {}),
+    }
+    return _create_proposal(
+        target,
+        before,
+        {
+            "operation": "execute" if target["artifact_type"] == "task_control" else "reorganize",
+            "after": after,
+            "rationale": str(tool_call.get("reason") or f"调用 {tool_name}"),
+            "risk_level": "medium",
+        },
+        source_message_id=source_message_id,
+    )
+
+
+def _focused_proposal_target(thread: dict, current: dict) -> tuple[dict, dict]:
+    """Route a task-level conversation proposal to the artifact in UI focus."""
+    if str(thread.get("artifact_type") or "") != "task_control":
+        return thread, current
+    focus = dict((thread.get("scope") or {}).get("focus") or {})
+    artifact_type = str(focus.get("artifact_type") or "")
+    if artifact_type not in EDITABLE_ARTIFACTS or artifact_type == "task_control":
+        return thread, current
+    target = {
+        **thread,
+        "artifact_type": artifact_type,
+        "artifact_version": str(focus.get("artifact_version") or thread.get("artifact_version") or ""),
+        "object_id": str(focus.get("object_id") or ""),
+        "scope": {**dict(thread.get("scope") or {}), "current": dict(focus.get("current") or {})},
+    }
+    if target.get("report_id") is None and str(thread.get("task_id") or ""):
+        from app.memory import short_term
+        task = short_term.load_task(str(thread.get("task_id") or "")) or {}
+        target["report_id"] = int(task.get("report_id") or 0) or None
+    return target, dict(focus.get("current") or {})
+
+
 def _apply_supported_proposal(row: dict) -> bool:
     """Apply only local report edits; upstream semantics remain approved artifacts.
 
@@ -439,6 +680,11 @@ def _apply_supported_proposal(row: dict) -> bool:
     content = str(after.get("content") or after.get("title") or "").strip()
     report_id = row.get("report_id")
     task_id = str(row.get("task_id") or "")
+    if artifact_type == "task_control":
+        tool_name = AgentToolName(str(after.get("tool_name") or ""))
+        context = build_task_agent_context(task_id)
+        execute_control_tool(tool_name, dict(after.get("arguments") or {}), context)
+        return True
     if artifact_type == "task_draft":
         with session_scope() as s:
             thread = s.execute(select(ORMInteractionThread).where(
@@ -618,6 +864,17 @@ def _build_interaction_prompt(thread: dict, current: dict, message: str) -> str:
     task_context = _interaction_task_context(str(thread.get("task_id") or ""))
     grounding = _interaction_grounding(thread, current, message)
     accepted = _accepted_interaction_decisions(int(thread["id"]))
+    task_id = str(thread.get("task_id") or "")
+    agent_context = {}
+    if task_id:
+        try:
+            agent_context = build_task_agent_context(
+                task_id, focus=dict((thread.get("scope") or {}).get("focus") or {}),
+            ).model_dump(mode="json")
+        except Exception:
+            # Prompt construction remains testable and failure reporting stays
+            # available even if the task store is temporarily unavailable.
+            agent_context = {"task_id": task_id, "current_focus": (thread.get("scope") or {}).get("focus") or {}}
     messages = list(thread.get("messages") or [])
     if messages and messages[-1].get("role") == "user" and messages[-1].get("content") == message:
         messages = messages[:-1]
@@ -634,14 +891,20 @@ def _build_interaction_prompt(thread: dict, current: dict, message: str) -> str:
         [
             ContextSection("用户消息", [
                 f"用户消息：{_truncate_tokens(message, max(256, total_budget // 3))}",
+                f"本轮是否确认上一条修改建议：{_is_confirmed_change_request(thread, message)}",
                 f"允许修改字段：{_dump(_editable_fields(thread, current))}",
-            ], weight=6, required_items=2),
+            ], weight=6, required_items=3),
             ContextSection("当前对象", [
                 f"当前作用域：{_dump(thread.get('scope') or {})}",
                 f"当前对象：{_dump(current)}",
             ], weight=5),
             ContextSection("直接依据", [f"直接依据：{_dump(grounding)}"], weight=5),
             ContextSection("任务边界", [f"任务边界：{_dump(task_context)}"], weight=3),
+            ContextSection("控制上下文", [
+                f"任务控制上下文：{_dump(agent_context)}",
+                f"允许调用的工具：{_dump(tool_manifest())}",
+                "只读工具可以直接调用；任何 confirmation_required=true 的工具只能形成待确认动作，不能声称已执行。",
+            ], weight=5, required_items=3),
             ContextSection("已确认变更", [f"已确认变更：{_dump(accepted)}"], weight=2),
             ContextSection("最近对话", [
                 f"{item.get('role', '')}：{item.get('content', '')}" for item in history
@@ -652,11 +915,31 @@ def _build_interaction_prompt(thread: dict, current: dict, message: str) -> str:
     return prompt
 
 
+def _build_compact_interaction_retry_prompt(thread: dict, current: dict, message: str) -> str:
+    """Minimal retry context for a truncated structured interaction response."""
+    latest_assistant = ""
+    for item in reversed(thread.get("messages") or []):
+        if item.get("role") == "assistant":
+            latest_assistant = str(item.get("content") or "")
+            break
+    return (
+        "上一轮结构化输出被截断。请只输出协议要求的 JSON，不复述背景，不扩写解释。\n"
+        f"用户本轮消息：{_truncate_tokens(message, 256)}\n"
+        f"用户是否在确认上一条修改建议：{_is_confirmed_change_request(thread, message)}\n"
+        f"上一条助手建议：{_truncate_tokens(latest_assistant, 512)}\n"
+        f"当前产物类型：{thread.get('artifact_type')}\n"
+        f"当前产物：{_truncate_tokens(_dump(current), 2400)}\n"
+        f"允许修改字段：{_dump(_editable_fields(thread, current))}\n"
+        "若用户确认修改，proposal.after 仅返回发生变化的允许字段；若不是修改请求，proposal 必须为 null。"
+    )
+
+
 def _editable_fields(thread: dict, current: dict) -> list[str]:
     artifact_type = str(thread.get("artifact_type") or "")
     fixed = {
         "task_draft": ["theme", "requirements"],
         "task_brief": ["theme", "requirements"],
+        "task_control": ["tool_name", "arguments"],
         "material_role": ["material_role", "claim_support", "allowed_usage", "forbidden_usage", "missing_information"],
         "fact": ["content", "dimension", "fact_type"],
         "inference": ["content", "based_fact_ids", "confidence_level", "confidence_reason", "uncertainty", "reasoning_chain"],
@@ -684,9 +967,42 @@ def _is_explicit_change_request(message: str) -> bool:
     return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in _DIRECT_CHANGE_PATTERNS)
 
 
+_CONFIRM_CHANGE_PATTERN = re.compile(
+    r"^(?:是的[，,。\s]*)?(?:认可|确认|同意|可以|就这样|按此执行|请生成|生成提案|请重试|重试)[！!。\s]*$"
+)
+_CHANGE_CUE_PATTERN = re.compile(r"(?:建议|修改|调整|拆分|合并|重组|替换|删除|提案|是否认可)")
+
+
+def _is_confirmed_change_request(thread: dict, message: str) -> bool:
+    """Treat a short confirmation as a change only after a real recommendation."""
+    if not _CONFIRM_CHANGE_PATTERN.match(str(message or "").strip()):
+        return False
+    for item in reversed(thread.get("messages") or []):
+        if item.get("role") != "assistant":
+            continue
+        return bool(_CHANGE_CUE_PATTERN.search(str(item.get("content") or "")))
+    return False
+
+
+def _is_change_request(thread: dict, message: str) -> bool:
+    return _is_explicit_change_request(message) or _is_confirmed_change_request(thread, message)
+
+
+def _pending_proposal_decision(thread: dict, message: str) -> tuple[dict, str] | None:
+    text = re.sub(r"[！!。\s]", "", str(message or "").strip())
+    accepted = bool(re.fullmatch(r"(?:是的)?(?:认可|确认|同意|可以|就这样|按此执行)", text))
+    rejected = bool(re.fullmatch(r"(?:不认可|不同意|取消|不要执行|撤销)", text))
+    if not accepted and not rejected:
+        return None
+    pending = [item for item in thread.get("proposals") or [] if item.get("status") == "proposed"]
+    if not pending:
+        return None
+    return pending[0], "accepted" if accepted else "rejected"
+
+
 def _normalize_proposal(thread: dict, current: dict, message: str,
                         proposal: Any) -> dict | None:
-    if not _is_explicit_change_request(message) or not isinstance(proposal, dict):
+    if not _is_change_request(thread, message) or not isinstance(proposal, dict):
         return None
     after = proposal.get("after")
     if not isinstance(after, dict):
@@ -709,6 +1025,36 @@ def _is_progress_question(message: str) -> bool:
         r"(?:任务|报告).{0,6}(?:进度|进行到哪|运行到哪)|进度怎么样|完成了吗",
         text,
     ))
+
+
+def _is_current_plan_question(message: str) -> bool:
+    if _is_explicit_change_request(message):
+        return False
+    text = re.sub(r"\s+", "", str(message or ""))
+    return bool(
+        re.search(r"(?:本任务|当前|现在|已经).{0,8}(?:章节规划|章节结构|报告结构|最终目录|目录)", text)
+        and re.search(r"(?:是什么|怎么样|如何|有哪些|给我看|展示|查看)", text)
+    )
+
+
+def _current_plan_reply(task_id: str) -> str:
+    if not task_id:
+        return "当前讨论尚未绑定任务，无法读取已生成的报告结构。"
+    plan = _current_plan(task_id, "final_plan")
+    if not plan:
+        return "本任务尚未形成最终报告结构。系统会在 Evidence 与 Analysis 完成后生成 FinalReportPlan；此处不会用初步分析计划代替或猜测最终目录。"
+    chapters = plan.get("chapter_plans") or plan.get("structure") or []
+    titles: list[str] = []
+    for item in chapters:
+        title = item.get("title") if isinstance(item, dict) else item
+        title = str(title or "").strip()
+        if title:
+            titles.append(title)
+    if not titles:
+        return "已找到本任务的 FinalReportPlan，但其中尚无有效章节。请在“协作审阅 → 最终目录”中查看并调整该阶段产物。"
+    lines = [f"{index}. {title}" for index, title in enumerate(titles, start=1)]
+    return "本任务当前已落库的最终章节规划如下：\n\n" + "\n".join(lines) + \
+        "\n\n这不是重新建议的目录。如需修改，请在“协作审阅 → 最终目录”中对该产物提出调整，确认后系统会从 Final Plan 的下游重新组织。"
 
 
 def _progress_reply(task_id: str) -> str:
@@ -760,6 +1106,8 @@ def _interaction_grounding(thread: dict, current: dict, message: str) -> dict[st
     task_inference_ids = {
         int(item) for item in task.get("inference_ids") or [] if str(item).isdigit()
     }
+    focus = dict((thread.get("scope") or {}).get("focus") or {})
+    references = [item for item in focus.get("references") or [] if isinstance(item, dict)]
     refs = current.get("source_refs") if isinstance(current, dict) else {}
     refs = refs if isinstance(refs, dict) else {}
     required_fact_ids = {
@@ -770,6 +1118,18 @@ def _interaction_grounding(thread: dict, current: dict, message: str) -> dict[st
         int(item) for item in refs.get("inference_ids") or []
         if str(item).isdigit() and int(item) in task_inference_ids
     }
+    for reference in references:
+        reference_current = reference.get("current") if isinstance(reference.get("current"), dict) else {}
+        reference_refs = reference_current.get("source_refs") if isinstance(reference_current, dict) else {}
+        reference_refs = reference_refs if isinstance(reference_refs, dict) else {}
+        required_fact_ids.update(
+            int(item) for item in reference_refs.get("fact_ids") or reference_current.get("based_fact_ids") or []
+            if str(item).isdigit() and int(item) in task_fact_ids
+        )
+        required_inference_ids.update(
+            int(item) for item in reference_refs.get("inference_ids") or []
+            if str(item).isdigit() and int(item) in task_inference_ids
+        )
     object_id = str(thread.get("object_id") or "")
     if thread.get("artifact_type") == "fact" and object_id.isdigit() and int(object_id) in task_fact_ids:
         required_fact_ids.add(int(object_id))
@@ -791,7 +1151,7 @@ def _interaction_grounding(thread: dict, current: dict, message: str) -> dict[st
             )).mappings().all()
             inference_rows = [dict(row) for row in rows]
 
-    query_text = " ".join((message, _dump(current)))
+    query_text = " ".join((message, _dump(current), _dump(references)))
     selected_inferences = _select_related_rows(
         inference_rows, query_text, required_inference_ids, limit=6,
     )
@@ -957,6 +1317,7 @@ def _resolve_current(thread: dict) -> dict:
 
 def _impact_for(artifact_type: str, thread: dict) -> dict:
     mapping = {
+        "task_control": [],
         "task_brief": ["analysis_plan", "evidence", "analysis", "final_plan", "narrative_plan", "writing", "qa"],
         "material_role": ["evidence", "analysis", "final_plan", "narrative_plan", "writing", "qa"],
         "analysis_plan": ["evidence", "analysis", "final_plan", "narrative_plan", "writing", "qa"],
@@ -1131,6 +1492,18 @@ def _prepare_revision_run(task_id: str, proposals: list[dict]) -> dict[str, Any]
     proposal_ids = [int(item["id"]) for item in proposals]
     earliest = min(_RECOMPUTE_ORDER.get(str(item.get("artifact_type") or ""), 5) for item in proposals)
     instructions = [_proposal_instruction(item) for item in proposals]
+    tool_calls = [
+        dict((_load(item.get("impact_json"), {}).get("scope") or {}).get("tool_call") or {})
+        for item in proposals
+    ]
+    structure_constraints = []
+    for item, tool_call in zip(proposals, tool_calls):
+        if str(item.get("artifact_type") or "") != "final_plan":
+            continue
+        after = _load(item.get("after_json"), {})
+        arguments = tool_call.get("arguments") if isinstance(tool_call.get("arguments"), dict) else {}
+        structure_constraints.append(list(after.get("required_structure") or arguments.get("new_structure") or []))
+    required_structure = next((item for item in reversed(structure_constraints) if item), [])
     update_reason = "根据用户已批准的交互提案生成候选版本：\n" + "\n".join(instructions)
     revision = max(1, int(base_task.get("run_revision") or 1)) + 1
     run_id = create_task_run(
@@ -1194,6 +1567,8 @@ def _prepare_revision_run(task_id: str, proposals: list[dict]) -> dict[str, Any]
         "intervention_force_evidence": force_evidence,
         "intervention_force_analysis": force_analysis,
         "intervention_force_final_plan": force_final_plan,
+        "intervention_required_structure": required_structure,
+        "intervention_tool_calls": [item for item in tool_calls if item],
         "intervention_rewrite_all": earliest <= 4,
         "parse_progress": {}, "evidence_progress": {}, "write_progress": {},
         "qa_notes": [], "stage_timings": {}, "stage_durations": {},
@@ -1400,6 +1775,10 @@ def _review_items(task_id: str, task: dict, artifact_type: str) -> list[dict]:
         return result
     if artifact_type == "qa_issue":
         issues = [*(task.get("qa_notes") or []), *(task.get("qa_results") or [])]
+        report_id = int(task.get("report_id") or 0)
+        if report_id:
+            from app.quality import attach_quality_issue_locations
+            issues = attach_quality_issue_locations(report_id, issues)
         return [_review_item(
             artifact_type, str(index), str(item.get("type") or item.get("section") or f"质量问题 {index + 1}"),
             item if isinstance(item, dict) else {"content": str(item)}, version,
@@ -1461,9 +1840,16 @@ def _artifact_summary(artifact_type: str, current: dict) -> str:
 
 
 def _proposal_instruction(row: dict) -> str:
+    after = _load(row.get("after_json"), {})
+    impact = _load(row.get("impact_json"), {})
+    tool_call = dict((impact.get("scope") or {}).get("tool_call") or {})
+    arguments = tool_call.get("arguments") if isinstance(tool_call.get("arguments"), dict) else {}
+    structure = [str(item) for item in after.get("required_structure") or arguments.get("new_structure") or [] if str(item).strip()]
+    structure_text = f"；用户确认的目录（必须保持 {len(structure)} 章及顺序）：{' | '.join(structure)}" if structure else ""
+    argument_text = f"；执行参数：{_dump(arguments)[:1200]}" if arguments else ""
     return (
         f"- [{row.get('artifact_type')}/{row.get('object_id') or '整体'}] "
-        f"{row.get('rationale') or '按批准提案调整'}；建议变更：{_dump(_load(row.get('after_json'), {}))[:1800]}"
+        f"{row.get('rationale') or '按批准提案调整'}；建议变更：{_dump(after)[:1800]}{structure_text}{argument_text}"
     )
 
 

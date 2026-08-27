@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
+import { computed, nextTick, ref, watch } from "vue";
 import { useQuery, useQueryClient } from "@tanstack/vue-query";
 import { useRoute, RouterLink } from "vue-router";
 import { api, jsonInit } from "@/api/http";
@@ -7,7 +7,6 @@ import type { ReportData, Sentence } from "@/api/types";
 import StatusBadge from "@/components/StatusBadge.vue";
 import VersionReviewWorkspace from "@/components/VersionReviewWorkspace.vue";
 import MaterialComparisonWorkspace from "@/components/MaterialComparisonWorkspace.vue";
-import ReviewCopilot from "@/components/ReviewCopilot.vue";
 
 const route = useRoute();
 const queryClient = useQueryClient();
@@ -24,6 +23,9 @@ const updateReason = ref("");
 const incrementalFiles = ref<HTMLInputElement>();
 const incrementalMaterialIds = ref<number[]>([]);
 const sourceComparisonId = ref<number | null>(null);
+const qaTargetSentenceId = ref<number | null>(null);
+const paperRef = ref<HTMLElement | null>(null);
+const selectionAction = ref<any>(null);
 
 const report = useQuery({
   queryKey: ["report", reportId],
@@ -45,20 +47,158 @@ const discussionTarget = computed(
     },
 );
 
-function choose(sentence: Sentence) {
-  selected.value = sentence;
-  discussionScope.value = {
-    artifactType: "sentence",
-    objectId: sentence.id,
+function allSentences() {
+  return (report.data.value?.sections || []).flatMap((section: any) =>
+    (section.paragraphs || []).flatMap((paragraph: any) => paragraph.sentences || []),
+  );
+}
+function sentenceRefs(sentence: any) {
+  return {
+    fact_ids: [...new Set([
+      ...(sentence.fact_ids || []),
+      ...(sentence.sources || sentence.facts || []).map((item: any) => item.fact_id || item.id),
+    ].filter(Boolean))],
+    inference_ids: [...new Set([
+      ...(sentence.inference_ids || []),
+      ...(sentence.inferences || []).map((item: any) => item.inference_id || item.id),
+    ].filter(Boolean))],
+  };
+}
+function sentenceArtifact(sentence: any, quote = "") {
+  return {
+    artifact_type: "sentence",
+    object_id: sentence.id,
+    artifact_version: String(report.data.value?.versions?.[0]?.version_no || 1),
+    current: { content: sentence.content, quote: quote || sentence.content, source_refs: sentenceRefs(sentence) },
+    title: "正文句子",
+  };
+}
+function paragraphArtifact(section: any, paragraph: any, paragraphIndex: number, quote = "") {
+  const sentences = paragraph.sentences || [];
+  const refs = sentences.map(sentenceRefs);
+  const content = sentences.map((item: any) => item.content).filter(Boolean).join("");
+  return {
+    artifact_type: "paragraph",
+    object_id: `${section.title}:${paragraphIndex + 1}`,
+    artifact_version: String(report.data.value?.versions?.[0]?.version_no || 1),
     current: {
-      content: sentence.content,
+      section: section.title, paragraph: paragraphIndex + 1, content, quote: quote || content,
+      sentence_ids: sentences.map((item: any) => item.id),
       source_refs: {
-        fact_ids: sentence.fact_ids || [],
-        inference_ids: sentence.inference_ids || [],
+        fact_ids: [...new Set(refs.flatMap((item: any) => item.fact_ids))],
+        inference_ids: [...new Set(refs.flatMap((item: any) => item.inference_ids))],
       },
     },
+    title: `${section.display_title || section.title} · 第 ${paragraphIndex + 1} 段`,
+  };
+}
+function dispatchAssistant(artifact?: any, reference?: any, append = false) {
+  window.dispatchEvent(new CustomEvent("ira:assistant-focus", {
+    detail: { taskId: report.data.value?.task_id, artifact, reference, append },
+  }));
+}
+async function locateIssue(issue: any) {
+  sideTab.value = "qa";
+  const sentenceId = Number(issue?.sentence_id || 0);
+  if (sentenceId) {
+    qaTargetSentenceId.value = sentenceId;
+    const sentence = allSentences().find((item: any) => Number(item.id) === sentenceId);
+    if (sentence) selected.value = sentence;
+    await nextTick();
+    document.getElementById(`sentence-${sentenceId}`)?.scrollIntoView({ behavior: "smooth", block: "center" });
+    return;
+  }
+  const section = String(issue?.section || "");
+  const sectionIndex = (report.data.value?.sections || []).findIndex((item: any) => item.title === section);
+  if (sectionIndex >= 0) {
+    await nextTick();
+    document.getElementById(`section-${sectionIndex}`)?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+}
+watch(() => report.data.value, async (value) => {
+  if (!value) return;
+  if (route.query.panel === "qa") sideTab.value = "qa";
+  const sentenceId = Number(route.query.qa_sentence || 0);
+  const section = String(route.query.qa_section || "");
+  if (sentenceId || section) await locateIssue({ sentence_id: sentenceId || undefined, section });
+}, { immediate: true });
+
+function choose(sentence: Sentence) {
+  selected.value = sentence;
+  const artifact = sentenceArtifact(sentence);
+  discussionScope.value = {
+    artifactType: artifact.artifact_type,
+    objectId: artifact.object_id,
+    current: artifact.current,
   };
   if (mode.value === "trace") sideTab.value = "evidence";
+}
+function discussParagraph(section: any, paragraph: any, paragraphIndex: number) {
+  const artifact = paragraphArtifact(section, paragraph, paragraphIndex);
+  discussionScope.value = { artifactType: artifact.artifact_type, objectId: artifact.object_id, current: artifact.current };
+  dispatchAssistant(artifact);
+}
+function referenceSelectedSentence() {
+  if (!currentDetails.value) return;
+  const artifact = sentenceArtifact(currentDetails.value);
+  dispatchAssistant(artifact, artifact, true);
+}
+function askAboutIssue(issue: any) {
+  const sentence = allSentences().find((item: any) => Number(item.id) === Number(issue?.sentence_id || 0));
+  const target = sentence ? sentenceArtifact(sentence) : undefined;
+  const reference = {
+    artifact_type: "qa_issue", object_id: String(issue?.sentence_id || issue?.section || ""),
+    current: { section: issue?.section || "", quote: issue?.quote || "", note: issue?.note || issue?.message || "" },
+    title: "质量问题",
+  };
+  dispatchAssistant(target, reference, true);
+}
+function captureSelection(event: MouseEvent) {
+  const selection = window.getSelection();
+  const text = String(selection?.toString() || "").replace(/\s+/g, " ").trim();
+  if (!selection || selection.rangeCount === 0 || text.length < 2 || !paperRef.value) {
+    selectionAction.value = null;
+    return;
+  }
+  const range = selection.getRangeAt(0);
+  if (!paperRef.value.contains(range.commonAncestorContainer)) return;
+  const elements = [...paperRef.value.querySelectorAll<HTMLElement>(".sentence")]
+    .filter((element) => { try { return range.intersectsNode(element); } catch { return false; } });
+  const sentences = elements.map((element) => allSentences().find((item: any) => String(item.id) === element.id.replace("sentence-", ""))).filter(Boolean);
+  const firstElement = elements[0];
+  const paragraphElement = firstElement?.closest<HTMLElement>(".paragraph-block");
+  let artifact: any;
+  if (sentences.length === 1) artifact = sentenceArtifact(sentences[0], text);
+  else if (paragraphElement && elements.every((element) => element.closest(".paragraph-block") === paragraphElement)) {
+    const sectionIndex = Number(paragraphElement.dataset.sectionIndex || 0);
+    const paragraphIndex = Number(paragraphElement.dataset.paragraphIndex || 0);
+    const section = report.data.value?.sections?.[sectionIndex];
+    if (section?.paragraphs?.[paragraphIndex]) {
+      artifact = paragraphArtifact(section, section.paragraphs[paragraphIndex], paragraphIndex, text);
+    }
+  }
+  if (!artifact) {
+    const refs = sentences.map(sentenceRefs);
+    artifact = {
+      artifact_type: "report_excerpt", object_id: "selection", title: "报告选段",
+      current: { quote: text.slice(0, 2000), sentence_ids: sentences.map((item: any) => item.id), source_refs: {
+        fact_ids: [...new Set(refs.flatMap((item: any) => item.fact_ids))],
+        inference_ids: [...new Set(refs.flatMap((item: any) => item.inference_ids))],
+      } },
+    };
+  }
+  selectionAction.value = {
+    artifact,
+    x: Math.min(window.innerWidth - 170, Math.max(12, event.clientX + 8)),
+    y: Math.min(window.innerHeight - 52, Math.max(12, event.clientY + 8)),
+  };
+}
+function sendSelectionReference() {
+  const artifact = selectionAction.value?.artifact;
+  if (!artifact) return;
+  dispatchAssistant(["sentence", "paragraph"].includes(artifact.artifact_type) ? artifact : undefined, artifact, true);
+  selectionAction.value = null;
+  window.getSelection()?.removeAllRanges();
 }
 function discussTitle() {
   discussionScope.value = {
@@ -66,7 +206,7 @@ function discussTitle() {
     objectId: "",
     current: { title: report.data.value?.title || "" },
   };
-  sideTab.value = "discuss";
+  openTaskAssistant();
 }
 function discussSection(section: any) {
   discussionScope.value = {
@@ -74,7 +214,22 @@ function discussSection(section: any) {
     objectId: section.title,
     current: { title: section.title },
   };
-  sideTab.value = "discuss";
+  openTaskAssistant();
+}
+function openTaskAssistant() {
+  const target = discussionTarget.value;
+  window.dispatchEvent(new CustomEvent("ira:assistant-focus", {
+    detail: {
+      taskId: report.data.value?.task_id,
+      artifact: {
+        artifact_type: target.artifactType,
+        object_id: target.objectId,
+        artifact_version: String(report.data.value?.versions?.[0]?.version_no || 1),
+        current: target.current,
+        title: target.artifactType === "sentence" ? "当前正文句子" : target.artifactType === "section_title" ? "当前章节标题" : "报告标题",
+      },
+    },
+  }));
 }
 function comparisonHandoff(payload: any) {
   incrementalMaterialIds.value = payload.material_ids || [];
@@ -203,6 +358,15 @@ function confidence(item: any) {
     ] || "需人工复核"
   );
 }
+function qaLabel(issue: any) {
+  const key = String(issue?.type || issue?.problem_type || "").toUpperCase();
+  return ({
+    CONCRETENESS_ISSUE: "表述不够具体", DUPLICATE: "内容重复", REPETITION: "内容重复",
+    LOGIC_GAP: "论证衔接不足", EVIDENCE_GAP: "依据不足", UNSUPPORTED: "依据不足",
+    STYLE_ISSUE: "表达不够自然", STRUCTURE_ISSUE: "结构问题", FORMAT_ISSUE: "格式问题",
+    TITLE_MISMATCH: "标题与内容需复核",
+  } as any)[key] || "质量问题";
+}
 </script>
 
 <template>
@@ -305,7 +469,7 @@ function confidence(item: any) {
           >分析推论<span class="mixed"></span>混合依据
         </div>
       </aside>
-      <main class="paper">
+      <main ref="paperRef" class="paper" @mouseup="captureSelection">
         <h1
           contenteditable
           spellcheck="false"
@@ -326,18 +490,22 @@ function confidence(item: any) {
           >
             {{ section.display_title || section.title }}
           </h2>
-          <template
+          <div
             v-for="(paragraph, paragraphIndex) in section.paragraphs"
             :key="paragraphIndex"
-            ><template
+            class="paragraph-block"
+            :data-section-index="sectionIndex"
+            :data-paragraph-index="paragraphIndex"
+            ><button class="paragraph-discuss" type="button" @click.stop="discussParagraph(section, paragraph, paragraphIndex)">讨论本段</button><template
               v-for="sentence in paragraph.sentences"
               :key="sentence.id"
               ><h3
                 v-if="sentence.source_level === 'SUBHEADING'"
+                :id="`sentence-${sentence.id}`"
                 class="sentence subheading"
                 :class="[
                   sourceClass(sentence),
-                  { selected: selected?.id === sentence.id },
+                  { selected: selected?.id === sentence.id, 'qa-target': qaTargetSentenceId === sentence.id },
                 ]"
                 contenteditable
                 spellcheck="false"
@@ -359,11 +527,13 @@ function confidence(item: any) {
                   (sentence) => sentence.source_level !== 'SUBHEADING',
                 )"
                 :key="sentence.id"
+                :id="`sentence-${sentence.id}`"
                 class="sentence"
                 :class="[
                   sourceClass(sentence),
                   {
                     selected: selected?.id === sentence.id,
+                    'qa-target': qaTargetSentenceId === sentence.id,
                     excluded: sentence.selected === false,
                   },
                 ]"
@@ -373,7 +543,7 @@ function confidence(item: any) {
                 @blur="saveSentence(sentence, $event)"
                 >{{ sentence.content }}</span
               >
-            </p></template
+            </p></div
           ></template
         >
       </main>
@@ -394,14 +564,15 @@ function confidence(item: any) {
           ><button
             class="tab"
             :class="{ active: sideTab === 'discuss' }"
-            @click="sideTab = 'discuss'"
+            @click="openTaskAssistant"
           >
-            讨论
+            助手
           </button>
         </div>
         <div v-if="sideTab === 'evidence'" class="panel-body">
           <template v-if="currentDetails"
             ><p class="selected-quote">{{ currentDetails.content }}</p>
+            <button class="btn sentence-assistant" type="button" @click="referenceSelectedSentence">引用给助手讨论或修改</button>
             <section
               v-for="source in currentDetails.sources ||
               currentDetails.facts ||
@@ -464,8 +635,15 @@ function confidence(item: any) {
             :key="index"
             class="qa-item"
           >
-            <span class="badge warning">{{ issue.type || "质量问题" }}</span>
+            <span class="badge warning">{{ qaLabel(issue) }}</span>
             <p>{{ issue.note || issue.quote || issue.message }}</p>
+            <button
+              v-if="issue.sentence_id || issue.section"
+              type="button"
+              class="qa-locate"
+              @click="locateIssue(issue)"
+            >{{ issue.sentence_id ? "定位到问题句" : "定位到章节" }}</button>
+            <button type="button" class="qa-locate" @click="askAboutIssue(issue)">引用给助手</button>
           </article>
           <div v-if="!qaIssues.length" class="empty">
             <div>
@@ -473,19 +651,15 @@ function confidence(item: any) {
             </div>
           </div>
         </div>
-        <div v-else class="panel-body">
-          <ReviewCopilot
-            :task-id="report.data.value.task_id"
-            :report-id="reportId"
-            :artifact-type="discussionTarget.artifactType"
-            :object-id="discussionTarget.objectId"
-            :current="discussionTarget.current"
-            @applied="
-              queryClient.invalidateQueries({ queryKey: ['report', reportId] })
-            "
-          />
+        <div v-else class="panel-body assistant-handoff">
+          <b>使用统一任务助手</b>
+          <p>助手会读取当前选中的句子、章节及其来源，并保留任务级连续会话。</p>
+          <button class="btn primary" type="button" @click="openTaskAssistant">打开任务助手</button>
         </div>
       </aside>
+    </div>
+    <div v-if="selectionAction" class="selection-action" :style="{ left: `${selectionAction.x}px`, top: `${selectionAction.y}px` }">
+      <span>已选内容</span><button type="button" @click="sendSelectionReference">引用给助手</button><button type="button" aria-label="取消引用" @click="selectionAction = null">×</button>
     </div>
   </div>
   <div v-else class="loading-line"></div>
@@ -716,9 +890,56 @@ function confidence(item: any) {
 .qa-item p {
   margin: 8px 0;
 }
+.assistant-handoff p { color: var(--color-muted); line-height: 1.6; }
+.qa-locate {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--color-primary);
+  font-size: 12px;
+}
+.sentence.qa-target {
+  background: #fff1d6 !important;
+  box-shadow: 0 0 0 2px #c98524 !important;
+}
 .subheading {
   text-indent: 0 !important;
 }
+.paragraph-block { position: relative; }
+.paragraph-discuss {
+  position: absolute;
+  left: -66px;
+  top: 5px;
+  padding: 3px 6px;
+  border: 0;
+  border-left: 2px solid var(--color-primary);
+  background: #fff;
+  color: var(--color-primary);
+  font-family: var(--font-ui);
+  font-size: 11px;
+  opacity: 0;
+  transition: opacity var(--motion-fast);
+}
+.paragraph-block:hover > .paragraph-discuss,
+.paragraph-discuss:focus-visible { opacity: 1; }
+.sentence-assistant { width: 100%; margin: -3px 0 8px; }
+.selection-action {
+  position: fixed;
+  z-index: 90;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 8px;
+  border: 1px solid var(--color-border-strong);
+  border-radius: 5px;
+  background: #fff;
+  box-shadow: var(--shadow-float);
+  font-family: var(--font-ui);
+  font-size: 11px;
+}
+.selection-action span { color: var(--color-muted); }
+.selection-action button { padding: 2px 4px; border: 0; background: transparent; color: var(--color-primary); }
+.selection-action button:last-child { color: var(--color-faint); font-size: 15px; }
 @media (max-width: 1350px) {
   .editor-grid {
     grid-template-columns: 190px minmax(600px, 820px) 300px;
@@ -765,5 +986,6 @@ function confidence(item: any) {
   .drawer-strip {
     grid-template-columns: 1fr;
   }
+  .paragraph-discuss { position: static; margin-bottom: 4px; opacity: 1; }
 }
 </style>

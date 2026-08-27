@@ -10,12 +10,13 @@ const route = useRoute();
 const ui = useUiStore();
 ui.ensureDraftId();
 const open = ref(false);
-const tab = ref<"progress" | "artifacts" | "discuss">("discuss");
+const tab = ref<"progress" | "artifacts" | "discuss">("progress");
 const task = ref<any>(null);
 const report = ref<any>(null);
 const workspace = ref<any>(null);
 const artifactType = ref("task_brief");
 const selected = ref<any>(null);
+const references = ref<any[]>([]);
 const draft = computed(() => ui.taskDraft);
 const draftId = computed(() => ui.draftId);
 const loading = ref(false);
@@ -115,8 +116,19 @@ const activeArtifact = computed(() => {
     title: "当前任务",
   };
 });
-const prompts = computed(() =>
-  isDraft.value
+const assistantFocus = computed(() => ({
+  ...activeArtifact.value,
+  references: references.value,
+}));
+const prompts = computed(() => {
+  if (["sentence", "paragraph", "qa_issue"].includes(activeArtifact.value.artifact_type)) {
+    return [
+      "解释这段内容存在的问题及其依据。",
+      "在不改变事实含义的前提下改写这段内容。",
+      "检查这段内容的事实和引用是否匹配。",
+    ];
+  }
+  return isDraft.value
     ? [
         "帮我判断当前需求是否清楚，还缺少哪些业务信息？",
         "根据这个目标，建议报告重点回答哪些问题？",
@@ -126,8 +138,8 @@ const prompts = computed(() =>
         "当前运行到哪一步，已经完成什么，下一步是什么？",
         "请解释当前阶段的输入、产出和必要性。",
         "如果修改当前产物，后续哪些环节需要重新计算？",
-      ],
-);
+      ];
+});
 
 const stageMeta: Record<string, { label: string; description: string }> = {
   created: { label: "等待开始", description: "任务目标和材料已登记，尚未进入处理。" },
@@ -190,7 +202,46 @@ async function switchTab(value: "progress" | "artifacts" | "discuss") {
 }
 
 function discussArtifact(item: any) {
+  selected.value = selected.value?.object_id === item.object_id ? null : item;
+}
+
+function beginArtifactDiscussion(item: any) {
   selected.value = item;
+  addReference(item);
+  tab.value = "discuss";
+}
+
+function referenceKey(item: any) {
+  return `${item?.artifact_type || "reference"}:${item?.object_id || ""}:${item?.current?.quote || item?.current?.content || ""}`;
+}
+function referenceSummary(item: any) {
+  return String(item?.current?.quote || item?.current?.content || item?.current?.note || item?.title || "所选内容")
+    .replace(/\s+/g, " ").slice(0, 72);
+}
+function artifactPreview(item: any) {
+  const current = item?.current || {};
+  const value = current.requirements || current.content || current.summary || current.objective ||
+    current.core_message || current.narrative_logic || current.note || current.quote || item?.summary || "";
+  return String(value).replace(/\s+/g, " ").slice(0, 360);
+}
+function addReference(item: any) {
+  if (!item) return;
+  const key = referenceKey(item);
+  const next = references.value.filter((entry) => referenceKey(entry) !== key);
+  references.value = [...next, item].slice(-8);
+}
+function removeReference(index: number) {
+  references.value = references.value.filter((_item, current) => current !== index);
+}
+
+function acceptExternalFocus(event: Event) {
+  const detail = (event as CustomEvent).detail;
+  if (!detail || (detail.taskId && taskId.value && String(detail.taskId) !== taskId.value)) return;
+  if (detail.reference) addReference(detail.reference);
+  if (detail.artifact) selected.value = detail.artifact;
+  else if (!detail.reference) selected.value = detail;
+  if (!detail.append && !detail.reference) references.value = [];
+  open.value = true;
   tab.value = "discuss";
 }
 
@@ -204,12 +255,14 @@ function proposalApplied(proposal: any) {
 
 watch(() => route.fullPath, () => {
   open.value = false;
-  tab.value = "discuss";
+  tab.value = "progress";
   selected.value = null;
+  references.value = [];
   loadContext();
 });
 onMounted(() => {
   loadContext();
+  window.addEventListener("ira:assistant-focus", acceptExternalFocus);
   timer = window.setInterval(() => {
     if (open.value && taskId.value) loadContext();
   }, 5000);
@@ -217,6 +270,7 @@ onMounted(() => {
 onBeforeUnmount(() => {
   if (timer) window.clearInterval(timer);
   stopResize?.();
+  window.removeEventListener("ira:assistant-focus", acceptExternalFocus);
 });
 </script>
 
@@ -231,7 +285,7 @@ onBeforeUnmount(() => {
         @pointerdown="startPanelResize"
       ></button>
       <header>
-        <div><small>{{ isDraft ? "任务创建前" : "当前任务" }}</small><b>报告协作助手</b></div>
+        <div><small>{{ isDraft ? "任务创建前" : currentStage.label }}</small><b>任务协作助手</b></div>
         <div class="panel-actions">
           <button type="button" @click="expanded = !expanded">
             {{ expanded ? "还原" : "扩展" }}
@@ -242,9 +296,9 @@ onBeforeUnmount(() => {
         </div>
       </header>
       <nav>
-        <button :class="{ active: tab === 'progress' }" @click="switchTab('progress')">{{ isDraft ? "需求" : "进度" }}</button>
-        <button v-if="!isDraft" :class="{ active: tab === 'artifacts' }" @click="switchTab('artifacts')">历史产物</button>
-        <button :class="{ active: tab === 'discuss' }" @click="switchTab('discuss')">讨论</button>
+        <button :class="{ active: tab === 'progress' }" @click="switchTab('progress')">{{ isDraft ? "需求" : "任务状态" }}</button>
+        <button v-if="!isDraft" :class="{ active: tab === 'artifacts' }" @click="switchTab('artifacts')">产物</button>
+        <button :class="{ active: tab === 'discuss' }" @click="switchTab('discuss')">协作对话</button>
       </nav>
       <div class="assistant-body" :class="{ 'discussion-active': tab === 'discuss' }">
         <div v-if="tab === 'progress'" class="progress-view">
@@ -272,24 +326,45 @@ onBeforeUnmount(() => {
             </button>
           </div>
           <div v-if="workspace?.items?.length" class="artifact-items">
-            <button v-for="item in workspace.items" :key="`${item.artifact_type}:${item.object_id}`" @click="discussArtifact(item)">
-              <b>{{ item.title }}</b><span>{{ item.summary || "查看并讨论" }}</span>
-            </button>
+            <article v-for="item in workspace.items" :key="`${item.artifact_type}:${item.object_id}`" :class="{ active: selected?.object_id === item.object_id }">
+              <button @click="discussArtifact(item)">
+                <span><b>{{ item.title }}</b><i>{{ selected?.object_id === item.object_id ? "收起" : "查看" }}</i></span>
+                <small v-if="selected?.object_id !== item.object_id">{{ item.summary || "查看内容" }}</small>
+              </button>
+              <div v-if="selected?.object_id === item.object_id" class="assistant-artifact-detail">
+                <p>{{ artifactPreview(item) || "该产物已形成，可交给助手结合任务上下文解释。" }}</p>
+                <button class="btn primary" @click="beginArtifactDiscussion(item)">引用并讨论</button>
+              </div>
+            </article>
           </div>
           <div v-else class="assistant-empty">该阶段尚未形成可审阅产物。</div>
         </div>
         <div v-else class="discussion-view">
-          <div class="discussion-scope"><small>正在讨论</small><b>{{ activeArtifact.title }}</b></div>
+          <div class="discussion-scope">
+            <small>正在讨论</small><b>{{ activeArtifact.title }}</b>
+            <div v-if="selected || isDraft" class="focus-context">
+              <p>{{ artifactPreview(activeArtifact) || "当前产物已作为对话上下文。" }}</p>
+              <button v-if="selected && !isDraft" type="button" @click="tab = 'artifacts'">返回查看产物</button>
+            </div>
+            <div v-if="references.length" class="reference-list">
+              <span v-for="(item, index) in references" :key="referenceKey(item)">
+                <i>引用</i>{{ referenceSummary(item) }}
+                <button type="button" aria-label="移除引用" @click="removeReference(index)">×</button>
+              </span>
+              <button type="button" class="clear-references" @click="references = []">清除引用</button>
+            </div>
+          </div>
           <ReviewCopilot
             v-if="interactionScopeReady"
-            :key="`${taskId}:${activeArtifact.artifact_type}:${activeArtifact.object_id}`"
+            :key="isDraft ? `draft:${draftId}` : `task:${taskId}`"
             compact
             :task-id="taskId"
-            :report-id="reportId"
-            :artifact-type="activeArtifact.artifact_type"
-            :artifact-version="activeArtifact.artifact_version"
-            :object-id="activeArtifact.object_id"
-            :current="activeArtifact.current"
+            :report-id="isDraft ? reportId : undefined"
+            :artifact-type="isDraft ? 'task_draft' : 'task_control'"
+            :artifact-version="isDraft ? 'draft' : ''"
+            :object-id="isDraft ? draftId : ''"
+            :current="isDraft ? activeArtifact.current : { task_id: taskId, stage: task?.stage || 'created' }"
+            :focus="assistantFocus"
             :suggested-prompts="prompts"
             @applied="proposalApplied"
           />
@@ -299,17 +374,18 @@ onBeforeUnmount(() => {
     </section>
     <button class="assistant-orb" :aria-label="open ? '关闭报告协作助手' : '打开报告协作助手'" @click="open = !open">
       <span class="orb-mark"><i></i><i></i><i></i></span>
-      <span class="orb-label">{{ isDraft ? "先讨论" : "问进度" }}</span>
+      <span class="orb-label">{{ isDraft ? "讨论需求" : "任务助手" }}</span>
     </button>
   </div>
 </template>
 
 <style scoped>
-.workflow-assistant{position:fixed;right:24px;bottom:24px;z-index:80}.assistant-orb{display:flex;align-items:center;gap:9px;height:46px;padding:0 15px 0 11px;border:1px solid #173f6c;border-radius:23px;background:#245b90;color:#fff;box-shadow:0 8px 24px rgba(24,55,89,.22);font-weight:650}.assistant-orb:hover{background:#1e4e7d}.orb-mark{display:flex;align-items:flex-end;justify-content:center;gap:2px;width:22px;height:22px;padding:5px 4px;border:1px solid rgba(255,255,255,.42);border-radius:50%}.orb-mark i{display:block;width:2px;background:#fff}.orb-mark i:nth-child(1){height:5px}.orb-mark i:nth-child(2){height:10px}.orb-mark i:nth-child(3){height:7px}.orb-label{font-size:13px}.assistant-panel{position:absolute;right:0;bottom:58px;width:min(430px,calc(100vw - 32px));height:min(690px,calc(100vh - 100px));display:grid;grid-template-rows:auto auto minmax(0,1fr);overflow:hidden;border:1px solid var(--color-border);border-radius:8px;background:#fff;box-shadow:0 18px 50px rgba(24,39,57,.2)}.assistant-panel>header{display:flex;align-items:center;justify-content:space-between;padding:15px 17px;border-bottom:1px solid var(--color-border)}.assistant-panel>header small,.assistant-panel>header b{display:block}.assistant-panel>header small{color:var(--color-muted);font-size:11px}.assistant-panel>header b{margin-top:2px}.assistant-panel>header button{display:grid;place-items:center;width:30px;height:30px;border:0;background:transparent;color:var(--color-muted)}.assistant-panel>nav{display:grid;grid-auto-flow:column;grid-auto-columns:1fr;padding:0 14px;border-bottom:1px solid var(--color-border)}.assistant-panel>nav button{padding:11px 4px;border:0;border-bottom:2px solid transparent;background:transparent;color:var(--color-muted)}.assistant-panel>nav button.active{border-bottom-color:var(--color-primary);color:var(--color-primary);font-weight:650}.assistant-body{min-height:0;overflow:auto}.progress-view{padding:22px}.progress-view>small{color:var(--color-primary)}.progress-view h3{margin:4px 0 9px;font-size:18px}.progress-view p{margin:0;color:var(--color-muted);line-height:1.7}.stage-state{display:flex;align-items:center;gap:12px}.stage-state>span{width:9px;height:9px;border-radius:50%;background:var(--color-primary);box-shadow:0 0 0 5px var(--color-primary-soft)}.stage-state>span.review,.stage-state>span.done{background:var(--color-success);box-shadow:0 0 0 5px #edf7ef}.stage-state>span.failed{background:var(--color-danger);box-shadow:0 0 0 5px #fff1ef}.progress-view dl{margin:20px 0;border-top:1px solid var(--color-border)}.progress-view dl div{display:flex;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--color-border)}.progress-view dt{color:var(--color-muted)}.progress-view dd{margin:0;font-weight:650}.ask-link{margin-top:17px;padding:0;border:0;background:transparent;color:var(--color-primary);font-weight:650}.artifact-view{display:grid;grid-template-columns:125px 1fr;min-height:100%}.artifact-types{padding:10px;border-right:1px solid var(--color-border);background:#fafbfc}.artifact-types button{display:flex;justify-content:space-between;width:100%;padding:9px 8px;border:0;border-left:2px solid transparent;background:transparent;color:var(--color-muted);text-align:left}.artifact-types button.active{border-left-color:var(--color-primary);background:var(--color-primary-soft);color:var(--color-primary)}.artifact-types button:disabled{opacity:.38}.artifact-types span{font-size:11px}.artifact-items button{display:grid;width:100%;gap:4px;padding:12px 14px;border:0;border-bottom:1px solid var(--color-border);background:#fff;text-align:left}.artifact-items button:hover{background:#f7f9fb}.artifact-items span{display:-webkit-box;overflow:hidden;color:var(--color-muted);font-size:11px;-webkit-line-clamp:2;-webkit-box-orient:vertical}.assistant-empty{padding:28px;color:var(--color-muted)}.discussion-view{padding:17px}.discussion-scope{padding-bottom:12px;margin-bottom:14px;border-bottom:1px solid var(--color-border)}.discussion-scope small,.discussion-scope b{display:block}.discussion-scope small{color:var(--color-muted)}.discussion-scope b{margin-top:2px}.loading{padding:20px;color:var(--color-muted)}
+.workflow-assistant{position:fixed;right:24px;bottom:24px;z-index:80}.assistant-orb{display:flex;align-items:center;gap:9px;height:46px;padding:0 15px 0 11px;border:1px solid #173f6c;border-radius:23px;background:#245b90;color:#fff;box-shadow:0 8px 24px rgba(24,55,89,.22);font-weight:650}.assistant-orb:hover{background:#1e4e7d}.orb-mark{display:flex;align-items:flex-end;justify-content:center;gap:2px;width:22px;height:22px;padding:5px 4px;border:1px solid rgba(255,255,255,.42);border-radius:50%}.orb-mark i{display:block;width:2px;background:#fff}.orb-mark i:nth-child(1){height:5px}.orb-mark i:nth-child(2){height:10px}.orb-mark i:nth-child(3){height:7px}.orb-label{font-size:13px}.assistant-panel{position:absolute;right:0;bottom:58px;width:min(560px,calc(100vw - 32px));height:min(720px,calc(100vh - 100px));display:grid;grid-template-rows:auto auto minmax(0,1fr);overflow:hidden;border:1px solid var(--color-border);border-radius:8px;background:#fff;box-shadow:0 18px 50px rgba(24,39,57,.2)}.assistant-panel>header{display:flex;align-items:center;justify-content:space-between;padding:15px 17px;border-bottom:1px solid var(--color-border)}.assistant-panel>header small,.assistant-panel>header b{display:block}.assistant-panel>header small{color:var(--color-muted);font-size:11px}.assistant-panel>header b{margin-top:2px}.assistant-panel>header button{display:grid;place-items:center;width:30px;height:30px;border:0;background:transparent;color:var(--color-muted)}.assistant-panel>nav{display:grid;grid-auto-flow:column;grid-auto-columns:1fr;padding:0 14px;border-bottom:1px solid var(--color-border)}.assistant-panel>nav button{padding:11px 4px;border:0;border-bottom:2px solid transparent;background:transparent;color:var(--color-muted)}.assistant-panel>nav button.active{border-bottom-color:var(--color-primary);color:var(--color-primary);font-weight:650}.assistant-body{min-height:0;overflow:auto}.progress-view{padding:22px}.progress-view>small{color:var(--color-primary)}.progress-view h3{margin:4px 0 9px;font-size:18px}.progress-view p{margin:0;color:var(--color-muted);line-height:1.7}.stage-state{display:flex;align-items:center;gap:12px}.stage-state>span{width:9px;height:9px;border-radius:50%;background:var(--color-primary);box-shadow:0 0 0 5px var(--color-primary-soft)}.stage-state>span.review,.stage-state>span.done{background:var(--color-success);box-shadow:0 0 0 5px #edf7ef}.stage-state>span.failed{background:var(--color-danger);box-shadow:0 0 0 5px #fff1ef}.progress-view dl{margin:20px 0;border-top:1px solid var(--color-border)}.progress-view dl div{display:flex;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--color-border)}.progress-view dt{color:var(--color-muted)}.progress-view dd{margin:0;font-weight:650}.ask-link{margin-top:17px;padding:0;border:0;background:transparent;color:var(--color-primary);font-weight:650}.artifact-view{display:grid;grid-template-rows:auto minmax(0,1fr);min-height:100%}.artifact-types{display:flex;gap:4px;padding:10px;overflow-x:auto;border-bottom:1px solid var(--color-border);background:#fafbfc}.artifact-types button{display:flex;flex:0 0 auto;align-items:center;gap:7px;padding:7px 9px;border:0;border-bottom:2px solid transparent;background:transparent;color:var(--color-muted)}.artifact-types button.active{border-bottom-color:var(--color-primary);background:var(--color-primary-soft);color:var(--color-primary)}.artifact-types button:disabled{opacity:.38}.artifact-types span{font-size:11px}.artifact-items{min-height:0;overflow:auto}.artifact-items article{border-bottom:1px solid var(--color-border)}.artifact-items article.active{background:#f7f9fb;box-shadow:inset 3px 0 var(--color-primary)}.artifact-items article>button{display:grid;width:100%;gap:5px;padding:13px 15px;border:0;background:transparent;text-align:left}.artifact-items article>button>span{display:flex;align-items:center;justify-content:space-between;gap:12px}.artifact-items i{color:var(--color-primary);font-size:11px;font-style:normal;font-weight:500}.artifact-items small{display:-webkit-box;overflow:hidden;color:var(--color-muted);font-size:11px;-webkit-line-clamp:2;-webkit-box-orient:vertical}.assistant-artifact-detail{display:grid;gap:10px;padding:0 15px 15px}.assistant-artifact-detail p{margin:0;color:var(--color-text-secondary);line-height:1.65}.assistant-artifact-detail .btn{justify-self:end}.assistant-empty{padding:28px;color:var(--color-muted)}.discussion-view{padding:17px}.discussion-scope{padding-bottom:12px;margin-bottom:14px;border-bottom:1px solid var(--color-border)}.discussion-scope small,.discussion-scope b{display:block}.discussion-scope small{color:var(--color-muted)}.discussion-scope b{margin-top:2px}.loading{padding:20px;color:var(--color-muted)}
 .assistant-body.discussion-active{overflow:hidden}
 .discussion-view{height:100%;min-height:0;display:grid;grid-template-rows:auto minmax(0,1fr)}
 .panel-actions{display:flex;align-items:center;gap:3px}.panel-actions button:first-child{width:auto;min-width:42px;padding:0 7px;color:var(--color-primary);font-size:12px}.panel-resize-handle{position:absolute;top:-5px;left:-5px;z-index:2;width:18px;height:18px;padding:0;border:0;border-top:2px solid var(--color-border-strong);border-left:2px solid var(--color-border-strong);background:transparent;cursor:nwse-resize}
-:global(body:has(.collaboration-shell) .workflow-assistant){display:none}
 @media(max-width:600px){.workflow-assistant{right:14px;bottom:14px}.assistant-panel{position:fixed;inset:12px;width:auto;height:auto;border-radius:7px}.orb-label{display:none}.assistant-orb{width:48px;padding:0;justify-content:center}}
 @media(max-width:600px){.assistant-panel{width:auto!important;height:auto!important}.panel-resize-handle{display:none}}
+.reference-list{display:flex;align-items:center;gap:6px;margin-top:9px;overflow-x:auto;padding-bottom:2px}.reference-list>span{display:flex;align-items:center;gap:5px;flex:0 0 auto;max-width:260px;padding:4px 7px;background:var(--color-surface-soft);border:1px solid var(--color-border);border-radius:4px;color:var(--color-muted);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.reference-list i{color:var(--color-primary);font-style:normal}.reference-list span button,.clear-references{padding:0;border:0;background:transparent;color:var(--color-faint)}.reference-list span button{font-size:15px}.clear-references{flex:0 0 auto;font-size:11px}
+.focus-context{display:grid;gap:6px;margin-top:9px;padding:10px 12px;border-left:2px solid var(--color-primary);background:var(--color-surface-soft)}.focus-context p{display:-webkit-box;overflow:hidden;margin:0;color:var(--color-text-secondary);line-height:1.55;-webkit-line-clamp:4;-webkit-box-orient:vertical}.focus-context button{justify-self:start;padding:0;border:0;background:transparent;color:var(--color-primary);font-size:11px}
 </style>
