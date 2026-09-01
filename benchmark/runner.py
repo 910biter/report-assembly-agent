@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import contextlib
 import json
+import importlib.metadata
 import os
 import platform
 import shlex
@@ -103,7 +105,9 @@ def _stream_request(client: httpx.Client, url: str, headers: dict[str, str], pay
     response_payload: dict[str, Any] = {}
     usage: dict[str, Any] = {}
     finish_reason = ""
+    chunk_arrivals: list[float] = []
     with client.stream("POST", url, headers=headers, json=payload) as response:
+        headers_at = time.perf_counter()
         response.raise_for_status()
         for line in response.iter_lines():
             event = _parse_sse_line(line)
@@ -116,8 +120,9 @@ def _stream_request(client: httpx.Client, url: str, headers: dict[str, str], pay
                 delta = choice.get("delta") or {}
                 fragment = str(delta.get("content") or "")
                 if fragment:
+                    chunk_arrivals.append(time.perf_counter())
                     if first_token_at is None:
-                        first_token_at = time.perf_counter()
+                        first_token_at = chunk_arrivals[-1]
                     content_parts.append(fragment)
                 finish_reason = str(choice.get("finish_reason") or finish_reason)
             if event.get("usage"):
@@ -132,6 +137,13 @@ def _stream_request(client: httpx.Client, url: str, headers: dict[str, str], pay
         "started_at": started_at,
         "finished_at": datetime.now(timezone.utc).isoformat(),
         "ttft_seconds": round((first_token_at or finished) - started, 6),
+        "time_to_headers_seconds": round(headers_at - started, 6),
+        "first_content_after_headers_seconds": round((first_token_at or finished) - headers_at, 6),
+        "stream_chunk_count": len(chunk_arrivals),
+        "stream_chunk_interarrival_seconds": [
+            round(chunk_arrivals[index] - chunk_arrivals[index - 1], 6)
+            for index in range(1, len(chunk_arrivals))
+        ],
         "transport": "stream",
         "raw_response": response_payload,
     }
@@ -166,7 +178,8 @@ def _endpoint_url(endpoint: str) -> str:
 
 def execute_case(case: dict[str, Any], endpoint: str, model_override: str = "", api_key: str = "",
                  stream: bool = True, timeout_seconds: float = 900.0,
-                 preserve_priority: bool = False) -> dict[str, Any]:
+                 preserve_priority: bool = False, client: httpx.Client | None = None,
+                 submitted_at: float | None = None, metrics_url: str = "") -> dict[str, Any]:
     generation = dict((case.get("request") or {}).get("generation") or {})
     model = model_override or str(generation.pop("model", ""))
     if not model:
@@ -184,11 +197,14 @@ def execute_case(case: dict[str, Any], endpoint: str, model_override: str = "", 
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
+    server_metrics_before = fetch_prometheus_snapshot(metrics_url)
     try:
-        with httpx.Client(timeout=timeout_seconds) as client:
+        request_started = time.perf_counter()
+        client_context = contextlib.nullcontext(client) if client is not None else httpx.Client(timeout=timeout_seconds)
+        with client_context as request_client:
             result = (
-                _stream_request(client, _endpoint_url(endpoint), headers, payload)
-                if stream else _non_stream_request(client, _endpoint_url(endpoint), headers, payload)
+                _stream_request(request_client, _endpoint_url(endpoint), headers, payload)
+                if stream else _non_stream_request(request_client, _endpoint_url(endpoint), headers, payload)
             )
     except Exception as exc:
         result = {
@@ -203,16 +219,40 @@ def execute_case(case: dict[str, Any], endpoint: str, model_override: str = "", 
             "transport": "stream" if stream else "non_stream",
             "error": f"{type(exc).__name__}:{exc}",
         }
+    server_metrics_after = fetch_prometheus_snapshot(metrics_url)
+    server_delta = metric_delta(server_metrics_before, server_metrics_after)
     usage = result.get("usage") or {}
     prompt_tokens = usage.get("prompt_tokens")
     output_tokens = usage.get("completion_tokens")
     latency = float(result.get("latency_seconds") or 0.0)
     ttft = result.get("ttft_seconds")
     decode_seconds = latency - float(ttft or 0.0) if ttft is not None else None
+    chunk_intervals = list(result.get("stream_chunk_interarrival_seconds") or [])
+    prompt_details = dict(usage.get("prompt_tokens_details") or {})
     result["metrics"] = {
         "reported_prompt_tokens": int(prompt_tokens) if prompt_tokens is not None else None,
         "reported_output_tokens": int(output_tokens) if output_tokens is not None else None,
         "ttft_seconds": ttft,
+        "time_to_headers_seconds": result.get("time_to_headers_seconds"),
+        "first_content_after_headers_seconds": result.get("first_content_after_headers_seconds"),
+        "client_queue_wait_seconds": (
+            round(max(0.0, request_started - submitted_at), 6)
+            if submitted_at is not None else 0.0
+        ),
+        "decode_seconds_client": round(decode_seconds, 6) if decode_seconds is not None else None,
+        "tpot_seconds": (
+            round(decode_seconds / max(int(output_tokens or 0) - 1, 1), 8)
+            if output_tokens is not None and decode_seconds is not None and decode_seconds > 0 else None
+        ),
+        "stream_chunk_count": int(result.get("stream_chunk_count") or 0),
+        "stream_chunk_interarrival_seconds_p50": percentile(chunk_intervals, 50),
+        "stream_chunk_interarrival_seconds_p95": percentile(chunk_intervals, 95),
+        "stream_chunk_interarrival_seconds_max": round(max(chunk_intervals), 6) if chunk_intervals else None,
+        "cached_prompt_tokens": int(prompt_details.get("cached_tokens") or 0),
+        "input_output_ratio": (
+            round(int(prompt_tokens) / max(int(output_tokens), 1), 6)
+            if prompt_tokens is not None and output_tokens is not None else None
+        ),
         # This is deliberately called a proxy: TTFT includes network and queue
         # time, so a client cannot claim it is model-internal prefill timing.
         "prefill_proxy_tokens_per_second": (
@@ -228,6 +268,8 @@ def execute_case(case: dict[str, Any], endpoint: str, model_override: str = "", 
             if prompt_tokens is not None and output_tokens is not None and latency > 0 else None
         ),
     }
+    result["server_internal_metrics"] = _server_inference_metrics(server_delta)
+    result["server_internal_metrics"]["attribution"] = "exclusive"
     result["validation"] = validate_output(case, result)
     result["reference_baseline"] = dict(case.get("baseline") or {})
     result["reference_shape"] = dict(case.get("shape") or {})
@@ -404,13 +446,80 @@ def _resource_summary(samples: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _iso_timestamp(value: str) -> float:
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _attach_resource_windows(results: list[dict[str, Any]], samples: list[dict[str, Any]]) -> None:
+    """Associate each request with resource samples observed during its wall-time window."""
+    timed_samples = [(_iso_timestamp(sample.get("at", "")), sample) for sample in samples]
+    for result in results:
+        started = _iso_timestamp(result.get("started_at", ""))
+        finished = _iso_timestamp(result.get("finished_at", ""))
+        window = [sample for at, sample in timed_samples if started <= at <= finished]
+        result["resource_window"] = {
+            "sample_count": len(window),
+            "shared_with_concurrent_requests": False,
+            "summary": _resource_summary(window),
+        }
+
+
+def _attach_concurrency(results: list[dict[str, Any]]) -> None:
+    intervals = [
+        (_iso_timestamp(item.get("started_at", "")), _iso_timestamp(item.get("finished_at", "")))
+        for item in results
+    ]
+    for index, result in enumerate(results):
+        started, finished = intervals[index]
+        overlap = sum(1 for other_started, other_finished in intervals
+                      if other_started <= finished and other_finished >= started)
+        result["overlapping_request_count"] = max(0, overlap - 1)
+        result["resource_window"]["shared_with_concurrent_requests"] = overlap > 1
+        if result.get("server_internal_metrics"):
+            result["server_internal_metrics"]["attribution"] = "shared" if overlap > 1 else "exclusive"
+
+
 def _environment() -> dict[str, Any]:
+    packages = {}
+    for package in ("vllm", "torch", "httpx", "psutil"):
+        try:
+            packages[package] = importlib.metadata.version(package)
+        except importlib.metadata.PackageNotFoundError:
+            packages[package] = None
     return {
         "python": sys.version,
         "platform": platform.platform(),
         "hostname": platform.node(),
         "pid": os.getpid(),
+        "packages": packages,
+        "serving_envelope": {
+            "model_path_or_id": os.getenv("MODEL_PATH_OR_ID", ""),
+            "served_model_name": os.getenv("SERVED_MODEL_NAME", ""),
+            "max_model_len": _env_number("MAX_MODEL_LEN"),
+            "max_num_seqs": _env_number("MAX_NUM_SEQS"),
+            "max_num_batched_tokens": _env_number("MAX_NUM_BATCHED_TOKENS"),
+            "gpu_memory_utilization": _env_number("GPU_MEMORY_UTILIZATION", floating=True),
+            "kv_cache_dtype": os.getenv("KV_CACHE_DTYPE", "") or "auto",
+            "calculate_kv_scales": os.getenv("CALCULATE_KV_SCALES", "0") == "1",
+            "cpu_offload_gb": _env_number("CPU_OFFLOAD_GB", floating=True),
+            "prefix_caching": True,
+            "chunked_prefill": True,
+            "scheduling_policy": "priority",
+        },
     }
+
+
+def _env_number(name: str, floating: bool = False) -> int | float | None:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return None
+    try:
+        return float(raw) if floating else int(raw)
+    except ValueError:
+        return None
 
 
 def fetch_prometheus_snapshot(url: str, timeout_seconds: float = 3.0) -> dict[str, float]:
@@ -448,6 +557,45 @@ def metric_delta(before: dict[str, float], after: dict[str, float]) -> dict[str,
     }
 
 
+def _metric_total(metrics: dict[str, float], name: str) -> float:
+    return sum(
+        float(value)
+        for key, value in metrics.items()
+        if key == name or key.startswith(name + "{")
+    )
+
+
+def _server_inference_metrics(delta: dict[str, float]) -> dict[str, float | int | None]:
+    """Derive model-internal timings from OpenAI server Prometheus counters."""
+    prompt_tokens = _metric_total(delta, "vllm:prompt_tokens_total")
+    output_tokens = _metric_total(delta, "vllm:generation_tokens_total")
+    computed_prompt_tokens = _metric_total(delta, "vllm:request_prefill_kv_computed_tokens_sum")
+    prefill_seconds = _metric_total(delta, "vllm:request_prefill_time_seconds_sum")
+    decode_seconds = _metric_total(delta, "vllm:request_decode_time_seconds_sum")
+    ttft_sum = _metric_total(delta, "vllm:time_to_first_token_seconds_sum")
+    ttft_count = _metric_total(delta, "vllm:time_to_first_token_seconds_count")
+    cache_queries = _metric_total(delta, "vllm:prefix_cache_queries_total")
+    cache_hits = _metric_total(delta, "vllm:prefix_cache_hits_total")
+    return {
+        "reported_request_count": int(round(ttft_count)),
+        "prompt_tokens": int(round(prompt_tokens)),
+        "computed_prompt_tokens": int(round(computed_prompt_tokens)),
+        "output_tokens": int(round(output_tokens)),
+        "prefill_seconds": round(prefill_seconds, 6) if prefill_seconds > 0 else None,
+        "decode_seconds": round(decode_seconds, 6) if decode_seconds > 0 else None,
+        "ttft_seconds_average": round(ttft_sum / ttft_count, 6) if ttft_count > 0 else None,
+        "prefill_tokens_per_second": (
+            round(computed_prompt_tokens / prefill_seconds, 4)
+            if computed_prompt_tokens > 0 and prefill_seconds > 0 else None
+        ),
+        "decode_tokens_per_second": (
+            round(output_tokens / decode_seconds, 4)
+            if output_tokens > 0 and decode_seconds > 0 else None
+        ),
+        "prefix_cache_hit_rate": round(cache_hits / cache_queries, 6) if cache_queries > 0 else None,
+    }
+
+
 def summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
     groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for result in results:
@@ -457,7 +605,15 @@ def summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
         latency = [float(item.get("latency_seconds") or 0.0) for item in items if item.get("success")]
         ttft = [float(item["metrics"]["ttft_seconds"]) for item in items if item.get("metrics", {}).get("ttft_seconds") is not None]
         decode = [float(item["metrics"]["decode_tokens_per_second"]) for item in items if item.get("metrics", {}).get("decode_tokens_per_second") is not None]
+        server_prefill = [float(item["server_internal_metrics"]["prefill_tokens_per_second"]) for item in items if item.get("server_internal_metrics", {}).get("prefill_tokens_per_second") is not None]
+        server_decode = [float(item["server_internal_metrics"]["decode_tokens_per_second"]) for item in items if item.get("server_internal_metrics", {}).get("decode_tokens_per_second") is not None]
+        server_ttft = [float(item["server_internal_metrics"]["ttft_seconds_average"]) for item in items if item.get("server_internal_metrics", {}).get("ttft_seconds_average") is not None]
         prefill_proxy = [float(item["metrics"]["prefill_proxy_tokens_per_second"]) for item in items if item.get("metrics", {}).get("prefill_proxy_tokens_per_second") is not None]
+        tpot = [float(item["metrics"]["tpot_seconds"]) for item in items if item.get("metrics", {}).get("tpot_seconds") is not None]
+        queue_wait = [float(item["metrics"]["client_queue_wait_seconds"]) for item in items if item.get("metrics", {}).get("client_queue_wait_seconds") is not None]
+        input_tokens = [float(item["metrics"]["reported_prompt_tokens"]) for item in items if item.get("metrics", {}).get("reported_prompt_tokens") is not None]
+        output_tokens = [float(item["metrics"]["reported_output_tokens"]) for item in items if item.get("metrics", {}).get("reported_output_tokens") is not None]
+        ratios = [float(item["metrics"]["input_output_ratio"]) for item in items if item.get("metrics", {}).get("input_output_ratio") is not None]
         summary[key] = {
             "calls": len(items),
             "success_rate": round(sum(1 for item in items if item.get("success")) / max(len(items), 1), 4),
@@ -468,8 +624,26 @@ def summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
             "ttft_seconds_p95": percentile(ttft, 95),
             "decode_tokens_per_second_p50": percentile(decode, 50),
             "decode_tokens_per_second_p95": percentile(decode, 95),
+            "server_prefill_tokens_per_second_p50": percentile(server_prefill, 50),
+            "server_prefill_tokens_per_second_p95": percentile(server_prefill, 95),
+            "server_decode_tokens_per_second_p50": percentile(server_decode, 50),
+            "server_decode_tokens_per_second_p95": percentile(server_decode, 95),
+            "server_ttft_seconds_p50": percentile(server_ttft, 50),
+            "server_ttft_seconds_p95": percentile(server_ttft, 95),
             "prefill_proxy_tokens_per_second_p50": percentile(prefill_proxy, 50),
             "prefill_proxy_tokens_per_second_p95": percentile(prefill_proxy, 95),
+            "tpot_seconds_p50": percentile(tpot, 50),
+            "tpot_seconds_p95": percentile(tpot, 95),
+            "client_queue_wait_seconds_p50": percentile(queue_wait, 50),
+            "client_queue_wait_seconds_p95": percentile(queue_wait, 95),
+            "input_tokens_p50": percentile(input_tokens, 50),
+            "input_tokens_p95": percentile(input_tokens, 95),
+            "input_tokens_max": max(input_tokens, default=None),
+            "output_tokens_p50": percentile(output_tokens, 50),
+            "output_tokens_p95": percentile(output_tokens, 95),
+            "output_tokens_max": max(output_tokens, default=None),
+            "input_output_ratio_p50": percentile(ratios, 50),
+            "input_output_ratio_p95": percentile(ratios, 95),
         }
     return summary
 
@@ -483,23 +657,33 @@ def run_dataset(cases: list[dict[str, Any]], endpoint: str, model_override: str,
     sampler.start()
     started_at = datetime.now(timezone.utc).isoformat()
     started = time.perf_counter()
-    jobs = [case for _ in range(max(1, repeat)) for case in cases]
+    jobs = [(index, case) for index, case in enumerate(
+        [case for _ in range(max(1, repeat)) for case in cases], start=1
+    )]
     results: list[dict[str, Any]] = []
     try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, concurrency)) as executor:
+        limits = httpx.Limits(max_connections=max(1, concurrency), max_keepalive_connections=max(1, concurrency))
+        with httpx.Client(timeout=timeout_seconds, limits=limits) as shared_client, concurrent.futures.ThreadPoolExecutor(max_workers=max(1, concurrency)) as executor:
+            submitted_at = time.perf_counter()
             futures = [
-                executor.submit(execute_case, case, endpoint, model_override, api_key, stream, timeout_seconds, preserve_priority)
-                for case in jobs
+                executor.submit(execute_case, case, endpoint, model_override, api_key, stream,
+                                timeout_seconds, preserve_priority, shared_client, submitted_at, metrics_url)
+                for _index, case in jobs
             ]
+            future_index = {future: jobs[index][0] for index, future in enumerate(futures)}
             for future in concurrent.futures.as_completed(futures):
-                results.append(future.result())
+                result = future.result()
+                result["job_index"] = future_index[future]
+                results.append(result)
     finally:
         samples = sampler.stop()
     server_metrics_after = fetch_prometheus_snapshot(metrics_url)
     elapsed = time.perf_counter() - started
+    _attach_resource_windows(results, samples)
+    _attach_concurrency(results)
     results.sort(key=lambda item: (item.get("case_id", ""), item.get("latency_seconds", 0.0)))
     return {
-        "schema_version": "1.0",
+        "schema_version": "1.2",
         "started_at": started_at,
         "finished_at": datetime.now(timezone.utc).isoformat(),
         "environment": _environment(),
@@ -529,9 +713,17 @@ def run_dataset(cases: list[dict[str, Any]], endpoint: str, model_override: str,
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Replay standalone JSON benchmark cases")
     parser.add_argument("--dataset", required=True, help="Path to stage-replay.jsonl")
-    parser.add_argument("--endpoint", required=True, help="OpenAI-compatible /v1 endpoint")
-    parser.add_argument("--model", default="", help="Override model id stored in captured requests")
-    parser.add_argument("--api-key", default="")
+    parser.add_argument(
+        "--endpoint",
+        default=os.getenv("OPENAI_BASE_URL", "http://127.0.0.1:8000/v1"),
+        help="OpenAI-compatible /v1 endpoint (default: OPENAI_BASE_URL or localhost:8000/v1)",
+    )
+    parser.add_argument(
+        "--model",
+        default=os.getenv("OPENAI_MODEL", ""),
+        help="Override captured model id (default: OPENAI_MODEL)",
+    )
+    parser.add_argument("--api-key", default=os.getenv("OPENAI_API_KEY", ""))
     parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--repeat", type=int, default=3)
     parser.add_argument("--warmup", type=int, default=1)

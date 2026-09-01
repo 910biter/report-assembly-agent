@@ -22,25 +22,70 @@ from app.token_monitor import current_context
 _call_context: contextvars.ContextVar[dict[str, Any]] = contextvars.ContextVar("benchmark_call_context", default={})
 _captured_call_ids: set[str] = set()
 _captured_call_ids_lock = threading.Lock()
+_active_calls: dict[str, dict[str, Any]] = {}
+_active_calls_lock = threading.Lock()
 
 
 @contextlib.contextmanager
 def benchmark_call_context(*, call_id: str, logical_call_id: str, agent: str, attempt: int):
     """Associate one raw gateway request with its logical Agent call and retry."""
-    token = _call_context.set({
+    call = {
         "call_id": str(call_id),
         "logical_call_id": str(logical_call_id),
         "agent": str(agent),
         "attempt": int(attempt),
-    })
+    }
+    token = _call_context.set(call)
+    _mark_call_boundary("start", call)
     try:
         yield
     finally:
+        _mark_call_boundary("end", call)
         _call_context.reset(token)
 
 
 def current_benchmark_call_context() -> dict[str, Any]:
     return dict(_call_context.get() or {})
+
+
+def active_call_snapshot() -> list[dict[str, Any]]:
+    """Return a small immutable snapshot for resource-sample correlation."""
+    with _active_calls_lock:
+        return [dict(value) for value in _active_calls.values()]
+
+
+def _mark_call_boundary(phase: str, call: dict[str, Any]) -> None:
+    context = current_context()
+    task_id = str(context.get("task_id") or "")
+    if not _task_is_allowed(task_id):
+        return
+    now_ns = time.time_ns()
+    monotonic_ns = time.perf_counter_ns()
+    payload = {
+        **call,
+        "task_id": task_id,
+        "run_id": str(context.get("run_id") or ""),
+        "stage": str(context.get("stage") or ""),
+        "phase": phase,
+        "wall_time_ns": now_ns,
+        "monotonic_ns": monotonic_ns,
+    }
+    with _active_calls_lock:
+        if phase == "start":
+            _active_calls[str(call["call_id"])] = payload
+        else:
+            _active_calls.pop(str(call["call_id"]), None)
+    try:
+        _capture_sink().submit({
+            "schema_version": "1.1",
+            "event_type": "call_boundary",
+            "captured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "call_id": str(call["call_id"]),
+            "phase": phase,
+            "payload": payload,
+        })
+    except Exception:
+        pass
 
 
 class BenchmarkCaptureSink:
@@ -138,10 +183,12 @@ class CaptureResourceSampler:
 
         while not self.stop_event.is_set():
             event = {
-                "schema_version": "1.0",
+                "schema_version": "1.1",
                 "event_type": "resource_sample",
                 "captured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "captured_at_ns": time.time_ns(),
                 "context": {"task_id": self.task_id},
+                "active_calls": active_call_snapshot(),
                 "resource": _resource_sample(self.accelerator_probe_command),
                 "server_metrics": _select_server_metrics(fetch_prometheus_snapshot(self.metrics_url)),
             }
@@ -181,6 +228,10 @@ _SERVER_METRIC_PREFIXES = (
     "vllm:prefix_cache_",
     "vllm:time_to_first_token_seconds",
     "vllm:time_per_output_token_seconds",
+    "vllm:request_time_per_output_token_seconds",
+    "vllm:request_prefill_time_seconds",
+    "vllm:request_decode_time_seconds",
+    "vllm:request_prefill_kv_computed_tokens",
     "vllm:e2e_request_latency_seconds",
     "vllm:request_prompt_tokens",
     "vllm:request_generation_tokens",
@@ -246,7 +297,7 @@ def capture_llm_call(*, backend: str, endpoint: str, request: dict[str, Any],
         with _captured_call_ids_lock:
             _captured_call_ids.add(call_id)
     event = {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "event_type": "call",
         "captured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "context": {
@@ -266,6 +317,7 @@ def capture_llm_call(*, backend: str, endpoint: str, request: dict[str, Any],
             "latency_seconds": round(float(elapsed_seconds or 0.0), 6),
             "error": str(error or "")[:1000],
         },
+        "captured_at_ns": time.time_ns(),
     }
     try:
         _capture_sink().submit(event)
@@ -287,7 +339,7 @@ def capture_enrichment(call_id: str, kind: str, payload: dict[str, Any]) -> None
     if not allowed:
         return
     event = {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "event_type": "enrichment",
         "captured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "call_id": str(call_id),
@@ -311,6 +363,8 @@ def close_capture_sink() -> None:
         sink.close()
     with _captured_call_ids_lock:
         _captured_call_ids.clear()
+    with _active_calls_lock:
+        _active_calls.clear()
 
 
 atexit.register(close_capture_sink)

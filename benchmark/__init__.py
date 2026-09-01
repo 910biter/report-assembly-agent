@@ -5,5 +5,4 @@ workflow, vector store, or web server.  It consumes JSONL captures and calls an
 OpenAI-compatible endpoint so a dataset can be replayed on another machine.
 """
 
-BENCHMARK_SCHEMA_VERSION = "1.0"
-
+BENCHMARK_SCHEMA_VERSION = "1.2"
