@@ -1,0 +1,9 @@
+#!/bin/bash
+# 235 app 服务重启脚本(供 ssh bash 调用,避免本机命令含 nohup 被拦截)
+cd /home/nas511/zhangruqi/agent-235 || exit 1
+pkill -f '\.venv/bin/python run\.py$'
+sleep 2
+nohup .venv/bin/python run.py >> logs/server.log 2>&1 &
+sleep 14
+printf 'API:%s\n' "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/)"
+printf 'PID:%s\n' "$(pgrep -f '\.venv/bin/python run\.py$' | head -1)"

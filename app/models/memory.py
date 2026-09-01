@@ -25,7 +25,6 @@ class StyleVariant:
     reasoning_profile: dict = field(default_factory=dict)  # 分析逻辑层:章节分析框架(输入→输出)/推论展开/风险与建议表达
     institution_rules: dict = field(default_factory=dict)  # 机构规则层:必须出现/禁止出现/字数/推断比例/数据引用
     structure_policy: dict = field(default_factory=dict)  # FORMAT_ONLY / SOFT_STRUCTURE / HARD_STRUCTURE
-    evidence_usage_profile: dict = field(default_factory=dict)  # 仅保留旧数据反序列化兼容，不进入当前运行链路
     exemplar_bank: list[dict] = field(default_factory=list)  # 已审核的材料→成文配对范例
     learning_cases: list[dict] = field(default_factory=list)  # 画像来源及质量等级
     profile_confidence: dict = field(default_factory=dict)  # 分层置信度，不用单一总分掩盖缺失
@@ -33,10 +32,6 @@ class StyleVariant:
     source_reports: list[str] = field(default_factory=list)
     status: str = "draft"  # draft / confirmed / locked
     id: int | None = None
-
-    def to_prompt_block(self) -> str:
-        """Backward-compatible writer profile without document layout tokens."""
-        return self.writer_prompt_block()
 
     def planner_prompt_block(self) -> str:
         """Planner only sees the declared structure policy, never DOCX layout."""
@@ -85,14 +80,16 @@ class StyleVariant:
             block += "- 惯用表达: " + "、".join(terminology["preferred"]) + "\n"
         if terminology.get("forbidden"):
             block += "- 避免表达: " + "、".join(terminology["forbidden"]) + "\n"
-        samples = self.select_exemplars(context or {}, limit=3) or self.style_samples[:3]
+        samples = self.select_exemplars(context, limit=3) if context else self.style_samples[:3]
         if samples:
             block += "- 匹配当前写作目的的已审核软范例(只借鉴组织与表达，不复制事实):\n"
             for sample in samples:
                 label = _SAMPLE_TYPES_label(sample.get("sample_type", ""))
                 purpose = str(sample.get("purpose") or sample.get("section") or "").strip()
                 purpose_text = f" / 用途:{purpose[:70]}" if purpose else ""
-                block += f"  [{label}{purpose_text}] {str(sample.get('content', ''))[:420]}\n"
+                realization = str(sample.get("realization_mode") or "").strip()
+                realization_text = f" / 材料运用:{realization[:60]}" if realization else ""
+                block += f"  [{label}{purpose_text}{realization_text}] {str(sample.get('content', ''))[:420]}\n"
                 negative = str(sample.get("negative_content") or "").strip()
                 if negative:
                     block += f"  [避免这种旧表达] {negative[:220]}\n"
@@ -108,7 +105,7 @@ class StyleVariant:
         if reasoning:
             block += f"- 分析逻辑(本机构如何分析): {json_dumps(reasoning, limit=600)}\n"
         rules = self.institution_rules or {}
-        if rules:
+        if rules.get("confirmed") is True:
             block += f"- 机构规则(业务约束): {json_dumps(rules, limit=500)}\n"
         return block.strip()
 

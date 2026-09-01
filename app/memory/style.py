@@ -27,7 +27,7 @@ from app.memory.style_profile import (
 from app.template_engine import compile_template
 
 _SAMPLE_LENGTH = 150
-_STYLE_LEARNER_VERSION = "editorial-v3"
+_STYLE_LEARNER_VERSION = "editorial-v4"
 _DEFAULT_PROFILE_NAME = "综合报告风格"
 _REALIZATION_KEYS = (
     "fact_expression", "judgment_expression", "fact_judgment_transition",
@@ -122,6 +122,14 @@ _VARIANT_PROMPT = """以下为同一机构、同一类型({type})的 {count} 份
     "closing_pattern": "收束通常完成什么表达任务",
     "list_table_preference": "何时使用自然段、清单或表格"
   }},
+  "material_realization": {{
+    "fact_selection": "一段中如何选择主事实、背景事实和限定事实",
+    "detail_retention": "时间、数字、主体、文件名等具体信息通常保留到什么程度",
+    "multi_source_synthesis": "多来源一致、互补或差异信息如何合并表达",
+    "fact_to_analysis": "事实如何支撑解释、判断、风险或建议，不得把相关性写成因果",
+    "boundary_expression": "证据不足、仅能部分证明或存在不确定性时如何表述",
+    "structure_choice": "何时采用自然段、清单或表格以承载材料信息"
+  }},
   "terminology": {{
     "preferred": ["惯用表达"],
     "forbidden": ["避免的表达"]
@@ -143,7 +151,7 @@ _VARIANT_PROMPT = """以下为同一机构、同一类型({type})的 {count} 份
     "data_requirements": "数据引用要求(如:关键数字必须注明来源)"
   }},
   "sample_annotations": [
-    {{"sample_id": "输入中的样例编号", "sample_type": "opening/fact/analysis/risk/conclusion/transition", "purpose": "该段承担的表达任务", "tags": ["可检索语义标签"]}}
+    {{"sample_id": "输入中的样例编号", "sample_type": "opening/fact/analysis/risk/conclusion/transition", "purpose": "该段承担的表达任务", "realization_mode": "单事实展开/多事实综合/事实到判断/风险边界/建议形成", "tags": ["可检索语义标签"]}}
   ]
 }}"""
 
@@ -290,15 +298,12 @@ def _extract_headings(text: str, path=None) -> list[dict]:
     headings: list[dict] = []
     if path and str(path).lower().endswith(".docx"):
         try:
-            from docx import Document
-
-            doc = Document(path)
-            for para in doc.paragraphs:
-                if not para.text.strip():
-                    continue
-                style = (para.style.name or "").lower()
-                if style.startswith(("heading", "标题")):
-                    headings.append({"text": para.text.strip(), "level": _heading_level_of_text(para.text.strip())})
+            schema = compile_template(path)
+            headings = [
+                {"text": str(item.get("text_pattern") or ""), "level": int(item.get("level") or 1)}
+                for item in schema.get("structure", {}).get("heading_patterns", [])
+                if str(item.get("text_pattern") or "").strip()
+            ]
         except Exception:
             headings = []
     if not headings:
@@ -380,6 +385,9 @@ def _build_variant(library_id: int, topic_type: str, members: list[dict]) -> Sty
     structure = payload.get("structure") if isinstance(payload.get("structure"), dict) else {}
     writing = payload.get("writing_style") if isinstance(payload.get("writing_style"), dict) else {}
     writing_patterns = payload.get("writing_patterns") if isinstance(payload.get("writing_patterns"), dict) else {}
+    material_realization = payload.get("material_realization") if isinstance(payload.get("material_realization"), dict) else {}
+    if material_realization:
+        writing_patterns = {**writing_patterns, "material_realization": material_realization}
     terminology = payload.get("terminology") if isinstance(payload.get("terminology"), dict) else {}
     chapter_styles = payload.get("chapter_styles") if isinstance(payload.get("chapter_styles"), list) else []
     reasoning = payload.get("reasoning_profile") if isinstance(payload.get("reasoning_profile"), dict) else {}
@@ -409,10 +417,10 @@ def _build_variant(library_id: int, topic_type: str, members: list[dict]) -> Sty
         institution_rules=institution_rules,
         exemplar_bank=exemplar_bank[:200],
         structure_policy={
-            "mode": "SOFT_STRUCTURE",
-            "source": "inferred_from_reports",
+            "mode": "FORMAT_ONLY",
+            "source": "safe_default",
             "confirmed": False,
-            "principle": "历史目录仅作参考；内容结构由当前任务的事实和分析决定。",
+            "principle": "模板默认只约束呈现和成文风格，当前报告结构由任务事实与分析决定。",
         },
         profile_confidence={
             "document_format": "high" if format_spec else "unavailable",
@@ -548,20 +556,26 @@ def _field_confidence(specs: list[dict], dominant: dict) -> dict:
 
 
 def _template_profile(dominant: dict, conflicts: dict, confidence: dict) -> dict:
+    schema = dominant.get("template_schema") if isinstance(dominant.get("template_schema"), dict) else {}
+    roles = schema.get("style", {}).get("roles", {}) if schema else {}
     learned_fields = sorted(k for k, v in dominant.items() if v not in (None, "", [], {}))
-    critical = [
-        "normal", "title", "heading1", "heading2", "margins_cm", "page_cm",
-        "body_paragraph", "numbering_patterns", "table_style", "image_rules",
-        "header_text", "footer_text",
-    ]
-    missing = [field for field in critical if field not in dominant]
+    required = {
+        "document.page": schema.get("document", {}).get("page"),
+        "document.margins": schema.get("document", {}).get("margins"),
+        "role.document_title": roles.get("document_title"),
+        "role.heading_1": roles.get("heading_1"),
+        "role.body": roles.get("body"),
+        "render_contract": schema.get("structure", {}).get("render_contract"),
+    }
+    missing = [field for field, value in required.items() if value in (None, "", [], {})]
     low_confidence = [field for field, score in confidence.items() if score < 0.67]
     return {
         "learned_fields": learned_fields,
         "missing_critical_fields": missing,
         "conflict_fields": sorted(conflicts.keys()),
         "low_confidence_fields": low_confidence,
-        "completeness": round((len(critical) - len(missing)) / len(critical), 2),
+        "completeness": round((len(required) - len(missing)) / max(1, len(required)), 2),
+        "render_ready": not missing,
         "recommendation": "可用于正式导出" if not missing and not low_confidence else "建议人工复核冲突或缺失的模板字段",
     }
 
@@ -629,7 +643,6 @@ def save_variant(variant: StyleVariant) -> StyleVariant:
                 reasoning_profile_json=json.dumps(variant.reasoning_profile, ensure_ascii=False),
                 institution_rules_json=json.dumps(variant.institution_rules, ensure_ascii=False),
                 structure_policy_json=json.dumps(variant.structure_policy, ensure_ascii=False),
-                evidence_usage_profile_json=json.dumps(variant.evidence_usage_profile, ensure_ascii=False),
                 exemplar_bank_json=json.dumps(variant.exemplar_bank, ensure_ascii=False),
                 learning_cases_json=json.dumps(variant.learning_cases, ensure_ascii=False),
                 profile_confidence_json=json.dumps(variant.profile_confidence, ensure_ascii=False),
@@ -760,7 +773,6 @@ def _row_to_variant(row) -> StyleVariant:
         reasoning_profile=_loads(row["reasoning_profile_json"]),
         institution_rules=_loads(row["institution_rules_json"]),
         structure_policy=_loads(row.get("structure_policy_json", "{}")),
-        evidence_usage_profile=_loads(row.get("evidence_usage_profile_json", "{}")),
         exemplar_bank=_loads_samples(row.get("exemplar_bank_json", "[]")),
         learning_cases=_loads_samples(row.get("learning_cases_json", "[]")),
         profile_confidence=_loads(row.get("profile_confidence_json", "{}")),
@@ -771,402 +783,22 @@ def _row_to_variant(row) -> StyleVariant:
 
 
 def extract_docx_format(path) -> dict:
-    """Extract layout tokens from a DOCX template."""
+    """Compile one DOCX into the only supported template representation."""
     if not str(path).lower().endswith(".docx"):
         return {}
-    from docx import Document
-    from docx.shared import Length
-    from docx.oxml.ns import qn
-
-    doc = Document(path)
     template_schema = compile_template(path)
+    if not template_schema:
+        return {}
     _write_template_schema_file(template_schema)
-    spec: dict = {
+    return {
         "source_template_path": str(path),
         "template_schema": template_schema,
-    }
-
-    def _font_name(font, style=None):
-        if getattr(font, "name", None):
-            return font.name
-        try:
-            rpr = style.element.rPr if style is not None else font._element.rPr
-            if rpr is not None and rpr.rFonts is not None:
-                return rpr.rFonts.get(qn("w:eastAsia")) or rpr.rFonts.get(qn("w:ascii")) or ""
-        except Exception:
-            return ""
-        return ""
-
-    def _font_size(font):
-        return round(font.size.pt, 1) if getattr(font, "size", None) else None
-
-    def _font_color(font):
-        color = getattr(getattr(font, "color", None), "rgb", None)
-        return str(color) if color else ""
-
-    def _alignment(value):
-        return str(value) if value is not None else ""
-
-    def _border_snapshot(element) -> dict:
-        borders: dict = {}
-        try:
-            ppr = element.pPr if hasattr(element, "pPr") else element.get_or_add_pPr()
-            pbdr = ppr.find(qn("w:pBdr")) if ppr is not None else None
-            if pbdr is None:
-                return {}
-            for name in ("top", "left", "bottom", "right", "between", "bar"):
-                node = pbdr.find(qn(f"w:{name}"))
-                if node is None:
-                    continue
-                borders[name] = {
-                    "val": node.get(qn("w:val"), ""),
-                    "color": node.get(qn("w:color"), ""),
-                    "sz": node.get(qn("w:sz"), ""),
-                    "space": node.get(qn("w:space"), ""),
-                }
-        except Exception:
-            return {}
-        return borders
-
-    def _paragraph_snapshot(para) -> dict:
-        pf = para.paragraph_format
-        snapshot = {
-            "style_name": para.style.name if para.style is not None else "",
-            "alignment": _alignment(para.alignment or pf.alignment),
-            "text_length": len(para.text.strip()),
-        }
-        if pf.left_indent is not None:
-            snapshot["left_indent_cm"] = round(pf.left_indent.cm, 2)
-        if pf.right_indent is not None:
-            snapshot["right_indent_cm"] = round(pf.right_indent.cm, 2)
-        if pf.first_line_indent is not None:
-            snapshot["first_line_indent_cm"] = round(pf.first_line_indent.cm, 2)
-        if pf.space_before is not None:
-            snapshot["space_before_pt"] = round(pf.space_before.pt, 1)
-        if pf.space_after is not None:
-            snapshot["space_after_pt"] = round(pf.space_after.pt, 1)
-        if pf.line_spacing is not None:
-            if isinstance(pf.line_spacing, Length):
-                snapshot["line_spacing_pt"] = round(pf.line_spacing.pt, 1)
-            elif isinstance(pf.line_spacing, float):
-                snapshot["line_spacing"] = round(pf.line_spacing, 2)
-        if pf.keep_with_next is not None:
-            snapshot["keep_with_next"] = bool(pf.keep_with_next)
-        if pf.keep_together is not None:
-            snapshot["keep_together"] = bool(pf.keep_together)
-        if pf.page_break_before is not None:
-            snapshot["page_break_before"] = bool(pf.page_break_before)
-        borders = _border_snapshot(para._p)
-        if borders:
-            snapshot["borders"] = borders
-        for run in para.runs:
-            if run.text.strip():
-                if _font_name(run.font):
-                    snapshot["font_name"] = _font_name(run.font)
-                if _font_size(run.font):
-                    snapshot["font_size_pt"] = _font_size(run.font)
-                if _font_color(run.font):
-                    snapshot["font_color_rgb"] = _font_color(run.font)
-                if run.bold is not None:
-                    snapshot["bold"] = bool(run.bold)
-                break
-        return snapshot
-
-    def _style_snapshot(style_name: str) -> dict:
-        snapshot: dict = {}
-        # 兼容中文/自定义标题样式名:同为标题,但命名来源不同——内置中文本地化("标题 1")、
-        # 模板自定义("一级标题")、英文("Heading 1")等,逐个尝试。
-        _ALIASES = {
-            "Heading 1": ["Heading 1", "标题 1", "一级标题", "标题一"],
-            "Heading 2": ["Heading 2", "标题 2", "二级标题", "标题二"],
-            "Heading 3": ["Heading 3", "标题 3", "三级标题", "标题三"],
-            "Title": ["Title", "标题", "文档标题", "主标题"],
-            "Normal": ["Normal", "正文"],
-        }
-        style = None
-        for _name in _ALIASES.get(style_name, [style_name]):
-            try:
-                style = doc.styles[_name]
-                break
-            except Exception:
-                style = None
-        if style is None:
-            return snapshot
-        try:
-            font = style.font
-            pf = style.paragraph_format
-            if _font_name(font, style):
-                snapshot["font_name"] = _font_name(font, style)
-            if _font_size(font):
-                snapshot["font_size_pt"] = _font_size(font)
-            if _font_color(font):
-                snapshot["font_color_rgb"] = _font_color(font)
-            if getattr(font, "bold", None) is not None:
-                snapshot["bold"] = bool(font.bold)
-            if getattr(font, "italic", None) is not None:
-                snapshot["italic"] = bool(font.italic)
-            if pf.line_spacing is not None:
-                if isinstance(pf.line_spacing, Length):
-                    snapshot["line_spacing_pt"] = round(pf.line_spacing.pt, 1)
-                elif isinstance(pf.line_spacing, float):
-                    snapshot["line_spacing"] = round(pf.line_spacing, 2)
-            if pf.first_line_indent is not None:
-                snapshot["first_line_indent_cm"] = round(pf.first_line_indent.cm, 2)
-            if pf.left_indent is not None:
-                snapshot["left_indent_cm"] = round(pf.left_indent.cm, 2)
-            if pf.right_indent is not None:
-                snapshot["right_indent_cm"] = round(pf.right_indent.cm, 2)
-            if pf.space_before is not None:
-                snapshot["space_before_pt"] = round(pf.space_before.pt, 1)
-            if pf.space_after is not None:
-                snapshot["space_after_pt"] = round(pf.space_after.pt, 1)
-            if pf.alignment is not None:
-                snapshot["alignment"] = _alignment(pf.alignment)
-            if pf.keep_with_next is not None:
-                snapshot["keep_with_next"] = bool(pf.keep_with_next)
-            if pf.keep_together is not None:
-                snapshot["keep_together"] = bool(pf.keep_together)
-            if pf.page_break_before is not None:
-                snapshot["page_break_before"] = bool(pf.page_break_before)
-            borders = _border_snapshot(style.element)
-            if borders:
-                snapshot["borders"] = borders
-        except Exception:
-            return {}
-        return snapshot
-
-    try:
-        spec["normal"] = _style_snapshot("Normal")
-        normal = spec["normal"]
-        if normal.get("font_name"):
-            spec["font_name"] = normal["font_name"]
-        if normal.get("font_size_pt"):
-            spec["font_size_pt"] = normal["font_size_pt"]
-        if normal.get("line_spacing_pt"):
-            spec["line_spacing_pt"] = normal["line_spacing_pt"]
-        elif normal.get("line_spacing"):
-            spec["line_spacing"] = normal["line_spacing"]
-        if normal.get("first_line_indent_cm") is not None:
-            spec["first_line_indent_cm"] = normal["first_line_indent_cm"]
-        if normal.get("space_before_pt") is not None:
-            spec["space_before_pt"] = normal["space_before_pt"]
-        if normal.get("space_after_pt") is not None:
-            spec["space_after_pt"] = normal["space_after_pt"]
-        if normal.get("alignment"):
-            spec["alignment"] = normal["alignment"]
-        if normal.get("font_color_rgb"):
-            spec["font_color_rgb"] = normal["font_color_rgb"]
-    except Exception:
-        pass
-
-    try:
-        spec["title"] = _style_snapshot("Title")
-        spec["heading1"] = _style_snapshot("Heading 1")
-        spec["heading2"] = _style_snapshot("Heading 2")
-        spec["heading3"] = _style_snapshot("Heading 3")
-        if spec["heading1"].get("font_name"):
-            spec["heading_font"] = spec["heading1"]["font_name"]
-        if spec["heading1"].get("font_size_pt"):
-            spec["heading_size_pt"] = spec["heading1"]["font_size_pt"]
-    except Exception:
-        pass
-
-    try:
-        section = doc.sections[0]
-        spec["margins_cm"] = {
-            "top": round(section.top_margin.cm, 2),
-            "bottom": round(section.bottom_margin.cm, 2),
-            "left": round(section.left_margin.cm, 2),
-            "right": round(section.right_margin.cm, 2),
-        }
-        spec["page_cm"] = {
-            "width": round(section.page_width.cm, 2),
-            "height": round(section.page_height.cm, 2),
-        }
-        header_text = "".join(p.text for p in section.header.paragraphs).strip() if section.header else ""
-        footer_text = "".join(p.text for p in section.footer.paragraphs).strip() if section.footer else ""
-        if header_text:
-            spec["header_text"] = header_text[:80]
-        if footer_text:
-            spec["footer_text"] = footer_text[:80]
-        if section.header and section.header.paragraphs:
-            spec["header_style"] = {"alignment": _alignment(section.header.paragraphs[0].alignment)}
-        if section.footer and section.footer.paragraphs:
-            spec["footer_style"] = {"alignment": _alignment(section.footer.paragraphs[0].alignment)}
-    except Exception:
-        pass
-
-    try:
-        first_para = next((para for para in doc.paragraphs if para.text.strip()), None)
-        if first_para is not None:
-            spec["first_paragraph_style"] = _paragraph_snapshot(first_para)
-    except Exception:
-        pass
-
-    try:
-        body_para = next((para for para in doc.paragraphs if para.text.strip() and not _looks_like_heading(para.text)), None)
-        if body_para is not None:
-            spec["body_paragraph"] = _paragraph_snapshot(body_para)
-    except Exception:
-        pass
-
-    try:
-        patterns = []
-        for para in doc.paragraphs:
-            text = para.text.strip()
-            if not text:
-                continue
-            pattern = _numbering_pattern(text)
-            if pattern and pattern not in patterns:
-                patterns.append(pattern)
-        if patterns:
-            spec["numbering_patterns"] = patterns[:8]
-    except Exception:
-        pass
-
-    try:
-        if doc.tables:
-            table = doc.tables[0]
-            spec["table_style"] = {
-                "rows": len(table.rows),
-                "cols": len(table.columns),
-                "style_name": table.style.name if table.style is not None else "",
-            }
-            for row in table.rows[:2]:
-                for cell in row.cells:
-                    for para in cell.paragraphs:
-                        for run in para.runs:
-                            if run.text.strip():
-                                if _font_name(run.font):
-                                    spec["table_style"]["font_name"] = _font_name(run.font)
-                                if _font_size(run.font):
-                                    spec["table_style"]["font_size_pt"] = _font_size(run.font)
-                                break
-                        if spec["table_style"].get("font_name"):
-                            break
-                    if spec["table_style"].get("font_name"):
-                        break
-                if spec["table_style"].get("font_name"):
-                    break
-    except Exception:
-        pass
-
-    try:
-        inline_shapes = getattr(doc, "inline_shapes", [])
-        if inline_shapes:
-            shape = inline_shapes[0]
-            spec["image_rules"] = {
-                "count": len(inline_shapes),
-                "first_width_cm": round(shape.width.cm, 2) if shape.width else None,
-                "first_height_cm": round(shape.height.cm, 2) if shape.height else None,
-            }
-    except Exception:
-        pass
-
-    spec["document_format"] = _document_format(spec)
-    return spec
-
-
-def _document_format(spec: dict) -> dict:
-    """Canonical structured style model for export and UI display."""
-    schema = spec.get("template_schema") if isinstance(spec.get("template_schema"), dict) else {}
-    roles = schema.get("style", {}).get("roles", {}) if schema else {}
-    document = schema.get("document", {}) if schema else {}
-    role_body = _legacy_role_style(roles.get("body"))
-    role_title = _legacy_role_style(roles.get("document_title"))
-    role_h1 = _legacy_role_style(roles.get("heading_1"))
-    role_h2 = _legacy_role_style(roles.get("heading_2"))
-    role_h3 = _legacy_role_style(roles.get("heading_3"))
-    return {
-        "page": {
-            "size_cm": spec.get("page_cm", {}) or _legacy_page_size(document.get("page", {})),
-            "margins_cm": spec.get("margins_cm", {}) or _legacy_margins(document.get("margins", {})),
-            "header": {"text": spec.get("header_text", ""), "style": spec.get("header_style", {})},
-            "footer": {"text": spec.get("footer_text", ""), "style": spec.get("footer_style", {})},
-        },
-        "typography": {
-            "body": role_body or spec.get("body_paragraph") or spec.get("normal", {}),
-            "title": role_title or spec.get("title", {}),
-            "heading1": role_h1 or spec.get("heading1", {}),
-            "heading2": role_h2 or spec.get("heading2", {}),
-            "heading3": role_h3 or spec.get("heading3", {}),
-        },
-        "structure": {
-            "numbering_patterns": spec.get("numbering_patterns", []),
-            "first_paragraph": spec.get("first_paragraph_style", {}),
-            "table": spec.get("table_style", {}),
-            "image": spec.get("image_rules", {}),
-        },
-        "export_hints": {
-            "clear_builtin_heading_borders": True,
-            "use_template_heading_borders": any(
-                (spec.get(name) or {}).get("borders") for name in ("title", "heading1", "heading2", "heading3")
-            ),
-        },
-    }
-
-
-def _legacy_role_style(role_style: dict | None) -> dict:
-    if not isinstance(role_style, dict):
-        return {}
-    paragraph = role_style.get("paragraph", {}) if isinstance(role_style.get("paragraph"), dict) else {}
-    run = role_style.get("run", {}) if isinstance(role_style.get("run"), dict) else {}
-    merged = {
-        "style_name": role_style.get("source_style", ""),
-        "alignment": paragraph.get("alignment", ""),
-        "left_indent_cm": paragraph.get("left_indent_cm"),
-        "right_indent_cm": paragraph.get("right_indent_cm"),
-        "first_line_indent_cm": paragraph.get("first_line_indent_cm"),
-        "space_before_pt": paragraph.get("space_before_pt"),
-        "space_after_pt": paragraph.get("space_after_pt"),
-        "borders": paragraph.get("borders"),
-        "font_name": run.get("font_east_asia") or run.get("font_ascii"),
-        "font_size_pt": run.get("font_size_pt"),
-        "font_color_rgb": run.get("font_color"),
-        "bold": run.get("bold"),
-        "italic": run.get("italic"),
-    }
-    line_spacing = paragraph.get("line_spacing")
-    if isinstance(line_spacing, dict):
-        if line_spacing.get("type") == "multiple":
-            merged["line_spacing"] = line_spacing.get("value")
-        elif line_spacing.get("type") == "exact_pt":
-            merged["line_spacing_pt"] = line_spacing.get("value")
-    return {k: v for k, v in merged.items() if v not in (None, "", "unknown", {})}
-
-
-def _legacy_page_size(page: dict) -> dict:
-    if not isinstance(page, dict):
-        return {}
-    return {"width": page.get("width_cm"), "height": page.get("height_cm")}
-
-
-def _legacy_margins(margins: dict) -> dict:
-    if not isinstance(margins, dict):
-        return {}
-    return {
-        "top": margins.get("top_cm"),
-        "bottom": margins.get("bottom_cm"),
-        "left": margins.get("left_cm"),
-        "right": margins.get("right_cm"),
     }
 
 
 def _looks_like_heading(text: str) -> bool:
     stripped = text.strip()
     return bool(_HEADING_RE.match(stripped)) or len(stripped) <= 25 and stripped.endswith(("：", ":"))
-
-
-def _numbering_pattern(text: str) -> str:
-    if re.match(r"^第[一二三四五六七八九十百]+[章节部分]", text):
-        return "第X章节式"
-    if re.match(r"^[一二三四五六七八九十]+、", text):
-        return "中文顿号一级标题"
-    if re.match(r"^（[一二三四五六七八九十]+）", text) or re.match(r"^\([一二三四五六七八九十]+\)", text):
-        return "中文括号二级标题"
-    if re.match(r"^\d+[.、]", text):
-        return "阿拉伯数字编号"
-    return ""
 
 
 def _loads(text: str) -> dict:

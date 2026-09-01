@@ -132,7 +132,7 @@ const stages = computed(() =>
             "analysis",
           ],
         },
-        { name: "报告生成", keys: ["writing", "knowledge"] },
+        { name: "报告生成", keys: ["writing"] },
         { name: "审核完成", keys: ["review", "done"] },
       ],
 );
@@ -163,12 +163,10 @@ const inferences = computed(() =>
   ),
 );
 const conflicts = computed(() => analysis.data.value?.conflicts || []);
-const qaNotes = computed(() => analysis.data.value?.qa_notes || []);
 const artifactCounts = computed(() => task.data.value?.artifact_counts || {});
 const factCount = computed(() => analysis.data.value ? facts.value.length : Number(artifactCounts.value.facts || 0));
 const inferenceCount = computed(() => analysis.data.value ? inferences.value.length : Number(artifactCounts.value.inferences || 0));
 const conflictCount = computed(() => analysis.data.value ? conflicts.value.length : Number(artifactCounts.value.conflicts || 0));
-const qaIssueCount = computed(() => analysis.data.value ? qaNotes.value.length : Number(artifactCounts.value.qa_issues || 0));
 function run() {
   command.mutate({ path: `/api/tasks/${taskId}/run` });
 }
@@ -398,9 +396,7 @@ function versionsList() {
               ><span>分析判断</span>
             </div>
             <div class="metric">
-              <strong>{{
-                conflictCount + qaIssueCount
-              }}</strong
+              <strong>{{ conflictCount }}</strong
               ><span>待核验</span>
             </div>
           </div>
@@ -530,7 +526,6 @@ function versionsList() {
               `关系网络 ${graphAssertionCount}`,
             ],
             ['conflicts', `冲突与待核验 ${conflicts.length}`],
-            ['qa', `质量检查 ${qaIssueCount}`],
           ]"
           :key="item[0]"
           :class="{ active: analysisType === item[0] }"
@@ -689,20 +684,7 @@ function versionsList() {
             <div>
               <strong>未发现需要核验的来源差异</strong>系统仅将可比口径下不能同时成立的说法标为直接矛盾。
             </div>
-          </div></template
-        ><template v-else
-          ><article
-            v-for="(item, index) in qaNotes"
-            :key="index"
-            class="knowledge-item conflict"
-          >
-            <b>{{ item.type || "质量问题" }}</b>
-            <p>{{ item.note || item.quote }}</p>
-          </article>
-          <div v-if="!qaNotes.length" class="empty">
-            <div><strong>暂无质量问题</strong>深度检查结果会在这里出现。</div>
-          </div></template
-        >
+          </div></template>
       </div>
     </section>
     <ArtifactReviewWorkspace

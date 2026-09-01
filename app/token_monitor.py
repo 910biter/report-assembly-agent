@@ -64,8 +64,6 @@ def log_llm_call(call_id: str, agent: str, input_chars: int, stats_delta: dict,
     prompt_tokens = int(stats_delta.get("prompt_tokens") or 0)
     output_tokens = int(stats_delta.get("output_tokens") or 0)
     context_tokens = prompt_tokens or int((context_audit or {}).get("actual_tokens") or 0)
-    if not context_tokens:
-        context_tokens = max(1, int(input_chars or 0))  # conservative legacy fallback
     returned_tokens = output_tokens
     parsed_tokens = _estimate_sub_tokens(valid_json_chars, returned_chars, returned_tokens)
     timing = {
@@ -919,8 +917,10 @@ def _workload_kind(stage: str, agent: str) -> str:
         return "reasoning_planning"
     if stage == "writing":
         return "document_generation"
-    if stage in {"knowledge", "qa"} or agent in {"qa", "knowledge"}:
-        return "post_review_quality_or_memory"
+    if stage == "graph_build" or agent == "graph":
+        return "knowledge_graph"
+    if stage == "qa" or agent == "qa":
+        return "quality_guardrail"
     if stage in {"planning"}:
         return "reasoning_planning"
     return "other"

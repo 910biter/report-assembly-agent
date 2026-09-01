@@ -29,8 +29,15 @@ class HeadingNumbering:
 def detect_numbering_strategy(schema: dict[str, Any] | None) -> HeadingNumbering:
     """Infer heading numbering style from template samples."""
     roles = ((schema or {}).get("style") or {}).get("roles") or {}
-    patterns = ((schema or {}).get("numbering") or {}).get("patterns") or []
+    numbering = ((schema or {}).get("style") or {}).get("numbering") or {}
+    patterns = numbering.get("patterns") or []
+    role_levels = numbering.get("role_levels") or {}
     level_formats: dict[int, str] = {}
+
+    for level, role in ((1, "heading_1"), (2, "heading_2"), (3, "heading_3")):
+        inferred = _infer_ooxml_format(role_levels.get(role), level)
+        if inferred:
+            level_formats[level] = inferred
 
     for level, role in ((1, "heading_1"), (2, "heading_2"), (3, "heading_3")):
         role_spec = roles.get(role) if isinstance(roles, dict) else {}
@@ -59,6 +66,31 @@ def detect_numbering_strategy(schema: dict[str, Any] | None) -> HeadingNumbering
     if 2 not in level_formats:
         level_formats[2] = "cjk_parenthesized"
     return HeadingNumbering(level_formats=level_formats)
+
+
+def _infer_ooxml_format(level_spec: Any, level: int) -> str | None:
+    if not isinstance(level_spec, dict):
+        return None
+    number_format = str(level_spec.get("number_format") or "").lower()
+    level_text = str(level_spec.get("level_text") or "")
+    if not level_text:
+        return None
+    if number_format in {"chinesecounting", "chineselegal", "ideographtraditional"}:
+        if level_text.startswith("第"):
+            return "cjk_chapter"
+        return "cjk_parenthesized" if any(char in level_text for char in "（）()") else "cjk_comma"
+    placeholders = len(re.findall(r"%\d+", level_text))
+    if placeholders > 1:
+        return "decimal_nested"
+    if any(char in level_text for char in "（）()"):
+        return "paren_decimal"
+    if "、" in level_text:
+        return "decimal_comma"
+    if "." in level_text:
+        return "decimal_dot" if level == 1 else "decimal_nested"
+    if placeholders == 1 and number_format == "decimal":
+        return "decimal_space"
+    return None
 
 
 def format_heading(level: int, path: list[int], title: str, strategy: HeadingNumbering) -> str:
@@ -135,6 +167,8 @@ def _prefix_for(fmt: str | None, path: list[int]) -> str:
         return f"（{current}）"
     if fmt == "decimal_dot":
         return f"{current}. "
+    if fmt == "decimal_space":
+        return f"{current} "
     if fmt == "decimal_comma":
         return f"{current}、"
     if fmt == "decimal_nested":

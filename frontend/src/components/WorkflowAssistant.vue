@@ -151,7 +151,6 @@ const stageMeta: Record<string, { label: string; description: string }> = {
   conflict: { label: "冲突核验", description: "检查多来源对同一事项是否存在矛盾。" },
   analysis: { label: "综合分析", description: "基于事实形成带依据和置信度的分析判断。" },
   writing: { label: "报告生成", description: "先组织叙事计划，再按章节生成并绑定来源。" },
-  knowledge: { label: "深度检查", description: "报告可审核后继续执行知识整理和深度质检。" },
   review: { label: "等待审核", description: "报告草稿已形成，可以审阅、讨论和修改。" },
   done: { label: "已完成", description: "报告已审核，可导出或进行增量更新。" },
   paused: { label: "已暂停", description: "任务停在安全边界，可继续运行。" },

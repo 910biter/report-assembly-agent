@@ -70,19 +70,11 @@ def _migrate_columns() -> None:
 
 
 def _migrate_integrity() -> None:
-    """Backfill stable identities and enforce critical PG uniqueness indexes."""
+    """Enforce critical PostgreSQL indexes for the current schema."""
     from sqlalchemy import text
 
     engine = _get_engine()
     with engine.begin() as conn:
-        conn.execute(text(
-            "UPDATE report_sentences SET lineage_id = 'legacy-' || id::text "
-            "WHERE lineage_id IS NULL OR lineage_id = ''"
-        ))
-        conn.execute(text(
-            "UPDATE report_versions SET version_major = version_no "
-            "WHERE version_minor = 0 AND version_major = 1 AND version_no > 1"
-        ))
         conn.execute(text(
             "CREATE UNIQUE INDEX IF NOT EXISTS uq_report_versions_report_sequence "
             "ON report_versions(report_id, version_no)"
@@ -136,10 +128,25 @@ def _migrate_integrity() -> None:
         ))
 
 
+def _remove_retired_schema() -> None:
+    """Remove storage objects that no current workflow reads or writes."""
+    from sqlalchemy import text
+
+    with _get_engine().begin() as conn:
+        conn.execute(text("DELETE FROM file_parse_profiles WHERE material_id IS NULL"))
+        conn.execute(text("ALTER TABLE file_parse_profiles DROP COLUMN IF EXISTS node_id"))
+        conn.execute(text("ALTER TABLE file_parse_profiles ALTER COLUMN material_id SET NOT NULL"))
+        conn.execute(text("ALTER TABLE style_variants DROP COLUMN IF EXISTS evidence_usage_profile_json"))
+        conn.execute(text("DROP TABLE IF EXISTS node_summaries CASCADE"))
+        conn.execute(text("DROP TABLE IF EXISTS export_packages CASCADE"))
+        conn.execute(text("DROP TABLE IF EXISTS file_nodes CASCADE"))
+
+
 def init_db() -> None:
     settings.ensure_dirs()
     create_all_tables()  # PG:ORM 统一建表(含迁移列)
     _migrate_columns()
+    _remove_retired_schema()
     _migrate_integrity()
 
 

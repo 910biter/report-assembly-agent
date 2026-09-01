@@ -57,9 +57,9 @@ def test_missing_or_invalid_unit_id_is_normalized_before_comparison():
     assert _positive_unit_id("42") == 42
 
 
-def test_save_pending_claim_normalizes_legacy_zero_to_null():
+def test_save_pending_claim_persists_null_fact_reference():
     recorded: list[dict] = []
-    claim = Claim(material_id=7, content="候选陈述", quote="无法绑定的短摘", fact_id=0)
+    claim = Claim(material_id=7, content="候选陈述", quote="无法绑定的短摘")
 
     with patch("app.evidence.extractor.ORMClaim", _FakeClaimTable(recorded)), patch(
         "app.evidence.extractor.session_scope", _fake_session_scope

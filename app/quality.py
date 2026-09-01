@@ -8,6 +8,7 @@ LLM 检查:逻辑跳跃、引用与内容一致性。结果统一为 qa_notes �
 确定性问题自动修;低风险问题可逆修;语义性问题仅提示人工/模型复核。
 """
 
+import hashlib
 import json
 import re
 
@@ -16,9 +17,22 @@ from app.context_budget import ContextSection, build_prompt_from_sections
 from app.db import session_scope
 from app.runtime_profiles import stage_input_budget_tokens
 
-_QA_SYSTEM = """你是报告质量检查员。检查报告是否存在以下问题,严格输出 JSON:
-{"issues": [{"type": "LOGIC_GAP|CITATION_MISMATCH|REDUNDANT", "section": "章节", "quote": "问题句片段", "note": "问题说明"}]}
-没有问题时输出 {"issues": []}"""
+_QA_SYSTEM = """你是报告质量检查员。输入中的章节、段落和句子均有稳定编号。
+检查逻辑跳跃、引用与内容不一致和明显重复，严格输出 JSON：
+{"issues": [{
+  "type": "LOGIC_GAP|CITATION_MISMATCH|REDUNDANT",
+  "target_type": "sentence|paragraph|section|report",
+  "sentence_ids": [123],
+  "section": "章节",
+  "paragraph": 1,
+  "quote": "必须来自被指向正文的原文片段",
+  "note": "问题说明"
+}]}
+约束：
+1. 句子问题必须返回输入中真实存在的 sentence_ids，不得虚构编号。
+2. 段落问题返回该段涉及的 sentence_ids；章节或全文问题可以为空。
+3. quote 必须逐字摘自对应正文，不要概括或改写。
+4. 不要把一般写作偏好当成质量问题。没有问题时输出 {"issues": []}。"""
 
 
 class _QualityAgent(BaseAgent):
@@ -280,20 +294,39 @@ def run_quality_check(report_id: int, plan_structure: list[str],
     if rows:
         try:
             sentence_lines = [
-                f"[{row['section']}] ({row['source_level']}) {row['content']}"
+                f"[SECTION:{row['section']}][PARAGRAPH:{int(row['paragraph'] or 0)}]"
+                f"[SENTENCE:{int(row['id'])}][SOURCE:{row['source_level']}] {row['content']}"
                 for row in rows
             ]
+            valid_sentence_ids = {int(row["id"]) for row in rows}
             prompt, _audit = build_prompt_from_sections("qa", [
-                ContextSection("instruction", ["检查以下报告句子清单。"], weight=5, required_items=1),
+                ContextSection("instruction", ["检查以下带稳定编号的报告正文。问题必须引用真实编号。"], weight=5, required_items=1),
                 ContextSection("report_sentences", sentence_lines, weight=4, required_items=1),
             ], stage_input_budget_tokens("qa"))
             payload = _QualityAgent().generate_json(prompt)
             for item in payload.get("issues", []):
+                sentence_ids = []
+                for value in item.get("sentence_ids") or []:
+                    try:
+                        sentence_id = int(value)
+                    except (TypeError, ValueError):
+                        continue
+                    if sentence_id in valid_sentence_ids:
+                        sentence_ids.append(sentence_id)
+                sentence_ids = list(dict.fromkeys(sentence_ids))
+                target_type = str(item.get("target_type") or "").strip().lower()
+                if target_type not in {"sentence", "paragraph", "section", "report"}:
+                    target_type = "sentence" if len(sentence_ids) == 1 else "paragraph" if sentence_ids else "section" if item.get("section") else "report"
                 issues.append({
                     "type": str(item.get("type", "LOGIC_GAP")),
+                    "target_type": target_type,
+                    "sentence_ids": sentence_ids,
+                    "sentence_id": sentence_ids[0] if len(sentence_ids) == 1 else None,
                     "section": str(item.get("section", "")),
+                    "paragraph": _safe_int(item.get("paragraph")),
                     "quote": str(item.get("quote", ""))[:60],
                     "note": str(item.get("note", "")),
+                    "location_source": "model_stable_id" if sentence_ids else "model_scope",
                 })
         except Exception:
             pass  # LLM 检查失败不阻塞;规则检查结果保留
@@ -313,7 +346,8 @@ def run_quality_check(report_id: int, plan_structure: list[str],
     return result
 
 
-def attach_quality_issue_locations(report_id: int, issues: list[dict], *, rows=None) -> list[dict]:
+def attach_quality_issue_locations(report_id: int, issues: list[dict], *, rows=None,
+                                   report_version_id: int | None = None) -> list[dict]:
     """Attach sentence/section anchors without changing QA semantics.
 
     New QA runs receive stable sentence ids. Historical QA records are resolved
@@ -329,37 +363,94 @@ def attach_quality_issue_locations(report_id: int, issues: list[dict], *, rows=N
                 .where(ORMSentence.c.report_id == int(report_id), ORMSentence.c.selected == 1)
                 .order_by(ORMSentence.c.position)
             ).mappings().all()
-    candidates = [dict(row) for row in rows]
+    candidates = [
+        dict(row) for row in rows
+        if row.get("selected", 1) not in {0, False}
+    ]
+    by_id = {int(row["id"]): row for row in candidates}
 
-    def normalized(value: str) -> str:
-        return re.sub(r"\s+", "", str(value or ""))
+    if report_version_id is None:
+        try:
+            from app.infrastructure.orm import ORMReportVersion
+            from sqlalchemy import select
+            with session_scope() as s:
+                version = s.execute(
+                    select(ORMReportVersion.c.id)
+                    .where(ORMReportVersion.c.report_id == int(report_id))
+                    .order_by(ORMReportVersion.c.version_no.desc())
+                    .limit(1)
+                ).first()
+            report_version_id = int(version[0]) if version else None
+        except Exception:
+            report_version_id = None
 
     result = []
     for raw in issues or []:
         issue = dict(raw or {})
-        sentence_id = issue.get("sentence_id")
-        if sentence_id and any(int(row["id"]) == int(sentence_id) for row in candidates):
-            issue["target_type"] = "sentence"
-            result.append(issue)
-            continue
+        valid_ids = []
+        for value in list(issue.get("sentence_ids") or []) + [issue.get("sentence_id")]:
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError):
+                continue
+            if parsed in by_id and parsed not in valid_ids:
+                valid_ids.append(parsed)
+        if valid_ids:
+            issue["sentence_ids"] = valid_ids
+            if len(valid_ids) == 1:
+                issue["sentence_id"] = valid_ids[0]
+            issue.setdefault("target_type", "sentence" if len(valid_ids) == 1 else "paragraph")
+            issue.setdefault("location_confidence", "high")
+            issue.setdefault("location_source", "stable_id")
         section = str(issue.get("section") or "").strip()
-        quote = normalized(issue.get("quote") or "")
-        ranked = [row for row in candidates if not section or str(row.get("section") or "") == section]
-        if quote:
-            matched = next((row for row in ranked if quote in normalized(row.get("user_edit") or row.get("content") or "")), None)
-            if matched is None:
-                matched = next((row for row in candidates if quote in normalized(row.get("user_edit") or row.get("content") or "")), None)
-            if matched is not None:
-                issue.update({
-                    "sentence_id": int(matched["id"]),
-                    "paragraph": int(matched.get("paragraph") or 0),
-                    "section": str(matched.get("section") or section),
-                    "target_type": "sentence",
-                })
         if not issue.get("target_type"):
             issue["target_type"] = "section" if section else "report"
+            issue["location_confidence"] = "section" if section else "report"
+            issue["location_source"] = "scope_only"
+
+        anchor_rows = [by_id[value] for value in issue.get("sentence_ids") or [] if value in by_id]
+        anchor_text = "\n".join(str(row.get("user_edit") or row.get("content") or "") for row in anchor_rows)
+        current_fingerprint = hashlib.sha256(anchor_text.encode("utf-8")).hexdigest() if anchor_text else ""
+        previous_fingerprint = str(issue.get("anchor_fingerprint") or "")
+        if previous_fingerprint and current_fingerprint and previous_fingerprint != current_fingerprint:
+            if str(issue.get("status") or "open") not in {"resolved", "ignored"}:
+                issue["status"] = "stale"
+            issue["location_confidence"] = "stale"
+        elif current_fingerprint:
+            issue.setdefault("anchor_fingerprint", current_fingerprint)
+
+        original_quote = str(issue.get("quote") or "")
+        if len(anchor_rows) == 1 and original_quote:
+            current_text = str(anchor_rows[0].get("user_edit") or anchor_rows[0].get("content") or "")
+            offset = current_text.find(original_quote)
+            if offset >= 0:
+                issue["quote_start"] = offset
+                issue["quote_end"] = offset + len(original_quote)
+
+        issue.setdefault("status", "open")
+        issue.setdefault("report_version_id", report_version_id)
+        issue.setdefault("issue_id", _quality_issue_id(report_id, issue))
         result.append(issue)
     return result
+
+
+def _quality_issue_id(report_id: int, issue: dict) -> str:
+    """Build a stable public identifier without exposing internal row ids."""
+    parts = [
+        str(report_id), str(issue.get("type") or issue.get("issue_type") or ""),
+        str(issue.get("target_type") or ""),
+        ",".join(str(value) for value in issue.get("sentence_ids") or []),
+        str(issue.get("section") or ""), str(issue.get("paragraph") or ""),
+        str(issue.get("quote") or ""), str(issue.get("note") or ""),
+    ]
+    return "qa_" + hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()[:16]
+
+
+def _safe_int(value, default: int = 0) -> int:
+    try:
+        return int(value or default)
+    except (TypeError, ValueError):
+        return default
 
 
 def _classify_issue(issue: dict) -> dict:

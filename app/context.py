@@ -1,6 +1,5 @@
 """Context Manager: build minimal context by workflow stage with hybrid retrieval."""
 
-from app.config import settings
 from app.runtime_profiles import stage_input_budget_tokens, stage_profile
 from app.context_budget import ContextSection, build_prompt_from_sections, count_tokens, truncate_tokens
 from app.models import Unit
@@ -246,13 +245,13 @@ class ContextManager:
         insight_lines: list[str] = []
         if insights:
             insight_lines.append("材料摘要(按价值排序,含候选事实要点):")
-            for insight in insights[:10]:
-                points = " / ".join(insight.get("key_points", [])[:3])
+            for insight in insights:
+                points = " / ".join(str(value) for value in insight.get("key_points", []))
                 insight_lines.append(
                     f"- [{insight.get('value_rank', '?')}级] {insight.get('doc_type', '')} "
                     f"{insight.get('topic', '')} 候选事实:{points or '无'} "
-                    f"关键实体:{'、'.join(insight.get('entities', [])[:5])} "
-                    f"时间:{'、'.join(insight.get('times', [])[:3])}"
+                    f"关键实体:{'、'.join(str(value) for value in insight.get('entities', []))} "
+                    f"时间:{'、'.join(str(value) for value in insight.get('times', []))}"
                 )
         prompt, _audit = build_prompt_from_sections(
             "planner",
@@ -380,7 +379,7 @@ class ContextManager:
                 try:
                     from app.retrieval import vector_store
                     if getattr(vector_store, "enabled", False) and query_vector:
-                        hits = vector_store.search_units(query_vector, top_k=_recall_budget(), query_text=query)
+                        hits = vector_store.search_units(query_vector, top_k=_recall_budget())
                         hit_ids = {int(h[0]) for h in hits}
                 except Exception:
                     hit_ids = set()
@@ -567,8 +566,7 @@ class ContextManager:
             }))
         return result
 
-    def for_analysis(self, facts: list[dict], conflicts: list[dict],
-                     timeline_block: str, memory_block: str) -> str:
+    def for_analysis(self, facts: list[dict], conflicts: list[dict]) -> str:
         fact_lines = ["事实清单(编号 + 来源):"] + [
             f"{fact['id']}. [{fact['sources']}] {fact['content']}" for fact in facts
         ]
@@ -577,8 +575,6 @@ class ContextManager:
             [
                 ContextSection("事实", fact_lines, weight=6),
                 ContextSection("来源冲突", ["来源冲突:", json_dumps(conflicts) if conflicts else "无"], weight=3),
-                ContextSection("事件时间线", ["事件时间线:", *timeline_block.splitlines()], weight=2),
-                ContextSection("历史知识", ["历史知识:", *memory_block.splitlines()], weight=1),
             ],
             self.budget_tokens("analysis"),
         )
@@ -605,7 +601,7 @@ class ContextManager:
         ]
         if insights:
             header_lines.append("材料理解摘要:")
-            for item in insights[:10]:
+            for item in insights:
                 header_lines.append(
                     f"- {item.get('filename','')}: {item.get('doc_type','')} / {item.get('topic','')} / "
                     f"角色:{item.get('material_role','')} / 边界:{item.get('claim_support','unknown')}"
@@ -835,7 +831,7 @@ class ContextManager:
         related_inferences = [
             inference for inference in inferences
             if any(bid in related_ids for bid in (inference.get("based_fact_ids") or []))
-        ] or inferences[:3]
+        ]
         return related_facts, related_inferences, style_block
 
     def _retrieve_facts(self, query: str, facts: list[dict], top_k: int,

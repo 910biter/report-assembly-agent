@@ -27,7 +27,7 @@ class Unit:
 
 @dataclass
 class Evidence:
-    fact_id: int
+    fact_id: int | None
     material_id: int
     unit_id: int
     source_file: str

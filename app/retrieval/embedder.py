@@ -7,7 +7,7 @@
 import time
 
 from app.gateway import model_gateway
-from app.llm_scheduler import embedding_num_gpu, invoke
+from app.llm_scheduler import invoke
 
 # 模型物理上下文上限(token):embedding 输入长度物理上限(允许硬编码)
 _EMBED_TOKEN_BUDGET = 8192
@@ -72,7 +72,6 @@ def _embed_chunk(chunk: list[str], base: int, vectors: list, errors: list[str]) 
             vecs = invoke(
                 "embed", model_gateway.embed, chunk,
                 timeout=_dynamic_timeout(chunk),
-                num_gpu=embedding_num_gpu(),  # 动态放置:agent 活跃时 CPU,否则 GPU
             )
             elapsed = time.time() - t0
             chars = sum(len(t or "") for t in chunk)

@@ -99,7 +99,7 @@ def list_comparisons(report_id: int) -> list[dict[str, Any]]:
     return [_run_detail(row, include_items=False) for row in rows]
 
 
-def get_comparison(comparison_id: int) -> dict[str, Any] | None:
+def get_comparison(comparison_id: int, *, compact: bool = False) -> dict[str, Any] | None:
     with session_scope() as s:
         row = s.execute(select(ORMMaterialComparisonRun).where(
             ORMMaterialComparisonRun.c.id == int(comparison_id)
@@ -111,8 +111,8 @@ def get_comparison(comparison_id: int) -> dict[str, Any] | None:
         ).order_by(ORMMaterialComparisonItem.c.id)).mappings().all()
     result = _run_detail(row, include_items=False)
     result_items = [_item_detail(item) for item in items]
-    _attach_new_fact_evidence(result_items)
-    result["items"] = result_items
+    if not compact:
+        _attach_new_fact_evidence(result_items)
     baseline = get_report_version(int(row["base_version_id"]))
     result["baseline"] = {
         "id": int(row["base_version_id"]),
@@ -120,7 +120,26 @@ def get_comparison(comparison_id: int) -> dict[str, Any] | None:
         "version_label": str((baseline or {}).get("version_label") or (baseline or {}).get("version_no") or ""),
     }
     result["document"] = _comparison_document(baseline or {}, result_items)
+    if compact:
+        result_items = [_compact_comparison_item(item) for item in result_items]
+        for sentence in result["document"].get("sentences", []):
+            sentence.pop("source_refs", None)
+    result["items"] = result_items
     return result
+
+
+def get_comparison_item(comparison_id: int, item_id: int) -> dict[str, Any] | None:
+    """Load the full provenance for one selected review item."""
+    with session_scope() as s:
+        row = s.execute(select(ORMMaterialComparisonItem).where(
+            ORMMaterialComparisonItem.c.id == int(item_id),
+            ORMMaterialComparisonItem.c.comparison_id == int(comparison_id),
+        )).mappings().first()
+    if row is None:
+        return None
+    item = _item_detail(row)
+    _attach_new_fact_evidence([item])
+    return item
 
 
 def update_comparison_item(comparison_id: int, item_id: int, *, status: str,
@@ -138,8 +157,7 @@ def update_comparison_item(comparison_id: int, item_id: int, *, status: str,
             ORMMaterialComparisonItem.c.id == int(item_id),
             ORMMaterialComparisonItem.c.comparison_id == int(comparison_id),
         ).values(**values))
-    comparison = get_comparison(comparison_id)
-    return next((item for item in (comparison or {}).get("items", []) if item["id"] == item_id), None)
+    return get_comparison_item(comparison_id, item_id)
 
 
 def complete_comparison_task(task_id: str) -> dict[str, Any]:
@@ -586,6 +604,27 @@ def _item_detail(row) -> dict[str, Any]:
         "rationale": row["rationale"], "evidence": _load(row["evidence_json"], {}),
         "impact": _load(row["impact_json"], {}), "user_note": row["user_note"],
     }
+
+
+def _compact_comparison_item(item: dict[str, Any]) -> dict[str, Any]:
+    """Keep the workspace index small; provenance is fetched on selection."""
+    result = {
+        key: item.get(key) for key in (
+            "id", "change_type", "status", "confidence", "new_fact_id",
+            "baseline_fact_id", "baseline_inference_id", "title",
+        )
+    }
+    compact_evidence: dict[str, Any] = {}
+    for key in ("new_fact", "baseline_fact"):
+        fact = (item.get("evidence") or {}).get(key)
+        if isinstance(fact, dict):
+            compact_evidence[key] = {
+                "id": fact.get("id"),
+                "content": fact.get("content"),
+                "evidence_count": len(fact.get("evidence") or []),
+            }
+    result["evidence"] = compact_evidence
+    return result
 
 
 def _load(value: Any, default: Any) -> Any:

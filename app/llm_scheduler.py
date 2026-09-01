@@ -1,31 +1,14 @@
-"""统一 LLM 资源边界:所有推理/embedding 调用必须经过此入口。
-
-背景:任务队列只管任务内调用,UI/模板分析/QA/后台可能绕过队列直接调用
-推理模型,导致资源状态混乱。本模块统一互斥与资源策略:
-
-- invoke(kind, fn):Ollama 串行；vLLM 使用有界并发，让服务端执行连续批处理；
-- heavy_stage():重资源阶段(解析/OCR)声明式上下文,按 GPU 策略
-  (settings.gpu_memory_tight)决定是否临时卸载推理模型——unload 是
-  资源调度策略,不是业务工作流的一部分;显存够时保持常驻零开销。
-"""
+"""Unified concurrency boundary for generation and CPU embedding calls."""
 import threading
 import time
-from contextlib import contextmanager
 
 from app.config import settings
 
 _generation_slots = threading.BoundedSemaphore(
     max(1, int(settings.llm_concurrency or 1))
-    if str(settings.generation_backend).lower() == "vllm" else 1
 )
 _interactive_slots = threading.BoundedSemaphore(max(1, int(settings.interactive_concurrency or 1)))
 _embedding_lock = threading.RLock()
-# 推理模型(qwen-agent)活跃状态:统一模型放置决策依据。
-# 解析阶段(heavy_stage, tight)卸载 agent → False → embedding 可独占 GPU;
-# LLM 阶段 agent 常驻 → True → embedding 让位走 CPU(显存 24.8G > 24.5G 不能共存)。
-_agent_active = True
-_agent_state_lock = threading.Lock()
-_heavy_active = False
 _lane_stats_lock = threading.Lock()
 _lane_stats = {
     "workflow": {"submitted": 0, "completed": 0, "failed": 0, "active": 0, "max_active": 0,
@@ -33,20 +16,6 @@ _lane_stats = {
     "interactive": {"submitted": 0, "completed": 0, "failed": 0, "active": 0, "max_active": 0,
                     "slot_wait_seconds": 0.0},
 }
-
-
-def set_agent_active(active: bool) -> None:
-    global _agent_active
-    with _agent_state_lock:
-        _agent_active = active
-
-
-def embedding_num_gpu() -> int:
-    """embedding 动态放置:解析重阶段让位给 Docling GPU。"""
-    with _agent_state_lock:
-        if _agent_active:
-            return 0
-    return settings.gpu_layers
 
 
 def invoke(kind: str, fn, *args, **kwargs):
@@ -103,28 +72,3 @@ def model_lane_stats() -> dict:
         ) if completed else 0.0
         values["slot_wait_seconds"] = round(float(values.get("slot_wait_seconds") or 0.0), 4)
     return result
-
-
-@contextmanager
-def heavy_stage(model: str = ""):
-    """重资源阶段(解析/OCR 等):按 GPU 策略决定卸载/预热推理模型。
-
-    tight 模式下进入即卸载 agent(agent 状态置 False → embedding 独占 GPU),
-    退出时预热恢复(agent 状态置 True → embedding 自动让位走 CPU)。
-    """
-    from app.gateway import model_gateway
-    tight = settings.gpu_memory_tight
-    if tight:
-        model_gateway.unload_model(model)
-        global _heavy_active, _agent_active
-        with _agent_state_lock:
-            _heavy_active = True
-            _agent_active = False
-    try:
-        yield
-    finally:
-        if tight:
-            model_gateway.warmup_model(model)
-            with _agent_state_lock:
-                _heavy_active = False
-                _agent_active = True

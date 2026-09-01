@@ -50,13 +50,13 @@ from app.material_comparison import (
     accepted_update_handoff,
     create_comparison_run,
     get_comparison,
+    get_comparison_item,
     list_comparisons,
     update_comparison_item,
 )
-from app.parser import parse_file
+from app.parsing import parse_file
 from app.rendering.headings import detect_numbering_strategy, format_heading, strip_heading_prefix
 from app.report_versions import (
-    attach_delta_version,
     create_incremental_delta,
     diff_report_version_to_current,
     diff_report_version_sentences,
@@ -68,10 +68,11 @@ from app.report_versions import (
     save_report_change_decision,
     list_report_change_decisions,
     apply_report_change_decisions,
-    latest_report_version,
     list_report_versions,
 )
 from app.task_runs import create_task_run
+from app.template_engine import compile_template
+from app.template_engine.compiler import COMPILER_VERSION
 from app.token_monitor import build_token_efficiency, build_workload_profile, list_llm_calls
 from app.workflow import WorkflowController
 from app.workflow.queue import enqueue_task, request_control, task_queue_status
@@ -389,10 +390,18 @@ def report_material_comparisons(report_id: int):
 
 
 @router.get("/material-comparisons/{comparison_id}")
-def material_comparison_detail(comparison_id: int):
-    result = get_comparison(comparison_id)
+def material_comparison_detail(comparison_id: int, compact: bool = False):
+    result = get_comparison(comparison_id, compact=compact)
     if result is None:
         return JSONResponse({"error": "COMPARISON_NOT_FOUND"}, status_code=404)
+    return result
+
+
+@router.get("/material-comparisons/{comparison_id}/items/{item_id}")
+def material_comparison_item_detail(comparison_id: int, item_id: int):
+    result = get_comparison_item(comparison_id, item_id)
+    if result is None:
+        return JSONResponse({"error": "COMPARISON_ITEM_NOT_FOUND"}, status_code=404)
     return result
 
 
@@ -602,19 +611,6 @@ def _assistant_task_context(task_id: str, task: dict) -> dict:
     }
 
 
-@router.post("/tasks/{task_id}/evidence-gaps/retrieve")
-def retrieve_evidence_gaps(task_id: str):
-    """Bounded WriteHERE hook: retrieve QA-declared evidence gaps only."""
-    if short_term.load_task(task_id) is None:
-        return JSONResponse({"error": "TASK_NOT_FOUND"}, status_code=404)
-    from app.workflow.controller import WorkflowController
-    try:
-        facts = WorkflowController(task_id).reflow_evidence_gaps()
-    except Exception as exc:
-        return JSONResponse({"error": "EVIDENCE_GAP_RETRIEVAL_FAILED", "detail": str(exc)[:200]}, status_code=500)
-    return {"status": "retrieved", "fact_count": len(facts), "facts": facts}
-
-
 @router.delete("/tasks/{task_id}")
 def delete_task(task_id: str):
     """删除任务记录。材料与已生成报告保留在资产库中。"""
@@ -782,7 +778,7 @@ def task_graph(task_id: str):
     result = graph_service.task_graph(task_id)
     result["build_status"] = task.get("graph_status") or {"status": "unknown"}
     jobs = task.get("background_jobs") or {}
-    background_job = jobs.get("graph_rebuild") or jobs.get("knowledge") or {}
+    background_job = jobs.get("graph_rebuild") or jobs.get("graph_build") or {}
     result["background_job"] = background_job
     result["build_active"] = _graph_job_active(background_job)
     return result
@@ -855,7 +851,7 @@ def rebuild_task_graph(task_id: str, background_tasks: BackgroundTasks):
     if graph_service.mode == "off":
         return JSONResponse({"error": "GRAPH_MODE_OFF"}, status_code=409)
     jobs = task.get("background_jobs") or {}
-    active_job = jobs.get("graph_rebuild") or jobs.get("knowledge") or {}
+    active_job = jobs.get("graph_rebuild") or jobs.get("graph_build") or {}
     if _graph_job_active(active_job):
         return {"status": "already_running", "task_id": task_id}
     if not task.get("fact_ids"):
@@ -1192,6 +1188,33 @@ def update_sentence(report_id: int, sentence_id: int, payload: dict):
     return {"ok": True, "content": content if content is not None else row[1]}
 
 
+@router.patch("/reports/{report_id}/quality-issues/{issue_id}")
+def update_quality_issue(report_id: int, issue_id: str, payload: dict):
+    """Record a review decision for one quality issue without mutating report text."""
+    task_id = _find_task_by_report(report_id)
+    if task_id is None:
+        return JSONResponse({"error": "REPORT_NOT_FOUND"}, status_code=404)
+    status = str(payload.get("status") or "").strip().lower()
+    if status not in {"open", "resolved", "ignored"}:
+        return JSONResponse({"error": "INVALID_QA_STATUS"}, status_code=400)
+
+    from app.quality import attach_quality_issue_locations
+    task = short_term.load_task(task_id) or {}
+    issues = attach_quality_issue_locations(
+        report_id, list(task.get("qa_notes") or []),
+    )
+    target = next((item for item in issues if item.get("issue_id") == issue_id), None)
+    if target is None:
+        return JSONResponse({"error": "QA_ISSUE_NOT_FOUND"}, status_code=404)
+    target["status"] = status
+    target["reviewed_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+    note = str(payload.get("note") or "").strip()
+    if note:
+        target["review_note"] = note[:500]
+    short_term.update_task(task_id, qa_notes=issues)
+    return {"ok": True, "issue": target}
+
+
 @router.post("/reports/{report_id}/finalize")
 def finalize_report(report_id: int, payload: dict | None = None):
     """审核完成:报告置为 final,任务进入已完成。"""
@@ -1201,7 +1224,11 @@ def finalize_report(report_id: int, payload: dict | None = None):
     payload = payload or {}
     task = short_term.load_task(task_id) or {}
     blocking_types = {"MISSING_SECTION", "SCALE_UNDERFILL", "CITATION_MISMATCH"}
-    blocking = [issue for issue in (task.get("qa_notes") or []) if issue.get("type") in blocking_types]
+    blocking = [
+        issue for issue in (task.get("qa_notes") or [])
+        if issue.get("type") in blocking_types
+        and str(issue.get("status") or "open") not in {"resolved", "ignored"}
+    ]
     if blocking and not payload.get("force"):
         return JSONResponse({"error": "QA_BLOCKING", "issues": blocking}, status_code=409)
     WorkflowController(task_id).finalize()
@@ -1422,6 +1449,10 @@ def get_template_schema(variant_id: int):
         return JSONResponse({"error": "VARIANT_NOT_FOUND"}, status_code=404)
     dominant = variant.format_spec.get("dominant") if isinstance(variant.format_spec, dict) else {}
     schema = dominant.get("template_schema") if isinstance(dominant, dict) else {}
+    if isinstance(dominant, dict) and schema.get("compiler_version") != COMPILER_VERSION:
+        source = Path(str(dominant.get("source_template_path") or ""))
+        if source.exists():
+            schema = compile_template(source)
     if not schema:
         return JSONResponse({"error": "TEMPLATE_SCHEMA_NOT_FOUND"}, status_code=404)
     return schema
@@ -1568,11 +1599,11 @@ def health():
     from app.runtime_profiles import runtime_profile_manifest
     from app.context_budget import tokenizer_method
 
-    generation_url = (
-        settings.generation_url
-        if str(settings.generation_backend).lower() == "vllm"
-        else settings.ollama_url
-    )
+    generation_url = settings.generation_url or "http://127.0.0.1:8100/v1"
+    embedding_runtime = {
+        "backend": settings.embedding_backend,
+        "model": settings.embedding_model_path or settings.embedding_model,
+    }
 
     try:
         status = invoke("health", model_gateway.health)
@@ -1581,7 +1612,7 @@ def health():
             "version": status.get("version"),
             "models": status.get("models", {}),
             "gateway_url": generation_url,
-            "embedding_url": settings.ollama_url,
+            "embedding_runtime": embedding_runtime,
             "runtime_root": str(settings.runtime_root),
             "queues": {
                 "tasks": task_queue_status(),
@@ -1603,7 +1634,7 @@ def health():
         return {
             "error": str(exc),
             "gateway_url": generation_url,
-            "embedding_url": settings.ollama_url,
+            "embedding_runtime": embedding_runtime,
             "runtime_root": str(settings.runtime_root),
         }
 
@@ -1756,26 +1787,22 @@ def _resource_snapshot() -> dict:
 # ---------- 辅助 ----------
 
 def _find_task_by_report(report_id: int) -> str | None:
-    """返回报告的根任务,兼容旧版曾创建的独立增量任务。"""
+    """Return the task that owns the report.
+
+    reports 表没有 task_id 列;任务通过 short_memory 的 payload.report_id 反查。
+    (回归修复:旧实现错误引用 ORMReport.task_id,导致所有报告详情 500)
+    """
     from app.infrastructure.orm import ORMShortMemory
-    from sqlalchemy import select
     with session_scope() as s:
         rows = s.execute(select(ORMShortMemory.c.task_id, ORMShortMemory.c.payload)).all()
-    matches: list[tuple[str, dict]] = []
-    for row in rows:
-        payload = json.loads(row[1])
+    for task_id, payload_text in rows:
         try:
-            payload_report_id = int(payload.get("report_id"))
+            payload = json.loads(payload_text or "{}")
         except (TypeError, ValueError):
             continue
-        if payload_report_id == int(report_id):
-            matches.append((str(row[0]), payload))
-    if not matches:
-        return None
-    roots = [item for item in matches if not item[1].get("incremental_base_task_id")]
-    candidates = roots or matches
-    candidates.sort(key=lambda item: (str(item[1].get("created_at") or ""), item[0]))
-    return candidates[0][0]
+        if payload.get("report_id") == int(report_id):
+            return task_id
+    return None
 
 
 def _sentence_details_bulk(rows) -> dict[int, dict]:
@@ -1828,22 +1855,9 @@ def _sentence_details_bulk(rows) -> dict[int, dict]:
 
 def _report_heading_strategy(style_profile_id: int | None):
     variant = style.get_variant(style_profile_id) if style_profile_id else None
-    locked = style.get_locked_variant()
-    selected = variant if _api_variant_has_template_roles(variant) else None
-    if selected is None and _api_variant_has_template_roles(locked):
-        selected = locked
-    dominant = selected.format_spec.get("dominant") if selected and isinstance(selected.format_spec, dict) else {}
+    dominant = variant.format_spec.get("dominant") if variant and isinstance(variant.format_spec, dict) else {}
     schema = dominant.get("template_schema") if isinstance(dominant, dict) else {}
     return detect_numbering_strategy(schema if isinstance(schema, dict) else {})
-
-
-def _api_variant_has_template_roles(variant) -> bool:
-    if variant is None or not isinstance(variant.format_spec, dict):
-        return False
-    dominant = variant.format_spec.get("dominant")
-    schema = dominant.get("template_schema") if isinstance(dominant, dict) else {}
-    roles = schema.get("style", {}).get("roles", {}) if isinstance(schema, dict) else {}
-    return isinstance(roles, dict) and bool(roles.get("document_title") and roles.get("body"))
 
 
 def variant_fields(variant) -> dict:
@@ -2011,6 +2025,12 @@ def _progress_summary(payload: dict) -> dict:
         "critical_path_done": payload.get("critical_path_done", False),
         "background_jobs": payload.get("background_jobs") or {},
         "artifact_status": payload.get("artifact_status") or {},
+        "stage_health": {
+            "material_analysis": payload.get("material_analysis_status") or {},
+            "intelligence": payload.get("intelligence_status") or {},
+            "quality": payload.get("qa_status") or {},
+            "artifact_recording": payload.get("artifact_recording_error") or {},
+        },
         "queue_status": payload.get("queue_status") or {},
         "performance": {
             "parse_reused": payload.get("parse_reused", 0),

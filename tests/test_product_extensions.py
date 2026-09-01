@@ -76,10 +76,10 @@ class ProductExtensionTests(unittest.TestCase):
 
     def test_context_budget_tracks_serving_window_and_stage_reserves(self):
         with (
-            patch("app.context.settings.model_context_window_tokens", 16000),
-            patch("app.context.settings.structured_output_tokens", 3000),
-            patch("app.context.settings.prompt_overhead_tokens", 2000),
-            patch("app.context.settings.safety_margin_tokens", 1000),
+            patch("app.runtime_profiles.settings.model_context_window_tokens", 16000),
+            patch("app.runtime_profiles.settings.structured_output_tokens", 3000),
+            patch("app.runtime_profiles.settings.prompt_overhead_tokens", 2000),
+            patch("app.runtime_profiles.settings.safety_margin_tokens", 1000),
         ):
             self.assertEqual(ContextManager({}).budget_tokens(), 10000)
 
@@ -171,19 +171,24 @@ class ProductExtensionTests(unittest.TestCase):
             "interaction_notifications",
         ):
             self.assertIn(table, Base.metadata.tables)
-        self.assertIn("evidence_usage_profile_json", Base.metadata.tables["style_variants"].c)
+        self.assertNotIn("evidence_usage_profile_json", Base.metadata.tables["style_variants"].c)
         proposals = Base.metadata.tables["change_proposals"]
         self.assertIn("execution_status", proposals.c)
         self.assertIn("candidate_version_id", proposals.c)
+
+    def test_retired_directory_storage_is_not_part_of_the_runtime_schema(self):
+        for table in ("file_nodes", "node_summaries", "export_packages"):
+            self.assertNotIn(table, Base.metadata.tables)
+        self.assertNotIn("node_id", Base.metadata.tables["file_parse_profiles"].c)
 
     def test_semantic_proposal_preserves_scope_in_recompute_instruction(self):
         instruction = _proposal_instruction({
             "artifact_type": "fact", "object_id": "18",
             "rationale": "需要重新核对限定条件",
-            "after_json": '{"content":"重新核对适用范围"}',
+            "after_json": '{"instruction":"重新核对适用范围与限定条件"}',
+            "impact_json": '{"scope":{"tool_call":{"tool_name":"recheck_fact","arguments":{"fact_id":18,"instruction":"重新核对适用范围与限定条件"}}}}',
         })
         self.assertIn("fact/18", instruction)
-        self.assertIn("重新核对限定条件", instruction)
         self.assertIn("适用范围", instruction)
 
     def test_tool_arguments_survive_into_recompute_instruction(self):
@@ -195,7 +200,7 @@ class ProductExtensionTests(unittest.TestCase):
         })
         self.assertIn("必须保持 5 章", instruction)
         self.assertIn("第五章", instruction)
-        self.assertIn("new_structure", instruction)
+        self.assertNotIn("new_structure", instruction)
 
     def test_narrative_summary_reports_semantic_units(self):
         summary = _artifact_summary("narrative_plan", {

@@ -1,4 +1,4 @@
-"""ORM 数据模型(SQLAlchemy 2.0)——38 张表集中定义。
+"""ORM 数据模型(SQLAlchemy 2.0)集中定义。
 
 - 表结构唯一真源:_SCHEMA(CREATE TABLE)解析生成 Table 对象
 - PostgreSQL 方言由 SQLAlchemy 自动映射(SQLite 已完全退出)
@@ -24,26 +24,9 @@ CREATE TABLE IF NOT EXISTS materials (
     duplicate_of INTEGER
 );
 
-CREATE TABLE IF NOT EXISTS file_nodes (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    parent_id INTEGER REFERENCES file_nodes(id),
-    node_type TEXT NOT NULL DEFAULT 'file',
-    name TEXT NOT NULL,
-    path TEXT NOT NULL UNIQUE,
-    relative_path TEXT NOT NULL DEFAULT '',
-    file_type TEXT NOT NULL DEFAULT '',
-    file_size INTEGER NOT NULL DEFAULT 0,
-    file_hash TEXT NOT NULL DEFAULT '',
-    material_id INTEGER REFERENCES materials(id),
-    status TEXT NOT NULL DEFAULT 'indexed',
-    created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
-    updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
-);
-
 CREATE TABLE IF NOT EXISTS file_parse_profiles (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    node_id INTEGER NOT NULL REFERENCES file_nodes(id),
-    material_id INTEGER REFERENCES materials(id),
+    material_id INTEGER NOT NULL REFERENCES materials(id),
     parser TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'pending',
     page_count INTEGER NOT NULL DEFAULT 0,
@@ -53,28 +36,7 @@ CREATE TABLE IF NOT EXISTS file_parse_profiles (
     markdown_chars INTEGER NOT NULL DEFAULT 0,
     structure_json TEXT NOT NULL DEFAULT '{}',
     error TEXT NOT NULL DEFAULT '',
-    parsed_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
-    UNIQUE(node_id, parser)
-);
-
-CREATE TABLE IF NOT EXISTS node_summaries (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    node_id INTEGER NOT NULL REFERENCES file_nodes(id),
-    summary_type TEXT NOT NULL DEFAULT 'folder',
-    status TEXT NOT NULL DEFAULT 'ready',
-    summary TEXT NOT NULL DEFAULT '',
-    detail_json TEXT NOT NULL DEFAULT '{}',
-    generated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
-    UNIQUE(node_id, summary_type)
-);
-
-CREATE TABLE IF NOT EXISTS export_packages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    node_id INTEGER NOT NULL REFERENCES file_nodes(id),
-    package_path TEXT NOT NULL,
-    file_count INTEGER NOT NULL DEFAULT 0,
-    total_size INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+    parsed_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
 );
 
 CREATE TABLE IF NOT EXISTS units (
@@ -187,7 +149,6 @@ CREATE TABLE IF NOT EXISTS style_variants (
     status TEXT NOT NULL DEFAULT 'draft',
     source_hash TEXT NOT NULL DEFAULT '',
     structure_policy_json TEXT NOT NULL DEFAULT '{}',
-    evidence_usage_profile_json TEXT NOT NULL DEFAULT '{}',
     exemplar_bank_json TEXT NOT NULL DEFAULT '[]',
     learning_cases_json TEXT NOT NULL DEFAULT '[]',
     profile_confidence_json TEXT NOT NULL DEFAULT '{}',
@@ -725,9 +686,6 @@ _MIGRATED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ('materials', 'file_hash', "TEXT NOT NULL DEFAULT ''"),
     ('materials', 'parser_version', "TEXT NOT NULL DEFAULT ''"),
     ('materials', 'parsed_at', 'TEXT'),
-    ('file_nodes', 'parent_id', 'INTEGER REFERENCES file_nodes(id)'),
-    ('file_nodes', 'material_id', 'INTEGER REFERENCES materials(id)'),
-    ('file_nodes', 'status', "TEXT NOT NULL DEFAULT 'indexed'"),
     ('file_parse_profiles', 'markdown_chars', 'INTEGER NOT NULL DEFAULT 0'),
     ('units', 'metadata_json', "TEXT NOT NULL DEFAULT '{}'"),
     ('material_insights', 'key_points', "TEXT NOT NULL DEFAULT '[]'"),
@@ -751,7 +709,6 @@ _MIGRATED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ('style_variants', 'reasoning_profile_json', "TEXT NOT NULL DEFAULT '{}'"),
     ('style_variants', 'institution_rules_json', "TEXT NOT NULL DEFAULT '{}'"),
     ('style_variants', 'structure_policy_json', "TEXT NOT NULL DEFAULT '{}'"),
-    ('style_variants', 'evidence_usage_profile_json', "TEXT NOT NULL DEFAULT '{}'"),
     ('style_variants', 'exemplar_bank_json', "TEXT NOT NULL DEFAULT '[]'"),
     ('style_variants', 'learning_cases_json', "TEXT NOT NULL DEFAULT '[]'"),
     ('style_variants', 'profile_confidence_json', "TEXT NOT NULL DEFAULT '{}'"),

@@ -81,29 +81,4 @@ def serializable_memory(memory: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def evidence_gap_contract(gaps: list[str], chapter: str = "") -> dict[str, Any]:
-    return {"status": "open", "chapter": chapter, "gaps": [str(g) for g in gaps if str(g).strip()]}
-
-
-def update_gap_contract(contract: dict[str, Any], status: str, note: str = "") -> dict[str, Any]:
-    result = dict(contract or {})
-    result["status"] = status
-    if note:
-        result["note"] = note
-    return result
-
-
-def evaluation_contract() -> dict[str, Any]:
-    """Survey-aligned quality dimensions used by the report QA layer."""
-    return {
-        "attribution": {"status": "programmatic", "metric": "source binding + attribution weak"},
-        "citation": {"status": "programmatic", "metric": "citation coverage + source validity"},
-        "correctness": {"status": "programmatic_llm", "metric": "numeric consistency + QA"},
-        "linguistic_quality": {"status": "llm_qa", "metric": "fluency + coherence"},
-        "preservation": {"status": "planned", "metric": "revision preservation"},
-        "relevance": {"status": "programmatic", "metric": "contract coverage"},
-        "retrieval": {"status": "programmatic", "metric": "need coverage + utility"},
-    }
-
-
-__all__ = ["StructureError", "order_chapters", "normalize_contract", "normalize_topic", "serializable_memory", "evidence_gap_contract", "update_gap_contract", "evaluation_contract"]
+__all__ = ["StructureError", "order_chapters", "normalize_contract", "normalize_topic", "serializable_memory"]

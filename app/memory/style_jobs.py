@@ -8,7 +8,7 @@ import threading
 import uuid
 from pathlib import Path
 
-from app.config import settings
+from app.parsing import parse_file
 
 
 _LOCK = threading.RLock()
@@ -51,7 +51,6 @@ def get_job(job_id: str) -> dict | None:
 def run_job(job_id: str) -> None:
     """Parse uploaded files and build StyleVariants after the request returns."""
     from app.memory import style
-    from app.parser import parse_file
 
     with _LOCK:
         job = _JOBS.get(job_id)

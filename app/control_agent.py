@@ -10,7 +10,7 @@ import re
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 
 from app.db import session_scope
@@ -20,14 +20,6 @@ from app.infrastructure.orm import (
 )
 from app.memory import short_term
 from app.workflow.queue import request_control, task_queue_status
-
-
-class AgentIntent(str, Enum):
-    ANSWER = "answer"
-    READ = "read"
-    NAVIGATE = "navigate"
-    PROPOSE = "propose"
-    EXECUTE = "execute"
 
 
 class AgentToolName(str, Enum):
@@ -43,6 +35,14 @@ class AgentToolName(str, Enum):
     PAUSE_TASK = "pause_task"
     RESUME_TASK = "resume_task"
     RETRY_TASK = "retry_task"
+    REVISE_TASK_REQUIREMENTS = "revise_task_requirements"
+    REVISE_ANALYSIS_PLAN = "revise_analysis_plan"
+    RECHECK_FACT = "recheck_fact"
+    RECHECK_INFERENCE = "recheck_inference"
+    REWRITE_SENTENCE = "rewrite_sentence"
+    REWRITE_PARAGRAPH = "rewrite_paragraph"
+    UPDATE_REPORT_TITLE = "update_report_title"
+    UPDATE_SECTION_TITLE = "update_section_title"
     REGENERATE_CHAPTER = "regenerate_chapter"
     RERUN_FINAL_PLAN = "rerun_final_plan"
     LOCATE_QUALITY_ISSUE = "locate_quality_issue"
@@ -55,6 +55,12 @@ class ArtifactFocus(BaseModel):
     artifact_version: str = ""
     current: dict[str, Any] = Field(default_factory=dict)
     references: list[dict[str, Any]] = Field(default_factory=list)
+
+    @field_validator("object_id", "artifact_version", mode="before")
+    @classmethod
+    def normalize_identifier(cls, value: Any) -> str:
+        """UI and historical rows may carry numeric ids; the protocol is textual."""
+        return "" if value is None else str(value)
 
 
 class TaskAgentContext(BaseModel):
@@ -80,18 +86,11 @@ class AgentToolCall(BaseModel):
     reason: str = ""
 
 
-class AgentDecision(BaseModel):
-    intent: AgentIntent = AgentIntent.ANSWER
-    reply: str
-    tool_call: AgentToolCall | None = None
-    proposal: dict[str, Any] | None = None
-
-
 _STAGE_LABELS = {
     "created": "等待开始", "parsing": "材料解析", "dedup": "去重归并",
     "material_analysis": "材料理解", "planning": "分析规划", "evidence": "事实与证据",
     "conflict": "冲突核验", "analysis": "综合分析", "writing": "报告生成",
-    "knowledge": "深度检查", "review": "等待审核", "done": "已完成",
+    "review": "等待审核", "done": "已完成",
     "paused": "已暂停", "failed": "运行异常",
 }
 
@@ -122,8 +121,37 @@ _TOOL_DEFINITIONS = {
     AgentToolName.PAUSE_TASK: (True, "在安全边界暂停任务"),
     AgentToolName.RESUME_TASK: (True, "从断点恢复任务"),
     AgentToolName.RETRY_TASK: (True, "从失败或暂停阶段重试任务"),
+    AgentToolName.REVISE_TASK_REQUIREMENTS: (True, "更新任务主题或报告要求，并从分析规划重新计算"),
+    AgentToolName.REVISE_ANALYSIS_PLAN: (True, "调用 Planner 调整分析问题与证据需求"),
+    AgentToolName.RECHECK_FACT: (True, "回到 Evidence 复核指定事实及其证据"),
+    AgentToolName.RECHECK_INFERENCE: (True, "回到 Analysis 复核指定推论及其依据"),
+    AgentToolName.REWRITE_SENTENCE: (True, "调用 Writer 在证据约束下改写指定句子"),
+    AgentToolName.REWRITE_PARAGRAPH: (True, "调用 Writer 在证据约束下改写指定段落"),
+    AgentToolName.UPDATE_REPORT_TITLE: (True, "修改报告主标题"),
+    AgentToolName.UPDATE_SECTION_TITLE: (True, "修改现有章节标题并同步目录"),
     AgentToolName.REGENERATE_CHAPTER: (True, "调用 Narrative Plan 与 Writer 重写指定章节"),
     AgentToolName.RERUN_FINAL_PLAN: (True, "调用 Final Planner 重组目录及其下游"),
+}
+
+_MUTATING_ARGUMENT_KEYS = {
+    AgentToolName.REVISE_TASK_REQUIREMENTS: {"updated_theme", "updated_requirements", "instruction"},
+    AgentToolName.REVISE_ANALYSIS_PLAN: {"instruction", "required_dimensions", "required_dimension_count"},
+    AgentToolName.RECHECK_FACT: {"fact_id", "instruction"},
+    AgentToolName.RECHECK_INFERENCE: {"inference_id", "instruction"},
+    AgentToolName.REWRITE_SENTENCE: {
+        "sentence_id", "instruction", "reference_fact_ids", "reference_inference_ids",
+    },
+    AgentToolName.REWRITE_PARAGRAPH: {
+        "chapter_title", "paragraph", "sentence_ids", "instruction",
+        "reference_fact_ids", "reference_inference_ids",
+    },
+    AgentToolName.UPDATE_REPORT_TITLE: {"new_title", "instruction"},
+    AgentToolName.UPDATE_SECTION_TITLE: {"old_title", "new_title", "instruction"},
+    AgentToolName.REGENERATE_CHAPTER: {"chapter_title", "instruction"},
+    AgentToolName.RERUN_FINAL_PLAN: {"instruction", "new_structure", "required_chapter_count"},
+    AgentToolName.PAUSE_TASK: set(),
+    AgentToolName.RESUME_TASK: set(),
+    AgentToolName.RETRY_TASK: set(),
 }
 
 
@@ -135,9 +163,50 @@ def tool_manifest() -> list[dict[str, Any]]:
             item["arguments"] = {
                 "instruction": "用户对目录调整的完整要求",
                 "new_structure": ["用户明确确认的章节标题，按顺序填写；未确认具体标题时留空"],
+                "required_chapter_count": "用户明确要求的章节数量；未明确时为 0",
+            }
+        elif name == AgentToolName.REWRITE_SENTENCE:
+            item["arguments"] = {
+                "sentence_id": "当前报告中的句子 ID",
+                "instruction": "只针对该句的具体修改要求",
+                "reference_fact_ids": ["用户额外引用的事实 ID"],
+                "reference_inference_ids": ["用户额外引用的推论 ID"],
+            }
+        elif name == AgentToolName.REWRITE_PARAGRAPH:
+            item["arguments"] = {
+                "chapter_title": "段落所属章节",
+                "paragraph": "段落序号",
+                "sentence_ids": ["段落内句子 ID"],
+                "instruction": "只针对该段的具体修改要求",
+                "reference_fact_ids": ["用户额外引用的事实 ID"],
+                "reference_inference_ids": ["用户额外引用的推论 ID"],
             }
         elif name == AgentToolName.REGENERATE_CHAPTER:
             item["arguments"] = {"chapter_title": "现有章节标题", "instruction": "本轮具体修改要求"}
+        elif name == AgentToolName.UPDATE_REPORT_TITLE:
+            item["arguments"] = {"new_title": "新的完整报告标题", "instruction": "标题调整要求"}
+        elif name == AgentToolName.UPDATE_SECTION_TITLE:
+            item["arguments"] = {
+                "old_title": "最终目录中现有的章节标题",
+                "new_title": "新的章节标题",
+                "instruction": "标题调整要求",
+            }
+        elif name == AgentToolName.REVISE_TASK_REQUIREMENTS:
+            item["arguments"] = {
+                "updated_theme": "调整后的完整报告主题；主题不变时原样保留",
+                "updated_requirements": "合并历史约束和本轮决定后的完整报告要求",
+                "instruction": "本轮需求调整的简要说明",
+            }
+        elif name == AgentToolName.REVISE_ANALYSIS_PLAN:
+            item["arguments"] = {
+                "instruction": "分析范围和证据需求的完整调整要求",
+                "required_dimensions": ["用户明确确认的分析维度；未确认具体名称时留空"],
+                "required_dimension_count": "用户明确要求的维度数量；未明确时为 0",
+            }
+        elif name == AgentToolName.RECHECK_FACT:
+            item["arguments"] = {"fact_id": "当前任务中的事实 ID", "instruction": "需要复核的问题"}
+        elif name == AgentToolName.RECHECK_INFERENCE:
+            item["arguments"] = {"inference_id": "当前任务中的推论 ID", "instruction": "需要复核的问题"}
         manifests.append(item)
     return manifests
 
@@ -185,61 +254,172 @@ def build_task_agent_context(task_id: str, focus: dict | None = None) -> TaskAge
     )
 
 
-def parse_agent_decision(payload: Any) -> AgentDecision:
-    if isinstance(payload, dict) and payload.get("intent") == "change":
-        payload = {**payload, "intent": "propose"}
+def validate_agent_tool_call(call: AgentToolCall, context: TaskAgentContext,
+                             message: str = "") -> AgentToolCall:
+    """Normalize model-selected tools against task scope and explicit user constraints."""
+    arguments = dict(call.arguments or {})
+    focus = context.current_focus
+    if call.tool_name == AgentToolName.REVISE_TASK_REQUIREMENTS:
+        requirements = str(arguments.get("updated_requirements") or "").strip()
+        if not requirements:
+            raise ValueError("需求调整缺少合并后的完整报告要求")
+        arguments["updated_requirements"] = requirements
+        arguments["updated_theme"] = str(arguments.get("updated_theme") or context.theme).strip()
+    elif call.tool_name == AgentToolName.REVISE_ANALYSIS_PLAN:
+        dimensions = _clean_text_list(arguments.get("required_dimensions"))
+        expected = _positive_int(arguments.get("required_dimension_count")) or next((
+            value for value in (_declared_count(message, unit) for unit in ("维度", "方面", "问题")) if value
+        ), 0)
+        if dimensions and expected and len(dimensions) != expected:
+            raise ValueError(f"分析维度数量不一致：用户要求 {expected} 个，提案识别到 {len(dimensions)} 个")
+        arguments.update(required_dimensions=dimensions, required_dimension_count=expected)
+    elif call.tool_name == AgentToolName.RERUN_FINAL_PLAN:
+        structure = _clean_text_list(arguments.get("new_structure"))
+        structure = _preserve_confirmed_structure_scope(
+            context.task_id,
+            structure,
+            f"{message}\n{arguments.get('instruction') or ''}",
+        )
+        expected = _positive_int(arguments.get("required_chapter_count")) or next((
+            value for value in (_declared_count(message, unit) for unit in ("章", "部分")) if value
+        ), 0) or len(structure)
+        if structure and expected and len(structure) != expected:
+            raise ValueError(f"章节数量不一致：用户要求 {expected} 章，提案识别到 {len(structure)} 章")
+        arguments.update(new_structure=structure, required_chapter_count=expected)
+    elif call.tool_name == AgentToolName.RECHECK_FACT:
+        value = arguments.get("fact_id") or (focus.object_id if focus.artifact_type == "fact" else "")
+        if not str(value).isdigit():
+            raise ValueError("复核事实前需要选中具体事实")
+        arguments["fact_id"] = int(value)
+    elif call.tool_name == AgentToolName.RECHECK_INFERENCE:
+        value = arguments.get("inference_id") or (focus.object_id if focus.artifact_type == "inference" else "")
+        if not str(value).isdigit():
+            raise ValueError("复核推论前需要选中具体推论")
+        arguments["inference_id"] = int(value)
+    elif call.tool_name == AgentToolName.REWRITE_SENTENCE:
+        value = arguments.get("sentence_id") or (focus.object_id if focus.artifact_type == "sentence" else "")
+        if focus.artifact_type != "sentence" or not str(value).isdigit() or str(value) != focus.object_id:
+            raise ValueError("改写句子前需要在报告中选中该句")
+        arguments["sentence_id"] = str(value)
+    elif call.tool_name == AgentToolName.REWRITE_PARAGRAPH:
+        if focus.artifact_type != "paragraph":
+            raise ValueError("改写段落前需要在报告中选中该段")
+        current = focus.current or {}
+        arguments["chapter_title"] = str(arguments.get("chapter_title") or current.get("section") or "")
+        arguments["paragraph"] = int(arguments.get("paragraph") or current.get("paragraph") or 0)
+        arguments["sentence_ids"] = list(arguments.get("sentence_ids") or current.get("sentence_ids") or [])
+        if not arguments["chapter_title"] or arguments["paragraph"] <= 0:
+            raise ValueError("所选段落缺少稳定定位信息")
+    elif call.tool_name == AgentToolName.UPDATE_REPORT_TITLE:
+        arguments["new_title"] = str(arguments.get("new_title") or "").strip()
+        if not arguments["new_title"] or context.report_id is None:
+            raise ValueError("修改报告标题需要已生成报告和明确的新标题")
+    elif call.tool_name == AgentToolName.UPDATE_SECTION_TITLE:
+        old_title = _canonical_chapter_title(
+            context.task_id,
+            str(arguments.get("old_title") or context.current_focus.current.get("section") or ""),
+        )
+        new_title = str(arguments.get("new_title") or "").strip()
+        if not old_title or not new_title:
+            raise ValueError("修改章节标题需要唯一的现有章节和明确的新标题")
+        arguments.update(old_title=old_title, new_title=new_title)
+    elif call.tool_name == AgentToolName.REGENERATE_CHAPTER:
+        chapter = _canonical_chapter_title(
+            context.task_id,
+            str(arguments.get("chapter_title") or focus.current.get("section") or focus.object_id),
+        )
+        titles = _load_plan(context.task_id, "final").get("titles") or []
+        if not chapter or chapter not in titles:
+            raise ValueError("需要指定当前最终目录中唯一存在的章节")
+        arguments["chapter_title"] = chapter
+    allowed = _MUTATING_ARGUMENT_KEYS.get(call.tool_name)
+    if allowed is not None:
+        arguments = {key: value for key, value in arguments.items() if key in allowed}
+    call.arguments = arguments
+    return call
+
+
+def _clean_text_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return list(dict.fromkeys(str(item).strip() for item in value if str(item).strip()))
+
+
+def _preserve_confirmed_structure_scope(task_id: str, proposed: list[str], instruction: str) -> list[str]:
+    """Apply structural edit semantics against persisted titles, not model paraphrases."""
+    if not proposed:
+        return []
+    from app.rendering.headings import strip_heading_prefix
+
+    current = [
+        strip_heading_prefix(str(item)) for item in (_load_plan(task_id, "final").get("titles") or [])
+        if strip_heading_prefix(str(item))
+    ]
+    proposed = [strip_heading_prefix(str(item)) for item in proposed if strip_heading_prefix(str(item))]
+    if not current:
+        return proposed
+
+    text = re.sub(r"\s+", "", str(instruction or ""))
+    split_match = re.search(r"第([一二三四五六七八九十\d]+)章.{0,24}拆分|拆分.{0,12}第([一二三四五六七八九十\d]+)章", text)
+    split_index = _chinese_or_arabic_int(next((value for value in split_match.groups() if value), "")) if split_match else 0
+    preserve_match = re.search(r"(?:保持|保留)(?:原有|原)?前([一二三四五六七八九十\d]+)章(?:不变)?", text)
+    preserve_count = _chinese_or_arabic_int(preserve_match.group(1)) if preserve_match else 0
+    if split_index:
+        preserve_count = max(preserve_count, split_index - 1)
+
+    if preserve_count <= 0:
+        return proposed
+    preserve_count = min(preserve_count, len(current))
+    tail_count = max(0, len(current) - (split_index or preserve_count))
+    replacement_end = len(proposed) - tail_count if tail_count else len(proposed)
+    replacements = proposed[preserve_count:replacement_end]
+    if not replacements:
+        raise ValueError("目录调整缺少目标章节的替代结构")
+    suffix = current[len(current) - tail_count:] if tail_count else []
+    return [*current[:preserve_count], *replacements, *suffix]
+
+
+def _chinese_or_arabic_int(value: str) -> int:
+    raw = str(value or "")
+    if raw.isdigit():
+        return int(raw)
+    numerals = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6,
+                "七": 7, "八": 8, "九": 9, "十": 10}
+    if raw in numerals:
+        return numerals[raw]
+    if raw.startswith("十"):
+        return 10 + numerals.get(raw[1:], 0)
+    if "十" in raw:
+        left, right = raw.split("十", 1)
+        return numerals.get(left, 0) * 10 + numerals.get(right, 0)
+    return 0
+
+
+def _positive_int(value: Any) -> int:
     try:
-        decision = AgentDecision.model_validate(payload)
-    except ValidationError as exc:
-        raise ValueError(f"INVALID_CONTROL_AGENT_OUTPUT: {exc.errors(include_url=False)}") from exc
-    if decision.tool_call:
-        decision.tool_call.confirmation_required = _TOOL_DEFINITIONS[decision.tool_call.tool_name][0]
-    return decision
+        parsed = int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+    return parsed if parsed > 0 else 0
 
 
-def resolve_common_read(message: str, context: TaskAgentContext) -> tuple[str, dict[str, Any]] | None:
-    """Handle high-frequency factual questions without an LLM round trip."""
-    text = re.sub(r"\s+", "", str(message or ""))
-    if re.search(r"(?:现在|当前|目前).{0,8}(?:进行到|运行到|处于)|(?:任务|报告).{0,6}(?:进度|状态)", text):
-        result = execute_read_tool(AgentToolName.GET_TASK_OVERVIEW, {}, context)
-        return format_tool_result(AgentToolName.GET_TASK_OVERVIEW, result), result
-    if re.search(r"(?:本任务|当前|现在|已经).{0,8}(?:章节规划|章节结构|报告结构|最终目录|目录)", text):
-        result = execute_read_tool(AgentToolName.GET_FINAL_PLAN, {}, context)
-        return format_tool_result(AgentToolName.GET_FINAL_PLAN, result), result
-    if re.search(r"(?:分析规划|分析维度|分析问题).{0,8}(?:是什么|有哪些|怎么样|查看)", text):
-        result = execute_read_tool(AgentToolName.GET_ANALYSIS_PLAN, {}, context)
-        return format_tool_result(AgentToolName.GET_ANALYSIS_PLAN, result), result
-    if re.search(r"(?:质量问题|质检问题|QA).{0,8}(?:有哪些|在哪|是什么|查看)", text, re.IGNORECASE):
-        result = execute_read_tool(AgentToolName.GET_QUALITY_ISSUES, {}, context)
-        return format_tool_result(AgentToolName.GET_QUALITY_ISSUES, result), result
-    return None
-
-
-def resolve_control_command(message: str, context: TaskAgentContext) -> AgentToolCall | None:
-    text = re.sub(r"\s+", "", str(message or ""))
-    if re.search(r"^(?:请)?暂停(?:当前)?任务", text):
-        return AgentToolCall(tool_name=AgentToolName.PAUSE_TASK, confirmation_required=True, reason="用户要求暂停任务")
-    if re.search(r"^(?:请)?(?:继续|恢复)(?:运行|任务)", text):
-        return AgentToolCall(tool_name=AgentToolName.RESUME_TASK, confirmation_required=True, reason="用户要求恢复任务")
-    if re.search(r"^(?:请)?(?:重试|重新运行)(?:当前阶段|失败阶段|当前任务|任务)$", text):
-        return AgentToolCall(tool_name=AgentToolName.RETRY_TASK, confirmation_required=True, reason="用户要求重试任务")
-    chapter = re.search(r"(?:重新生成|重写|改写)(第[^，。；\s]{1,16}章|[^，。；\s]{2,30}章)", text)
-    if chapter:
-        chapter_title = _canonical_chapter_title(context.task_id, chapter.group(1))
-        return AgentToolCall(
-            tool_name=AgentToolName.REGENERATE_CHAPTER,
-            arguments={"chapter_title": chapter_title, "instruction": str(message).strip()},
-            confirmation_required=True,
-            reason="用户要求调用现有成文链路重写指定章节",
-        )
-    if re.search(r"(?:重新规划|重做|重组).{0,6}(?:目录|章节结构|报告结构)", text):
-        return AgentToolCall(
-            tool_name=AgentToolName.RERUN_FINAL_PLAN,
-            arguments={"instruction": str(message).strip()},
-            confirmation_required=True,
-            reason="用户要求调用 Final Planner 重组报告结构",
-        )
-    return None
+def _declared_count(message: str, unit: str) -> int:
+    match = re.search(rf"(?:划分|分成|调整为|改为|保留|形成|共)?\s*([一二三四五六七八九十\d]+)\s*个?{unit}", str(message or ""))
+    if not match:
+        return 0
+    raw = match.group(1)
+    if raw.isdigit():
+        return int(raw)
+    numerals = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6,
+                "七": 7, "八": 8, "九": 9, "十": 10}
+    if raw in numerals:
+        return numerals[raw]
+    if raw.startswith("十"):
+        return 10 + numerals.get(raw[1:], 0)
+    if "十" in raw:
+        left, right = raw.split("十", 1)
+        return numerals.get(left, 0) * 10 + numerals.get(right, 0)
+    return 0
 
 
 def execute_read_tool(name: AgentToolName, arguments: dict[str, Any], context: TaskAgentContext) -> dict[str, Any]:
@@ -299,78 +479,6 @@ def _require_control_success(result: dict[str, Any]) -> dict[str, Any]:
     }:
         raise ValueError(f"TASK_CONTROL_REJECTED: {result.get('status')}")
     return result
-
-
-def format_tool_result(name: AgentToolName, result: dict[str, Any]) -> str:
-    if name == AgentToolName.GET_TASK_OVERVIEW:
-        parts = [f"当前处于“{result.get('stage_label')}”阶段。"]
-        progress = result.get("progress") or {}
-        labels = {"parse": "材料", "material_analysis": "材料理解", "evidence": "证据批次", "writing": "章节"}
-        done = []
-        for key, label in labels.items():
-            item = progress.get(key) or {}
-            if item.get("total"):
-                done.append(f"{label} {item.get('done', 0)}/{item['total']}")
-        if done:
-            parts.append("已完成：" + "、".join(done) + "。")
-        if result.get("error"):
-            parts.append("当前异常：" + str(result["error"])[:240])
-        return "".join(parts)
-    if name in {AgentToolName.GET_FINAL_PLAN, AgentToolName.GET_ANALYSIS_PLAN}:
-        if not result.get("exists"):
-            label = "最终报告结构" if name == AgentToolName.GET_FINAL_PLAN else "分析规划"
-            return f"本任务尚未形成{label}，助手不会用建议内容冒充已落库产物。"
-        titles = result.get("titles") or []
-        label = "最终章节规划" if name == AgentToolName.GET_FINAL_PLAN else "分析规划"
-        return f"本任务当前已落库的{label}如下：\n\n" + "\n".join(
-            f"{index}. {title}" for index, title in enumerate(titles, start=1)
-        )
-    if name == AgentToolName.GET_QUALITY_ISSUES:
-        issues = result.get("issues") or []
-        if not issues:
-            return "当前报告没有已记录的质量问题。"
-        return f"当前共记录 {len(issues)} 个质量问题：\n\n" + "\n".join(
-            f"{index}. [{item.get('type', '质量问题')}] {item.get('note') or item.get('quote') or ''}"
-            for index, item in enumerate(issues[:12], start=1)
-        )
-    if name == AgentToolName.GET_REPORT_SECTION:
-        sentences = result.get("sentences") or []
-        if not sentences:
-            return "没有找到对应章节正文。"
-        return f"已读取“{result.get('chapter_title') or sentences[0].get('section')}”，共 {len(sentences)} 句。"
-    if name == AgentToolName.GET_FACT_EVIDENCE:
-        fact = result.get("fact") or {}
-        evidence = result.get("evidence") or []
-        if not fact:
-            return "该事实不属于当前任务，或已经不存在。"
-        lines = [f"事实：{fact.get('content')}", f"依据共 {len(evidence)} 处："]
-        lines.extend(
-            f"- {item.get('source_file')}{f' · 第 {item.get("page")} 页' if item.get('page') else ''}：{item.get('quote')}"
-            for item in evidence[:8]
-        )
-        return "\n".join(lines)
-    if name == AgentToolName.GET_MATERIALS:
-        materials = result.get("materials") or []
-        return f"当前任务使用 {len(materials)} 份材料：\n" + "\n".join(
-            f"- {item.get('filename')}：{item.get('material_role') or '角色待确认'}"
-            for item in materials[:20]
-        )
-    if name == AgentToolName.GET_INFERENCE:
-        item = result.get("inference") or {}
-        if not item:
-            return "该推论不属于当前任务，或已经不存在。"
-        return (
-            f"推论：{item.get('content')}\n"
-            f"置信度：{item.get('confidence_level') or '待复核'}\n"
-            f"依据事实：{'、'.join(str(value) for value in item.get('based_fact_ids') or []) or '无'}\n"
-            f"推理说明：{item.get('reasoning_chain') or item.get('confidence_reason') or '未记录'}"
-        )
-    if name == AgentToolName.GET_CONFLICTS:
-        conflicts = result.get("conflicts") or []
-        if not conflicts:
-            return "当前任务没有已记录的材料冲突。"
-        return f"当前共有 {len(conflicts)} 组冲突，已保留冲突双方与核验状态，可在“冲突与核验”中展开查看。"
-    return json.dumps(result, ensure_ascii=False)
 
 
 def _load_plan(task_id: str, stage: Literal["analysis", "final"]) -> dict[str, Any]:

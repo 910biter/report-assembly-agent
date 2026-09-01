@@ -283,7 +283,7 @@ from app.models import Stage
 from app.workflow import WorkflowController, next_stage
 from app.writing.writer import _coerce_paragraphs
 check("状态机:去重后进入材料理解",
-      next_stage(Stage.DEDUP) == Stage.MATERIAL_ANALYSIS
+      next_stage(Stage.PARSING) == Stage.MATERIAL_ANALYSIS
       and next_stage(Stage.MATERIAL_ANALYSIS) == Stage.PLANNING)
 check("Writer JSON结构容错:paragraphs字符串不崩溃",
       _coerce_paragraphs({"paragraphs": ["仅为文本"]})[0]["sentences"][0]["text"] == "仅为文本")

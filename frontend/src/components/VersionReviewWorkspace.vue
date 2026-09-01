@@ -109,7 +109,7 @@ function paragraphScope(section: any, paragraph: any): Scope {
   return { level: "paragraph", section: section.section, paragraph: paragraph.old_paragraph ?? paragraph.paragraph, old_paragraph: paragraph.old_paragraph, new_paragraph: paragraph.new_paragraph };
 }
 function sentenceScope(section: any, paragraph: any, sentence: any): Scope {
-  return { level: "sentence", section: section.section, paragraph: paragraph.new_paragraph ?? paragraph.old_paragraph, old_paragraph: paragraph.old_paragraph, new_paragraph: paragraph.new_paragraph, sentence_index: sentence.old_index, old_sentence_id: sentence.old_sentence_id, current_sentence_id: sentence.current_sentence_id };
+  return { level: "sentence", section: section.section, paragraph: paragraph.new_paragraph ?? paragraph.old_paragraph, old_paragraph: paragraph.old_paragraph, new_paragraph: paragraph.new_paragraph, old_sentence_id: sentence.old_sentence_id, current_sentence_id: sentence.current_sentence_id };
 }
 
 async function decide(key: string, changeType: string, scope: Scope, decision: "keep_current" | "use_base") {

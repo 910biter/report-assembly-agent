@@ -2,7 +2,15 @@
 set -euo pipefail
 
 PROJECT_ROOT="${PROJECT_ROOT:-/home/nas511/zhangruqi/agent-235}"
-MODEL_PATH="${MODEL_PATH:-/home/nas511/zhangruqi/models/Qwen3.6-27B-GPTQ-Int4}"
+LOCAL_MODEL_PATH="/home/zhangruqi/.cache/ira-models/Qwen3.6-27B-GPTQ-Int4"
+NAS_MODEL_PATH="/home/nas511/zhangruqi/models/Qwen3.6-27B-GPTQ-Int4"
+# Keep NAS as the durable source, but avoid blocking every service restart on
+# network-storage I/O when the verified local mirror is already available.
+DEFAULT_MODEL_PATH="$NAS_MODEL_PATH"
+if [[ -d "$LOCAL_MODEL_PATH" ]]; then
+  DEFAULT_MODEL_PATH="$LOCAL_MODEL_PATH"
+fi
+MODEL_PATH="${MODEL_PATH:-$DEFAULT_MODEL_PATH}"
 HOST="${IRA_VLLM_HOST:-127.0.0.1}"
 PORT="${IRA_VLLM_PORT:-8100}"
 
@@ -16,13 +24,15 @@ args=(
   --port "$PORT"
   --served-model-name qwen3.6-27b
   --trust-remote-code
-  --max-model-len "${IRA_VLLM_MAX_MODEL_LEN:-24576}"
+  --max-model-len "${IRA_VLLM_MAX_MODEL_LEN:-22528}"
   --max-num-seqs "${IRA_VLLM_MAX_NUM_SEQS:-2}"
   --max-num-batched-tokens "${IRA_VLLM_MAX_BATCHED_TOKENS:-8192}"
   --gpu-memory-utilization "${IRA_VLLM_GPU_MEMORY_UTILIZATION:-0.98}"
   --limit-mm-per-prompt '{"image":0,"video":0}'
   --enable-prefix-caching
   --enable-chunked-prefill
+  --enable-auto-tool-choice
+  --tool-call-parser qwen3_coder
   --scheduling-policy priority
 )
 

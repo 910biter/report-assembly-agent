@@ -3,7 +3,7 @@ import { computed, nextTick, ref, watch } from "vue";
 import { useQuery, useQueryClient } from "@tanstack/vue-query";
 import { useRoute, RouterLink } from "vue-router";
 import { api, jsonInit } from "@/api/http";
-import type { ReportData, Sentence } from "@/api/types";
+import type { QualityIssue, ReportData, Sentence } from "@/api/types";
 import StatusBadge from "@/components/StatusBadge.vue";
 import VersionReviewWorkspace from "@/components/VersionReviewWorkspace.vue";
 import MaterialComparisonWorkspace from "@/components/MaterialComparisonWorkspace.vue";
@@ -11,7 +11,7 @@ import MaterialComparisonWorkspace from "@/components/MaterialComparisonWorkspac
 const route = useRoute();
 const queryClient = useQueryClient();
 const reportId = Number(route.params.reportId);
-const mode = ref<"edit" | "trace">("edit");
+const mode = ref<"edit" | "trace" | "review">("edit");
 const sideTab = ref("evidence");
 const selected = ref<Sentence | null>(null);
 const discussionScope = ref<any>(null);
@@ -24,6 +24,7 @@ const incrementalFiles = ref<HTMLInputElement>();
 const incrementalMaterialIds = ref<number[]>([]);
 const sourceComparisonId = ref<number | null>(null);
 const qaTargetSentenceId = ref<number | null>(null);
+const activeQaIssueId = ref("");
 const paperRef = ref<HTMLElement | null>(null);
 const selectionAction = ref<any>(null);
 
@@ -37,6 +38,50 @@ const materials = useQuery({
   enabled: incrementOpen,
 });
 const qaIssues = computed(() => report.data.value?.qa_issues || []);
+const activeQaIssue = computed(() =>
+  qaIssues.value.find((issue) => issue.issue_id === activeQaIssueId.value) || null,
+);
+const activeQaIssues = computed(() =>
+  qaIssues.value.filter((issue) => !["resolved", "ignored"].includes(issue.status || "open")),
+);
+const activeLocationIssues = computed(() => {
+  const current = activeQaIssue.value;
+  if (!current) return [];
+  const ids = current.sentence_ids || (current.sentence_id ? [current.sentence_id] : []);
+  return activeQaIssues.value.filter((issue) => {
+    const issueIds = issue.sentence_ids || (issue.sentence_id ? [issue.sentence_id] : []);
+    if (ids.length && issueIds.length) return issueIds.some((id) => ids.includes(id));
+    return issue.section === current.section && Number(issue.paragraph || 0) === Number(current.paragraph || 0);
+  });
+});
+const reportScopeIssues = computed(() =>
+  activeQaIssues.value.filter((issue) => issue.target_type === "report" || (!issue.section && !issue.sentence_id)),
+);
+const sentenceIssueMap = computed(() => {
+  const result = new Map<number, QualityIssue[]>();
+  for (const issue of activeQaIssues.value) {
+    for (const id of issue.sentence_ids || (issue.sentence_id ? [issue.sentence_id] : [])) {
+      result.set(Number(id), [...(result.get(Number(id)) || []), issue]);
+    }
+  }
+  return result;
+});
+const sectionIssueMap = computed(() => {
+  const result = new Map<string, QualityIssue[]>();
+  for (const issue of activeQaIssues.value) {
+    const key = String(issue.section || "");
+    if (key) result.set(key, [...(result.get(key) || []), issue]);
+  }
+  return result;
+});
+const paragraphIssueMap = computed(() => {
+  const result = new Map<string, QualityIssue[]>();
+  for (const issue of activeQaIssues.value.filter((item) => item.target_type === "paragraph")) {
+    const key = `${issue.section || ""}:${Number(issue.paragraph || 0)}`;
+    result.set(key, [...(result.get(key) || []), issue]);
+  }
+  return result;
+});
 const currentDetails = computed(() => selected.value);
 const discussionTarget = computed(
   () =>
@@ -67,7 +112,7 @@ function sentenceRefs(sentence: any) {
 function sentenceArtifact(sentence: any, quote = "") {
   return {
     artifact_type: "sentence",
-    object_id: sentence.id,
+    object_id: String(sentence.id),
     artifact_version: String(report.data.value?.versions?.[0]?.version_no || 1),
     current: { content: sentence.content, quote: quote || sentence.content, source_refs: sentenceRefs(sentence) },
     title: "正文句子",
@@ -98,8 +143,10 @@ function dispatchAssistant(artifact?: any, reference?: any, append = false) {
   }));
 }
 async function locateIssue(issue: any) {
+  mode.value = "review";
   sideTab.value = "qa";
-  const sentenceId = Number(issue?.sentence_id || 0);
+  activeQaIssueId.value = String(issue?.issue_id || "");
+  const sentenceId = Number(issue?.sentence_id || issue?.sentence_ids?.[0] || 0);
   if (sentenceId) {
     qaTargetSentenceId.value = sentenceId;
     const sentence = allSentences().find((item: any) => Number(item.id) === sentenceId);
@@ -115,13 +162,30 @@ async function locateIssue(issue: any) {
     document.getElementById(`section-${sectionIndex}`)?.scrollIntoView({ behavior: "smooth", block: "start" });
   }
 }
+function issuesForSentence(sentenceId: number) {
+  return sentenceIssueMap.value.get(Number(sentenceId)) || [];
+}
+function issuesForParagraph(section: string, paragraph: number) {
+  return paragraphIssueMap.value.get(`${section}:${paragraph}`) || [];
+}
+function issuesForSection(section: string) {
+  return sectionIssueMap.value.get(section) || [];
+}
+function strongestSeverity(issues: QualityIssue[]) {
+  if (issues.some((issue) => issue.severity === "high")) return "high";
+  if (issues.some((issue) => issue.severity === "medium")) return "medium";
+  return issues.length ? "low" : "";
+}
 watch(() => report.data.value, async (value) => {
   if (!value) return;
-  if (route.query.panel === "qa") sideTab.value = "qa";
+  if (route.query.panel === "qa") mode.value = "review";
   const sentenceId = Number(route.query.qa_sentence || 0);
   const section = String(route.query.qa_section || "");
   if (sentenceId || section) await locateIssue({ sentence_id: sentenceId || undefined, section });
 }, { immediate: true });
+watch(mode, (value) => {
+  if (value !== "review" && sideTab.value === "qa") sideTab.value = "evidence";
+});
 
 function choose(sentence: Sentence) {
   selected.value = sentence;
@@ -131,7 +195,20 @@ function choose(sentence: Sentence) {
     objectId: artifact.object_id,
     current: artifact.current,
   };
+  if (mode.value === "review") {
+    const issue = issuesForSentence(sentence.id)[0];
+    if (issue) void locateIssue(issue);
+    return;
+  }
   if (mode.value === "trace") sideTab.value = "evidence";
+}
+function handleSectionClick(section: any) {
+  if (mode.value === "review") {
+    const issue = issuesForSection(section.title)[0];
+    if (issue) void locateIssue(issue);
+    return;
+  }
+  discussSection(section);
 }
 function discussParagraph(section: any, paragraph: any, paragraphIndex: number) {
   const artifact = paragraphArtifact(section, paragraph, paragraphIndex);
@@ -147,8 +224,8 @@ function askAboutIssue(issue: any) {
   const sentence = allSentences().find((item: any) => Number(item.id) === Number(issue?.sentence_id || 0));
   const target = sentence ? sentenceArtifact(sentence) : undefined;
   const reference = {
-    artifact_type: "qa_issue", object_id: String(issue?.sentence_id || issue?.section || ""),
-    current: { section: issue?.section || "", quote: issue?.quote || "", note: issue?.note || issue?.message || "" },
+    artifact_type: "qa_issue", object_id: String(issue?.issue_id || issue?.sentence_id || issue?.section || ""),
+    current: { section: issue?.section || "", paragraph: issue?.paragraph || null, quote: issue?.quote || "", note: issue?.note || issue?.message || "", severity: issue?.severity || "medium" },
     title: "质量问题",
   };
   dispatchAssistant(target, reference, true);
@@ -281,9 +358,30 @@ async function saveSentence(sentence: Sentence, event: FocusEvent) {
     );
     sentence.content = result.content || value;
     saveState.value = "已保存";
+    await queryClient.invalidateQueries({ queryKey: ["report", reportId] });
   } catch {
     saveState.value = "保存失败";
   }
+}
+async function updateQaStatus(issue: QualityIssue, status: "open" | "resolved" | "ignored") {
+  try {
+    const result = await api<any>(
+      `/api/reports/${reportId}/quality-issues/${issue.issue_id}`,
+      jsonInit("PATCH", { status }),
+    );
+    Object.assign(issue, result.issue || { status });
+    if (status !== "open" && activeQaIssueId.value === issue.issue_id) {
+      activeQaIssueId.value = "";
+      sideTab.value = "evidence";
+    }
+    await queryClient.invalidateQueries({ queryKey: ["report", reportId] });
+  } catch (error: any) {
+    alert(error.message || "质量问题状态更新失败");
+  }
+}
+async function showIssueEvidence(issue: QualityIssue) {
+  await locateIssue(issue);
+  sideTab.value = "evidence";
 }
 async function finalize(force = false) {
   try {
@@ -367,6 +465,17 @@ function qaLabel(issue: any) {
     TITLE_MISMATCH: "标题与内容需复核",
   } as any)[key] || "质量问题";
 }
+function qaSeverityLabel(issue: QualityIssue) {
+  return ({ high: "高风险", medium: "需关注", low: "一般" } as any)[issue.severity || "medium"];
+}
+function qaScopeLabel(issue: QualityIssue) {
+  const scope = ({ sentence: "句子", paragraph: "段落", section: "章节", report: "全文" } as any)[issue.target_type || "report"];
+  if (issue.section && issue.paragraph) return `${issue.section} · 第 ${issue.paragraph} 段`;
+  return issue.section || scope;
+}
+function qaStatusLabel(issue: QualityIssue) {
+  return ({ open: "待处理", stale: "编辑后需复核", resolved: "已解决", ignored: "已忽略" } as any)[issue.status || "open"];
+}
 </script>
 
 <template>
@@ -393,6 +502,11 @@ function qaLabel(issue: any) {
             @click="mode = 'trace'"
           >
             溯源
+          </button><button
+            :class="{ active: mode === 'review' }"
+            @click="mode = 'review'"
+          >
+            审阅
           </button>
         </div>
         <StatusBadge :stage="report.data.value.status" /><button
@@ -462,18 +576,20 @@ function qaLabel(issue: any) {
           v-for="(section, index) in report.data.value.sections"
           :key="section.title"
           :href="`#section-${index}`"
-          >{{ section.display_title || section.title }}</a
+          >{{ section.display_title || section.title }}
+          <span v-if="mode === 'review' && issuesForSection(section.title).length" class="toc-qa-count">{{ issuesForSection(section.title).length }}</span></a
         >
-        <div class="trace-key">
+        <div v-if="mode === 'trace'" class="trace-key">
           <span class="fact"></span>事实依据<span class="inference"></span
           >分析推论<span class="mixed"></span>混合依据
         </div>
       </aside>
       <main ref="paperRef" class="paper" @mouseup="captureSelection">
+        <button v-if="mode === 'review' && reportScopeIssues.length" class="report-qa-notice" type="button" @click="locateIssue(reportScopeIssues[0])">全文问题 {{ reportScopeIssues.length }}</button>
         <h1
-          contenteditable
+          :contenteditable="mode !== 'review'"
           spellcheck="false"
-          @click="discussTitle"
+          @click="mode !== 'review' && discussTitle()"
           @blur="saveTitle"
         >
           {{ report.data.value.title }}
@@ -483,9 +599,10 @@ function qaLabel(issue: any) {
           :key="section.title"
           ><h2
             :id="`section-${sectionIndex}`"
-            contenteditable
+            :class="{ 'qa-section': issuesForSection(section.title).length }"
+            :contenteditable="mode !== 'review'"
             spellcheck="false"
-            @click="discussSection(section)"
+            @click="handleSectionClick(section)"
             @blur="saveSection(section, sectionIndex, $event)"
           >
             {{ section.display_title || section.title }}
@@ -496,7 +613,8 @@ function qaLabel(issue: any) {
             class="paragraph-block"
             :data-section-index="sectionIndex"
             :data-paragraph-index="paragraphIndex"
-            ><button class="paragraph-discuss" type="button" @click.stop="discussParagraph(section, paragraph, paragraphIndex)">讨论本段</button><template
+            :class="[`qa-${strongestSeverity(issuesForParagraph(section.title, paragraphIndex + 1))}`, { 'qa-paragraph': issuesForParagraph(section.title, paragraphIndex + 1).length }]"
+            ><button v-if="mode !== 'review'" class="paragraph-discuss" type="button" @click.stop="discussParagraph(section, paragraph, paragraphIndex)">讨论本段</button><button v-if="mode === 'review' && issuesForParagraph(section.title, paragraphIndex + 1).length" class="paragraph-qa" type="button" @click.stop="locateIssue(issuesForParagraph(section.title, paragraphIndex + 1)[0])">{{ issuesForParagraph(section.title, paragraphIndex + 1).length }}</button><template
               v-for="sentence in paragraph.sentences"
               :key="sentence.id"
               ><h3
@@ -505,9 +623,10 @@ function qaLabel(issue: any) {
                 class="sentence subheading"
                 :class="[
                   sourceClass(sentence),
-                  { selected: selected?.id === sentence.id, 'qa-target': qaTargetSentenceId === sentence.id },
+                  `qa-${strongestSeverity(issuesForSentence(sentence.id))}`,
+                  { selected: selected?.id === sentence.id, 'qa-target': qaTargetSentenceId === sentence.id, 'qa-issue': issuesForSentence(sentence.id).length },
                 ]"
-                contenteditable
+                :contenteditable="mode !== 'review'"
                 spellcheck="false"
                 @click="choose(sentence)"
                 @blur="saveSentence(sentence, $event)"
@@ -531,13 +650,15 @@ function qaLabel(issue: any) {
                 class="sentence"
                 :class="[
                   sourceClass(sentence),
+                  `qa-${strongestSeverity(issuesForSentence(sentence.id))}`,
                   {
                     selected: selected?.id === sentence.id,
                     'qa-target': qaTargetSentenceId === sentence.id,
+                    'qa-issue': issuesForSentence(sentence.id).length,
                     excluded: sentence.selected === false,
                   },
                 ]"
-                contenteditable
+                :contenteditable="mode !== 'review'"
                 spellcheck="false"
                 @click="choose(sentence)"
                 @blur="saveSentence(sentence, $event)"
@@ -555,12 +676,6 @@ function qaLabel(issue: any) {
             @click="sideTab = 'evidence'"
           >
             证据</button
-          ><button
-            class="tab"
-            :class="{ active: sideTab === 'qa' }"
-            @click="sideTab = 'qa'"
-          >
-            质检</button
           ><button
             class="tab"
             :class="{ active: sideTab === 'discuss' }"
@@ -629,25 +744,37 @@ function qaLabel(issue: any) {
             </div>
           </div>
         </div>
-        <div v-else-if="sideTab === 'qa'" class="panel-body">
-          <article
-            v-for="(issue, index) in qaIssues"
-            :key="index"
-            class="qa-item"
-          >
-            <span class="badge warning">{{ qaLabel(issue) }}</span>
-            <p>{{ issue.note || issue.quote || issue.message }}</p>
-            <button
-              v-if="issue.sentence_id || issue.section"
-              type="button"
-              class="qa-locate"
-              @click="locateIssue(issue)"
-            >{{ issue.sentence_id ? "定位到问题句" : "定位到章节" }}</button>
-            <button type="button" class="qa-locate" @click="askAboutIssue(issue)">引用给助手</button>
-          </article>
-          <div v-if="!qaIssues.length" class="empty">
+        <div v-else-if="sideTab === 'qa'" class="panel-body qa-workspace">
+          <template v-if="activeQaIssue">
+            <button class="qa-back" type="button" @click="activeQaIssueId = ''; sideTab = 'evidence'">× 关闭问题详情</button>
+            <article class="qa-detail">
+              <div class="qa-detail-head">
+                <span :class="['qa-severity', `qa-${activeQaIssue.severity || 'medium'}`]">{{ qaSeverityLabel(activeQaIssue) }}</span>
+                <span class="qa-state">{{ qaStatusLabel(activeQaIssue) }}</span>
+              </div>
+              <h3>{{ qaLabel(activeQaIssue) }}</h3>
+              <p class="qa-location">{{ qaScopeLabel(activeQaIssue) }}</p>
+              <blockquote v-if="activeQaIssue.quote">{{ activeQaIssue.quote }}</blockquote>
+              <p class="qa-note">{{ activeQaIssue.note || "请结合正文与证据复核该处。" }}</p>
+              <p v-if="activeQaIssue.status === 'stale'" class="qa-stale-note">正文已被编辑，此问题需要重新确认。</p>
+              <div v-if="activeLocationIssues.length > 1" class="qa-siblings"><span>该处还有 {{ activeLocationIssues.length - 1 }} 项</span><button v-for="(issue, index) in activeLocationIssues" :key="issue.issue_id" :class="{ active: issue.issue_id === activeQaIssueId }" type="button" @click="activeQaIssueId = issue.issue_id">{{ index + 1 }}</button></div>
+              <div class="qa-detail-actions">
+                <button class="btn primary" type="button" @click="locateIssue(activeQaIssue)">定位正文</button>
+                <button v-if="activeQaIssue.sentence_id || activeQaIssue.sentence_ids?.length" class="btn" type="button" @click="showIssueEvidence(activeQaIssue)">查看依据</button>
+                <button class="btn" type="button" @click="askAboutIssue(activeQaIssue)">交给助手</button>
+              </div>
+              <div class="qa-review-actions">
+                <button v-if="['resolved', 'ignored'].includes(activeQaIssue.status || '')" type="button" @click="updateQaStatus(activeQaIssue, 'open')">重新打开</button>
+                <template v-else>
+                  <button type="button" @click="updateQaStatus(activeQaIssue, 'resolved')">标记已解决</button>
+                  <button type="button" @click="updateQaStatus(activeQaIssue, 'ignored')">忽略此项</button>
+                </template>
+              </div>
+            </article>
+          </template>
+          <div v-else class="empty">
             <div>
-              <strong>暂无质量问题</strong>确定性修复与语义建议会在此分级呈现。
+              <strong>选择正文中的问题标记</strong>只展示与当前句子、段落或章节对应的问题。
             </div>
           </div>
         </div>
@@ -761,6 +888,17 @@ function qaLabel(issue: any) {
   color: var(--color-primary);
   background: var(--color-primary-soft);
 }
+.toc-qa-count {
+  float: right;
+  min-width: 18px;
+  padding: 0 5px;
+  border-radius: 9px;
+  background: #f7e4df;
+  color: #8f3e31;
+  text-align: center;
+  font-size: 10px;
+  line-height: 18px;
+}
 .trace-key {
   display: grid;
   grid-template-columns: 14px 1fr;
@@ -810,6 +948,10 @@ function qaLabel(issue: any) {
   margin: 32px 0 18px;
   font-size: 19px;
   line-height: 1.6;
+}
+.mode-review .paper > h2.qa-section {
+  padding-left: 10px;
+  border-left: 3px solid #b85b4b;
 }
 .paper h3 {
   margin: 22px 0 10px;
@@ -866,8 +1008,7 @@ function qaLabel(issue: any) {
   background: var(--color-surface-soft);
   border-left: 2px solid var(--color-primary);
 }
-.evidence-card,
-.qa-item {
+.evidence-card {
   padding: 14px 0;
   border-bottom: 1px solid var(--color-border);
 }
@@ -887,25 +1028,55 @@ function qaLabel(issue: any) {
   border-left: 2px solid #679c74;
   padding-left: 10px;
 }
-.qa-item p {
-  margin: 8px 0;
-}
 .assistant-handoff p { color: var(--color-muted); line-height: 1.6; }
-.qa-locate {
-  padding: 0;
-  border: 0;
-  background: transparent;
-  color: var(--color-primary);
-  font-size: 12px;
-}
 .sentence.qa-target {
   background: #fff1d6 !important;
   box-shadow: 0 0 0 2px #c98524 !important;
 }
+.mode-review .sentence.qa-issue {
+  cursor: pointer;
+  text-decoration-line: underline;
+  text-decoration-style: wavy;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 4px;
+}
+.mode-review .sentence.qa-issue.qa-high { text-decoration-color: #b84b3e; }
+.mode-review .sentence.qa-issue.qa-medium { text-decoration-color: #c38329; }
+.mode-review .sentence.qa-issue.qa-low { text-decoration-color: #6d7f91; }
 .subheading {
   text-indent: 0 !important;
 }
 .paragraph-block { position: relative; }
+.mode-review .paragraph-block.qa-paragraph {
+  margin-left: -12px;
+  padding-left: 10px;
+  border-left: 2px solid #c38329;
+}
+.mode-review .paragraph-block.qa-high { border-left-color: #b84b3e; }
+.mode-review .paragraph-block.qa-low { border-left-color: #6d7f91; }
+.report-qa-notice {
+  float: right;
+  margin: -48px -52px 0 0;
+  padding: 5px 9px;
+  border: 1px solid #dfb7af;
+  border-radius: 4px;
+  background: #fff7f5;
+  color: #8f3e31;
+  font: 500 11px/1.4 var(--font-ui);
+}
+.paragraph-qa {
+  position: absolute;
+  right: -28px;
+  top: 4px;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 1px solid #d5a04d;
+  border-radius: 50%;
+  background: #fffaf0;
+  color: #8b5a13;
+  font: 600 10px/18px var(--font-ui);
+}
 .paragraph-discuss {
   position: absolute;
   left: -66px;
@@ -940,6 +1111,40 @@ function qaLabel(issue: any) {
 .selection-action span { color: var(--color-muted); }
 .selection-action button { padding: 2px 4px; border: 0; background: transparent; color: var(--color-primary); }
 .selection-action button:last-child { color: var(--color-faint); font-size: 15px; }
+.qa-workspace { padding: 0; }
+.qa-back {
+  margin: 12px 14px 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--color-primary);
+  font-size: 11px;
+}
+.qa-detail { padding: 16px 14px; }
+.qa-detail-head { display: flex; align-items: center; justify-content: space-between; }
+.qa-severity { padding: 3px 7px; border-radius: 4px; background: #edf0f3; color: #526170; font-size: 10px; }
+.qa-severity.qa-high { background: #f7e4df; color: #8f3e31; }
+.qa-severity.qa-medium { background: #fff0d8; color: #815615; }
+.qa-state { color: var(--color-muted); font-size: 10px; }
+.qa-detail h3 { margin: 14px 0 5px; font-size: 16px; }
+.qa-location { color: var(--color-muted); font-size: 11px; }
+.qa-detail blockquote {
+  margin: 14px 0;
+  padding: 11px 12px;
+  border-left: 2px solid #c38329;
+  background: var(--color-surface-soft);
+  color: var(--color-text);
+  font-size: 12px;
+  line-height: 1.65;
+}
+.qa-note { font-size: 12px; line-height: 1.7; }
+.qa-stale-note { padding: 8px; background: #fff7e8; color: #815615; font-size: 11px; }
+.qa-siblings { display: flex; align-items: center; gap: 5px; margin-top: 12px; color: var(--color-muted); font-size: 10px; }
+.qa-siblings button { width: 22px; height: 22px; padding: 0; border: 1px solid var(--color-border); border-radius: 3px; background: #fff; color: var(--color-muted); }
+.qa-siblings button.active { border-color: var(--color-primary); background: var(--color-primary-soft); color: var(--color-primary); }
+.qa-detail-actions { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 18px; }
+.qa-review-actions { display: flex; gap: 14px; margin-top: 16px; padding-top: 13px; border-top: 1px solid var(--color-border); }
+.qa-review-actions button { padding: 0; border: 0; background: transparent; color: var(--color-primary); font-size: 11px; }
 @media (max-width: 1350px) {
   .editor-grid {
     grid-template-columns: 190px minmax(600px, 820px) 300px;

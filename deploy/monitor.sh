@@ -23,6 +23,6 @@ try:
 except Exception:
     print(\"task_query_fail\")
 '" 2>/dev/null)
-MODELS=$(sshpass -e ssh $SSHOPTS "$DST" "ls /usr/share/ollama/.ollama/models/manifests/registry.ollama.ai/library/ 2>/dev/null | wc -l" 2>/dev/null)
+MODEL=$(sshpass -e ssh $SSHOPTS "$DST" "curl -s --max-time 10 http://127.0.0.1:8100/v1/models 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); print((d.get(\"data\") or [{}])[0].get(\"id\",\"unavailable\"))'" 2>/dev/null)
 API=$(sshpass -e ssh $SSHOPTS "$DST" "curl -s -o /dev/null -w '%{http_code}' --max-time 10 http://127.0.0.1:8000/api/tasks 2>/dev/null" 2>/dev/null)
-echo "综述任务: ${OUT:-无} | 模型: ${MODELS:-0}/5 | API: ${API:-000}"
+echo "综述任务: ${OUT:-无} | 生成模型: ${MODEL:-unavailable} | API: ${API:-000}"

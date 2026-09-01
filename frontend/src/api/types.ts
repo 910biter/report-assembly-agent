@@ -1,4 +1,4 @@
-export type TaskStage = "created" | "parsing" | "dedup" | "material_analysis" | "planning" | "evidence" | "conflict" | "analysis" | "writing" | "knowledge" | "review" | "done" | "failed" | "paused" | string;
+export type TaskStage = "created" | "parsing" | "dedup" | "material_analysis" | "planning" | "evidence" | "conflict" | "analysis" | "writing" | "review" | "done" | "failed" | "paused" | string;
 
 export interface TaskSummary {
   task_id: string;
@@ -44,12 +44,26 @@ export interface Sentence {
 }
 
 export interface ReportSection { title: string; display_title?: string; paragraphs: Array<{ sentences: Sentence[] }> }
+export interface QualityIssue {
+  issue_id: string;
+  type: string;
+  severity?: "high" | "medium" | "low";
+  status?: "open" | "resolved" | "ignored" | "stale";
+  target_type?: "sentence" | "paragraph" | "section" | "report";
+  sentence_id?: number;
+  sentence_ids?: number[];
+  section?: string;
+  paragraph?: number;
+  quote?: string;
+  note?: string;
+  location_confidence?: string;
+}
 export interface ReportData {
   id: number;
   title: string;
   status: string;
   task_id?: string;
   sections: ReportSection[];
-  qa_issues: any[];
+  qa_issues: QualityIssue[];
   versions: any[];
 }

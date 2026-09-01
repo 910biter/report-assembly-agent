@@ -227,9 +227,9 @@ def create_incremental_delta(report_id: int, added_material_ids: list[int],
         old_hashes = {m.get("file_hash") or m.get("fingerprint") for m in old_materials}
         added_materials = [m for m in new_materials if (m.get("file_hash") or m.get("fingerprint")) not in old_hashes]
         duplicate_materials = [m for m in new_materials if (m.get("file_hash") or m.get("fingerprint")) in old_hashes]
-        fact_delta = _object_delta(old_facts, current["fact_snapshot"], key="content")
-        inference_delta = _object_delta(old_inferences, current["inference_snapshot"], key="content")
-        conflict_delta = _object_delta(old_conflicts, current["conflict_snapshot"], key="fact_key")
+        fact_delta = _object_delta(old_facts, current["fact_snapshot"])
+        inference_delta = _object_delta(old_inferences, current["inference_snapshot"])
+        conflict_delta = _object_delta(old_conflicts, current["conflict_snapshot"])
         affected = _affected_chapters(current["sentence_snapshot"], fact_delta["added"], inference_delta["added"])
         cur = s.execute(
             insert(ORMReportVersionDelta).values(
@@ -543,12 +543,12 @@ def _plan_snapshot(plan) -> dict[str, Any]:
     }
 
 
-def _object_delta(old_items: list[dict[str, Any]], new_items: list[dict[str, Any]], key: str) -> dict[str, list[dict[str, Any]]]:
-    # Database identity is stable across content edits. Text is only a fallback
-    # for imported legacy snapshots without ids.
+def _object_delta(old_items: list[dict[str, Any]], new_items: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
     def identity(item: dict[str, Any]) -> str:
         item_id = item.get("id")
-        return f"id:{item_id}" if item_id is not None else f"value:{item.get(key, '')}"
+        if item_id is None:
+            raise ValueError("VERSION_ARTIFACT_ID_REQUIRED")
+        return f"id:{item_id}"
 
     old_by_key = {identity(item): item for item in old_items}
     new_by_key = {identity(item): item for item in new_items}
@@ -790,7 +790,6 @@ def restore_report_version_scope(version_id: int, scope: dict[str, Any]) -> dict
     level = str(scope.get("level") or ("sentence" if scope.get("old_sentence_id") is not None else "paragraph" if paragraph is not None else "section"))
     old_sentence_id = scope.get("old_sentence_id")
     current_sentence_id = scope.get("current_sentence_id")
-    sentence_index = scope.get("sentence_index")  # backward compatible fallback
     if not section:
         return {"report_id": report_id, "restored": 0, "reason": "section_required"}
     old_groups = _sentence_groups(version.get("sentence_snapshot") or [])
@@ -803,13 +802,8 @@ def restore_report_version_scope(version_id: int, scope: dict[str, Any]) -> dict
     elif level == "section":
         for items in old_groups[section].values():
             targets.extend(items)
-    elif level == "paragraph" or sentence_index is None:
+    elif level == "paragraph":
         targets.extend(old_groups[section].get(int(paragraph), []))
-    else:
-        items = old_groups[section].get(int(paragraph), [])
-        idx = int(sentence_index)
-        if 0 <= idx < len(items):
-            targets.append(items[idx])
     if not targets:
         return {"report_id": report_id, "restored": 0, "reason": "no_target"}
     with session_scope() as s:
@@ -1283,8 +1277,8 @@ def build_incremental_impact(report_id: int, delta_id: int, task_id: str = "") -
     old_facts = _json_load(base["fact_snapshot"], [])
     old_inferences = _json_load(base["inference_snapshot"], [])
     old_conflicts = _json_load(base["conflict_snapshot"], [])
-    fact_delta = _object_delta(old_facts, current["fact_snapshot"], key="content")
-    inference_delta = _object_delta(old_inferences, current["inference_snapshot"], key="content")
+    fact_delta = _object_delta(old_facts, current["fact_snapshot"])
+    inference_delta = _object_delta(old_inferences, current["inference_snapshot"])
     superseded_fact_ids = {
         int(item["id"]) for item in current["fact_snapshot"]
         if item.get("id") is not None and item.get("lifecycle_status") == "superseded"
@@ -1298,7 +1292,7 @@ def build_incremental_impact(report_id: int, delta_id: int, task_id: str = "") -
             item for item in fact_delta["modified"]
             if int((item.get("current") or {}).get("id") or -1) not in superseded_fact_ids
         ]
-    conflict_delta = _object_delta(old_conflicts, current["conflict_snapshot"], key="fact_key")
+    conflict_delta = _object_delta(old_conflicts, current["conflict_snapshot"])
     base_plan = _json_load(base["report_plan_snapshot"], {})
     current_plan = current.get("report_plan_snapshot") or {}
     structure_changes = _structure_changes(base_plan.get("structure") or [], current_plan.get("structure") or [])

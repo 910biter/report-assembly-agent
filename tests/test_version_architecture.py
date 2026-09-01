@@ -36,7 +36,6 @@ class VersionArchitectureTests(unittest.TestCase):
         delta = _object_delta(
             [{"id": 7, "content": "旧事实"}],
             [{"id": 7, "content": "修订后的事实"}],
-            key="content",
         )
         self.assertEqual(len(delta["modified"]), 1)
         self.assertFalse(delta["added"])
