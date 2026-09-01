@@ -675,14 +675,19 @@ class WriterAgent(BaseAgent):
             report_callback(report)
 
         target_titles = {str(title).strip() for title in (target_chapter_titles or []) if str(title).strip()}
+        existing_titles = {str(chapter.get("title", "")).strip() for chapter in chapters}
+        preserved_titles = existing_titles - target_titles if target_titles else set()
         completed_sections, position = self._resume_report_memory(
-            report.id, report_memory, chapters, excluded_sections=target_titles,
+            report.id,
+            report_memory,
+            chapters,
+            excluded_sections=target_titles,
+            preserved_sections=preserved_titles,
         )
         if target_titles:
             # 旧 revision 的 chapter_draft 只是历史完成标记。当前增量明确命中的
             # 章节必须重新生成,不能被同 task_id 下的旧 artifact 跳过。
             completed_sections.difference_update(target_titles)
-            existing_titles = {str(chapter.get("title", "")).strip() for chapter in chapters}
             for title in existing_titles - target_titles:
                 completed_sections.add(title)
         chapter_count = len(chapters) or 1
@@ -959,6 +964,184 @@ class WriterAgent(BaseAgent):
                 pass
         return report
 
+    def rewrite_user_scope(self, *, report_id: int, scope: dict, instruction: str,
+                           facts: list[dict], inferences: list[dict]) -> dict:
+        """Rewrite one persisted sentence or paragraph with explicit evidence bindings."""
+        arguments = dict(scope.get("arguments") or {})
+        sentence_id = int(arguments.get("sentence_id") or 0)
+        chapter_title = str(arguments.get("chapter_title") or "")
+        paragraph = int(arguments.get("paragraph") or 0)
+        with session_scope() as s:
+            if sentence_id:
+                target = s.execute(select(ORMSentence).where(
+                    ORMSentence.c.id == sentence_id, ORMSentence.c.report_id == report_id,
+                )).mappings().first()
+                if target is None:
+                    raise ValueError("REVISION_SENTENCE_NOT_FOUND")
+                chapter_title = str(target["section"])
+                paragraph = int(target["paragraph"] or 1)
+            rows = s.execute(select(ORMSentence).where(
+                ORMSentence.c.report_id == report_id,
+                ORMSentence.c.section == chapter_title,
+                ORMSentence.c.paragraph == paragraph,
+                ORMSentence.c.selected == 1,
+            ).order_by(ORMSentence.c.position, ORMSentence.c.id)).mappings().all()
+            neighbours = s.execute(select(
+                ORMSentence.c.paragraph, ORMSentence.c.content, ORMSentence.c.user_edit,
+            ).where(
+                ORMSentence.c.report_id == report_id,
+                ORMSentence.c.section == chapter_title,
+                ORMSentence.c.paragraph.in_([max(1, paragraph - 1), paragraph + 1]),
+                ORMSentence.c.selected == 1,
+            ).order_by(ORMSentence.c.position)).mappings().all()
+        editable_rows = [row for row in rows if str(row["source_level"] or "") != "SUBHEADING"]
+        if not editable_rows:
+            raise ValueError("REVISION_PARAGRAPH_NOT_FOUND")
+        target_rows = [row for row in editable_rows if int(row["id"]) == sentence_id] if sentence_id else editable_rows
+        if not target_rows:
+            raise ValueError("REVISION_TARGET_NOT_FOUND")
+
+        existing_fact_ids: set[int] = set()
+        existing_inference_ids: set[int] = set()
+        for row in editable_rows:
+            try:
+                refs = json.loads(row["source_refs"] or "{}")
+            except (TypeError, ValueError):
+                refs = {}
+            existing_fact_ids.update(_int_ids(refs.get("fact_ids")))
+            existing_inference_ids.update(_int_ids(refs.get("inference_ids")))
+        requested_fact_ids = set(_int_ids(arguments.get("reference_fact_ids")))
+        requested_inference_ids = set(_int_ids(arguments.get("reference_inference_ids")))
+        allowed_fact_ids = existing_fact_ids | requested_fact_ids
+        allowed_inference_ids = existing_inference_ids | requested_inference_ids
+        support_facts = [item for item in facts if int(item.get("id") or 0) in allowed_fact_ids]
+        support_inferences = [item for item in inferences if int(item.get("id") or 0) in allowed_inference_ids]
+        valid_fact_ids = {int(item.get("id") or 0) for item in support_facts}
+        valid_inference_ids = {int(item.get("id") or 0) for item in support_inferences}
+
+        original = "".join(str(row["user_edit"] or row["content"] or "") for row in target_rows)
+        paragraph_text = "".join(str(row["user_edit"] or row["content"] or "") for row in editable_rows)
+        neighbour_text = {}
+        for row in neighbours:
+            neighbour_text.setdefault(int(row["paragraph"]), []).append(str(row["user_edit"] or row["content"] or ""))
+        context_lines = [
+            f"上一段：{''.join(neighbour_text.get(paragraph - 1, [])) or '无'}",
+            f"当前段：{paragraph_text}",
+            f"下一段：{''.join(neighbour_text.get(paragraph + 1, [])) or '无'}",
+        ]
+        scope_label = "指定句子" if sentence_id else "指定段落"
+        output_rule = (
+            "只输出一个 sentences 元素" if sentence_id
+            else "按自然表达输出该段所需的多个 sentences 元素"
+        )
+        prompt, _audit = build_prompt_from_sections(
+            "writer",
+            [
+                ContextSection("修改任务", [
+                    f"章节：{chapter_title}；目标：{scope_label}",
+                    f"用户要求：{instruction}",
+                    f"原内容：{original}",
+                    "只修改指定范围，保持与前后文衔接。具体事实优先，不得引入未提供的信息。"
+                    "每个事实性句子必须绑定实际支持它的 fact_ids/inference_ids；不得沿用不再支持新表达的旧引用。"
+                    f"严格输出 JSON：{{\"paragraphs\":[{{\"sentences\":[{{\"text\":\"...\",\"fact_ids\":[],\"inference_ids\":[]}}]}}]}}；{output_rule}。",
+                ], weight=6, required_items=4),
+                ContextSection("前后文", context_lines, weight=2),
+                ContextSection("可用事实", [
+                    f"fact_id={item.get('id')}：{item.get('content', '')}" for item in support_facts
+                ], weight=5),
+                ContextSection("可用推论", [
+                    f"inference_id={item.get('id')}；依据事实={item.get('based_fact_ids') or []}：{item.get('content', '')}"
+                    for item in support_inferences
+                ], weight=4),
+            ],
+            min(6000, settings.model_context_window_tokens // 3),
+        )
+        payload = self.generate_json(prompt, max_tokens=min(3072, settings.writer_output_tokens))
+        generated = []
+        for item in _coerce_paragraphs(payload):
+            for sentence in item.get("sentences") or []:
+                if not isinstance(sentence, dict) or not str(sentence.get("text") or "").strip():
+                    continue
+                fact_ids = [value for value in _int_ids(sentence.get("fact_ids")) if value in valid_fact_ids]
+                inference_ids = [value for value in _int_ids(sentence.get("inference_ids")) if value in valid_inference_ids]
+                generated.append({
+                    "text": str(sentence.get("text") or "").strip(),
+                    "fact_ids": fact_ids,
+                    "inference_ids": inference_ids,
+                })
+        if sentence_id and len(generated) != 1:
+            raise ValueError("REVISION_SENTENCE_OUTPUT_INVALID")
+        if not generated:
+            raise ValueError("REVISION_OUTPUT_EMPTY")
+        if (existing_fact_ids or existing_inference_ids) and not any(
+            item["fact_ids"] or item["inference_ids"] for item in generated
+        ):
+            raise ValueError("REVISION_EVIDENCE_BINDING_MISSING")
+
+        if sentence_id:
+            self._replace_user_sentence(report_id, target_rows[0], generated[0])
+        else:
+            self._replace_user_paragraph(report_id, chapter_title, paragraph, editable_rows, generated)
+        return {
+            "scope": "sentence" if sentence_id else "paragraph",
+            "section": chapter_title,
+            "paragraph": paragraph,
+            "sentence_count": len(generated),
+            "fact_ids": sorted({value for item in generated for value in item["fact_ids"]}),
+            "inference_ids": sorted({value for item in generated for value in item["inference_ids"]}),
+        }
+
+    def _replace_user_sentence(self, report_id: int, row: dict, generated: dict) -> None:
+        sentence_id = int(row["id"])
+        history = []
+        try:
+            history = json.loads(row["edit_history"] or "[]")
+        except (TypeError, ValueError):
+            pass
+        history.append({"content": row["user_edit"] or row["content"], "source": "writer_scope_revision"})
+        level = "MATERIAL_FACT" if generated["fact_ids"] else (
+            "MATERIAL_INFERENCE" if generated["inference_ids"] else "TRANSITION"
+        )
+        with session_scope() as s:
+            s.execute(delete(ORMSentenceFact).where(ORMSentenceFact.c.sentence_id == sentence_id))
+            s.execute(delete(ORMSentenceInference).where(ORMSentenceInference.c.sentence_id == sentence_id))
+            s.execute(update(ORMSentence).where(
+                ORMSentence.c.id == sentence_id, ORMSentence.c.report_id == report_id,
+            ).values(
+                user_edit=generated["text"], source_level=level,
+                source_refs=json.dumps({"fact_ids": generated["fact_ids"], "inference_ids": generated["inference_ids"]}, ensure_ascii=False),
+                edit_history=json.dumps(history[-50:], ensure_ascii=False), origin_call_id=self.last_call_id,
+            ))
+            for fact_id in generated["fact_ids"]:
+                s.execute(ORMSentenceFact.insert().values(sentence_id=sentence_id, fact_id=fact_id))
+            for inference_id in generated["inference_ids"]:
+                s.execute(ORMSentenceInference.insert().values(sentence_id=sentence_id, inference_id=inference_id))
+
+    def _replace_user_paragraph(self, report_id: int, chapter_title: str, paragraph: int,
+                                rows: list[dict], generated: list[dict]) -> None:
+        sentence_ids = [int(row["id"]) for row in rows]
+        positions = [int(row["position"]) for row in rows]
+        with session_scope() as s:
+            s.execute(delete(ORMSentenceFact).where(ORMSentenceFact.c.sentence_id.in_(sentence_ids)))
+            s.execute(delete(ORMSentenceInference).where(ORMSentenceInference.c.sentence_id.in_(sentence_ids)))
+            s.execute(delete(ORMSentence).where(ORMSentence.c.id.in_(sentence_ids)))
+            for index, item in enumerate(generated):
+                position = positions[index] if index < len(positions) else positions[-1] + index + 1
+                level = "MATERIAL_FACT" if item["fact_ids"] else (
+                    "MATERIAL_INFERENCE" if item["inference_ids"] else "TRANSITION"
+                )
+                cursor = s.execute(ORMSentence.insert().values(
+                    report_id=report_id, section=chapter_title, paragraph=paragraph,
+                    position=position, content=item["text"], source_level=level,
+                    source_refs=json.dumps({"fact_ids": item["fact_ids"], "inference_ids": item["inference_ids"]}, ensure_ascii=False),
+                    lineage_id=uuid.uuid4().hex, origin_call_id=self.last_call_id,
+                ))
+                new_id = int(cursor.inserted_primary_key[0])
+                for fact_id in item["fact_ids"]:
+                    s.execute(ORMSentenceFact.insert().values(sentence_id=new_id, fact_id=fact_id))
+                for inference_id in item["inference_ids"]:
+                    s.execute(ORMSentenceInference.insert().values(sentence_id=new_id, inference_id=inference_id))
+
     @staticmethod
     def _delete_chapter_in_session(s, report_id: int, chapter_title: str) -> None:
         rows = s.execute(
@@ -1048,7 +1231,8 @@ class WriterAgent(BaseAgent):
         return report
 
     def _resume_report_memory(self, report_id: int, report_memory: dict, chapters: list[dict],
-                              excluded_sections: set[str] | None = None) -> tuple[set[str], int]:
+                              excluded_sections: set[str] | None = None,
+                              preserved_sections: set[str] | None = None) -> tuple[set[str], int]:
         """Load existing chapter rows so a partial report can continue safely."""
         order = {
             str(chapter.get("title", "")): index
@@ -1063,11 +1247,13 @@ class WriterAgent(BaseAgent):
             artifact_rows = s.execute(
                 select(ORMTaskArtifact.c.payload).where(
                     ORMTaskArtifact.c.task_id == (getattr(self, "_task_id", "") or ""),
+                    ORMTaskArtifact.c.run_id == (getattr(self, "_run_id", "") or ""),
                     ORMTaskArtifact.c.stage.like("chapter_draft:%"),
                     ORMTaskArtifact.c.status == "done",
                 )
             ).mappings().all()
         excluded_sections = excluded_sections or set()
+        preserved_sections = preserved_sections or set()
         completed_markers: set[str] = set()
         for artifact in artifact_rows:
             try:
@@ -1080,11 +1266,16 @@ class WriterAgent(BaseAgent):
         section_text: dict[str, list[str]] = {}
         position = 0
         for row in rows:
-            if str(row["section"]) in excluded_sections:
+            section = str(row["section"])
+            if section in excluded_sections:
                 continue
-            if row["section"] in completed_markers:
-                completed_sections.add(row["section"])
-            section_text.setdefault(row["section"], []).append(row["content"])
+            if section not in completed_markers and section not in preserved_sections:
+                # Rows from an older run are a baseline, not resume state. If
+                # they were counted as memory here, their Facts would be marked
+                # used before the replacement chapter was generated.
+                continue
+            completed_sections.add(section)
+            section_text.setdefault(section, []).append(row["content"])
             position = max(position, int(row["position"]))
             try:
                 refs = json.loads(row["source_refs"] or "{}")
@@ -1187,9 +1378,10 @@ class WriterAgent(BaseAgent):
                     "target_words": int(unit.get("target_words") or 0),
                     "sample_type": _style_sample_type(unit_plan, chapter_index, chapter_count),
                 })
-                unit_style = "\n\n".join(
-                    value for value in (dynamic_style, chapter_style) if str(value).strip()
-                )
+                # The context manager already carries the static profile. Use
+                # one purpose-matched block here instead of injecting the same
+                # template twice and over-constraining prose.
+                unit_style = dynamic_style
             generated = self._generate_chapter_pass(
                 chapter_title, chapter_index, chapter_count, structure,
                 chapter_facts, chapter_inferences, unit_style,

@@ -1,7 +1,9 @@
-"""Workflow Controller:单任务串行编排。
+"""Single-task report workflow orchestration.
 
-阶段:解析 → 去重 → 规划 → 材料理解 → 事实 → 冲突 → 分析 → 写作 → 在线评审 → 完成。
-Agent 由控制器顺序驱动,阶段产物写入短期记忆(task payload)。
+Critical path: material parsing -> material understanding -> analysis planning
+-> evidence -> graph/conflict checks -> analysis -> final report planning ->
+narrative writing -> quality review. Task payload drives the UI, while stage
+artifacts and dependency signatures provide durable audit and safe resume.
 """
 import json
 import re
@@ -30,13 +32,15 @@ from app.infrastructure.orm import (
     ORMMaterialScan,
     ORMPlan,
     ORMSentence,
+    ORMSentenceFact,
+    ORMSentenceInference,
     ORMTaskArtifact,
     ORMUnit,
 )
 from app.llm_queue import PRIORITY_BACKGROUND, llm_priority
 from app.memory import short_term
 from app.models import Stage, Unit
-from app.parser import PARSER_VERSION, parse_file_with_profile
+from app.parsing import PARSER_VERSION, parse_file_with_profile
 from app.policy import build_report_policy, policy_prompt_block
 from app.retrieval import vector_store
 from app.report_versions import (
@@ -47,7 +51,8 @@ from app.report_versions import (
 from app.task_artifacts import save_task_artifact
 from app.task_runs import update_task_run
 from app.token_monitor import build_token_efficiency, build_workload_profile, token_context
-from app.context_budget import count_tokens, publish_context_audit, tokenizer_method
+from app.context_budget import count_tokens, publish_context_audit, tokenizer_method, truncate_tokens
+from app.workflow.stage_state import stage_input_signature, signature_matches
 
 _MATERIAL_ANALYSIS_PROMPT = """你是材料分析师。理解一份情报材料,输出 JSON:
 {
@@ -73,8 +78,9 @@ analysis_agent = AnalysisAgent()
 writer_agent = WriterAgent()
 
 
-def _analysis_groups(facts: list[dict], max_group_size: int = 45) -> dict[str, list[dict]]:
+def _analysis_groups(facts: list[dict], max_group_size: int | None = None) -> dict[str, list[dict]]:
     """Group facts for local analysis without domain-specific keywords."""
+    max_group_size = max(1, int(max_group_size or settings.analysis_facts_per_batch))
     groups: dict[str, list[dict]] = {}
     for fact in facts:
         dimension = str(fact.get("dimension") or "未分类")
@@ -125,7 +131,7 @@ class WorkflowController:
     # ---------- 对外入口 ----------
 
     def _control_boundary(self) -> None:
-        """Pause only between workflow stages; never interrupt an LLM call."""
+        """Honor pauses here; the gateway also checks after every LLM call."""
         task = short_term.load_task(self.task_id) or self.task
         if (task.get("control_request") if task else "") == "pause":
             self._update(stage="paused", queue_status={"status": "paused"}, control_request="")
@@ -169,11 +175,6 @@ class WorkflowController:
             "parse_results": self.task.get("parse_results", []),
         })
         _mark("parse")
-        with self._token_context("dedup"):
-            self.dedup()
-        self._control_boundary()
-        self._record_artifact("dedup", {"dedup_pairs": self.task.get("dedup_pairs", [])})
-        _mark("dedup")
         with self._token_context("material_analysis"):
             self.analyze_materials()
         self._control_boundary()
@@ -181,6 +182,8 @@ class WorkflowController:
             "material_insights": self.task.get("material_insights", []),
             "reused": self.task.get("material_analysis_reused", 0),
             "cache_hits": self.task.get("material_analysis_cache_hits", 0),
+            "status": self.task.get("material_analysis_status", {}),
+            "errors": self.task.get("material_analysis_errors", []),
         })
         _mark("material_analysis")
         if self.task.get("plan_id"):
@@ -195,6 +198,7 @@ class WorkflowController:
         })
         _mark("plan")
         self._control_boundary()
+        evidence_signature = stage_input_signature("evidence", self.task, plan=self._plan())
         if (self.task.get("incremental_update")
                 and not self.task.get("incremental_added_material_ids")
                 and not self.task.get("intervention_force_evidence")):
@@ -206,8 +210,10 @@ class WorkflowController:
             self._update(
                 stage=str(Stage.EVIDENCE),
                 evidence_progress={"status": "reused", "fact_count": len(facts)},
+                evidence_input_signature=evidence_signature,
             )
-        elif self.task.get("fact_ids"):
+        elif (self.task.get("fact_ids")
+              and str(self.task.get("evidence_active_signature") or "") == evidence_signature):
             # 断点续跑(维度级):evidence_progress.done 记录已完成维度数
             ep = self.task.get("evidence_progress") or {}
             done = int(ep.get("done") or 0)
@@ -223,6 +229,10 @@ class WorkflowController:
                 self._update(stage=str(Stage.EVIDENCE), resume={"stage": "evidence", "status": "partial"})
                 facts = self.extract_evidence(start_dimension=done)
         else:
+            self._update(
+                evidence_active_signature=evidence_signature,
+                evidence_progress={"done": 0, "total": 0, "status": "starting"},
+            )
             with self._token_context("evidence"):
                 facts = self.extract_evidence()
         self._control_boundary()
@@ -233,10 +243,16 @@ class WorkflowController:
                 list(self.task.get("incremental_inherited_inference_ids") or []),
             )
             self._update(incremental_lifecycle=lifecycle)
-            facts = self._facts()
+        # Extractor return values can contain only the resumed batch or the
+        # incremental delta. All downstream stages consume the complete task
+        # registry so previously persisted Facts cannot disappear silently.
+        facts = self._facts()
+        self._update(evidence_input_signature=evidence_signature)
+        self._consolidate_intelligence(facts)
         self._record_artifact("evidence", {
             "fact_ids": self.task.get("fact_ids", []),
             "fact_count": len(facts),
+            "intelligence_status": self.task.get("intelligence_status", {}),
         })
         _mark("evidence")
         # Build the task graph from validated Facts before Analysis. A graph
@@ -250,11 +266,17 @@ class WorkflowController:
 
             if graph_service.mode == "off":
                 self._update(graph_status={"status": "skipped", "reason": "graph_mode_off"})
-            elif graph_service.has_task_graph(self.task_id):
+            elif (graph_service.has_task_graph(self.task_id)
+                  and self._graph_covers_facts(facts)):
                 stats = graph_service.task_graph(self.task_id).get("stats") or {}
                 self._update(graph_status={"status": "reused", **stats})
             else:
-                self._update(graph_status={"status": "pending", "reason": "post_review_background"})
+                self._update(graph_status={
+                    "status": "pending",
+                    "reason": "post_review_background",
+                    "pending_fact_count": len({int(f["id"]) for f in facts if f.get("id") is not None}
+                                              - set(self.task.get("graph_fact_ids") or [])),
+                })
         graph_status = self.task.get("graph_status", {})
         self._record_artifact(
             "graph", {"graph_status": graph_status},
@@ -295,7 +317,10 @@ class WorkflowController:
                 finished=True,
             )
             return
-        if self.task.get("analysis_done"):
+        analysis_signature = stage_input_signature("analysis", self.task, plan=self._plan())
+        if self.task.get("analysis_done") and signature_matches(
+            self.task, "analysis", analysis_signature,
+        ):
             self._update(stage=str(Stage.ANALYSIS), resume={"stage": "analysis", "status": "reused"})
         elif self.task.get("incremental_update"):
             if self.task.get("intervention_force_analysis"):
@@ -340,11 +365,13 @@ class WorkflowController:
             with self._token_context("analysis"):
                 self.analyze(facts)
         self._control_boundary()
+        self._update(analysis_input_signature=analysis_signature)
         self._record_artifact("analysis", {
             "inference_ids": self.task.get("inference_ids", []),
             "external_ids": self.task.get("external_ids", []),
         })
         _mark("analysis")
+        final_plan_signature = stage_input_signature("final_plan", self.task, plan=self._plan())
         if self.task.get("incremental_update"):
             # 增量 final_plan 策略:
             # - 无新增材料(补写模式):复用 base 规划,结构不变,只补写内容。
@@ -354,16 +381,21 @@ class WorkflowController:
                 with self._token_context("final_planning"):
                     self.finalize_report_structure()
             elif not self.task.get("incremental_added_material_ids"):
+                # A no-material revision deliberately inherits the approved
+                # structure unless the interaction explicitly forces replanning.
                 self._update(stage=str(Stage.PLANNING), resume={"stage": "final_plan", "status": "reused"})
             else:
                 with self._token_context("final_planning"):
                     self.finalize_report_structure()
-        elif self.task.get("final_plan_frozen"):
+        elif self.task.get("final_plan_frozen") and signature_matches(
+            self.task, "final_plan", final_plan_signature,
+        ):
             self._update(stage=str(Stage.PLANNING), resume={"stage": "final_plan", "status": "reused"})
         else:
             with self._token_context("final_planning"):
                 self.finalize_report_structure()
         self._control_boundary()
+        self._update(final_plan_input_signature=final_plan_signature)
         self._record_artifact("final_plan", {
             "plan_id": self.task.get("plan_id"),
             "plan_title": self.task.get("plan_title", ""),
@@ -372,11 +404,42 @@ class WorkflowController:
         })
         _mark("final_plan")
         target_chapters = self._prepare_incremental_write_scope()
-        if self.task.get("report_id") and self._report_has_all_chapters() and not self.task.get("incremental_update"):
+        writing_signature = stage_input_signature("writing", self.task, plan=self._plan())
+        self._active_writing_signature = writing_signature
+        targeted_revision = dict(self.task.get("intervention_target_scope") or {})
+        if targeted_revision:
+            with self._token_context("writing"):
+                result = writer_agent.rewrite_user_scope(
+                    report_id=int(self.task.get("report_id") or 0),
+                    scope=targeted_revision,
+                    instruction=str((targeted_revision.get("arguments") or {}).get("instruction") or ""),
+                    facts=self._facts(),
+                    inferences=self._inferences(),
+            )
+            self._update(write_progress={"status": "done", "done": 1, "total": 1, **result})
+            current_plan = self._plan()
+            self._normalize_report_order(int(self.task["report_id"]), current_plan)
+            self._run_quality_check(self._selected_variant(), current_plan, int(self.task["report_id"]))
+        elif self.task.get("intervention_scope_locked") and not target_chapters:
+            self._update(stage=str(Stage.WRITING), write_progress={
+                "status": "unchanged", "done": 0, "total": 0,
+            })
+            self._normalize_report_order(int(self.task["report_id"]), self._plan())
+        elif (self.task.get("report_id")
+              and self._report_has_all_chapters(writing_signature)
+              and not self.task.get("incremental_update")):
             self._update(stage=str(Stage.WRITING), write_progress={"status": "resumed"})
         else:
             with self._token_context("writing"):
-                self.write(target_chapter_titles=target_chapters)
+                # Replaced chapters stay in the database until all new chapters
+                # succeed, but must be excluded from Writer memory meanwhile.
+                writer_targets = list(dict.fromkeys([
+                    *(target_chapters or []),
+                    *[str(title) for title in self.task.get("intervention_obsolete_sections") or []],
+                ])) if self.task.get("intervention_scope_locked") else target_chapters
+                self.write(target_chapter_titles=writer_targets)
+        self._update(writing_input_signature=writing_signature)
+        self._remove_intervention_obsolete_sections()
         self._control_boundary()
         self._record_artifact("write", {
             "report_id": self.task.get("report_id"),
@@ -438,7 +501,7 @@ class WorkflowController:
             metadata={"report_id": self.task.get("report_id"), "ttfr_seconds": ttfr},
             finished=True,
         )
-        self._start_background_post_review(facts)
+        self._start_background_graph_build(facts)
 
     def _update(self, **fields) -> None:
         """更新短期记忆并同步内存快照,保证后续阶段读到最新产物。"""
@@ -448,8 +511,9 @@ class WorkflowController:
             "inference_ids", "external_ids", "conflict_ids", "report_id",
             "qa_notes", "report_stats",
             "stage_timings", "stage_durations", "llm_stats", "token_efficiency", "workload_profile", "resource_samples", "error",
-            "ttfr_seconds", "critical_path_done", "background_jobs", "knowledge_stats",
-            "artifact_status", "queue_status",
+            "ttfr_seconds", "critical_path_done", "background_jobs", "graph_stats",
+            "artifact_status", "queue_status", "material_analysis_status",
+            "material_analysis_errors", "intelligence_status", "qa_status", "graph_fact_ids",
             "final_plan_frozen", "incremental_plan", "incremental_delta", "incremental_structure_review_required",
         }
         if set(fields) & version_fields:
@@ -471,11 +535,7 @@ class WorkflowController:
 
     def parse_materials(self) -> None:
         self._update(stage=str(Stage.PARSING))
-        # 解析阶段不依赖 LLM:声明重资源阶段,按 GPU 策略(gpu_memory_tight)由
-        # 统一调度器决定是否临时卸载推理模型(策略化,不写死 unload)。
-        from app.llm_scheduler import heavy_stage
-        with heavy_stage():
-            self._parse_loop()
+        self._parse_loop()
 
     def _parse_loop(self) -> None:
         parse_errors: list[dict] = []
@@ -496,6 +556,15 @@ class WorkflowController:
                     select(ORMMaterial).where(ORMMaterial.c.id == material_id)
                 ).mappings().first()
             if material is None:
+                error = {
+                    "material_id": material_id,
+                    "filename": "",
+                    "error": "MATERIAL_NOT_FOUND",
+                    "duration_seconds": round(time.time() - item_started, 2),
+                }
+                parse_errors.append(error)
+                parse_results.append({**error, "status": "failed", "unit_count": 0, "parser": PARSER_VERSION})
+                self._update(parse_progress={"done": index, "total": total})
                 continue
             # 复用:同材料已解析过(units 存在)→ 跳过解析与向量化(材料库二次任务直接引用)
             with session_scope() as s:
@@ -508,6 +577,28 @@ class WorkflowController:
                 ).mappings().first()["c"]
                 material_parser_version = pv_row["parser_version"] if pv_row is not None else None
             if already > 0 and material_parser_version == PARSER_VERSION:
+                repair_error = ""
+                if self._material_needs_embedding_repair(int(material_id)):
+                    with session_scope() as s:
+                        rows = s.execute(
+                            select(ORMUnit).where(ORMUnit.c.material_id == int(material_id))
+                            .order_by(ORMUnit.c.id)
+                        ).mappings().all()
+                    repair_units = [Unit(
+                        id=int(row["id"]), material_id=int(row["material_id"]),
+                        kind=str(row["kind"]), content=str(row["content"] or ""),
+                        page=row["page"], paragraph=row["paragraph"],
+                        image_desc=row["image_desc"], metadata_json=row["metadata_json"] or "{}",
+                    ) for row in rows]
+                    repair_error = self._embed_units(
+                        int(material_id), [int(row["id"]) for row in rows], repair_units,
+                    )
+                    if repair_error:
+                        embed_errors.append({
+                            "material_id": int(material_id),
+                            "filename": material["filename"],
+                            "error": f"embed: {repair_error}",
+                        })
                 reused += 1
                 parse_results.append({
                     "material_id": int(material_id),
@@ -516,6 +607,11 @@ class WorkflowController:
                     "duration_seconds": 0.0,
                     "unit_count": int(already),
                     "parser": material_parser_version,
+                    "embed_status": (
+                        "skipped" if not getattr(vector_store, "enabled", False)
+                        else "failed" if repair_error else "reused"
+                    ),
+                    "embed_error": repair_error,
                 })
                 self._update(parse_progress={"done": index, "total": total})
                 continue
@@ -575,7 +671,11 @@ class WorkflowController:
                     "error": f"embed: {embed_error}",
                 })
             duration = round(time.time() - item_started, 2)
-            parse_status = "partial" if embed_error else "success"
+            # Parsing and vector indexing are separate capabilities. Parsed
+            # Units remain fully usable through lexical retrieval when vector
+            # indexing degrades, so the material must not be shown as a parser
+            # failure in the UI.
+            parse_status = "success"
             parse_results.append({
                 "material_id": int(material_id),
                 "filename": material["filename"],
@@ -589,7 +689,10 @@ class WorkflowController:
                 "image_count": int(parse_profile.get("image_count") or 0),
                 "ocr_enabled": bool(parse_profile.get("ocr_enabled")),
                 "ocr_route": parse_profile.get("ocr_route", ""),
-                "embed_status": "failed" if embed_error else "success",
+                "embed_status": (
+                    "skipped" if not getattr(vector_store, "enabled", False)
+                    else "failed" if embed_error else "success"
+                ),
                 "embed_error": embed_error,
             })
             self._save_parse_profile(
@@ -614,28 +717,47 @@ class WorkflowController:
         返回错误信息(空串=成功)。向量缺失的材料由检索层词法回退,不阻塞任务。
         """
         pairs = [(uid, u) for uid, u in zip(unit_ids, units) if (u.content or "").strip()]
-        if not pairs:
+        if not pairs or not getattr(vector_store, "enabled", False):
             return ""
         from app.retrieval.embedder import embed_texts_adaptive
         vectors, errors = embed_texts_adaptive([u.content for _, u in pairs])
         unit_vecs: list[np.ndarray] = []
+        save_failures = 0
         for (uid, _unit), vector in zip(pairs, vectors):
             if vector is None:
                 continue
             try:
-                vector_store.save_unit_vector(uid, vector)
-                unit_vecs.append(np.asarray(vector, dtype=np.float32))
+                if vector_store.save_unit_vector(uid, vector):
+                    unit_vecs.append(np.asarray(vector, dtype=np.float32))
+                else:
+                    save_failures += 1
             except Exception:
-                pass
+                save_failures += 1
         if errors:
             return "; ".join(errors[:3])
         if unit_vecs:
             try:
                 material_vector = np.mean(unit_vecs, axis=0)
-                vector_store.save_material_vector(material_id, material_vector.tolist())
+                if not vector_store.save_material_vector(material_id, material_vector.tolist()):
+                    save_failures += 1
             except Exception:
-                pass
+                save_failures += 1
+        if save_failures:
+            return f"VECTOR_STORE_WRITE_FAILED:{save_failures}"
         return ""
+
+    @staticmethod
+    def _material_needs_embedding_repair(material_id: int) -> bool:
+        if not getattr(vector_store, "enabled", False):
+            return False
+        profiles = Base.metadata.tables["file_parse_profiles"]
+        with session_scope() as s:
+            row = s.execute(
+                select(profiles.c.error)
+                .where(profiles.c.material_id == int(material_id))
+                .order_by(profiles.c.id.desc()).limit(1)
+            ).mappings().first()
+        return bool(row and str(row["error"] or "").lower().startswith("embed:"))
 
     @staticmethod
     def _save_parse_profile(material_id: int, material, profile: dict, status: str,
@@ -645,17 +767,10 @@ class WorkflowController:
             structure = dict(profile or {})
             structure["duration_seconds"] = duration
             structure["unit_count"] = int(unit_count)
-            file_nodes = Base.metadata.tables["file_nodes"]
             file_parse_profiles = Base.metadata.tables["file_parse_profiles"]
             with session_scope() as s:
-                row = s.execute(
-                    select(file_nodes.c.id).where(file_nodes.c.material_id == int(material_id))
-                    .order_by(file_nodes.c.id.desc()).limit(1)
-                ).mappings().first()
-                node_id = int(row["id"]) if row else 0
                 s.execute(
                     insert(file_parse_profiles).values(
-                        node_id=node_id,
                         material_id=int(material_id),
                         parser=str(profile.get("parser") or PARSER_VERSION),
                         status=status,
@@ -672,13 +787,6 @@ class WorkflowController:
         except Exception:
             pass
 
-    def dedup(self) -> None:
-        self._update(stage=str(Stage.DEDUP))
-        # 材料重复是语义判断(实质内容重复),不由向量相似度阈值(如 0.88)自动判定。
-        # 同主题材料相似度天然高,硬编码阈值会误标;重复/印证语义由
-        # Intelligence Consolidation 的 FactCluster/corroborates 关系承担。
-        self._update(dedup_pairs=[])
-
     def plan(self) -> None:
         self._update(stage=str(Stage.PLANNING))
         from app.context import ContextManager
@@ -690,11 +798,7 @@ class WorkflowController:
         policy = build_report_policy(self.task, variant, profile)
         self._update(report_policy=policy)
         requirements = self.task.get("user_requirements", "")
-        if self.task.get("intervention_recompute_from"):
-            requirements = (
-                f"{requirements}\n\n本轮经用户批准的调整：\n"
-                f"{self.task.get('incremental_update_reason', '')}"
-            ).strip()
+        analysis_constraint = dict(self.task.get("intervention_analysis_constraint") or {})
         context_block = cm.for_planner(
             self.task.get("theme", ""),
             requirements,
@@ -704,7 +808,16 @@ class WorkflowController:
             policy_prompt_block(policy),
         )
         try:
-            plan = planner.plan(context_block, user_requirements=requirements)
+            plan = planner.plan(
+                context_block,
+                user_requirements=requirements,
+                revision_instruction=str(
+                    analysis_constraint.get("instruction")
+                    or (self.task.get("incremental_update_reason", "") if self.task.get("intervention_recompute_from") else "")
+                ),
+                required_dimensions=list(analysis_constraint.get("required_dimensions") or []),
+                required_dimension_count=int(analysis_constraint.get("required_dimension_count") or 0),
+            )
         except Exception:
             raise
         self._update(plan_id=plan.id, plan_title=plan.title)
@@ -712,6 +825,15 @@ class WorkflowController:
     def finalize_report_structure(self) -> None:
         """Freeze final chapters after Evidence + Analysis, not before."""
         self._update(stage=str(Stage.PLANNING))
+        required_structure = list(self.task.get("intervention_required_structure") or [])
+        if required_structure and self.task.get("intervention_force_final_plan"):
+            final_plan = planner.revise_final_plan_structure(
+                int(self.task.get("plan_id") or 0),
+                required_structure,
+                instruction=str(self.task.get("incremental_update_reason") or ""),
+            )
+            self._update(plan_title=final_plan.title, final_plan_frozen=True)
+            return
         from app.context import ContextManager
 
         plan = self._plan()
@@ -734,7 +856,11 @@ class WorkflowController:
             variant.planner_prompt_block() if variant else self._style_block(),
             policy_prompt_block(policy),
         )
-        final_plan = planner.finalize_report_plan(int(plan["id"]), context_block)
+        final_plan = planner.finalize_report_plan(
+            int(plan["id"]), context_block,
+            required_structure=required_structure,
+            required_chapter_count=int(self.task.get("intervention_required_chapter_count") or 0),
+        )
         self._update(plan_title=final_plan.title, final_plan_frozen=True)
 
     def analyze_materials(self) -> None:
@@ -747,11 +873,18 @@ class WorkflowController:
 
         units_by_material, filenames = self._load_units()
         if not units_by_material:
+            self._update(material_analysis_status={
+                "status": "failed",
+                "error": "NO_PARSED_MATERIAL_UNITS",
+                "success_count": 0,
+                "total": len(self.task.get("material_ids") or []),
+            })
             return
         analyzer = BaseAgent()
         analyzer.name = "material_analyzer"
         analyzer.role = _MATERIAL_ANALYSIS_PROMPT
         insights: list[dict] = []
+        analysis_errors: list[dict] = []
         material_ids = [int(i) for i in self.task.get("material_ids", [])]
         total = len(material_ids)
         # 复用:同材料已分析过(material_insights 有记录)→ 跳过 LLM,直接引用
@@ -781,8 +914,9 @@ class WorkflowController:
                         "forbidden_usage": json.loads(r["forbidden_usage"] or "[]"),
                         "missing_information": json.loads(r["missing_information"] or "[]"),
                     }
-        except Exception:
+        except Exception as exc:
             existing = {}
+            analysis_errors.append({"stage": "load_existing", "error": str(exc)[:300]})
         reused = 0
         cache_hits = 0
         for index, material_id in enumerate(material_ids, start=1):
@@ -800,6 +934,12 @@ class WorkflowController:
                 theme=self.task.get("theme") or "",
             )
             if not text:
+                analysis_errors.append({
+                    "material_id": material_id,
+                    "filename": filenames.get(material_id, ""),
+                    "error": "EMPTY_MATERIAL_CONTEXT",
+                })
+                self._update(material_analysis_progress={"done": index, "total": total})
                 continue
             effective_inputs = {
                 "material_id": material_id,
@@ -852,7 +992,13 @@ class WorkflowController:
                     }},
                 })
                 payload = analyzer.generate_json(f"材料文本:\n{text}")
-            except Exception:
+            except Exception as exc:
+                analysis_errors.append({
+                    "material_id": material_id,
+                    "filename": filenames.get(material_id, ""),
+                    "error": str(exc)[:300],
+                })
+                self._update(material_analysis_progress={"done": index, "total": total})
                 continue
             insight = {
                 "material_id": material_id,
@@ -913,6 +1059,13 @@ class WorkflowController:
             material_analysis_reused=reused,
             material_analysis_cache_hits=cache_hits,
             task_profile=profile,
+            material_analysis_errors=analysis_errors,
+            material_analysis_status={
+                "status": "ready" if len(insights) == total else "partial",
+                "success_count": len(insights),
+                "failure_count": max(0, total - len(insights)),
+                "total": total,
+            },
         )
 
     def extract_evidence(self, start_dimension: int = 0) -> list[dict]:
@@ -931,10 +1084,22 @@ class WorkflowController:
         needs = plan.get("evidence_needs") or [
             {"need": d, "dimension": d, "priority": "medium"} for d in plan.get("dimensions", [])
         ]
+        evidence_recheck = dict(self.task.get("intervention_evidence_recheck") or {})
+        if evidence_recheck:
+            focus = str(evidence_recheck.get("fact_content") or "").strip()
+            instruction = str(evidence_recheck.get("instruction") or "复核该事实及其证据").strip()
+            needs = [{
+                "need": f"复核要求：{instruction}；待复核事实：{focus}",
+                "dimension": "用户指定事实复核",
+                "priority": "high",
+            }, *needs]
+        required_facts = list(plan.get("required_facts", []))
+        if evidence_recheck.get("fact_content"):
+            required_facts = [str(evidence_recheck["fact_content"]), *required_facts]
         facts = evidence_agent.extract_facts(
             needs, units_by_material, filenames,
             cm=self.cm, insights=insights,
-            required_facts=plan.get("required_facts", []),
+            required_facts=required_facts,
             task_id=self.task_id,
             start_dimension=start_dimension,
             progress_callback=lambda done, total: self._update(evidence_progress={"done": done, "total": total}),
@@ -956,38 +1121,9 @@ class WorkflowController:
         if self.task.get("incremental_update"):
             prior_new_ids = [int(x) for x in (self.task.get("incremental_new_fact_ids") or [])]
             self._update(incremental_new_fact_ids=list(dict.fromkeys(prior_new_ids + persisted_ids + new_ids)))
-        fact_payload = [{"id": f.id, "content": f.content, "sources": load_evidence_quotes(f.id)} for f in facts]
-        # Intelligence Consolidation:Fact 聚簇(多源印证)+ Ledger 情报底稿
-        self._consolidate_intelligence(facts)
-        return fact_payload
+        return [{"id": f.id, "content": f.content, "sources": load_evidence_quotes(f.id)} for f in facts]
 
-    def reflow_evidence_gaps(self) -> list[dict]:
-        """Explicit WriteHERE boundary: retrieve open writing gaps, then refresh ledger.
-
-        This is intentionally bounded to the gap contract and does not restart
-        parsing or planner stages. A caller may invoke it after QA and then
-        request a local chapter rewrite.
-        """
-        task = self.task or {}
-        gaps = task.get("qa_evidence_gaps") or []
-        if not gaps:
-            return []
-        from app.context import ContextManager
-        from app.evidence.extractor import EvidenceAgent
-        units_by_material, filenames = self._load_units()
-        cm = ContextManager(task, units_by_material, filenames)
-        needs = [{"need": str(g), "dimension": "writing_evidence_gap", "priority": "high"} for g in gaps if str(g).strip()]
-        facts = EvidenceAgent().extract_facts(
-            needs, units_by_material, filenames, cm=cm,
-            insights=task.get("material_insights", []),
-            task_id=self.task_id,
-        )
-        self._update(evidence_gap_contract={"status": "retrieved", "gaps": gaps,
-                                            "new_fact_ids": [int(f.id) for f in facts if f.id is not None]})
-        return [{"id": f.id, "content": f.content} for f in facts]
-
-
-    def _consolidate_intelligence(self, facts) -> None:
+    def _consolidate_intelligence(self, facts: list[dict]) -> None:
         """Fact Consolidation + Intelligence Ledger(多源印证/覆盖/缺口/置信度)。
 
         Analysis 读 Ledger 而非散乱 Fact;重复/印证语义在此层处理(非向量阈值)。
@@ -1000,12 +1136,13 @@ class WorkflowController:
             needs = plan.get("evidence_needs") or [
                 {"need": d, "dimension": d, "priority": "medium"} for d in plan.get("dimensions", [])
             ]
-            fact_rows = [
-                {"id": int(f.id), "content": f.content, "dimension": f.dimension or "",
-                 "need_id": int(getattr(f, "need_id", 0) or 0),
-                 "sources": load_evidence_quotes(f.id) if f.id else []}
-                for f in facts if f.id is not None
-            ]
+            fact_rows = [{
+                "id": int(fact["id"]),
+                "content": str(fact.get("content") or ""),
+                "dimension": str(fact.get("dimension") or ""),
+                "need_id": int(fact.get("need_id") or 0),
+                "sources": fact.get("sources") or load_evidence_quotes(int(fact["id"])),
+            } for fact in facts if fact.get("id") is not None]
             clusters = cluster_facts(fact_rows)
             for cluster in clusters:
                 save_cluster(cluster, self.task_id)
@@ -1015,8 +1152,18 @@ class WorkflowController:
             ledger = build_ledger(self.task_id, needs, fact_rows)
             persist_ledger(self.task_id, ledger)
             self._update(intelligence_ledger=ledger)
-        except Exception:
-            pass  # 整编失败不阻塞主流程(evidence 本身已落库)
+            self._update(intelligence_status={
+                "status": "ready",
+                "fact_count": len(fact_rows),
+                "cluster_count": len(clusters),
+            })
+        except Exception as exc:
+            # Consolidation is advisory, but a silent failure would make later
+            # analysis look complete while operating without its ledger.
+            self._update(intelligence_status={
+                "status": "degraded",
+                "error": str(exc)[:300],
+            })
 
     def _build_task_graph(self, facts: list[dict]) -> dict:
         """Create an evidence-grounded task graph and publish an outbox event."""
@@ -1043,7 +1190,10 @@ class WorkflowController:
                 active_fact_ids={int(fact.get("id") or 0) for fact in facts if fact.get("id") is not None},
             )
             status = result.as_dict()
-            self._update(graph_status=status)
+            active_ids = {int(fact.get("id") or 0) for fact in facts if fact.get("id") is not None}
+            failed_ids = {int(value) for value in status.get("failed_fact_ids") or []}
+            covered_ids = sorted(active_ids - failed_ids) if status.get("status") in {"ready", "partial_ready"} else []
+            self._update(graph_status=status, graph_fact_ids=covered_ids)
             return status
         except Exception as exc:
             status = {"status": "degraded", "error": str(exc)[:300]}
@@ -1104,37 +1254,46 @@ class WorkflowController:
                 )
             return
         conflicts = self._conflicts()
-        memory_block = self._knowledge_block()
-        timeline_block = self._timeline_block()
         # 情报底稿:Analysis 读 Ledger(聚簇/关系/覆盖/缺口),而非散乱 Fact
         ledger = self.task.get("intelligence_ledger") or {}
         ledger_block = ""
         if ledger:
-            gaps = "、".join(str(g) for g in (ledger.get("information_gaps") or [])[:6])
+            gaps = "、".join(str(g) for g in (ledger.get("information_gaps") or []))
             clusters = "; ".join(
                 f"{c.get('key', '')[:40]}({c.get('status', '')})"
-                for c in (ledger.get("fact_clusters") or [])[:6]
+                for c in (ledger.get("fact_clusters") or [])
             )
             relations = "; ".join(
-                f"{r.get('relation_type', '')}" for r in (ledger.get("fact_relations") or [])[:6]
+                f"{r.get('relation_type', '')}" for r in (ledger.get("fact_relations") or [])
             )
-            ledger_block = (
+            ledger_block = truncate_tokens((
                 f"情报底稿(供分析参考):\n"
                 f"- 信息缺口:{gaps or '无'}\n"
                 f"- 事实聚簇:{clusters or '无'}\n"
                 f"- 事实关系:{relations or '无'}\n"
-            )
+            ), max(512, settings.analysis_facts_per_batch * 24))
         # Map:仅在 Analysis 阶段补充通用元数据,避免影响后续 Planner/Writer。
         analysis_facts = self._facts_for_analysis(facts)
         groups = _analysis_groups(analysis_facts)
         local_inferences: list = []
         for dimension, group_facts in groups.items():
-            context_block = self.cm.for_analysis(group_facts, conflicts, timeline_block, memory_block) if self.cm else ""
+            context_block = self.cm.for_analysis(group_facts, conflicts) if self.cm else ""
+            inference_recheck = dict(self.task.get("intervention_inference_recheck") or {})
+            if inference_recheck:
+                context_block = (
+                    "用户指定推论复核要求："
+                    f"{inference_recheck.get('instruction', '')}\n"
+                    f"待复核推论：{inference_recheck.get('inference_content', '')}\n"
+                    f"原依据事实 ID：{inference_recheck.get('based_fact_ids', [])}\n\n"
+                    f"{context_block}"
+                )
             try:
                 from app.graph import graph_service
-                graph_block = graph_service.context_for_analysis(self.task_id, group_facts)
-                if graph_block:
-                    context_block = f"{graph_block}\n\n{context_block}"
+                group_ids = {int(fact.get("id") or 0) for fact in group_facts if fact.get("id") is not None}
+                if group_ids and group_ids <= set(self.task.get("graph_fact_ids") or []):
+                    graph_block = graph_service.context_for_analysis(self.task_id, group_facts)
+                    if graph_block:
+                        context_block = f"{graph_block}\n\n{context_block}"
             except Exception:
                 pass
             if ledger_block:
@@ -1143,7 +1302,7 @@ class WorkflowController:
         # Reduce:跨维度综合(局部推断 → 全局推断 + 覆盖状态元数据)
         global_inferences, external, global_meta = analysis_agent.analyze_global(
             local_inferences, facts,
-            "、".join(str(c.get("description") or c.get("note") or "") for c in (conflicts or [])[:5]),
+            "、".join(str(c.get("description") or c.get("note") or "") for c in (conflicts or [])),
         )
         inferences = local_inferences + global_inferences
         generated_ids = [int(i.id) for i in inferences if i.id is not None]
@@ -1296,9 +1455,25 @@ class WorkflowController:
         from app.evidence.extractor import load_conflict_records
         return load_conflict_records(conflict_ids)
 
-    def _knowledge_block(self) -> str:
-        """Graph RAG is injected per analysis group; no stale global block."""
-        return ""
+    def _remove_intervention_obsolete_sections(self) -> None:
+        """Remove replaced chapters only after their replacement finished successfully."""
+        report_id = int(self.task.get("report_id") or 0)
+        titles = [
+            str(title) for title in self.task.get("intervention_obsolete_sections") or []
+            if str(title).strip()
+        ]
+        if not report_id or not titles:
+            return
+        with session_scope() as s:
+            rows = s.execute(select(ORMSentence.c.id).where(
+                ORMSentence.c.report_id == report_id,
+                ORMSentence.c.section.in_(titles),
+            )).mappings().all()
+            sentence_ids = [int(row["id"]) for row in rows]
+            if sentence_ids:
+                s.execute(delete(ORMSentenceFact).where(ORMSentenceFact.c.sentence_id.in_(sentence_ids)))
+                s.execute(delete(ORMSentenceInference).where(ORMSentenceInference.c.sentence_id.in_(sentence_ids)))
+                s.execute(delete(ORMSentence).where(ORMSentence.c.id.in_(sentence_ids)))
 
     def _prepare_incremental_write_scope(self) -> list[str] | None:
         """Build the incremental write plan and gate major structure changes."""
@@ -1310,6 +1485,24 @@ class WorkflowController:
             task_id=self.task_id,
         )
         plan = self._plan()
+        if self.task.get("intervention_scope_locked"):
+            target_chapters = [
+                str(title) for title in self.task.get("intervention_rewrite_sections") or []
+                if str(title).strip()
+            ]
+            impact["rewrite_sections"] = target_chapters
+            impact["rewrite_scope_reason"] = "approved_exact_scope"
+            instruction_policy = {
+                "rewrite_sections": target_chapters,
+                "content_intent": "restructure" if self.task.get("intervention_required_structure") else "preserve",
+                "reason": "用户已确认精确修改范围",
+            }
+            self._update(
+                incremental_plan=impact,
+                incremental_delta={**(self.task.get("incremental_delta") or {}), "impact": impact},
+                incremental_execution_policy=instruction_policy,
+            )
+            return target_chapters
         instruction_policy = self._instruction_update_policy(plan)
         self.task["incremental_execution_policy"] = instruction_policy
         impact["execution_policy"] = instruction_policy
@@ -1408,9 +1601,6 @@ class WorkflowController:
         # chapter/subsection purpose is known. Keep only non-style runtime
         # context here to avoid injecting one generic example set everywhere.
         style_block = ""
-        timeline_block = self._timeline_block()
-        if timeline_block:
-            style_block = f"{style_block}\n\n事件时间线(供时间线章节引用):\n{timeline_block}"
         chapters = plan.get("chapter_plans") or [{"title": t} for t in (plan.get("structure") or [])]
         self._update(write_progress={
             "done": 0,
@@ -1451,95 +1641,13 @@ class WorkflowController:
             self._normalize_report_order(report.id, plan)
         self._run_quality_check(variant, plan, report.id)
 
-        # QA 闭环:四类质检 + Repair 路由 + 缺口回流
-        self._run_report_qa(report.id, plan, facts)
-
-
-    def _run_report_qa(self, report_id: int, plan: dict, facts: list[dict]) -> None:
-        """写作后 QA:逐章四类质检(一次 LLM 调用/章)→ Repair Router → 缺口回流。
-
-        QA 只发现问题;修复动作由程序路由(记录);证据缺口回流到
-        Intelligence Ledger 的 information_gaps(不自动编造)。
-        """
-        try:
-            from app.qa.qa import ReportQA, route_repairs
-            qa_agent = ReportQA()
-            qa_results: list[dict] = []
-            repair_actions: list[dict] = []
-            with session_scope() as s:
-                sentence_rows = s.execute(
-                    select(ORMSentence.c.section, ORMSentence.c.content, ORMSentence.c.source_refs)
-                    .where(ORMSentence.c.report_id == report_id)
-                    .order_by(ORMSentence.c.position, ORMSentence.c.id)
-                ).mappings().all()
-            sections: dict[str, dict] = {}
-            for row in sentence_rows:
-                section = sections.setdefault(str(row["section"] or ""), {
-                    "section": str(row["section"] or ""), "texts": [], "fact_ids": set(), "inference_ids": set(),
-                })
-                section["texts"].append(str(row["content"] or ""))
-                try:
-                    refs = json.loads(row["source_refs"] or "{}")
-                except (TypeError, ValueError):
-                    refs = {}
-                section["fact_ids"].update(int(x) for x in refs.get("fact_ids", []) if str(x).isdigit())
-                section["inference_ids"].update(int(x) for x in refs.get("inference_ids", []) if str(x).isdigit())
-            for section in sections.values():
-                result = qa_agent.check(
-                    {"content": "\n".join(section["texts"]),
-                     "fact_ids": sorted(section["fact_ids"]),
-                     "inference_ids": sorted(section["inference_ids"])},
-                    facts=facts,
-                )
-                qa_results.append({"section": section["section"], "qa": result})
-                for action in route_repairs(result):
-                    action["section"] = section["section"]
-                    repair_actions.append(action)
-            evidence_gaps = [
-                a.get("reason", "") for a in repair_actions
-                if a.get("action") in ("attribution_repair", "narrative_rewrite")
-            ]
-            from app.planning.structure import evidence_gap_contract, evaluation_contract
-            gap_contract = evidence_gap_contract(evidence_gaps)
-            self._update(qa_results=qa_results, repair_actions=repair_actions,
-                         qa_evidence_gaps=evidence_gaps,
-                         evidence_gap_contract=gap_contract,
-                         evaluation_contract=evaluation_contract())
-            # Repair 真执行(不编造):引用问题 → 标记无依据句子(edit_history 留痕,供人工复核)
-            repaired = 0
-            for action in repair_actions:
-                if action.get("action") == "attribution_repair":
-                    with session_scope() as s:
-                        rows = s.execute(
-                            select(
-                                ORMSentence.c.id, ORMSentence.c.content, ORMSentence.c.source_refs
-                            )
-                            .where(
-                                ORMSentence.c.report_id == report_id,
-                                ORMSentence.c.section == action.get("section", ""),
-                                ORMSentence.c.source_refs.in_(["{}", ""]),
-                            )
-                        ).mappings().all()
-                        for row in rows:
-                            s.execute(
-                                update(ORMSentence)
-                                .where(ORMSentence.c.id == row["id"])
-                                .values(
-                                    edit_history=func.json_patch(
-                                        ORMSentence.c.edit_history,
-                                        '[{"qa": "attribution_repair", "note": "无引用句子,待人工复核"}]',
-                                    )
-                                )
-                            )
-                            repaired += 1
-            self._update(qa_repaired_sentences=repaired)
-        except Exception:
-            pass  # QA 失败不阻塞交付(报告已生成)
-
-
     def _record_chapter_artifact(self, payload: dict) -> None:
         # 每章写毕的边界:检查暂停(不打断单次 LLM 调用,只在章/章之间暂停)
         self._control_boundary()
+        payload = {
+            **payload,
+            "writing_input_signature": str(getattr(self, "_active_writing_signature", "") or ""),
+        }
         chapter = str(payload.get("chapter", ""))
         self._record_artifact(
             f"chapter_draft:{payload.get('chapter_index', '')}:{chapter}",
@@ -1547,20 +1655,11 @@ class WorkflowController:
         )
 
     def _effective_institution_rules(self, variant) -> dict:
-        """Keep learned style rules without forcing incompatible historical-report constraints."""
+        """Only explicit user-confirmed business rules may constrain new reports."""
         if not variant:
             return {}
         rules = dict(variant.institution_rules or {})
-        profile = self.task.get("task_profile") or {}
-        if profile.get("report_mode") == "requirement_summary":
-            rules.pop("must_include", None)
-            rules.pop("word_count", None)
-            rules.pop("inference_ratio", None)
-        return rules
-
-    def _timeline_block(self) -> str:
-        """Timeline context is supplied by evidence-grounded Graph RAG when active."""
-        return ""
+        return rules if rules.get("confirmed") is True else {}
 
     def _run_quality_check(self, variant, plan: dict, report_id: int) -> None:
         """报告质量检查:重复/模板缺失/术语违规/机构规则/逻辑跳跃 → qa_notes 供人工审核。"""
@@ -1576,10 +1675,12 @@ class WorkflowController:
                 .get("allow_symbolic_lists")
             )
         }
+        quality_error = ""
         try:
             issues = run_quality_check(report_id, plan.get("structure") or [], forbidden, institution_rules, qa_policy)
-        except Exception:
+        except Exception as exc:
             issues = []
+            quality_error = str(exc)[:300]
         with session_scope() as s:
             rows = s.execute(select(
                 ORMSentence.c.section, ORMSentence.c.content, ORMSentence.c.user_edit,
@@ -1661,6 +1762,11 @@ class WorkflowController:
             "planned_fact_coverage": planned_fact_coverage,
             "evidence_status": budget.get("evidence_status", ""),
             "underfill_reason": budget.get("underfill_reason", ""),
+        }, qa_status={
+            "status": "degraded" if quality_error else "ready",
+            "error": quality_error,
+            "issue_count": len(issues),
+            "located_issue_count": sum(1 for issue in issues if issue.get("sentence_ids")),
         })
 
     def _auto_quality_fix(self, report_id: int, plan: dict) -> bool:
@@ -1802,25 +1908,36 @@ class WorkflowController:
                 .where(ORMSentence.c.report_id == report_id)
                 .order_by(ORMSentence.c.position, ORMSentence.c.id)
             ).mappings().all()
+            stale_ids = [int(row["id"]) for row in rows if str(row["section"]) not in order]
+            if stale_ids:
+                # Historical content belongs in immutable report versions, not
+                # behind the current draft at a synthetic sort position.
+                s.execute(delete(ORMSentenceFact).where(ORMSentenceFact.c.sentence_id.in_(stale_ids)))
+                s.execute(delete(ORMSentenceInference).where(ORMSentenceInference.c.sentence_id.in_(stale_ids)))
+                s.execute(delete(ORMSentence).where(ORMSentence.c.id.in_(stale_ids)))
             counters: dict[str, int] = {}
             for row in rows:
                 section = str(row["section"])
+                if section not in order:
+                    continue
                 counters[section] = counters.get(section, 0) + 1
                 s.execute(
                     update(ORMSentence)
                     .where(ORMSentence.c.id == row["id"])
-                    .values(position=_chapter_position(order.get(section, 999), counters[section]))
+                    .values(position=_chapter_position(order[section], counters[section]))
                 )
 
-    def _sink_knowledge(self, facts: list[dict]) -> dict:
-        """Publish reviewed task assertions into the workspace graph.
+    def _publish_task_graph(self, facts: list[dict]) -> dict:
+        """Build and project task assertions without publishing them as reviewed.
 
         Build the evidence-grounded graph after TTFR when it was intentionally
         kept off the critical path, then project its validated assertions.
         """
         from app.graph import graph_service
 
-        if not settings.graph_build_before_analysis and not graph_service.has_task_graph(self.task_id):
+        if (not settings.graph_build_before_analysis
+                and (not graph_service.has_task_graph(self.task_id)
+                     or not self._graph_covers_facts(facts))):
             with self._token_context("graph_build"):
                 graph_status = self._build_task_graph(facts)
         else:
@@ -1839,32 +1956,37 @@ class WorkflowController:
             "graph", {"graph_status": graph_status},
             status=_graph_artifact_status(graph_status),
         )
-        self._update(knowledge_stats={
+        self._update(graph_stats={
             "validated_task_graph": has_graph,
             "graph_status": graph_status.get("status", "unknown"),
             "projected_events": projected,
         })
         return graph_status
 
-    def _start_background_post_review(self, facts: list[dict]) -> None:
-        """Run non-critical post-review jobs without delaying TTFR."""
+    def _graph_covers_facts(self, facts: list[dict]) -> bool:
+        active_ids = {int(fact.get("id") or 0) for fact in facts if fact.get("id") is not None}
+        covered_ids = {int(value) for value in self.task.get("graph_fact_ids") or []}
+        return bool(active_ids) and active_ids <= covered_ids
+
+    def _start_background_graph_build(self, facts: list[dict]) -> None:
+        """Build the non-critical task graph without delaying first review."""
         import time as _time
 
         jobs = dict(self.task.get("background_jobs") or {})
-        jobs["knowledge"] = {"status": "queued", "queued_at": round(_time.time(), 1)}
+        jobs["graph_build"] = {"status": "queued", "queued_at": round(_time.time(), 1)}
         self._update(background_jobs=jobs)
 
         def _run() -> None:
             started = _time.time()
             try:
                 jobs = dict(self.task.get("background_jobs") or {})
-                jobs["knowledge"] = {"status": "running", "started_at": round(started, 1)}
+                jobs["graph_build"] = {"status": "running", "started_at": round(started, 1)}
                 self._update(background_jobs=jobs)
-                with llm_priority(PRIORITY_BACKGROUND), self._token_context("knowledge"):
-                    graph_status = self._sink_knowledge(facts)
+                with llm_priority(PRIORITY_BACKGROUND), self._token_context("graph_build"):
+                    graph_status = self._publish_task_graph(facts)
                 graph_state = str(graph_status.get("status") or "unknown")
                 jobs = dict(self.task.get("background_jobs") or {})
-                jobs["knowledge"] = {
+                jobs["graph_build"] = {
                     "status": (
                         "done" if graph_state in {"ready", "reused", "skipped"}
                         else "partial" if graph_state == "partial_ready"
@@ -1877,7 +1999,7 @@ class WorkflowController:
                 self._update(background_jobs=jobs)
             except Exception as exc:
                 jobs = dict(self.task.get("background_jobs") or {})
-                jobs["knowledge"] = {
+                jobs["graph_build"] = {
                     "status": "failed",
                     "duration_seconds": round(_time.time() - started, 1),
                     "error": str(exc),
@@ -1945,9 +2067,16 @@ class WorkflowController:
                 },
             }
             self._update(artifact_status=artifacts)
-        except Exception:
-            # Artifact recording must never break the report generation path.
-            return
+        except Exception as exc:
+            # Artifact recording must never break report generation, but it is
+            # the resume/audit contract and therefore cannot fail invisibly.
+            diagnostic = {
+                "stage": stage,
+                "status": "degraded",
+                "error": str(exc)[:300],
+            }
+            short_term.update_task(self.task_id, artifact_recording_error=diagnostic)
+            self.task["artifact_recording_error"] = diagnostic
 
     def _token_context(self, stage: str):
         profile = self.task.get("task_profile") or {}
@@ -1967,7 +2096,7 @@ class WorkflowController:
         units_by_material, filenames = self._load_units()
         self.cm = ContextManager(self.task, units_by_material, filenames)
 
-    def _report_has_all_chapters(self) -> bool:
+    def _report_has_all_chapters(self, writing_signature: str) -> bool:
         report_id = self.task.get("report_id")
         if report_id is None or not self.task.get("plan_id"):
             return False
@@ -1987,6 +2116,7 @@ class WorkflowController:
                 select(ORMTaskArtifact.c.payload)
                 .where(
                     ORMTaskArtifact.c.task_id == self.task_id,
+                    ORMTaskArtifact.c.run_id == str(self.task.get("run_id") or ""),
                     ORMTaskArtifact.c.stage.like("chapter_draft:%"),
                     ORMTaskArtifact.c.status == "done",
                 )
@@ -1997,9 +2127,20 @@ class WorkflowController:
                 payload = json.loads(row["payload"] or "{}")
             except (TypeError, ValueError):
                 continue
-            if payload.get("status") == "done" and payload.get("chapter"):
+            if (payload.get("status") == "done"
+                    and payload.get("chapter")
+                    and payload.get("writing_input_signature") == writing_signature):
                 actual.add(str(payload.get("chapter")))
-        return set(expected) <= actual
+        if not set(expected) <= actual:
+            return False
+        with session_scope() as s:
+            persisted = set(s.execute(
+                select(ORMSentence.c.section).where(
+                    ORMSentence.c.report_id == int(report_id),
+                    ORMSentence.c.selected == 1,
+                )
+            ).scalars().all())
+        return set(expected) <= {str(value) for value in persisted if str(value).strip()}
 
     def _plan(self) -> dict:
         plan_id = self.task.get("plan_id")
@@ -2130,7 +2271,7 @@ class WorkflowController:
 
     def _style_block(self) -> str:
         variant = self._selected_variant()
-        return variant.to_prompt_block() if variant else ""
+        return variant.writer_prompt_block() if variant else ""
 
     def _selected_variant(self):
         """变体选择优先级:任务指定 variant_id > 全局锁定变体。"""

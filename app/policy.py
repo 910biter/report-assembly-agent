@@ -140,11 +140,12 @@ def _structure_type(format_spec: dict, institution_rules: dict) -> str:
 
 def _format_summary(format_spec: dict) -> dict:
     dominant = format_spec.get("dominant") if isinstance(format_spec, dict) else {}
-    document_format = dominant.get("document_format") if isinstance(dominant, dict) else {}
-    if isinstance(document_format, dict):
-        return {
-            "has_template_schema": bool(dominant.get("template_schema")),
-            "layout": document_format.get("layout", {}),
-            "export_hints": document_format.get("export_hints", {}),
-        }
-    return {}
+    schema = dominant.get("template_schema") if isinstance(dominant, dict) else {}
+    if not isinstance(schema, dict) or not schema:
+        return {}
+    return {
+        "has_template_schema": True,
+        "document": schema.get("document", {}),
+        "roles": schema.get("style", {}).get("roles", {}),
+        "numbering": schema.get("style", {}).get("numbering", {}),
+    }

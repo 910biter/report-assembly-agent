@@ -63,21 +63,21 @@ class QdrantVectorStore:
         except Exception:
             pass  # 集合创建失败不致命:检索回退关键词,下次写入再试
 
-    def save_material_vector(self, material_id: int, vector: list[float]) -> None:
-        self._upsert(
+    def save_material_vector(self, material_id: int, vector: list[float]) -> bool:
+        return self._upsert(
             self.materials_collection,
             int(material_id),
             vector,
             {"material_id": int(material_id), "kind": "material"},
         )
 
-    def save_unit_vector(self, unit_id: int, vector: list[float]) -> None:
+    def save_unit_vector(self, unit_id: int, vector: list[float]) -> bool:
         payload = self._unit_payload(unit_id)
         payload["kind"] = "unit"
-        self._upsert(self.units_collection, int(unit_id), vector, payload)
+        return self._upsert(self.units_collection, int(unit_id), vector, payload)
 
-    def save_fact_vector(self, fact_id: int, vector: list[float], task_id: str = "") -> None:
-        self._upsert(
+    def save_fact_vector(self, fact_id: int, vector: list[float], task_id: str = "") -> bool:
+        return self._upsert(
             self.facts_collection,
             int(fact_id),
             vector,
@@ -133,8 +133,8 @@ class QdrantVectorStore:
             return []
 
     def search_units(self, query_vector: list[float] | np.ndarray, top_k: int = 10,
-                     query_text: str = "", filters: dict | None = None) -> list[tuple[int, float]]:
-        """Qdrant 向量检索;query_text 仅作兼容参数(关键词候选由 rag 层内存补充)。"""
+                     filters: dict | None = None) -> list[tuple[int, float]]:
+        """Run task-filtered Qdrant unit vector retrieval."""
         if not self.enabled or self.client is None:
             return []
         try:
@@ -151,9 +151,9 @@ class QdrantVectorStore:
         except Exception:
             return []
 
-    def _upsert(self, collection: str, point_id: int, vector: list[float], payload: dict) -> None:
+    def _upsert(self, collection: str, point_id: int, vector: list[float], payload: dict) -> bool:
         if not self.enabled or self.client is None:
-            return
+            return False
         try:
             from qdrant_client.models import PointStruct
 
@@ -163,8 +163,9 @@ class QdrantVectorStore:
                 collection_name=collection,
                 points=[PointStruct(id=point_id, vector=values, payload=payload)],
             )
+            return True
         except Exception:
-            pass  # 单点写入失败跳过,不中断任务;检索层自动回退关键词
+            return False  # Retrieval falls back to lexical search; caller records degradation.
 
     def _unit_payload(self, unit_id: int) -> dict:
         from app.db import session_scope

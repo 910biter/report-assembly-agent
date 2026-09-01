@@ -30,6 +30,7 @@ _LOCK = threading.Lock()
 _WORKER_STARTED = False
 _RUNNING_TASK_ID: str | None = None
 _QUEUED_TASK_IDS: set[str] = set()
+_CANCELLED_TASK_IDS: set[str] = set()
 _STATS = {
     "submitted": 0,
     "started": 0,
@@ -99,6 +100,7 @@ def enqueue_task(task_id: str, priority: int = TASK_PRIORITY_NORMAL) -> dict:
             return {"status": "already_running"}
         if task_id in _QUEUED_TASK_IDS:
             return {"status": "already_queued", "queue_position": _queue_position(task_id)}
+        _CANCELLED_TASK_IDS.discard(task_id)
         _QUEUED_TASK_IDS.add(task_id)
         _STATS["submitted"] += 1
         position = _QUEUE.qsize() + 1
@@ -127,8 +129,15 @@ def request_control(task_id: str, action: str) -> dict:
                 task_id, stage="paused", control_request="",
                 queue_status={"status": "paused", "finished_at": round(time.time(), 1)},
             ) | {"status": "paused"}
-        if not worker_owns_task:
-            return {"status": "not_running"}
+        if queued and not worker_owns_task:
+            with _LOCK:
+                _QUEUED_TASK_IDS.discard(task_id)
+                _CANCELLED_TASK_IDS.add(task_id)
+            short_term.update_task(
+                task_id, stage="paused", control_request="",
+                queue_status={"status": "paused", "finished_at": round(time.time(), 1)},
+            )
+            return {"status": "paused"}
         short_term.update_task(task_id, control_request="pause", control_requested_at=round(time.time(), 1))
         from app import task_control
         task_control.request_pause(task_id)
@@ -162,7 +171,7 @@ def task_queue_status() -> dict:
         )
         return {
             "running_task_id": _RUNNING_TASK_ID,
-            "pending": _QUEUE.qsize(),
+            "pending": len(_QUEUED_TASK_IDS),
             "queued_task_ids": sorted(_QUEUED_TASK_IDS),
             "stats": stats,
         }
@@ -186,6 +195,11 @@ def _worker_loop() -> None:
 
     while True:
         item = _QUEUE.get()
+        with _LOCK:
+            if item.task_id in _CANCELLED_TASK_IDS:
+                _CANCELLED_TASK_IDS.discard(item.task_id)
+                _QUEUE.task_done()
+                continue
         wait = time.time() - item.queued_at
         with _LOCK:
             _QUEUED_TASK_IDS.discard(item.task_id)
@@ -229,9 +243,10 @@ def _worker_loop() -> None:
                 "finished_at": round(time.time(), 1),
             })
         except Exception as exc:
-            with _LOCK:
-                _STATS["failed"] += 1
             paused = str(exc) == "TASK_PAUSED"
+            if not paused:
+                with _LOCK:
+                    _STATS["failed"] += 1
             task = short_term.load_task(item.task_id) or {}
             from app.task_runs import update_task_run
             update_task_run(
@@ -240,13 +255,22 @@ def _worker_loop() -> None:
                 metadata={"error": "" if paused else str(exc)[:500]},
                 finished=not paused,
             )
-            if not paused and str(task.get("run_mode") or "") == "interaction_revision":
+            interaction_revision = not paused and str(task.get("run_mode") or "") == "interaction_revision"
+            if interaction_revision:
                 try:
                     from app.interaction import fail_recompute_for_run
                     fail_recompute_for_run(str(task.get("run_id") or ""), str(exc))
                 except Exception:
                     pass
-            short_term.update_task(item.task_id, stage="paused" if paused else "failed", error="" if paused else str(exc), queue_status={
+            # A candidate revision is isolated from the last reviewable report.
+            # Its failure must not turn that existing report into a failed task.
+            next_stage = "paused" if paused else ("review" if interaction_revision else "failed")
+            short_term.update_task(
+                item.task_id,
+                stage=next_stage,
+                error="" if (paused or interaction_revision) else str(exc),
+                revision_error=str(exc) if interaction_revision else "",
+                queue_status={
                 "status": "paused" if paused else "failed",
                 "queue_wait_seconds": round(wait, 1),
                 "finished_at": round(time.time(), 1),
@@ -285,7 +309,7 @@ def _heartbeat_loop(task_id: str, stop: threading.Event) -> None:
 
 
 def _queue_position(task_id: str) -> int | None:
-    queued = list(_QUEUE.queue)
+    queued = [item for item in list(_QUEUE.queue) if item.task_id not in _CANCELLED_TASK_IDS]
     for index, item in enumerate(sorted(queued), start=1):
         if item.task_id == task_id:
             return index

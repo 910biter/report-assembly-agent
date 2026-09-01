@@ -126,7 +126,7 @@ def bind_sources(quote: str, units_by_material: dict[int, list[Unit]], filenames
                     if _normalize(quote) not in _normalize(unit.content):
                         return []  # unit_id 不能替代 quote 校验,短摘必须真实存在
                     return [Evidence(
-                        fact_id=0, material_id=material_id, unit_id=unit.id or 0,
+                        fact_id=None, material_id=material_id, unit_id=unit.id or 0,
                         source_file=filenames.get(material_id, ""), page=unit.page,
                         paragraph=unit.paragraph, quote=quote,
                     )]
@@ -145,7 +145,7 @@ def bind_sources(quote: str, units_by_material: dict[int, list[Unit]], filenames
         if hit:
             material_id, unit = hit
             evidence_list.append(Evidence(
-                fact_id=0, material_id=material_id, unit_id=unit.id or 0,
+                fact_id=None, material_id=material_id, unit_id=unit.id or 0,
                 source_file=filenames.get(material_id, ""), page=unit.page,
                 paragraph=unit.paragraph, quote=quote,
             ))
@@ -156,7 +156,7 @@ def bind_sources(quote: str, units_by_material: dict[int, list[Unit]], filenames
         if hit:
             material_id, unit = hit
             evidence_list.append(Evidence(
-                fact_id=0, material_id=material_id, unit_id=unit.id or 0,
+                fact_id=None, material_id=material_id, unit_id=unit.id or 0,
                 source_file=filenames.get(material_id, ""), page=unit.page,
                 paragraph=unit.paragraph, quote=fragment,
             ))
@@ -407,6 +407,7 @@ def _split_batch_meta(batch_meta: dict, part: str, **split_fields) -> dict:
     if len(material_ids) == 1:
         meta["batch_material_units"] = {material_ids[0]: unit_count}
     else:
+        # A split can cut between materials; do not retain the parent's counts.
         meta["batch_material_units"] = {}
     return meta
 
@@ -537,8 +538,6 @@ class EvidenceAgent(BaseAgent):
             return []
         batches = self._fit_material_batches(batches, needs)
         concurrency = max(1, int(settings.evidence_batch_concurrency or 1))
-        if str(settings.generation_backend).lower() != "vllm":
-            concurrency = 1
 
         def run_one(batch_index: int, material_text: str, batch_meta: dict) -> list[Fact]:
             worker = EvidenceAgent()
@@ -566,6 +565,8 @@ class EvidenceAgent(BaseAgent):
         from app.runtime_profiles import stage_input_budget_tokens
 
         need_tokens = count_tokens(self._build_need_block(needs))
+        # Instructions and section labels are small but variable. This allowance
+        # is a packing boundary, not a content quota.
         material_budget = max(
             2048,
             stage_input_budget_tokens("evidence") - need_tokens - 768,
@@ -600,8 +601,8 @@ class EvidenceAgent(BaseAgent):
         insight_block = self._build_insight_block([])
         instruction = (
             "请提取与上述任一 Evidence Need 相关的陈述;每条必须标注属于哪个 need_id。"
-            f"若发现与用户目标明显相关但不属于任何 need 的高价值事实,也提取并标注 need_id=0。"
-            f"如果材料覆盖多个平台/标准/攻击/机制,请分别抽取,不要合并成过度概括的一条。输出 JSON。"
+            "若发现与用户目标明显相关但不属于任何 need 的高价值事实,也提取并标注 need_id=0。"
+            "如果材料覆盖多个平台/标准/攻击/机制,请分别抽取,不要合并成过度概括的一条。输出 JSON。"
         )
         from app.runtime_profiles import stage_input_budget_tokens
         prompt, _audit = build_prompt_from_sections("evidence", [
@@ -1116,7 +1117,7 @@ def save_fact_with_evidence(fact: Fact, evidence_list: list[Evidence], task_id: 
 def save_claim(claim: Claim, status: str, origin_call_id: str = "", task_id: str = "") -> int:
     fact_id = int(claim.fact_id) if claim.fact_id is not None else None
     if fact_id is not None and fact_id <= 0:
-        fact_id = None
+        raise ValueError("Claim fact_id must reference a persisted fact")
     if status == "promoted" and fact_id is None:
         raise ValueError("A promoted claim must reference a persisted fact")
     with session_scope() as s:
@@ -1190,7 +1191,6 @@ def load_conflict_records(conflict_ids: list[int]) -> list[dict]:
     claims_by_id = {int(row["id"]): dict(row) for row in claim_rows}
     records: list[dict] = []
     for row in rows:
-        item = dict(row)
         claim_ids = parsed_ids.get(int(row["id"]), [])
         entries = _conflict_entries(claim_ids, claims_by_id) if claim_ids else []
         if not entries:

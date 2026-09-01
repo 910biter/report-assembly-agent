@@ -8,7 +8,6 @@ from __future__ import annotations
 from collections import Counter
 import math
 import re
-from statistics import median
 
 
 _SENTENCE_SPLIT = re.compile(r"(?<=[。！？!?；;])")
@@ -16,6 +15,12 @@ _TOKEN_RE = re.compile(r"[A-Za-z0-9_]{2,}|[\u4e00-\u9fff]{2,}")
 _PLACEHOLDER_RE = re.compile(
     r"(?:[×Xx]{2,}|_{3,}|\{\{.+?\}\}|<[^>]{1,40}>|【(?:填写|说明|占位)[^】]*】)"
 )
+_CONCRETE_RE = re.compile(
+    r"(?:\d+(?:\.\d+)?(?:%|亿元|万元|人|项|个|年|月|日|小时|分钟|公里|米)?|"
+    r"《[^》]{2,60}》|(?:委员会|办公室|公司|部门|机构|平台|系统))"
+)
+_ATTRIBUTION_RE = re.compile(r"(?:根据|依据|材料显示|数据显示|报告指出|文件明确|统计表明)")
+_JUDGMENT_RE = re.compile(r"(?:表明|说明|意味着|反映出|由此可见|预计|可能|风险|建议|需要|应当)")
 
 
 def build_report_exemplars(members: list[dict], per_report_limit: int = 512) -> list[dict]:
@@ -85,11 +90,14 @@ def annotate_exemplars(exemplars: list[dict], annotations: list[dict]) -> list[d
         purpose = str(annotation.get("purpose") or "").strip()
         sample_type = str(annotation.get("sample_type") or "").strip().lower()
         tags = annotation.get("tags") if isinstance(annotation.get("tags"), list) else []
+        realization_mode = str(annotation.get("realization_mode") or "").strip()
         if purpose:
             exemplar["purpose"] = purpose[:160]
         if sample_type in {"opening", "fact", "analysis", "risk", "conclusion", "transition"}:
             exemplar["sample_type"] = sample_type
         exemplar["tags"] = [str(tag)[:40] for tag in tags[:8] if str(tag).strip()]
+        if realization_mode:
+            exemplar["realization_mode"] = realization_mode[:80]
     return exemplars
 
 
@@ -109,6 +117,13 @@ def aggregate_style_metrics(exemplars: list[dict]) -> dict:
         sentence_lengths.extend(len(sentence) for sentence in sentences)
         punctuation.update(char for char in text if char in "，。；：！？、（）")
     total_chars = max(1, sum(paragraph_lengths))
+    concrete_count = sum(bool(_CONCRETE_RE.search(str(item["content"]))) for item in usable)
+    attribution_count = sum(bool(_ATTRIBUTION_RE.search(str(item["content"]))) for item in usable)
+    judgment_count = sum(bool(_JUDGMENT_RE.search(str(item["content"]))) for item in usable)
+    fact_judgment_count = sum(
+        bool(_CONCRETE_RE.search(str(item["content"]))) and bool(_JUDGMENT_RE.search(str(item["content"])))
+        for item in usable
+    )
     return {
         "sample_count": len(usable),
         "paragraph_chars": _distribution(paragraph_lengths),
@@ -119,6 +134,12 @@ def aggregate_style_metrics(exemplars: list[dict]) -> dict:
         },
         "structural_roles": dict(Counter(str(item.get("structural_role") or "body") for item in usable)),
         "source_report_count": len({str(item.get("source_report") or "") for item in usable}),
+        "material_realization": {
+            "concrete_detail_ratio": round(concrete_count / len(usable), 3),
+            "explicit_attribution_ratio": round(attribution_count / len(usable), 3),
+            "judgment_paragraph_ratio": round(judgment_count / len(usable), 3),
+            "fact_judgment_combination_ratio": round(fact_judgment_count / len(usable), 3),
+        },
     }
 
 
@@ -165,8 +186,9 @@ def select_exemplars(bank: list[dict], context: dict, limit: int = 3) -> list[di
     best_score = scored[0][0] if scored else 0.0
     selected: list[dict] = []
     seen_sections: set[tuple[str, str]] = set()
+    minimum_score = 1.0 if (query_terms or desired_role) else float("inf")
     for _score, _index, item in scored:
-        if selected and best_score >= 2.0 and _score < 1.0:
+        if _score < minimum_score:
             break
         section_key = (str(item.get("source_report") or ""), str(item.get("section") or ""))
         if section_key in seen_sections and len(selected) + 1 < limit:
@@ -175,12 +197,6 @@ def select_exemplars(bank: list[dict], context: dict, limit: int = 3) -> list[di
         seen_sections.add(section_key)
         if len(selected) >= max(1, limit):
             break
-    if len(selected) < min(limit, len(scored)) and (not selected or best_score < 2.0):
-        for _score, _index, item in scored:
-            if item not in selected:
-                selected.append(item)
-            if len(selected) >= limit:
-                break
     return selected
 
 

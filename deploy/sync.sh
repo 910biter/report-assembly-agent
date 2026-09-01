@@ -1,10 +1,9 @@
 #!/bin/bash
-# 模块迁移:代码 / site-packages / ollama 模型 / HF 缓存 的搬运脚本
+# 模块迁移:代码 / site-packages / Hugging Face 模型缓存 / Qdrant 的搬运脚本
 # 用法:先 export SSHPASS='<ssh密码>'
 #   sync.sh code    本地 → 目标机(代码,排除 venv/runtime)
 #   sync.sh sp      源机 → 目标机(site-packages,离线部署用)
-#   sync.sh models  源机 → 目标机(ollama 模型 19G,拷到大盘再 sudo 放置)
-#   sync.sh hf      源机 → 目标机(docling 模型缓存 506M)
+#   sync.sh hf      源机 → 目标机(Docling、Embedding 与 vLLM 模型缓存)
 #   sync.sh qdrant  源机 → 目标机(qdrant 二进制+配置)
 set -euo pipefail
 
@@ -15,7 +14,7 @@ LOCAL="${LOCAL:-/home/biter/agent/report-assembly-agent}"
 
 SSHOPTS="-o StrictHostKeyChecking=no"
 
-cmd="${1:?用法: sync.sh <code|sp|models|hf|qdrant>}"
+cmd="${1:?用法: sync.sh <code|sp|hf|qdrant>}"
 
 case "$cmd" in
   code)
@@ -30,12 +29,6 @@ case "$cmd" in
       /home/nas511/zhangruqi/agent/.venv/lib/python3.12/site-packages/ \
       $DST:$DST_APP/.venv/lib/python3.12/site-packages/"
     echo "site-packages 已同步(新增依赖:见 DEPLOY.md 三.B wheel 步骤)"
-    ;;
-  models)
-    # ollama 模型 → 目标机大盘;sudo 放置见 DEPLOY.md 四
-    sshpass -e ssh $SSHOPTS "$SRC" "sshpass -e scp $SSHOPTS -r /home/cs928/.ollama/models \
-      $DST:/home/nas511/zhangruqi/ollama_models/"
-    echo "ollama 模型已拷贝(需 sudo 放置: DEPLOY.md 四)"
     ;;
   hf)
     sshpass -e ssh $SSHOPTS "$SRC" "sshpass -e scp $SSHOPTS -r /home/zhangruqi/.cache/huggingface \

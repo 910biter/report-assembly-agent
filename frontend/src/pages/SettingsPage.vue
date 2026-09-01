@@ -19,7 +19,7 @@ const maxStageLatency = computed(() => Math.max(...stages.value.map((item: any) 
 
 const stageNames: Record<string, string> = {
   material_analysis: "材料理解", planning: "分析规划", evidence: "证据提取", conflict: "冲突核验",
-  analysis: "综合分析", final_planning: "报告规划", writing: "报告成文", knowledge: "知识沉淀", qa: "质量检查",
+  analysis: "综合分析", final_planning: "报告规划", writing: "报告成文", graph_build: "知识图谱", qa: "质量检查",
 };
 function stageName(stage: string) { return stageNames[stage] || stage || "其他"; }
 function compact(value: number) {

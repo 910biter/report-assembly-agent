@@ -3,11 +3,14 @@ fastapi
 uvicorn
 httpx
 pydantic-settings
+pydantic-ai-slim[openai]==1.107.5
 sqlalchemy>=2.0
 python-multipart
 
-# 模型/Ollama 网关
-qdrant-client
+# 向量检索
+qdrant-client>=1.12,<1.14
+protobuf>=6.30.2,<7
+grpcio-tools==1.76.0
 
 # 解析(Docling 统一)
 docling

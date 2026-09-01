@@ -2,7 +2,7 @@
 from app.models import Stage
 
 _STAGE_ORDER = [
-    Stage.PARSING, Stage.DEDUP, Stage.MATERIAL_ANALYSIS, Stage.PLANNING,
+    Stage.PARSING, Stage.MATERIAL_ANALYSIS, Stage.PLANNING,
     Stage.EVIDENCE, Stage.CONFLICT, Stage.ANALYSIS, Stage.WRITING,
     Stage.REVIEW, Stage.DONE,
 ]

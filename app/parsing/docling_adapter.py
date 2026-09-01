@@ -1,7 +1,6 @@
 """Docling parsing backend.
 
 Docling is the single production parser and owns OCR/ASR/Vision extraction.
-Legacy parsers and project-specific OCR providers are not part of the path.
 """
 from __future__ import annotations
 
@@ -28,12 +27,11 @@ def can_parse_with_docling(path: str | Path) -> bool:
 
 
 def parse_with_docling(path: str | Path) -> tuple[list[Unit], dict]:
-    """分层自适应解析:最快可靠路径优先,按需逐级升级。
+    """Run the format-appropriate Docling pipeline.
 
-    路由:FAST_NATIVE → STRUCTURED → SELECTIVE_OCR → FULL_OCR(→ VISION 预留)
-    - 原生格式(docx/pptx/html/md/txt 等):直接结构化,不 OCR
-    - PDF:先零模型文本层提取,质量好直接用;否则版面解析(模型);
-      仍差的页面才页面级 OCR;全部页面差才整份 OCR。
+    Native office/text formats use Docling structured conversion. PDFs first
+    use Docling layout/table extraction and escalate to Docling full OCR only
+    when page-level quality is insufficient.
     """
     source = Path(path)
     ext = source.suffix.lower()
@@ -84,68 +82,36 @@ def _xml_text_units(source: Path) -> tuple[list[Unit], dict]:
 
 
 def _parse_pdf_layered(source: Path) -> tuple[list[Unit], dict]:
-    """PDF 分层路由(最快可靠路径优先,判断偏保守:拿不准就升级)。"""
+    """Select between Docling structured and full-OCR PDF pipelines."""
     total_pages = _pdf_page_count(source)
-    # 结构存疑页:页面含图像对象(图表/扫描图)→ 文本层结构不足,升级到 STRUCTURED
-    graphic_pages = _graphic_heavy_pages(source)
-    # 1. FAST_NATIVE:文本层提取(零模型);仅当全部页文本质量 ok 且无结构存疑页
-    native_units = _native_text_units(source)
-    native_status = _assess_units_by_page(native_units, total_pages)
-    if (native_units and total_pages > 0
-            and len(native_status) >= total_pages
-            and all(status == "ok" for status in native_status.values())
-            and not graphic_pages):
-        return native_units, _layered_profile(source, "FAST_NATIVE", native_status)
-
-    # 2. STRUCTURED:Docling 版面解析(模型,无 OCR)
     try:
         units, profile = _convert(source, ".pdf", do_ocr=False)
-    except Exception:
-        # STRUCTURED 失败 → 显式降级 FULL_OCR,不静默返回空
+    except Exception as structured_error:
         units, profile = _convert(source, ".pdf", do_ocr=True)
-        profile.update(_layered_meta("FULL_OCR", _assess_units_by_page(native_units, total_pages),
-                                     ocr_pages="all", fallback_reason="structured_failed"))
+        profile.update(_layered_meta(
+            "FULL_OCR", _assess_units_by_page(units, total_pages), ocr_pages="all",
+            escalation_reason=f"structured_failed:{type(structured_error).__name__}",
+        ))
         return units, profile
     status = _assess_units_by_page(units, total_pages)
     poor_pages = [page for page, s in status.items() if s != "ok"]
     if not poor_pages:
         profile.update(_layered_meta("STRUCTURED", status))
         return units, profile
-
-    if total_pages >= 2 and len(poor_pages) >= total_pages:
-        # 3. FULL_OCR:几乎全部页面质量差 → 整份 OCR
-        try:
-            units, profile = _convert(source, ".pdf", do_ocr=True)
-        except Exception:
-            # FULL_OCR 失败 → 保留文本层结果并标注(内容优先,宁有文本不空)
-            if native_units:
-                return native_units, _layered_profile(source, "FAST_NATIVE_FALLBACK", native_status)
-            raise
-        profile.update(_layered_meta("FULL_OCR", status, ocr_pages="all",
-                                     fallback_reason=f"pages_poor:{len(poor_pages)}/{total_pages}"))
-        return units, profile
-
-    # 4. SELECTIVE_OCR:只对问题页做页面级 OCR(不整份)
-    ocr_units = _ocr_pages_units(source, poor_pages)
-    merged = units + ocr_units
-    profile.update(_layered_meta("SELECTIVE_OCR", status, ocr_pages=poor_pages,
-                                 fallback_reason=f"pages_poor:{len(poor_pages)}/{total_pages}"))
-    return merged, profile
-
-
-def _graphic_heavy_pages(source: Path) -> set[int]:
-    """页面含图像对象(图表/扫描图)→ 结构存疑页集合(保守信号,无阈值)。"""
     try:
-        import fitz
-        doc = fitz.open(str(source))
-        pages: set[int] = set()
-        for index in range(len(doc)):
-            if doc[index].get_images():
-                pages.add(index + 1)
-        doc.close()
-        return pages
-    except Exception:
-        return set()
+        ocr_units, ocr_profile = _convert(source, ".pdf", do_ocr=True)
+    except Exception as ocr_error:
+        profile.update(_layered_meta(
+            "STRUCTURED_PARTIAL", status, ocr_pages="all",
+            escalation_reason=f"full_ocr_failed:{type(ocr_error).__name__}",
+        ))
+        profile["partial_success"] = bool(units)
+        return units, profile
+    ocr_profile.update(_layered_meta(
+        "FULL_OCR", _assess_units_by_page(ocr_units, total_pages), ocr_pages="all",
+        escalation_reason=f"pages_poor:{len(poor_pages)}/{total_pages}",
+    ))
+    return ocr_units, ocr_profile
 
 
 def _pdf_page_count(source: Path) -> int:
@@ -167,43 +133,15 @@ def _layered_profile(source: Path, method: str, page_status: dict) -> dict:
     }
 
 
-def _layered_meta(method: str, page_status: dict, ocr_pages=None, fallback_reason: str = "") -> dict:
+def _layered_meta(method: str, page_status: dict, ocr_pages=None, escalation_reason: str = "") -> dict:
     return {
         "parse_method": method,
-        "fallback_reason": fallback_reason,
+        "escalation_reason": escalation_reason,
         "ocr_pages": ocr_pages if ocr_pages is not None else [],
         "vision_pages": [],
         "page_quality": {str(k): v for k, v in sorted(page_status.items())},
-        "ocr_enabled": method in ("SELECTIVE_OCR", "FULL_OCR"),
+        "ocr_enabled": method == "FULL_OCR",
     }
-
-
-def _native_text_units(source: Path) -> list[Unit]:
-    """零模型文本层提取(pypdfium2,嵌入文本层)。"""
-    try:
-        import pypdfium2 as pdfium
-    except ImportError:
-        return []
-    units: list[Unit] = []
-    try:
-        pdf = pdfium.PdfDocument(str(source))
-        for index in range(len(pdf)):
-            page = pdf[index]
-            text = ""
-            try:
-                text = (page.get_textpage().get_text_range() or "").strip()
-            except Exception:
-                text = ""
-            if text:
-                units.append(Unit(
-                    material_id=0, kind="text", content=text,
-                    page=index + 1, paragraph=index + 1,
-                    metadata_json=json.dumps({"source_type": "text_layer"}, ensure_ascii=False),
-                ))
-        pdf.close()
-    except Exception:
-        return []
-    return units
 
 
 def _assess_units_by_page(units: list[Unit], total_pages: int = 0) -> dict[int, str]:
@@ -236,65 +174,6 @@ def _page_quality(text: str) -> str:
     if readable <= len(stripped) / 2:
         return "unreadable"
     return "ok"
-
-
-_OCR_ENGINE = None
-
-
-def _get_ocr_engine():
-    global _OCR_ENGINE
-    if _OCR_ENGINE is None:
-        from rapidocr import RapidOCR
-        from rapidocr.utils.typings import ModelType
-        model_type = (settings.docling_ocr_model or "medium").strip().lower()
-        _MODEL_TYPE = {"tiny": ModelType.TINY, "small": ModelType.SMALL, "medium": ModelType.MEDIUM}
-        mt = _MODEL_TYPE.get(model_type, ModelType.MEDIUM)
-        _OCR_ENGINE = RapidOCR(params={
-            "Det.model_type": mt,
-            "Rec.model_type": mt,
-            # RapidOCR 3.x: ONNX Runtime provider 由 EngineConfig 控制。
-            # 开启 CUDA 时优先 CUDA,不可用时 provider_config 自动回退 CPU。
-            "EngineConfig.onnxruntime.use_cuda": bool(settings.docling_ocr_cuda and (settings.docling_device or "").lower().startswith("cuda")),
-        })
-    return _OCR_ENGINE
-
-
-def _ocr_pages_units(source: Path, pages: list[int]) -> list[Unit]:
-    """页面级 OCR:仅渲染并识别指定页(不整份 OCR)。"""
-    if not pages:
-        return []
-    try:
-        import numpy as np
-        import pypdfium2 as pdfium
-    except ImportError:
-        return []
-    ocr = _get_ocr_engine()
-    units: list[Unit] = []
-    try:
-        pdf = pdfium.PdfDocument(str(source))
-        for index in range(len(pdf)):
-            page_no = index + 1
-            if page_no not in pages:
-                continue
-            page = pdf[index]
-            bitmap = page.render(scale=2.0).to_pil()
-            result = ocr(np.asarray(bitmap))
-            lines = []
-            # rapidocr 3.9:返回 RapidOCROutput(.txts);旧版:元组 (result, elapse)
-            if result is not None and hasattr(result, "txts"):
-                lines = [str(t).strip() for t in result.txts if t and str(t).strip()]
-            elif isinstance(result, (list, tuple)) and result and result[0]:
-                lines = [str(t).strip() for _box, t, _score in result[0] if t and str(t).strip()]
-            if lines:
-                units.append(Unit(
-                    material_id=0, kind="text", content="\n".join(lines),
-                    page=page_no, paragraph=0,
-                    metadata_json=json.dumps({"source_type": "ocr", "ocr_page": True}, ensure_ascii=False),
-                ))
-        pdf.close()
-    except Exception:
-        return []
-    return units
 
 
 def _convert(source: Path, ext: str, do_ocr: bool) -> tuple[list[Unit], dict]:
@@ -386,18 +265,13 @@ def _asr_pipeline_options(ext: str):
 
 def _pdf_pipeline_options(do_ocr: bool):
     from docling.datamodel.pipeline_options import (
-        EasyOcrOptions,
         OcrAutoOptions,
         PdfPipelineOptions,
-        RapidOcrOptions,
-        TesseractOcrOptions,
     )
 
     options = PdfPipelineOptions()
     options.do_ocr = bool(do_ocr)
-    # 解析阶段调度:Layout/Table 使用 GPU;OCR 由 RapidOCR ONNX 保持 CPU;
-    # torch.compile 关闭,避免 RT-DETR 在该环境出现 CUDA invalid argument。
-    # 纯文本 PDF 仍走 FAST_NATIVE 零模型路径。
+    # Layout, table recognition and OCR all belong to the Docling pipeline.
     _accelerator = getattr(options, "accelerator_options", None)
     if _accelerator is not None:
         _accelerator.device = (settings.docling_device or "cpu").strip().lower()
@@ -417,19 +291,7 @@ def _pdf_pipeline_options(do_ocr: bool):
         pass
     if not do_ocr:
         return options
-    engine = (settings.docling_ocr_engine or "auto").strip().lower()
-    # RapidOCR(onnxruntime)语言码为 'ch'/'chinese_cht';EasyOCR 为 'ch_sim';
-    # 两者混用时按后端分别给定,避免 onnxruntime 后端报不支持语言码
-    if engine == "auto":
-        options.ocr_options = OcrAutoOptions(lang=["ch", "en"])
-    elif engine == "rapidocr":
-        options.ocr_options = RapidOcrOptions(lang=["ch", "en"])
-    elif engine == "easyocr":
-        options.ocr_options = EasyOcrOptions(lang=["ch_sim", "en"])
-    elif engine == "tesseract":
-        options.ocr_options = TesseractOcrOptions(lang=["chi_sim", "eng"])
-    else:
-        raise ValueError(f"UNSUPPORTED_DOCLING_OCR_ENGINE: {engine}")
+    options.ocr_options = OcrAutoOptions(lang=["ch", "en"])
     return options
 
 
@@ -514,8 +376,8 @@ def _profile_from_docling_dict(data: dict, markdown: str, source: Path) -> dict:
         "image_count": len(pictures),
         "markdown_chars": len(markdown or ""),
         "capabilities": {
-            "docling_ocr_engine": settings.docling_ocr_engine,
-            "multimodal_backend": "docling_builtin",
+            "ocr": "docling_auto",
+            "multimodal": "docling_builtin",
         },
         "structure": {
             "headings": headings[:30],

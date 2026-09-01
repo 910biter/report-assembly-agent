@@ -209,9 +209,9 @@ class VllmGatewayTests(unittest.TestCase):
         def fake_process(self, needs, text, meta, units, filenames, task_id, index, count, round_tag=0):
             return [text]
 
-        with patch.object(settings, "generation_backend", "vllm"), patch.object(
-            settings, "evidence_batch_concurrency", 2
-        ), patch.object(EvidenceAgent, "_process_batch", fake_process):
+        with patch.object(settings, "evidence_batch_concurrency", 2), patch.object(
+            EvidenceAgent, "_process_batch", fake_process
+        ):
             result = agent._process_batches(
                 [("first", {}), ("second", {})], [], {}, {}, "task",
             )

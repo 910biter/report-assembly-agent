@@ -7,6 +7,7 @@ presentation unless explicitly marked as hard structure.
 """
 
 import json
+from copy import deepcopy
 
 from app.agents.base import BaseAgent
 from app.context_budget import ContextSection, build_prompt_from_sections
@@ -125,6 +126,11 @@ _FINAL_SYSTEM = """你是情报报告结构总规划师。现在 Evidence 与 An
 9. report_budget 是 Analysis 后冻结的全文唯一规模预算。它应综合用户目标、Facts、Inferences 与章节结构;
    下游不得再次静默缩减。证据不足时允许 underfill,但必须给出 underfill_reason,禁止为写满而重复或虚构。"""
 
+_LOCAL_RESTRUCTURE_SYSTEM = """你只负责调整最终报告中发生变化的局部章节契约，不重新规划全文。
+严格输出 JSON：{"chapters":[章节契约]}。章节标题和顺序必须与用户确认的新标题完全一致。
+只能重组输入中已有的问题、事实主题、推论主题和小节，不得创造材料事实或修改未变化章节。
+拆分时将原章节内容按语义分配到新章节；合并时去重整合；保留 primary_fact_ids、primary_inference_ids 和规模预算。"""
+
 
 def _normalize_needs(raw) -> list[dict]:
     """归一化 Evidence Needs(结构化待证实需求):容错模型输出格式。
@@ -158,13 +164,39 @@ class PlannerAgent(BaseAgent):
     name = "planner"
     role = _SYSTEM
 
-    def plan(self, context_block: str, user_requirements: str = "") -> ReportPlan:
+    def plan(self, context_block: str, user_requirements: str = "",
+             revision_instruction: str = "", required_dimensions: list[str] | None = None,
+             required_dimension_count: int = 0) -> ReportPlan:
         """Create an analysis plan before evidence extraction."""
+        dimensions = list(dict.fromkeys(
+            str(item).strip() for item in required_dimensions or [] if str(item).strip()
+        ))
+        constraint = ""
+        if dimensions:
+            constraint = (
+                f"用户已确认分析维度为 {len(dimensions)} 个："
+                + " | ".join(dimensions)
+                + "。dimensions 必须完整保持名称和顺序；evidence_needs 应覆盖这些维度，但仍允许发现高价值新事实。"
+            )
+        elif int(required_dimension_count or 0) > 0:
+            constraint = f"用户明确要求规划 {int(required_dimension_count)} 个分析维度，输出数量必须准确。"
         prompt, _audit = build_prompt_from_sections("planner", [
-            ContextSection("instruction", ["请输出分析规划 JSON。"], weight=5, required_items=1),
+            ContextSection("instruction", [
+                "请输出分析规划 JSON。",
+                f"本轮经用户批准的调整：{revision_instruction}" if revision_instruction else "",
+                constraint,
+            ], weight=5, required_items=1),
             ContextSection("task_context", context_block.splitlines(), weight=3, required_items=1),
         ], stage_input_budget_tokens("planner"))
         payload = self.generate_json(prompt)
+        generated_dimensions = [str(item).strip() for item in payload.get("dimensions") or [] if str(item).strip()]
+        if dimensions:
+            payload["dimensions"] = dimensions
+        elif required_dimension_count and len(generated_dimensions) != int(required_dimension_count):
+            raise ValueError(
+                f"ANALYSIS_DIMENSION_COUNT_MISMATCH: expected={int(required_dimension_count)}, "
+                f"actual={len(generated_dimensions)}"
+            )
         plan = ReportPlan(
             title=str(payload.get("title", "")),
             objective=str(payload.get("objective", "")),
@@ -189,7 +221,86 @@ class PlannerAgent(BaseAgent):
         plan.analysis_plan_json = _plan_snapshot(plan, "analysis")
         return save_plan(plan)
 
-    def finalize_report_plan(self, plan_id: int, context_block: str) -> ReportPlan:
+    def revise_final_plan_structure(self, plan_id: int, required_structure: list[str],
+                                    instruction: str = "") -> ReportPlan:
+        """Apply an approved structure diff without regenerating unchanged chapters."""
+        from app.config import settings
+        from app.rendering.headings import strip_heading_prefix
+
+        titles = [
+            strip_heading_prefix(str(item)) for item in required_structure
+            if strip_heading_prefix(str(item))
+        ]
+        if not titles or len(set(titles)) != len(titles):
+            raise ValueError("INVALID_REQUIRED_STRUCTURE")
+        with session_scope() as s:
+            row = s.execute(select(ORMPlan).where(ORMPlan.c.id == plan_id)).mappings().first()
+        if row is None:
+            raise ValueError(f"PLAN_NOT_FOUND: {plan_id}")
+        old_chapters = json.loads(row["chapter_plans"] or "[]")
+        old_by_title = {str(item.get("title") or ""): dict(item) for item in old_chapters}
+        affected_old = [item for item in old_chapters if str(item.get("title") or "") not in set(titles)]
+        affected_titles = [title for title in titles if title not in old_by_title]
+        changed_chapters = _fallback_local_restructure(affected_old, affected_titles)
+
+        if affected_titles:
+            prompt = (
+                f"用户修改要求：{instruction or '按用户确认目录调整局部章节'}\n"
+                f"需要输出的新章节标题：{json.dumps(affected_titles, ensure_ascii=False)}\n"
+                f"被替换的原章节契约：{json.dumps(affected_old, ensure_ascii=False)}"
+            )
+            try:
+                payload = self.generate_json(
+                    prompt,
+                    system=_LOCAL_RESTRUCTURE_SYSTEM,
+                    max_tokens=min(4096, int(settings.final_planner_output_tokens)),
+                )
+                candidate = payload.get("chapters") if isinstance(payload.get("chapters"), list) else []
+                candidate_titles = [str(item.get("title") or "") for item in candidate if isinstance(item, dict)]
+                if candidate_titles == affected_titles:
+                    changed_chapters = [dict(item) for item in candidate]
+            except Exception:
+                # The approved structure remains executable even when the compact
+                # semantic refinement fails; Narrative Plan will refine each chapter.
+                pass
+
+        changed_by_title = {str(item.get("title") or ""): item for item in changed_chapters}
+        chapters = [
+            deepcopy(old_by_title[title]) if title in old_by_title
+            else deepcopy(changed_by_title.get(title) or {"title": title})
+            for title in titles
+        ]
+        for title, chapter in zip(titles, chapters):
+            chapter["title"] = title
+        budget = json.loads(row["budget"] or "{}")
+        chapters = normalize_chapter_budgets(chapters, int(budget.get("target_words") or 0))
+        plan = ReportPlan(
+            id=plan_id,
+            title=str(row["title"] or ""),
+            objective=str(row["objective"] or ""),
+            audience=str(row["audience"] or ""),
+            report_type=str(row["report_type"] or ""),
+            core_question=str(row["core_question"] or ""),
+            core_judgment=str(row["core_judgment"] or ""),
+            narrative_logic=str(row["narrative_logic"] or ""),
+            structure=titles,
+            dimensions=json.loads(row["dimensions"] or "[]"),
+            evidence_needs=json.loads(row["evidence_needs"] or "[]"),
+            required_facts=json.loads(row["required_facts"] or "[]"),
+            budget=budget,
+            chapter_plans=chapters,
+            user_requirements=str(row["user_requirements"] or ""),
+            plan_stage="final",
+        )
+        normalized = normalize_contract({"chapter_plans": chapters})
+        plan.chapter_plans = normalized["chapter_plans"]
+        plan.structure = [str(item.get("title") or "") for item in plan.chapter_plans]
+        plan.final_plan_json = _plan_snapshot(plan, "final")
+        return update_plan(plan)
+
+    def finalize_report_plan(self, plan_id: int, context_block: str,
+                             required_structure: list[str] | None = None,
+                             required_chapter_count: int = 0) -> ReportPlan:
         """Freeze the final report structure after Evidence + Analysis."""
         with session_scope() as s:
             existing = s.execute(
@@ -204,11 +315,28 @@ class PlannerAgent(BaseAgent):
             500,
             int(settings.writer_output_tokens * settings.writer_visible_word_token_ratio),
         )
+        structure = []
+        if required_structure:
+            from app.rendering.headings import strip_heading_prefix
+            structure = [strip_heading_prefix(str(item)) for item in required_structure if strip_heading_prefix(str(item))]
+        structure_instruction = ""
+        if structure:
+            structure_instruction = (
+                f"\n用户已明确确认最终目录为 {len(structure)} 章，章节标题和顺序如下：\n"
+                + "\n".join(f"{index + 1}. {title}" for index, title in enumerate(structure))
+                + "\n请在该目录约束内完成每章问题、证据、推论、小节与篇幅规划，不要合并、删减或改名。"
+            )
+        elif int(required_chapter_count or 0) > 0:
+            structure_instruction = (
+                f"\n用户明确要求最终报告为 {int(required_chapter_count)} 章。"
+                "请自主规划恰好对应数量的章节，不得擅自减少或增加。"
+            )
         instruction = (
             f"执行资源边界:单个小节一次成文的安全容量约 {safe_unit_words} 字。"
             "章节与小节数量仍由内容逻辑决定，但任何小节的 target_words 不得超过该容量；"
             "较长内容应在规划阶段拆成多个各自有明确研究问题的语义小节，不得依赖 Writer 续写或事后补写。\n"
             "请输出字段完整、闭合的最终报告结构 JSON。"
+            + structure_instruction
         )
         prompt, _audit = build_prompt_from_sections("final_planning", [
             ContextSection("instruction", [instruction], weight=5, required_items=1),
@@ -220,6 +348,11 @@ class PlannerAgent(BaseAgent):
             max_tokens=settings.final_planner_output_tokens,
         )
         chapters = payload.get("chapters") if isinstance(payload.get("chapters"), list) else []
+        if required_chapter_count and len(chapters) != int(required_chapter_count):
+            raise ValueError(
+                f"FINAL_PLAN_CHAPTER_COUNT_MISMATCH: expected={int(required_chapter_count)}, "
+                f"actual={len(chapters)}"
+            )
         if not chapters:
             chapters = [{"title": "综合分析", "questions": [], "judgment": payload.get("core_judgment", "")}]
         final_budget = reconcile_scale_budget(
@@ -252,6 +385,68 @@ class PlannerAgent(BaseAgent):
         plan.structure = [c.get("title", "") for c in plan.chapter_plans]
         plan.final_plan_json = _plan_snapshot(plan, "final")
         return update_plan(plan)
+
+
+def _fallback_local_restructure(old_chapters: list[dict], new_titles: list[str]) -> list[dict]:
+    """Reshape existing contracts by order; values stay domain-neutral and evidence-bound."""
+    if not new_titles:
+        return []
+    sources = [deepcopy(item) for item in old_chapters if isinstance(item, dict)]
+    if not sources:
+        return [{
+            "title": title,
+            "core_question": f"本章围绕“{title}”需要回答什么问题",
+            "questions": [f"围绕“{title}”组织已有事实与分析判断"],
+            "judgment": "按用户确认的章节边界组织已有证据",
+            "subsections": [],
+            "target_words": 0,
+        } for title in new_titles]
+    if len(new_titles) == 1 and len(sources) > 1:
+        merged = deepcopy(sources[0])
+        for key in (
+            "questions", "required_facts", "required_inferences", "primary_fact_ids",
+            "primary_inference_ids", "subsections", "exclude", "evidence_requirements",
+            "completion_criteria",
+        ):
+            values = []
+            for source in sources:
+                values.extend(source.get(key) or [])
+            merged[key] = list(dict.fromkeys(
+                json.dumps(item, ensure_ascii=False, sort_keys=True) for item in values
+            ))
+            merged[key] = [json.loads(item) for item in merged[key]]
+        merged["target_words"] = sum(int(item.get("target_words") or 0) for item in sources)
+        merged["title"] = new_titles[0]
+        return [merged]
+
+    result = []
+    for index, title in enumerate(new_titles):
+        source = deepcopy(sources[min(index, len(sources) - 1)])
+        source["title"] = title
+        if len(sources) == 1 and len(new_titles) > 1:
+            subsections = list(sources[0].get("subsections") or [])
+            assigned = [item for position, item in enumerate(subsections) if position % len(new_titles) == index]
+            source["subsections"] = assigned
+            if assigned:
+                source["primary_fact_ids"] = _ordered_ids(assigned, "primary_fact_ids")
+                source["primary_inference_ids"] = _ordered_ids(assigned, "primary_inference_ids")
+                purposes = [str(item.get("purpose") or "") for item in assigned if str(item.get("purpose") or "")]
+                if purposes:
+                    source["questions"] = purposes
+                    source["core_question"] = purposes[0]
+            original_target = int(sources[0].get("target_words") or 0)
+            source["target_words"] = original_target // len(new_titles) if original_target else 0
+        result.append(source)
+    return result
+
+
+def _ordered_ids(items: list[dict], key: str) -> list[int]:
+    values = []
+    for item in items:
+        for value in item.get(key) or []:
+            if str(value).isdigit() and int(value) not in values:
+                values.append(int(value))
+    return values
 
 
 def _plan_snapshot(plan: ReportPlan, stage: str) -> dict:

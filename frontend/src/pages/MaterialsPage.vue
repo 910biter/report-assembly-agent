@@ -52,6 +52,20 @@ function resetFilters() { search.value = ""; type.value = ""; status.value = "";
 function selectMaterial(id: number) { selected.value = id; detailTab.value = "overview"; }
 function formatDate(value?: string) { if (!value) return "尚未解析"; const date = new Date(value); return Number.isNaN(date.getTime()) ? value : date.toLocaleString("zh-CN", { year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" }); }
 function statusLabel(item: MaterialSummary) { return item.is_duplicate ? "重复" : item.parse_status === "ready" ? "已解析" : item.parse_status === "error" ? "异常" : "待解析"; }
+function unitKindLabel(value: string) { return ({ text: "正文", paragraph: "段落", table: "表格", image: "图片", picture: "图片", heading: "标题" } as any)[String(value || "").toLowerCase()] || "内容"; }
+const metadataRows = computed(() => {
+  const metadata = detail.data.value?.units?.[0]?.metadata || {};
+  const labels: Record<string, string> = {
+    source_type: "内容来源", language: "识别语言", page_count: "页数",
+    has_ocr: "文字识别", has_tables: "表格识别", has_images: "图片识别",
+    title: "文档标题", author: "作者", created_at: "创建时间",
+  };
+  return Object.entries(metadata).flatMap(([key, value]) => {
+    if (!labels[key] || value == null || typeof value === "object") return [];
+    const display = typeof value === "boolean" ? (value ? "已启用" : "未发现") : String(value);
+    return [{ key, label: labels[key], value: display }];
+  });
+});
 </script>
 
 <template>
@@ -82,8 +96,8 @@ function statusLabel(item: MaterialSummary) { return item.is_duplicate ? "重复
           <div class="detail-head"><div><small>材料详情</small><h2>{{ detail.data.value.filename }}</h2></div><button class="icon-button" aria-label="关闭详情" @click="selected = null"><AppIcon name="close" :size="17" /></button></div>
           <div class="tabs"><button v-for="tab in [['overview','概览'],['content','解析内容'],['meta','元数据']]" :key="tab[0]" class="tab" :class="{ active: detailTab === tab[0] }" @click="detailTab = tab[0]">{{ tab[1] }}</button></div>
           <div v-if="detailTab === 'overview'" class="detail-body"><dl><dt>文件类型</dt><dd>{{ (detail.data.value.file_type || '—').toUpperCase() }}</dd><dt>解析状态</dt><dd>{{ statusLabel(detail.data.value) }}</dd><dt>解析时间</dt><dd>{{ formatDate(detail.data.value.parsed_at) }}</dd><dt>内容单元</dt><dd>{{ detail.data.value.units?.length || 0 }}</dd><dt>关联任务</dt><dd>{{ detail.data.value.tasks?.length || 0 }}</dd></dl><h3>使用记录</h3><RouterLink v-for="task in detail.data.value.tasks || []" :key="task.task_id || task" :to="`/tasks/${task.task_id || task}`" class="task-use"><span>{{ task.theme || task.task_id || task }}</span><b>打开任务</b></RouterLink><div v-if="!detail.data.value.tasks?.length" class="quiet-empty">尚未被任何任务使用</div></div>
-          <div v-else-if="detailTab === 'content'" class="unit-list"><details v-for="unit in detail.data.value.units || []" :key="unit.id"><summary><span>{{ unit.kind }}</span><b>{{ unit.page ? `第 ${unit.page} 页` : `单元 ${unit.id}` }}</b></summary><p>{{ unit.content || unit.image_desc || '无文本内容' }}</p></details></div>
-          <pre v-else class="metadata">{{ JSON.stringify(detail.data.value.units?.[0]?.metadata || {}, null, 2) }}</pre>
+          <div v-else-if="detailTab === 'content'" class="unit-list"><details v-for="unit in detail.data.value.units || []" :key="unit.id"><summary><span>{{ unitKindLabel(unit.kind) }}</span><b>{{ unit.page ? `第 ${unit.page} 页` : '文档内容' }}</b></summary><p>{{ unit.content || unit.image_desc || '无文本内容' }}</p></details></div>
+          <div v-else class="detail-body metadata"><dl v-if="metadataRows.length"><template v-for="row in metadataRows" :key="row.key"><dt>{{ row.label }}</dt><dd>{{ row.value }}</dd></template></dl><div v-else class="quiet-empty">该材料没有需要额外展示的文档属性</div></div>
         </template>
         <div v-else-if="detail.isLoading.value" class="detail-loading"><div class="loading-line"></div></div><div v-else class="empty"><div><strong>选择一份材料</strong>查看解析内容、元数据和任务关系。</div></div>
       </aside>

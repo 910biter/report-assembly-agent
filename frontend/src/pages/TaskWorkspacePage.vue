@@ -38,7 +38,7 @@ const materials = useQuery({
 const analysis = useQuery({
   queryKey: ["task-analysis", taskId],
   queryFn: () => api<any>(`/api/tasks/${taskId}/analysis`),
-  enabled: computed(() => ["analysis", "overview"].includes(active.value)),
+  enabled: computed(() => active.value === "analysis"),
   staleTime: 30000,
 });
 const graph = useQuery({
@@ -132,7 +132,7 @@ const stages = computed(() =>
             "analysis",
           ],
         },
-        { name: "报告生成", keys: ["writing", "knowledge"] },
+        { name: "报告生成", keys: ["writing"] },
         { name: "审核完成", keys: ["review", "done"] },
       ],
 );
@@ -153,6 +153,9 @@ const running = computed(
       task.data.value?.stage || "created",
     ),
 );
+const pauseRequested = computed(
+  () => task.data.value?.queue_status?.status === "pause_requested",
+);
 const facts = computed(() => analysis.data.value?.facts || []);
 const inferences = computed(() =>
   (analysis.data.value?.inferences || []).filter(
@@ -160,6 +163,10 @@ const inferences = computed(() =>
   ),
 );
 const conflicts = computed(() => analysis.data.value?.conflicts || []);
+const artifactCounts = computed(() => task.data.value?.artifact_counts || {});
+const factCount = computed(() => analysis.data.value ? facts.value.length : Number(artifactCounts.value.facts || 0));
+const inferenceCount = computed(() => analysis.data.value ? inferences.value.length : Number(artifactCounts.value.inferences || 0));
+const conflictCount = computed(() => analysis.data.value ? conflicts.value.length : Number(artifactCounts.value.conflicts || 0));
 function run() {
   command.mutate({ path: `/api/tasks/${taskId}/run` });
 }
@@ -229,8 +236,13 @@ function versionsList() {
           {{
             task.data.value.stage === "failed" ? "重新运行" : "开始运行"
           }}</button
-        ><button v-if="running" class="btn" @click="control('pause')">
-          暂停</button
+        ><button
+          v-if="running"
+          class="btn"
+          :disabled="command.isPending.value || pauseRequested"
+          @click="control('pause')"
+        >
+          {{ pauseRequested ? "正在暂停…" : "暂停" }}</button
         ><button
           v-if="task.data.value.stage === 'paused'"
           class="btn primary"
@@ -376,17 +388,15 @@ function versionsList() {
               ><span>材料</span>
             </div>
             <div class="metric">
-              <strong>{{ facts.length }}</strong
+              <strong>{{ factCount }}</strong
               ><span>事实</span>
             </div>
             <div class="metric">
-              <strong>{{ inferences.length }}</strong
+              <strong>{{ inferenceCount }}</strong
               ><span>分析判断</span>
             </div>
             <div class="metric">
-              <strong>{{
-                conflicts.length + (task.data.value.qa_notes?.length || 0)
-              }}</strong
+              <strong>{{ conflictCount }}</strong
               ><span>待核验</span>
             </div>
           </div>
@@ -451,8 +461,8 @@ function versionsList() {
             <div>
               <b>分析结果</b
               ><span
-                >{{ facts.length }} 条事实 ·
-                {{ inferences.length }} 条判断</span
+                >{{ factCount }} 条事实 ·
+                {{ inferenceCount }} 条判断</span
               >
             </div>
             <strong>查看</strong>
@@ -516,7 +526,6 @@ function versionsList() {
               `关系网络 ${graphAssertionCount}`,
             ],
             ['conflicts', `冲突与待核验 ${conflicts.length}`],
-            ['qa', `质量检查 ${task.data.value.qa_notes?.length || 0}`],
           ]"
           :key="item[0]"
           :class="{ active: analysisType === item[0] }"
@@ -675,20 +684,7 @@ function versionsList() {
             <div>
               <strong>未发现需要核验的来源差异</strong>系统仅将可比口径下不能同时成立的说法标为直接矛盾。
             </div>
-          </div></template
-        ><template v-else
-          ><article
-            v-for="(item, index) in task.data.value.qa_notes || []"
-            :key="index"
-            class="knowledge-item conflict"
-          >
-            <b>{{ item.type || "质量问题" }}</b>
-            <p>{{ item.note || item.quote }}</p>
-          </article>
-          <div v-if="!task.data.value.qa_notes?.length" class="empty">
-            <div><strong>暂无质量问题</strong>深度检查结果会在这里出现。</div>
-          </div></template
-        >
+          </div></template>
       </div>
     </section>
     <ArtifactReviewWorkspace

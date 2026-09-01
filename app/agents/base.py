@@ -2,7 +2,6 @@
 
 所有 Agent 共用同一模型服务,靠 role(system prompt)区分职责。
 """
-import contextlib
 import threading
 import time
 
@@ -73,52 +72,41 @@ class BaseAgent:
 
     def _with_retry(self, fn, chars: int, context_audit: dict | None = None):
         last_error = None
-        # A logical call may have several transport attempts.  The identifier is
-        # only observational and never enters the model prompt or business data.
-        logical_call_id = new_call_id()
         for attempt in range(self.max_retries + 1):
             call_id = new_call_id()
             self.last_call_id = call_id
             count_llm_call(chars)
             reset_last_generation_call()
             started = time.time()
-            capture_scope = contextlib.nullcontext()
-            if settings.benchmark_capture_enabled:
-                from app.benchmark_capture import benchmark_call_context
-                capture_scope = benchmark_call_context(
-                    call_id=call_id, logical_call_id=logical_call_id,
-                    agent=self.name, attempt=attempt,
+            try:
+                result = fn()
+                elapsed = time.time() - started
+                count_llm_duration(self.name, elapsed, chars)
+                log_llm_call(
+                    call_id, self.name, chars,
+                    last_generation_stats(),
+                    elapsed, retry_count=attempt, success=True,
+                    context_audit=context_audit,
+                    **last_generation_meta(),
                 )
-            with capture_scope:
-                try:
-                    result = fn()
-                    elapsed = time.time() - started
-                    count_llm_duration(self.name, elapsed, chars)
-                    log_llm_call(
-                        call_id, self.name, chars,
-                        last_generation_stats(),
-                        elapsed, retry_count=attempt, success=True,
-                        context_audit=context_audit,
-                        **last_generation_meta(),
-                    )
-                    return result
-                except Exception as exc:
-                    if str(exc) == "TASK_PAUSED":
-                        raise
-                    elapsed = time.time() - started
-                    count_llm_duration(self.name, elapsed, chars)
-                    log_llm_call(
-                        call_id, self.name, chars,
-                        last_generation_stats(),
-                        elapsed, retry_count=attempt, success=False, error=str(exc),
-                        context_audit=context_audit,
-                        **last_generation_meta(),
-                    )
-                    last_error = exc
-                    if attempt >= self.max_retries or not self.should_retry(exc):
-                        break
-                    count_llm_retry()
-                    time.sleep(1.5 * (attempt + 1))
+                return result
+            except Exception as exc:
+                if str(exc) == "TASK_PAUSED":
+                    raise
+                elapsed = time.time() - started
+                count_llm_duration(self.name, elapsed, chars)
+                log_llm_call(
+                    call_id, self.name, chars,
+                    last_generation_stats(),
+                    elapsed, retry_count=attempt, success=False, error=str(exc),
+                    context_audit=context_audit,
+                    **last_generation_meta(),
+                )
+                last_error = exc
+                if attempt >= self.max_retries or not self.should_retry(exc):
+                    break
+                count_llm_retry()
+                time.sleep(1.5 * (attempt + 1))
         raise last_error
 
 

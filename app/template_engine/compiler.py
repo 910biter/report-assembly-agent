@@ -16,7 +16,7 @@ from docx.enum.section import WD_ORIENT
 from docx.shared import Length
 from docx.oxml.ns import qn
 
-COMPILER_VERSION = "template-compiler-1.0"
+COMPILER_VERSION = "template-compiler-2.0"
 
 ROLE_DOCUMENT_TITLE = "document_title"
 ROLE_HEADING_1 = "heading_1"
@@ -120,9 +120,19 @@ def _document_layout(doc) -> dict:
 
 def _document_structure(doc, role_paragraphs: dict) -> dict:
     headings = []
-    for para in doc.paragraphs:
+    for paragraph_index, para in enumerate(doc.paragraphs):
+        if para._p is getattr(role_paragraphs.get(ROLE_DOCUMENT_TITLE), "_p", None):
+            continue
         for item in _heading_items(para):
+            item["paragraph_index"] = paragraph_index
             headings.append(item)
+    body_anchor = next((item for item in headings if item.get("paragraph_index") is not None), None)
+    body_index = (
+        body_anchor.get("paragraph_index")
+        if body_anchor
+        else _paragraph_index(doc, role_paragraphs.get(ROLE_BODY))
+    )
+    title_para = role_paragraphs.get(ROLE_DOCUMENT_TITLE)
     return {
         "roles_detected": sorted(k for k, v in role_paragraphs.items() if v is not None),
         "heading_patterns": headings[:20],
@@ -131,6 +141,18 @@ def _document_structure(doc, role_paragraphs: dict) -> dict:
         "metadata_fields": _metadata_fields(doc),
         "signature_fields": _signature_fields(doc),
         "placeholders": _placeholder_registry(doc, role_paragraphs),
+        "render_contract": {
+            "mode": "replace_title_insert_body",
+            "title_anchor": {
+                "location": "paragraph",
+                "paragraph_index": _paragraph_index(doc, title_para),
+            } if title_para is not None else None,
+            "body_anchor": {
+                "location": "paragraph",
+                "paragraph_index": body_index,
+            } if body_index is not None else None,
+            "preserve_prefix": bool(title_para is not None and body_index is not None),
+        },
     }
 
 
@@ -143,20 +165,47 @@ def _detect_role_paragraphs(paragraphs: list) -> dict:
         ROLE_BODY: None,
         ROLE_SIGNATURE: None,
     }
-    if paragraphs:
-        roles[ROLE_DOCUMENT_TITLE] = paragraphs[0]
-    roles[ROLE_BODY] = _best_body_paragraph(paragraphs[1:])
-    for para in paragraphs[1:]:
+    title = _best_title_paragraph(paragraphs[:8])
+    roles[ROLE_DOCUMENT_TITLE] = title
+    body_candidates = [para for para in paragraphs if para is not title]
+    roles[ROLE_BODY] = _best_body_paragraph(body_candidates)
+    for para in body_candidates:
         role = _paragraph_role(para)
         if role in {ROLE_HEADING_1, ROLE_HEADING_2, ROLE_HEADING_3} and roles[role] is None:
             roles[role] = para
-    for para in paragraphs[1:]:
+    for para in body_candidates:
         text = para.text.strip()
         if roles[ROLE_SIGNATURE] is None and re.search(r"(单位|日期|年\s*月\s*日|盖章|署名)", text):
             roles[ROLE_SIGNATURE] = para
-    if roles[ROLE_BODY] is None and len(paragraphs) > 1:
-        roles[ROLE_BODY] = next((p for p in paragraphs[1:] if _paragraph_role(p) == ROLE_BODY), paragraphs[1])
+    if roles[ROLE_BODY] is None and body_candidates:
+        roles[ROLE_BODY] = next((p for p in body_candidates if _paragraph_role(p) == ROLE_BODY), body_candidates[0])
     return roles
+
+
+def _best_title_paragraph(paragraphs: list):
+    """Choose a title from the cover area without assuming the first text is it."""
+    scored = []
+    for index, para in enumerate(paragraphs):
+        text = para.text.strip()
+        if not text or _looks_like_non_body_meta(text) or _is_template_instruction(text):
+            continue
+        style = (para.style.name or "").lower() if para.style is not None else ""
+        align = _alignment(para.alignment, _pf_value(para.style.paragraph_format if para.style is not None else None, "alignment"))
+        run = next((item for item in para.runs if item.text.strip()), None)
+        size = getattr(getattr(run, "font", None), "size", None)
+        score = max(0, 7 - index)
+        if align == "center":
+            score += 8
+        if any(marker in style for marker in ("title", "标题", "题名")):
+            score += 8
+        if size is not None and size.pt >= 16:
+            score += 5
+        if 4 <= len(text) <= 60:
+            score += 3
+        if _paragraph_role(para) in {ROLE_HEADING_2, ROLE_HEADING_3}:
+            score -= 10
+        scored.append((score, -index, para))
+    return max(scored, key=lambda item: (item[0], item[1]))[2] if scored else (paragraphs[0] if paragraphs else None)
 
 
 def _best_body_paragraph(paragraphs: list):
@@ -203,11 +252,12 @@ def _body_candidate_score(para) -> int:
 def _paragraph_role(para) -> str:
     text = para.text.strip()
     style = (para.style.name or "").lower() if para.style is not None else ""
-    if _CJK_HEADING_1.match(text) or _NUM_HEADING_1.match(text) or style.startswith(("heading 1", "标题 1")) or "一级标题" in style:
+    semantic_level = _semantic_heading_level(para)
+    if semantic_level == 1 or _CJK_HEADING_1.match(text) or _NUM_HEADING_1.match(text) or style.startswith(("heading 1", "标题 1")) or "一级标题" in style:
         return ROLE_HEADING_1
-    if _CJK_HEADING_2.match(text) or _NUM_HEADING_2.match(text) or style.startswith(("heading 2", "标题 2")) or "二级标题" in style:
+    if semantic_level == 2 or _CJK_HEADING_2.match(text) or _NUM_HEADING_2.match(text) or style.startswith(("heading 2", "标题 2")) or "二级标题" in style:
         return ROLE_HEADING_2
-    if _NUM_HEADING_3.match(text) or style.startswith(("heading 3", "标题 3")) or "三级标题" in style:
+    if semantic_level == 3 or _NUM_HEADING_3.match(text) or style.startswith(("heading 3", "标题 3")) or "三级标题" in style:
         return ROLE_HEADING_3
     return ROLE_BODY
 
@@ -220,6 +270,8 @@ def _computed_role_style(doc, role: str, para) -> dict:
         "sample_text": _role_sample_text(role, para.text),
         "samples": _role_samples(role, para.text),
         "source_style": para.style.name if para.style is not None else "",
+        "source_index": _paragraph_index(doc, para),
+        "confidence": _role_confidence(role, para),
         "computed_from": ["style_definition", "paragraph_direct_formatting", "run_direct_formatting"],
     }
 
@@ -228,14 +280,15 @@ def _paragraph_style(doc, para) -> dict:
     pf = para.paragraph_format
     style_pf = para.style.paragraph_format if para.style is not None else None
     normal_pf = doc.styles["Normal"].paragraph_format
+    line_spacing = _line_spacing(pf.line_spacing, _pf_value(style_pf, "line_spacing"), normal_pf.line_spacing)
     return {
         "alignment": _alignment(para.alignment, _pf_value(style_pf, "alignment"), normal_pf.alignment),
         "left_indent_cm": _length_value(pf.left_indent, _pf_value(style_pf, "left_indent"), normal_pf.left_indent),
         "right_indent_cm": _length_value(pf.right_indent, _pf_value(style_pf, "right_indent"), normal_pf.right_indent),
         "first_line_indent_cm": _length_value(pf.first_line_indent, _pf_value(style_pf, "first_line_indent"), normal_pf.first_line_indent),
-        "space_before_pt": _pt_value(pf.space_before, _pf_value(style_pf, "space_before"), normal_pf.space_before),
-        "space_after_pt": _pt_value(pf.space_after, _pf_value(style_pf, "space_after"), normal_pf.space_after),
-        "line_spacing": _line_spacing(pf.line_spacing, _pf_value(style_pf, "line_spacing"), normal_pf.line_spacing),
+        "space_before_pt": _default_number(_pt_value(pf.space_before, _pf_value(style_pf, "space_before"), normal_pf.space_before), 0.0),
+        "space_after_pt": _default_number(_pt_value(pf.space_after, _pf_value(style_pf, "space_after"), normal_pf.space_after), 0.0),
+        "line_spacing": {"type": "multiple", "value": 1.0} if line_spacing == "unknown" else line_spacing,
         "keep_with_next": _bool_value(pf.keep_with_next, _pf_value(style_pf, "keep_with_next"), normal_pf.keep_with_next),
         "keep_together": _bool_value(pf.keep_together, _pf_value(style_pf, "keep_together"), normal_pf.keep_together),
         "page_break_before": _bool_value(pf.page_break_before, _pf_value(style_pf, "page_break_before"), normal_pf.page_break_before),
@@ -252,7 +305,11 @@ def _run_style(doc, para, run) -> dict:
     style_font = para.style.font if para.style is not None else None
     normal_font = doc.styles["Normal"].font
     font = run.font if run is not None else None
-    xmlfont = _rpr_font_values(para.style)
+    xmlfont = _rpr_font_values(para.style) or {}
+    defaults = _doc_default_rpr_values(doc)
+    for key, value in defaults.items():
+        if not xmlfont.get(key):
+            xmlfont[key] = value
     return {
         "font_east_asia": _font_name(font, style_font, normal_font, "eastAsia", xmlfont),
         "font_ascii": _font_name(font, style_font, normal_font, "ascii", xmlfont),
@@ -278,11 +335,15 @@ def _run_style(doc, para, run) -> dict:
 
 def _doc_defaults(doc) -> dict:
     normal = doc.styles["Normal"]
+    xmlfont = _rpr_font_values(normal) or {}
+    for key, value in _doc_default_rpr_values(doc).items():
+        if not xmlfont.get(key):
+            xmlfont[key] = value
     return {
         "run": {
-            "font_east_asia": _font_name(None, normal.font, None, "eastAsia"),
-            "font_ascii": _font_name(None, normal.font, None, "ascii"),
-            "font_size_pt": _font_size(None, normal.font, None),
+            "font_east_asia": _font_name(None, normal.font, None, "eastAsia", xmlfont),
+            "font_ascii": _font_name(None, normal.font, None, "ascii", xmlfont),
+            "font_size_pt": _font_size(None, normal.font, None, xmlfont),
         },
         "paragraph": {
             "line_spacing": _line_spacing(normal.paragraph_format.line_spacing),
@@ -309,8 +370,178 @@ def _numbering(doc) -> dict:
         elif _NUM_HEADING_1.match(text):
             pattern = "arabic_level_1"
         if pattern and pattern not in [p["format"] for p in patterns]:
-            patterns.append({"format": pattern, "sample": _text_pattern(text)})
-    return {"patterns": patterns}
+            sample = next((line for line in _logical_lines(text) if _heading_items(line)), text)
+            patterns.append({"format": pattern, "sample": _text_pattern(sample)})
+    definitions = _numbering_definitions(doc)
+    return {
+        "patterns": patterns,
+        "definitions": definitions,
+        "role_levels": _numbering_role_levels(doc, definitions),
+    }
+
+
+def _numbering_definitions(doc) -> list[dict]:
+    """Decode OOXML numbering instead of relying on rendered paragraph text."""
+    try:
+        root = doc.part.numbering_part.element
+    except Exception:
+        return []
+    abstract_by_id = {
+        node.get(qn("w:abstractNumId")): node
+        for node in root.findall(qn("w:abstractNum"))
+    }
+    definitions = []
+    for num in root.findall(qn("w:num")):
+        num_id = num.get(qn("w:numId"))
+        abstract_ref = num.find(qn("w:abstractNumId"))
+        abstract_id = abstract_ref.get(qn("w:val")) if abstract_ref is not None else None
+        abstract = abstract_by_id.get(abstract_id)
+        if abstract is None:
+            continue
+        levels = []
+        for level in abstract.findall(qn("w:lvl")):
+            levels.append(_numbering_level(level))
+        if levels:
+            definitions.append({
+                "num_id": _as_int(num_id),
+                "abstract_num_id": _as_int(abstract_id),
+                "levels": levels,
+            })
+    return definitions
+
+
+def _numbering_level(level) -> dict:
+    def value(name: str, default=""):
+        node = level.find(qn(f"w:{name}"))
+        return node.get(qn("w:val"), default) if node is not None else default
+
+    ppr = level.find(qn("w:pPr"))
+    ind = ppr.find(qn("w:ind")) if ppr is not None else None
+    return {
+        "level": _as_int(level.get(qn("w:ilvl"))),
+        "start": _as_int(value("start", "1")),
+        "number_format": value("numFmt"),
+        "level_text": value("lvlText"),
+        "suffix": value("suff", "tab"),
+        "paragraph_style": value("pStyle"),
+        "alignment": value("lvlJc"),
+        "left_twips": _as_int(ind.get(qn("w:left"))) if ind is not None else None,
+        "hanging_twips": _as_int(ind.get(qn("w:hanging"))) if ind is not None else None,
+    }
+
+
+def _numbering_role_levels(doc, definitions: list[dict]) -> dict:
+    role_levels: dict[str, dict] = {}
+    definitions_by_id = {item.get("num_id"): item for item in definitions}
+    for para in doc.paragraphs:
+        semantic = _semantic_heading_level(para)
+        numbering = _paragraph_numbering(para)
+        if semantic not in {1, 2, 3} or not numbering:
+            continue
+        definition = definitions_by_id.get(numbering.get("num_id")) or {}
+        level = next(
+            (item for item in definition.get("levels") or [] if item.get("level") == numbering.get("level")),
+            {},
+        )
+        if level:
+            role_levels[f"heading_{semantic}"] = {
+                "num_id": numbering.get("num_id"),
+                **level,
+                "style_name": para.style.name if para.style is not None else "",
+            }
+    used_style_ids = {
+        para.style.style_id
+        for para in doc.paragraphs
+        if para.text.strip() and para.style is not None and _semantic_heading_level(para) in {1, 2, 3}
+    }
+    for definition in definitions:
+        for level in definition.get("levels") or []:
+            style_id = str(level.get("paragraph_style") or "")
+            if not style_id or style_id not in used_style_ids:
+                continue
+            style = next((item for item in doc.styles if item.style_id == style_id), None)
+            style_name = style.name if style is not None else style_id
+            semantic = _style_heading_level(style_name)
+            if semantic and f"heading_{semantic}" not in role_levels:
+                role_levels[f"heading_{semantic}"] = {
+                    "num_id": definition.get("num_id"),
+                    **level,
+                    "style_name": style_name,
+                }
+    return role_levels
+
+
+def _paragraph_numbering(para) -> dict:
+    try:
+        style = para.style
+        ppr = para._p.pPr
+        num_pr = ppr.numPr if ppr is not None else None
+        visited = set()
+        while num_pr is None and style is not None and style.style_id not in visited:
+            visited.add(style.style_id)
+            ppr = style.element.pPr
+            num_pr = ppr.numPr if ppr is not None else None
+            style = style.base_style
+        if num_pr is None:
+            return {}
+        return {
+            "num_id": _as_int(num_pr.numId.val) if num_pr.numId is not None else None,
+            "level": _as_int(num_pr.ilvl.val) if num_pr.ilvl is not None else 0,
+        }
+    except Exception:
+        return {}
+
+
+def _semantic_heading_level(para) -> int:
+    style_name = para.style.name if para.style is not None else ""
+    named_level = _style_heading_level(style_name)
+    if named_level:
+        return named_level
+    outline = _outline_level(para)
+    if str(outline).isdigit() and 0 <= int(outline) <= 2:
+        return int(outline) + 1
+    numbering_level = _style_numbering_level(para)
+    return numbering_level if numbering_level in {1, 2, 3} else 0
+
+
+def _style_heading_level(style_name: str) -> int:
+    value = str(style_name or "").lower().replace("_", " ")
+    patterns = {
+        1: ("heading 1", "标题 1", "标题1", "一级标题", "标题一"),
+        2: ("heading 2", "标题 2", "标题2", "二级标题", "标题二"),
+        3: ("heading 3", "标题 3", "标题3", "三级标题", "标题三"),
+    }
+    for level, markers in patterns.items():
+        if any(marker in value for marker in markers):
+            return level
+    return 0
+
+
+def _style_numbering_level(para) -> int:
+    style_id = getattr(getattr(para, "style", None), "style_id", "")
+    if not style_id:
+        return 0
+    try:
+        root = para.part.numbering_part.element
+        for abstract in root.findall(qn("w:abstractNum")):
+            for level in abstract.findall(qn("w:lvl")):
+                pstyle = level.find(qn("w:pStyle"))
+                if pstyle is not None and pstyle.get(qn("w:val")) == style_id:
+                    return (_as_int(level.get(qn("w:ilvl"))) or 0) + 1
+    except Exception:
+        pass
+    return 0
+
+
+def _as_int(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _default_number(value, fallback: float):
+    return fallback if value in (None, "", "unknown") else value
 
 
 def _tables(doc) -> list[dict]:
@@ -399,13 +630,26 @@ def _quality(schema: dict) -> dict:
     body_para = roles.get(ROLE_BODY, {}).get("paragraph", {})
     for field in ("first_line_indent_cm", "line_spacing", "space_after_pt"):
         checks.append({"item": f"正文{field}", "status": "ok" if body_para.get(field) not in ("unknown", None, "") else "unknown"})
-    checks.append({"item": "页眉页脚", "status": "ok" if schema.get("style", {}).get("headers") or schema.get("style", {}).get("footers") else "unknown"})
-    checks.append({"item": "表格", "status": "ok" if schema.get("style", {}).get("tables") else "unknown"})
+    numbering = schema.get("style", {}).get("numbering", {})
+    checks.append({
+        "item": "标题编号",
+        "status": "ok" if numbering.get("patterns") or numbering.get("definitions") else "not_applicable",
+    })
+    contract = schema.get("structure", {}).get("render_contract", {})
+    checks.append({
+        "item": "原模板填充锚点",
+        "status": "ok" if contract.get("title_anchor") and contract.get("body_anchor") else "unknown",
+    })
     unknown = [c["item"] for c in checks if c["status"] == "unknown"]
+    applicable = [item for item in checks if item["status"] != "not_applicable"]
     return {
         "checks": checks,
         "unknown_items": unknown,
-        "completeness": round((len(checks) - len(unknown)) / max(len(checks), 1), 2),
+        "completeness": round((len(applicable) - len(unknown)) / max(len(applicable), 1), 2),
+        "render_ready": not any(
+            item["status"] == "unknown" and item["item"] in {"识别主标题", "识别正文", "识别一级标题", "原模板填充锚点"}
+            for item in checks
+        ),
         "recommendation": "可用于正式导出" if not unknown else "部分模板属性需人工复核",
     }
 
@@ -424,12 +668,8 @@ def _heading_items(para_or_text) -> list[dict]:
         style_name = ""
     role = ""
     if para is not None:
-        if style_name.startswith(("heading 1", "标题 1")) or "一级标题" in style_name:
-            role = ROLE_HEADING_1
-        elif style_name.startswith(("heading 2", "标题 2")) or "二级标题" in style_name:
-            role = ROLE_HEADING_2
-        elif style_name.startswith(("heading 3", "标题 3")) or "三级标题" in style_name:
-            role = ROLE_HEADING_3
+        level = _semantic_heading_level(para)
+        role = {1: ROLE_HEADING_1, 2: ROLE_HEADING_2, 3: ROLE_HEADING_3}.get(level, "")
     for line in _logical_lines(text):
         r = role
         if not r:
@@ -440,7 +680,12 @@ def _heading_items(para_or_text) -> list[dict]:
             elif _NUM_HEADING_3.match(line):
                 r = ROLE_HEADING_3
         if r:
-            items.append({"role": r, "level": _heading_level(r), "text_pattern": _text_pattern(line)})
+            item = {"role": r, "level": _heading_level(r), "text_pattern": _text_pattern(line)}
+            if para is not None:
+                numbering = _paragraph_numbering(para)
+                if numbering:
+                    item["numbering"] = numbering
+            items.append(item)
     return items
 
 
@@ -507,21 +752,25 @@ def _is_template_instruction(text: str) -> bool:
     stripped = text.strip()
     return bool(
         (stripped.startswith("[") and stripped.endswith("]"))
+        or re.search(r"[【\[]\s*(?:填写|说明|关键词|占位|按需)[^】\]]*[】\]]", stripped)
+        or ("填写" in stripped and "按《" in stripped)
         or ("填写" in stripped and ("[" in stripped or "。" in stripped))
-        or "示例" in stripped
+        or stripped.startswith(("示例：", "示例:", "范例：", "范例:"))
         or "说明" in stripped
     )
 
 
 def _template_instructions(doc) -> list[dict]:
     instructions = []
-    for para in doc.paragraphs:
+    for paragraph_index, para in enumerate(doc.paragraphs):
         chunks = _split_heading_instruction_chunks(para.text)
         for chunk in chunks:
             if chunk["role"] == "TEMPLATE_INSTRUCTION":
                 instructions.append({
                     "role": "TEMPLATE_INSTRUCTION",
                     "text_pattern": _text_pattern(chunk["text"]),
+                    "location": "paragraph",
+                    "paragraph_index": paragraph_index,
                     "render": False,
                 })
     return instructions[:50]
@@ -556,7 +805,10 @@ def _split_heading_instruction_chunks(text: str) -> list[dict]:
             current_heading = heading[0]["role"]
             chunks.append({"role": current_heading, "text": line})
         else:
-            chunks.append({"role": "TEMPLATE_INSTRUCTION" if current_heading else ROLE_BODY, "text": line})
+            chunks.append({
+                "role": "TEMPLATE_INSTRUCTION" if current_heading or _is_template_instruction(line) else ROLE_BODY,
+                "text": line,
+            })
     return chunks
 
 
@@ -650,6 +902,8 @@ def _placeholder_registry(doc, role_paragraphs: dict) -> dict:
     physical = _physical_placeholders(doc)
     for item in physical:
         key = _normalize_placeholder(item["text"])
+        if not key:
+            continue
         _register_placeholder(registry, key, "text", "UNKNOWN", False)
         registry[key]["physical_placeholder"] = item
     return registry
@@ -686,8 +940,16 @@ def _placeholder_name(label: str, component: str = "metadata") -> str:
 
 def _normalize_placeholder(text: str) -> str:
     value = text.strip("{}《》【】_ ").strip()
-    mapping = {"报告标题": "report_title", "报告主题": "report_title", "报告单位": "report_unit", "报告时间": "report_date", "报告编号": "report_no", "正文": "report_body"}
-    return mapping.get(value, value or "unnamed_placeholder")
+    mapping = {
+        "报告标题": "report_title", "标题": "report_title", "报告主题": "report_title",
+        "报告单位": "report_unit", "报告时间": "report_date", "报告日期": "report_date",
+        "报告编号": "report_no", "正文": "report_body", "报告正文": "report_body",
+    }
+    if value in mapping:
+        return mapping[value]
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{1,60}", value):
+        return value
+    return ""
 
 
 def _header_footer_text(part) -> str:
@@ -702,6 +964,28 @@ def _paragraph_style_from_any(para) -> dict:
         "line_spacing": _line_spacing(pf.line_spacing),
         "space_after_pt": _pt_value(pf.space_after),
     }
+
+
+def _paragraph_index(doc, para) -> int | None:
+    if para is None:
+        return None
+    target = para._p
+    return next((index for index, item in enumerate(doc.paragraphs) if item._p is target), None)
+
+
+def _role_confidence(role: str, para) -> str:
+    if para is None:
+        return "unavailable"
+    style_name = para.style.name if para.style is not None else ""
+    if role == ROLE_DOCUMENT_TITLE:
+        is_title_style = "title" in style_name.lower() or style_name in {"标题", "文档标题", "主标题"}
+        return "high" if is_title_style else "medium"
+    if role in {ROLE_HEADING_1, ROLE_HEADING_2, ROLE_HEADING_3}:
+        expected = _heading_level(role)
+        return "high" if _semantic_heading_level(para) == expected else "medium"
+    if role == ROLE_BODY:
+        return "high" if any(marker in style_name.lower() for marker in ("正文", "body", "normal")) else "medium"
+    return "medium"
 
 
 def _computed_borders(para) -> dict:
@@ -771,9 +1055,20 @@ def _outline_level(para) -> str:
     try:
         ppr = para._p.pPr
         node = ppr.find(qn("w:outlineLvl")) if ppr is not None else None
-        return node.get(qn("w:val"), "") if node is not None else ""
+        if node is not None:
+            return node.get(qn("w:val"), "")
+        style = para.style
+        visited = set()
+        while style is not None and style.style_id not in visited:
+            visited.add(style.style_id)
+            ppr = style.element.pPr
+            node = ppr.find(qn("w:outlineLvl")) if ppr is not None else None
+            if node is not None:
+                return node.get(qn("w:val"), "")
+            style = style.base_style
     except Exception:
-        return ""
+        pass
+    return ""
 
 
 def _widow_control(para) -> str | bool:
@@ -870,23 +1165,45 @@ def _rpr_font_values(style):
     if style is None:
         return None
     try:
-        rPr = style.element.find(qn("w:rPr"))
-        if rPr is None:
-            return None
-        rf = rPr.find(qn("w:rFonts"))
         out = {"ascii": None, "hAnsi": None, "eastAsia": None, "cs": None, "size_pt": None}
-        if rf is not None:
-            for k in ("ascii", "hAnsi", "eastAsia", "cs"):
-                out[k] = rf.get(qn("w:" + k))
-        sz = rPr.find(qn("w:sz"))
-        if sz is not None:
-            try:
-                out["size_pt"] = round(int(sz.get(qn("w:val")) or 0) / 2, 1)
-            except Exception:
-                pass
+        current = style
+        visited = set()
+        while current is not None and current.style_id not in visited:
+            visited.add(current.style_id)
+            rPr = current.element.find(qn("w:rPr"))
+            rf = rPr.find(qn("w:rFonts")) if rPr is not None else None
+            if rf is not None:
+                for key in ("ascii", "hAnsi", "eastAsia", "cs"):
+                    if not out[key]:
+                        out[key] = rf.get(qn("w:" + key))
+            sz = rPr.find(qn("w:sz")) if rPr is not None else None
+            if sz is not None and out["size_pt"] is None:
+                try:
+                    out["size_pt"] = round(int(sz.get(qn("w:val")) or 0) / 2, 1)
+                except Exception:
+                    pass
+            current = current.base_style
         return out
     except Exception:
         return None
+
+
+def _doc_default_rpr_values(doc) -> dict:
+    out = {"ascii": None, "hAnsi": None, "eastAsia": None, "cs": None, "size_pt": None}
+    try:
+        defaults = doc.styles.element.find(qn("w:docDefaults"))
+        rpr_default = defaults.find(qn("w:rPrDefault")) if defaults is not None else None
+        rpr = rpr_default.find(qn("w:rPr")) if rpr_default is not None else None
+        fonts = rpr.find(qn("w:rFonts")) if rpr is not None else None
+        if fonts is not None:
+            for key in ("ascii", "hAnsi", "eastAsia", "cs"):
+                out[key] = fonts.get(qn("w:" + key))
+        size = rpr.find(qn("w:sz")) if rpr is not None else None
+        if size is not None:
+            out["size_pt"] = round(int(size.get(qn("w:val")) or 0) / 2, 1)
+    except Exception:
+        pass
+    return out
 
 
 def _font_color(font, style_font, normal_font) -> str:

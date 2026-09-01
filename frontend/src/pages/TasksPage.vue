@@ -82,7 +82,7 @@ function taskType(task: TaskSummary) { return task.run_mode === "material_compar
     <header class="page-header"><div><h1>任务</h1><p>查找、跟进和管理报告任务。</p></div><RouterLink class="btn primary page-action" to="/?create=1"><AppIcon name="plus" :size="16" />新建任务</RouterLink></header>
     <section class="surface task-browser" :class="{ 'has-detail': selected }">
       <div class="browser-main">
-        <nav class="view-tabs" aria-label="任务视图"><button v-for="item in viewItems" :key="item.key" :class="{ active: view === item.key }" @click="view = item.key">{{ item.label }}<span>{{ item.count }}</span></button></nav>
+        <nav class="view-tabs" aria-label="任务视图"><button v-for="item in viewItems" :key="item.key" :class="{ active: view === item.key }" @click="view = item.key">{{ item.label }}<span>{{ tasks.isLoading.value ? "—" : item.count }}</span></button></nav>
         <div class="filter-bar">
           <label class="search-box"><AppIcon name="search" :size="16" /><input v-model="search" placeholder="搜索任务名称、ID 或更新说明" /></label>
           <select v-model="dateRange"><option value="all">全部时间</option><option value="7">近 7 天</option><option value="30">近 30 天</option><option value="90">近 90 天</option></select>
@@ -90,7 +90,7 @@ function taskType(task: TaskSummary) { return task.run_mode === "material_compar
           <select v-model="sortBy"><option value="updated_desc">最近更新</option><option value="created_desc">最近创建</option><option value="materials_desc">材料最多</option><option value="name">按名称</option></select>
           <button v-if="hasFilters" class="btn tertiary reset" @click="resetFilters">重置</button>
         </div>
-        <div class="result-meta"><span>共 {{ filtered.length }} 个任务</span><span v-if="tasks.isFetching.value && !tasks.isLoading.value">正在更新…</span></div>
+        <div class="result-meta"><span>{{ tasks.isLoading.value ? "正在加载任务…" : `共 ${filtered.length} 个任务` }}</span><span v-if="tasks.isFetching.value && !tasks.isLoading.value">正在更新…</span></div>
         <div v-if="tasks.isLoading.value" class="loading-line"></div>
         <div v-if="filtered.length" class="task-table">
           <div class="table-head"><span>任务名称</span><span>状态</span><span>材料</span><span>模板</span><span>最近更新</span><span></span></div>

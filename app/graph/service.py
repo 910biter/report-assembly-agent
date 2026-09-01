@@ -15,7 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
-from sqlalchemy import and_, delete, select, update
+from sqlalchemy import select, update
 
 from app.agents.base import BaseAgent
 from app.config import settings

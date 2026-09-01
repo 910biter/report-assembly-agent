@@ -6,7 +6,6 @@ import math
 import re
 import threading
 from dataclasses import dataclass, field
-from pathlib import Path
 
 from app.config import settings
 
