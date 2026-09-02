@@ -167,6 +167,10 @@ def create_incremental_task(
         report = s.execute(select(ORMReport).where(ORMReport.c.id == report_id)).mappings().first()
         if report is None:
             return JSONResponse({"error": "REPORT_NOT_FOUND"}, status_code=404)
+    for h in reversed(base_task.get("run_history") or []):
+        if h.get("mode") == "incremental" and h.get("stage") == "created":
+            return JSONResponse({"error": "PREVIOUS_INCREMENT_PENDING",
+                                 "message": "上一增量轮次尚未运行"}, status_code=409)
     # Always snapshot the current working tree. This preserves edits made after
     # the last version before an incremental run starts.
     version = ensure_report_version(

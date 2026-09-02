@@ -16,6 +16,7 @@ const sideTab = ref("evidence");
 const selected = ref<Sentence | null>(null);
 const discussionScope = ref<any>(null);
 const saveState = ref("已保存");
+const creating = ref(false);
 const incrementOpen = ref(false);
 const comparisonOpen = ref(false);
 const versionOpen = ref(Boolean(route.query.version));
@@ -397,6 +398,8 @@ async function finalize(force = false) {
   }
 }
 async function createIncremental() {
+  if (creating.value) return;
+  creating.value = true;
   const form = new FormData();
   form.set("update_reason", updateReason.value);
   form.set("existing_material_ids", incrementalMaterialIds.value.join(","));
@@ -412,6 +415,8 @@ async function createIncremental() {
     location.href = `/tasks/${result.task_id}`;
   } catch (error: any) {
     alert(error.message || "创建增量任务失败");
+  } finally {
+    creating.value = false;
   }
 }
 async function reviewApplied() {
@@ -541,8 +546,8 @@ function qaStatusLabel(issue: QualityIssue) {
         placeholder="本次更新说明"
       ></textarea>
       <div class="button-row">
-        <button class="btn primary" @click="createIncremental">
-          创建增量轮次</button
+        <button class="btn primary" :disabled="creating" @click="createIncremental">
+                  {{ creating ? "创建中…" : "创建增量轮次" }}</button>
         ><button class="btn tertiary" @click="incrementOpen = false">
           取消
         </button>
