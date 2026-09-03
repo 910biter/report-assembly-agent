@@ -92,7 +92,7 @@ def _filter_inferences_by_facts(
     return (result or inferences)[:limit]
 
 
-def _business_block(task_profile: dict, chapter_plan: dict) -> str:
+def _business_block(task_profile: dict | None, chapter_plan: dict) -> str:
     if not task_profile:
         return ""
     lines = [f"材料包模式: {task_profile.get('report_mode', 'generic')}"]
@@ -156,24 +156,7 @@ def _text_length(text: str) -> int:
     return measure_text_words(text)
 
 
-def _ids_used_in_chapter(report_id: int, chapter_title: str) -> dict[str, set[int]]:
-    with session_scope() as s:
-        rows = s.execute(
-            select(ORMSentence.c.source_refs).where(
-                ORMSentence.c.report_id == report_id,
-                ORMSentence.c.section == chapter_title,
-            )
-        ).mappings().all()
-    fact_ids: set[int] = set()
-    inference_ids: set[int] = set()
-    for row in rows:
-        try:
-            refs = json.loads(row["source_refs"] or "{}")
-        except (TypeError, ValueError):
-            continue
-        fact_ids.update(_int_ids(refs.get("fact_ids")))
-        inference_ids.update(_int_ids(refs.get("inference_ids")))
-    return {"fact_ids": fact_ids, "inference_ids": inference_ids}
+
 
 
 
@@ -741,6 +724,7 @@ class WriterAgent(BaseAgent):
                 chapter_plan=chapter_plan,
                 institution_rules=institution_rules,
                 narrative_plan=narrative_plan,
+                business_block=_business_block(task_profile, chapter_plan),
                 policy_block=policy_prompt_block(_writer_policy_only(report_policy or {})),
                 minimum_ratio=minimum_ratio,
                 style_variant=style_variant,

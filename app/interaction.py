@@ -385,8 +385,7 @@ def _run_task_agent_interaction(
         with token_context(task_id=str(thread.get("task_id") or ""), stage="interaction"):
             with llm_priority(PRIORITY_INTERACTIVE):
                 result = invoke(
-                    "task_collaboration_agent",
-                    run_task_collaboration_agent,
+                    "review_copilot", run_task_collaboration_agent,
                     agent_context,
                     content,
                     history,
@@ -470,7 +469,7 @@ def _run_draft_agent_interaction(
         with token_context(task_id="", stage="interaction"):
             with llm_priority(PRIORITY_INTERACTIVE):
                 result = invoke(
-                    "task_draft_agent", run_task_draft_agent,
+                    "review_copilot", run_task_draft_agent,
                     current, content, history,
                 )
             context_audit.update({

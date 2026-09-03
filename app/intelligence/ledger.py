@@ -65,13 +65,7 @@ def build_ledger(task_id: str, needs: list[dict], facts: list[dict],
     }
 
 
-def _overlap(a: str, b: str) -> bool:
-    """轻量词面重叠(need 与 fact 的相关性粗判;精确判定由模型负责)。"""
-    a_terms = set((a or "").split())
-    b_terms = set((b or "").split())
-    if not a_terms or not b_terms:
-        return False
-    return len(a_terms & b_terms) / min(len(a_terms), len(b_terms)) >= 0.5
+
 
 
 def _confidence(need_coverage: list[dict]) -> float:

@@ -436,7 +436,6 @@ class EvidenceAgent(BaseAgent):
         required_facts: list[str] | None = None,
         task_id: str = "",
         progress_callback=None,
-        start_dimension: int = 0,
     ) -> list[Fact]:
         """主线(论文思想整合):First-pass 合并读取 → Coverage Audit → Iterative Retrieval。
 

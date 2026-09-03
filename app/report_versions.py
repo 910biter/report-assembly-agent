@@ -162,6 +162,8 @@ def build_report_snapshot(report_id: int, task_id: str = "") -> dict[str, Any]:
         "conflicts": conflicts,
         "sentences": sentences,
         "plan": plan_snapshot,
+        "narrative_plan": narrative,
+        "scale_plan": _json_load(plan["budget"] if plan is not None else "{}", {}),
     }
     metadata["snapshot_hash"] = _stable_json_hash(payload_for_hash)
     return {

@@ -291,8 +291,13 @@ def _pdf_pipeline_options(do_ocr: bool):
         pass
     if not do_ocr:
         return options
-    options.ocr_options = OcrAutoOptions(lang=["ch", "en"])
+    options.ocr_options = OcrAutoOptions(lang=_ocr_languages())
     return options
+
+
+def _ocr_languages() -> list[str]:
+    raw = (settings.ocr_languages or "").strip()
+    return [item.strip() for item in raw.split(",") if item.strip()] or ["ch", "en"]
 
 
 def _units_from_docling_dict(data: dict) -> list[Unit]:

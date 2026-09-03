@@ -68,6 +68,7 @@ def cluster_facts(facts: list[dict]) -> list[FactCluster]:
     # 多独立来源 → corroborated;单来源 → single_source(冲突由 resolve_relations 标记 conflicted)
     for cluster in clusters:
         cluster.status = "corroborated" if len(set(cluster.sources)) > 1 else "single_source"
+        cluster.note = f"来源数:{len(set(cluster.sources))}"
     return clusters
 
 

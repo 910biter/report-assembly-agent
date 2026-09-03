@@ -1791,11 +1791,20 @@ def _resource_snapshot() -> dict:
 # ---------- 辅助 ----------
 
 def _find_task_by_report(report_id: int) -> str | None:
-    """Return the task that owns the report.
+    """Return the task that owns the report via the indexed report_versions row."""
+    from app.infrastructure.orm import ORMReportVersion
+    with session_scope() as s:
+        row = s.execute(
+            select(ORMReportVersion.c.task_id)
+            .where(ORMReportVersion.c.report_id == int(report_id))
+            .order_by(ORMReportVersion.c.id.desc())
+            .limit(1)
+        ).mappings().first()
+    task_id = str(row["task_id"] or "") if row else ""
+    return task_id if task_id else _find_task_by_short_memory(report_id)
 
-    reports 表没有 task_id 列;任务通过 short_memory 的 payload.report_id 反查。
-    (回归修复:旧实现错误引用 ORMReport.task_id,导致所有报告详情 500)
-    """
+
+def _find_task_by_short_memory(report_id: int) -> str | None:
     from app.infrastructure.orm import ORMShortMemory
     with session_scope() as s:
         rows = s.execute(select(ORMShortMemory.c.task_id, ORMShortMemory.c.payload)).all()

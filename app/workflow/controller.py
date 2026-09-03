@@ -227,7 +227,7 @@ class WorkflowController:
                 facts = self._facts()
             else:
                 self._update(stage=str(Stage.EVIDENCE), resume={"stage": "evidence", "status": "partial"})
-                facts = self.extract_evidence(start_dimension=done)
+                facts = self.extract_evidence()
         else:
             self._update(
                 evidence_active_signature=evidence_signature,
@@ -1068,7 +1068,7 @@ class WorkflowController:
             },
         )
 
-    def extract_evidence(self, start_dimension: int = 0) -> list[dict]:
+    def extract_evidence(self) -> list[dict]:
         self._update(stage=str(Stage.EVIDENCE))
         from app.context import ContextManager
 
@@ -1101,7 +1101,6 @@ class WorkflowController:
             cm=self.cm, insights=insights,
             required_facts=required_facts,
             task_id=self.task_id,
-            start_dimension=start_dimension,
             progress_callback=lambda done, total: self._update(evidence_progress={"done": done, "total": total}),
         )
         # A batch can persist Facts before a later batch fails. Recover those
