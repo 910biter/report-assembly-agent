@@ -137,7 +137,7 @@ class WorkflowController:
             self._update(stage="paused", queue_status={"status": "paused"}, control_request="")
             raise RuntimeError("TASK_PAUSED")
 
-    def run_to_review(self) -> None:
+    def run_to_review(self) -> str:
         """跑完 解析→去重→规划→事实→冲突→分析→写作,停在评审阶段等待用户。
 
         各阶段耗时记录到 task.stage_timings(自阶段起点累计秒数),便于定位热点。
@@ -186,6 +186,22 @@ class WorkflowController:
             "errors": self.task.get("material_analysis_errors", []),
         })
         _mark("material_analysis")
+        if (
+            self.task.get("workflow_mode") == "collaborative"
+            and self.task.get("requirement_review", self.task.get("planning_review")) == "required"
+            and not self.task.get("requirement_review_completed", self.task.get("planning_review_completed"))
+        ):
+            self._update(
+                stage=str(Stage.REQUIREMENT_REVIEW),
+                requirement_review_pending=True,
+                resume={"stage": "material_analysis", "status": "awaiting_user_requirements"},
+            )
+            update_task_run(
+                str(self.task.get("run_id") or ""),
+                status="awaiting_requirement_review",
+                metadata={"checkpoint": "requirements"},
+            )
+            return "awaiting_requirements"
         if self.task.get("plan_id"):
             self._update(stage=str(Stage.PLANNING), resume={"stage": "plan", "status": "reused"})
         else:
@@ -316,7 +332,7 @@ class WorkflowController:
                 metadata={"comparison_id": comparison.get("id"), "report_id": comparison.get("report_id")},
                 finished=True,
             )
-            return
+            return "review"
         analysis_signature = stage_input_signature("analysis", self.task, plan=self._plan())
         if self.task.get("analysis_done") and signature_matches(
             self.task, "analysis", analysis_signature,
@@ -403,6 +419,22 @@ class WorkflowController:
             "final_plan_snapshot": self._safe_plan_snapshot(),
         })
         _mark("final_plan")
+        if (
+            self.task.get("workflow_mode") == "collaborative"
+            and self.task.get("directory_review") == "required"
+            and not self.task.get("directory_review_completed")
+        ):
+            self._update(
+                stage=str(Stage.DIRECTORY_REVIEW),
+                directory_review_pending=True,
+                resume={"stage": "final_plan", "status": "awaiting_user_review"},
+            )
+            update_task_run(
+                str(self.task.get("run_id") or ""),
+                status="awaiting_directory_review",
+                metadata={"checkpoint": "final_plan"},
+            )
+            return "awaiting_directory"
         target_chapters = self._prepare_incremental_write_scope()
         writing_signature = stage_input_signature("writing", self.task, plan=self._plan())
         self._active_writing_signature = writing_signature
@@ -502,6 +534,7 @@ class WorkflowController:
             finished=True,
         )
         self._start_background_graph_build(facts)
+        return "review"
 
     def _update(self, **fields) -> None:
         """更新短期记忆并同步内存快照,保证后续阶段读到最新产物。"""

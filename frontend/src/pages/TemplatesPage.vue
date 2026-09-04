@@ -78,8 +78,8 @@ onBeforeUnmount(()=>window.clearTimeout(pollTimer));
 
 <template>
   <div class="page-stack">
-    <header class="page-header"><div><h1>模板中心</h1><p>原始 DOCX 保证版式，成文画像学习语言、信息组织以及事实与判断的表达方式。</p></div></header>
-    <section class="surface upload-bar"><div><h2>学习模板与成品报告</h2><p class="muted">从 DOCX 提取真实版式，并从成品正文归纳语言、信息组织以及事实与判断的表达方式。</p></div><input ref="upload" type="file" accept=".docx" multiple><button class="btn primary" :disabled="learningBusy" @click="startLearning">{{learningBusy?'处理中…':'上传并学习'}}</button></section>
+    <header class="page-header"><h1>模板中心</h1></header>
+    <section class="surface upload-bar"><h2>学习模板</h2><input ref="upload" type="file" accept=".docx" multiple><button class="btn primary" :disabled="learningBusy" @click="startLearning">{{learningBusy?'处理中…':'上传并学习'}}</button></section>
     <section v-if="uploading||learningJob" class="surface learning-progress" aria-live="polite"><div class="progress-heading"><div><strong>{{uploading?'正在上传文件':phaseLabel}}</strong><span>{{uploading?`已上传 ${uploadPercent}%`:(learningJob?.message||'正在处理')}}</span></div><b>{{uploading?`${uploadPercent}%`:`${learningJob?.progress_percent||0}%`}}</b></div><div class="progress-track"><span :style="{width:`${uploading?uploadPercent:(learningJob?.progress_percent||0)}%`}"></span></div><div v-if="!uploading&&learningJob" class="progress-detail"><span>文件 {{learningJob.processed_files||0}} / {{learningJob.total_files||0}}</span><span v-if="learningJob.current_file">当前：{{learningJob.current_file}}</span><span v-if="learningJob.failed_files" class="error-text">{{learningJob.failed_files}} 份解析失败</span></div></section>
     <p v-if="error" class="error-text">{{error}}</p>
     <section class="template-layout">

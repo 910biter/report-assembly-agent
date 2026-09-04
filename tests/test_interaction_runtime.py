@@ -11,6 +11,7 @@ from app.interaction import (
     _latest_failed_proposal,
     _task_decision_memory,
     _thread_summary,
+    _interrupted_turn_retry_content,
     close_thread,
 )
 
@@ -116,6 +117,23 @@ class InteractionRuntimeTests(unittest.TestCase):
         ]
         history = _bounded_history(messages, 128)
         self.assertEqual(history[-1]["content"], "最近答复")
+
+    def test_agent_history_caps_an_oversized_latest_turn(self):
+        history = _bounded_history([
+            {"role": "user", "content": "很长的粘贴内容" * 4000},
+        ], 128)
+        self.assertEqual(len(history), 1)
+        self.assertLessEqual(sum(len(item["content"]) for item in history), 512)
+        self.assertIn("已截断", history[0]["content"])
+
+    def test_interrupted_turn_can_be_retried_without_reconstructing_context(self):
+        thread = {"messages": [
+            {"id": 4, "role": "user", "content": "请说明材料的主体", "metadata": {"status": "interrupted"}},
+        ]}
+        with patch("app.interaction._update_message_metadata") as update:
+            content = _interrupted_turn_retry_content(thread, "重试上一轮")
+        self.assertEqual(content, "请说明材料的主体")
+        update.assert_called_once_with(4, {"status": "retried", "retryable": False})
 
     def test_interaction_lane_is_not_blocked_by_workflow_lane(self):
         original_generation = llm_scheduler._generation_slots

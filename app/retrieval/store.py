@@ -151,6 +151,24 @@ class QdrantVectorStore:
         except Exception:
             return []
 
+    def search_facts(self, query_vector: list[float] | np.ndarray, top_k: int = 10,
+                     filters: dict | None = None) -> list[tuple[int, float]]:
+        """Run task-filtered semantic fact retrieval for interactive review."""
+        if not self.enabled or self.client is None:
+            return []
+        try:
+            query = np.asarray(query_vector, dtype=np.float32).tolist()
+            hits = self.client.search(
+                collection_name=self.facts_collection,
+                query_vector=query,
+                query_filter=self._qdrant_filter(filters or {}),
+                limit=max(top_k, 1),
+                with_payload=False,
+            )
+            return [(int(hit.id), float(hit.score or 0)) for hit in hits]
+        except Exception:
+            return []
+
     def _upsert(self, collection: str, point_id: int, vector: list[float], payload: dict) -> bool:
         if not self.enabled or self.client is None:
             return False

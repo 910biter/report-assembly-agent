@@ -14,6 +14,8 @@ from typing import Literal
 from pydantic_ai import Agent, ModelRetry, RunContext, UsageLimits
 
 from app.collaboration_model import build_collaboration_model
+from app.config import settings
+from app.context_budget import count_tokens
 from app.control_agent import (
     AgentToolCall,
     AgentToolName,
@@ -39,6 +41,14 @@ _SYSTEM_PROMPT = """你是报告整编系统的任务协作助手。你的职责
 10. 简单问题直接回答；复杂判断用 2-5 个要点完整说明，不展示 JSON、字段名或内部协议。
 11. 结构化决策记忆中的“已确认决定”是持续约束；“待确认决定”不能当作已经执行。
 12. 新要求与已确认决定冲突时，应明确指出变化，再按用户最新明确要求形成提案。
+13. 如果当前处于 requirement_review_pending，表示材料理解已经完成、分析规划尚未开始。此时优先读取材料理解结果，帮助用户把材料转化为明确的主题、受众、重点和篇幅要求；用户说“你来想/帮我写需求”时，应基于材料真实内容形成完整需求草案，并调用 propose_task_requirements，不要追问用户已经交给你的理解工作。
+14. 如果当前处于 directory_review_pending，优先读取并解释最终目录；用户意见应作为目录修订建议，不要直接修改正文。若用户要求调整目录，应形成完整、可执行的新目录提案，而不是只返回一句建议。
+15. 用户询问材料内容、材料关系、具体主体或材料是否支持某个判断时，先调用 read_materials；摘要不足时必须调用 search_material_units 检索原始材料片段。回答必须标明文件和页码/段落，不得根据文件名、常见行业模式或猜测补全。
+16. 涉及材料、事实、推论、目录、正文、冲突或质量问题时，先读取任务地图或相应摘要索引，再按需读取具体对象；不得只因已知数量而猜测内容。
+17. 用户询问哪条事实、哪项推论、哪句话、哪里冲突或哪里有问题时，先使用浏览工具找到真实对象 ID，再读取对象详情和证据；不得编造编号、来源或引用关系。
+18. 同时修改两个及以上章节标题时，必须调用 propose_section_titles 形成一张完整的批量提案；不得拆成多个单章节提案，更不得只修改其中第一章。
+19. 用户询问某个结论、句子或说法是否有依据时，先调用 search_fact_evidence；如需进一步核验，再调用 read_fact_evidence。不得仅凭事实数量或摘要判断。
+20. 用户明确要求在需求讨论或目录讨论阶段“确认并继续”时，调用 propose_checkpoint_continue 形成一张控制提案；接受后才继续工作流。不要把确认意图误解为重写目录或正文。
 """
 
 
@@ -97,19 +107,37 @@ def _build_agent() -> Agent[TaskAgentDeps, str]:
         return ctx.deps.read(AgentToolName.GET_TASK_OVERVIEW)
 
     @agent.tool
-    def read_final_report_plan(ctx: RunContext[TaskAgentDeps]) -> dict:
-        """读取数据库中当前有效的最终报告目录和章节契约。"""
-        return ctx.deps.read(AgentToolName.GET_FINAL_PLAN)
+    def read_task_map(ctx: RunContext[TaskAgentDeps]) -> dict:
+        """读取任务全景：材料主题、规划摘要、事实和推论概览、报告结构及待处理事项。"""
+        return ctx.deps.read(AgentToolName.GET_TASK_MAP)
 
     @agent.tool
-    def read_analysis_plan(ctx: RunContext[TaskAgentDeps]) -> dict:
-        """读取当前有效的分析维度和分析规划。"""
-        return ctx.deps.read(AgentToolName.GET_ANALYSIS_PLAN)
+    def read_final_report_plan(ctx: RunContext[TaskAgentDeps], include_details: bool = False) -> dict:
+        """读取当前有效的最终报告目录；仅在需要逐项讨论章节契约时读取详情。"""
+        return ctx.deps.read(AgentToolName.GET_FINAL_PLAN, {"include_details": include_details})
 
     @agent.tool
-    def read_report_section(ctx: RunContext[TaskAgentDeps], chapter_title: str) -> dict:
-        """按真实章节标题读取报告正文及句子定位。"""
-        return ctx.deps.read(AgentToolName.GET_REPORT_SECTION, {"chapter_title": chapter_title})
+    def read_analysis_plan(ctx: RunContext[TaskAgentDeps], include_details: bool = False) -> dict:
+        """读取当前有效的分析维度和分析规划；仅在需要逐项讨论时读取详情。"""
+        return ctx.deps.read(AgentToolName.GET_ANALYSIS_PLAN, {"include_details": include_details})
+
+    @agent.tool
+    def read_report_outline(ctx: RunContext[TaskAgentDeps]) -> dict:
+        """读取报告章节、段落、事实引用和推论引用概览。"""
+        return ctx.deps.read(AgentToolName.GET_REPORT_OUTLINE)
+
+    @agent.tool
+    def read_report_section(ctx: RunContext[TaskAgentDeps], chapter_title: str,
+                            offset: int = 0, limit: int = 60) -> dict:
+        """按真实章节标题读取正文段落、句子 ID 和对应事实/推论引用。"""
+        return ctx.deps.read(AgentToolName.GET_REPORT_SECTION, {
+            "chapter_title": chapter_title, "offset": offset, "limit": limit,
+        })
+
+    @agent.tool
+    def read_report_sentence(ctx: RunContext[TaskAgentDeps], sentence_id: int) -> dict:
+        """读取某一报告句子的正文、所在段落和事实/推论引用。"""
+        return ctx.deps.read(AgentToolName.GET_REPORT_SENTENCE, {"sentence_id": sentence_id})
 
     @agent.tool
     def read_fact_evidence(ctx: RunContext[TaskAgentDeps], fact_id: int) -> dict:
@@ -117,9 +145,26 @@ def _build_agent() -> Agent[TaskAgentDeps, str]:
         return ctx.deps.read(AgentToolName.GET_FACT_EVIDENCE, {"fact_id": fact_id})
 
     @agent.tool
+    def browse_facts(ctx: RunContext[TaskAgentDeps], query: str = "", dimension: str = "",
+                     offset: int = 0, limit: int = 12) -> dict:
+        """浏览任务事实摘要。先用此工具找到相关事实，再调用 read_fact_evidence 核验原始依据。"""
+        return ctx.deps.read(AgentToolName.LIST_FACTS, {
+            "query": query, "dimension": dimension, "offset": offset, "limit": limit,
+        })
+
+    @agent.tool
     def read_inference(ctx: RunContext[TaskAgentDeps], inference_id: int) -> dict:
         """读取指定推论、置信度和依据事实。"""
         return ctx.deps.read(AgentToolName.GET_INFERENCE, {"inference_id": inference_id})
+
+    @agent.tool
+    def browse_inferences(ctx: RunContext[TaskAgentDeps], query: str = "", dimension: str = "",
+                          confidence: str = "", offset: int = 0, limit: int = 12) -> dict:
+        """浏览任务分析判断摘要及其依据事实。"""
+        return ctx.deps.read(AgentToolName.LIST_INFERENCES, {
+            "query": query, "dimension": dimension, "confidence": confidence,
+            "offset": offset, "limit": limit,
+        })
 
     @agent.tool
     def read_conflicts(ctx: RunContext[TaskAgentDeps]) -> dict:
@@ -127,9 +172,9 @@ def _build_agent() -> Agent[TaskAgentDeps, str]:
         return ctx.deps.read(AgentToolName.GET_CONFLICTS)
 
     @agent.tool
-    def read_quality_issues(ctx: RunContext[TaskAgentDeps]) -> dict:
+    def read_quality_issues(ctx: RunContext[TaskAgentDeps], offset: int = 0, limit: int = 12) -> dict:
         """读取当前报告质量问题及其正文定位。"""
-        return ctx.deps.read(AgentToolName.GET_QUALITY_ISSUES)
+        return ctx.deps.read(AgentToolName.GET_QUALITY_ISSUES, {"offset": offset, "limit": limit})
 
     @agent.tool
     def locate_quality_issue(ctx: RunContext[TaskAgentDeps], issue_index: int) -> dict:
@@ -138,8 +183,21 @@ def _build_agent() -> Agent[TaskAgentDeps, str]:
 
     @agent.tool
     def read_materials(ctx: RunContext[TaskAgentDeps]) -> dict:
-        """读取任务使用的材料及材料角色。"""
+        """读取任务材料及已落库的材料理解摘要、关键点和缺失信息。"""
         return ctx.deps.read(AgentToolName.GET_MATERIALS)
+
+    @agent.tool
+    def search_material_units(ctx: RunContext[TaskAgentDeps], query: str,
+                              material_id: int = 0, limit: int = 6) -> dict:
+        """按问题检索当前任务材料的原始片段，返回文件、页码、段落与正文摘录。"""
+        return ctx.deps.read(AgentToolName.SEARCH_MATERIAL_UNITS, {
+            "query": query, "material_id": material_id, "limit": limit,
+        })
+
+    @agent.tool
+    def search_fact_evidence(ctx: RunContext[TaskAgentDeps], query: str, limit: int = 6) -> dict:
+        """按问题混合检索任务事实及其原始证据，用于回答“依据是什么、是否支持”。"""
+        return ctx.deps.read(AgentToolName.SEARCH_FACT_EVIDENCE, {"query": query, "limit": limit})
 
     @agent.tool
     def propose_split_chapter(
@@ -356,6 +414,18 @@ def _build_agent() -> Agent[TaskAgentDeps, str]:
         ))
 
     @agent.tool
+    def propose_section_titles(
+        ctx: RunContext[TaskAgentDeps], changes: list[dict[str, str]],
+    ) -> dict:
+        """批量修改两个及以上现有章节标题并同步目录；每项均需包含 old_title 和 new_title。"""
+        return ctx.deps.propose(AgentToolCall(
+            tool_name=AgentToolName.UPDATE_SECTION_TITLES,
+            arguments={"changes": changes, "instruction": ctx.deps.user_message},
+            confirmation_required=True,
+            reason=f"批量修改 {len(changes)} 个章节标题",
+        ))
+
+    @agent.tool
     def propose_task_control(
         ctx: RunContext[TaskAgentDeps], action: Literal["pause", "resume", "retry"],
     ) -> dict:
@@ -368,6 +438,30 @@ def _build_agent() -> Agent[TaskAgentDeps, str]:
         return ctx.deps.propose(AgentToolCall(
             tool_name=mapping[action], arguments={}, confirmation_required=True,
             reason={"pause": "暂停当前任务", "resume": "恢复当前任务", "retry": "重试当前任务"}[action],
+        ))
+
+    @agent.tool
+    def propose_checkpoint_continue(
+        ctx: RunContext[TaskAgentDeps], checkpoint: Literal["requirements", "directory"],
+        feedback: str = "",
+    ) -> dict:
+        """确认当前需求或目录检查点并继续工作流；仍须由用户接受这张提案。"""
+        context = ctx.deps.context
+        if checkpoint == "requirements":
+            if not context.requirement_review_pending:
+                raise ModelRetry("当前不在需求确认阶段，不能确认需求并继续。")
+            if not context.theme or not context.user_requirements:
+                raise ModelRetry("当前尚未保存完整主题和报告要求，请先形成并接受需求提案。")
+            tool_name, reason = AgentToolName.CONFIRM_REQUIREMENTS, "确认任务需求并继续分析规划"
+        else:
+            if not context.directory_review_pending:
+                raise ModelRetry("当前不在目录确认阶段，不能确认目录并继续。")
+            tool_name, reason = AgentToolName.CONFIRM_DIRECTORY, "确认当前目录并继续叙事组织和写作"
+        return ctx.deps.propose(AgentToolCall(
+            tool_name=tool_name,
+            arguments={"feedback": str(feedback or "").strip()} if checkpoint == "directory" else {},
+            confirmation_required=True,
+            reason=reason,
         ))
 
     return agent
@@ -383,6 +477,9 @@ def run_task_collaboration_agent(
         context=context,
         user_message=user_message,
     )
+    # The interaction lane has a smaller context envelope than the report
+    # pipeline. Bound all non-tool prompt fields so a large selection or old
+    # decision record cannot starve the agent's tool calls.
     history_text = "\n".join(
         f"{('用户' if item.get('role') == 'user' else '助手')}：{item.get('content', '')}"
         for item in recent_history
@@ -395,19 +492,23 @@ def run_task_collaboration_agent(
         "references": context.current_focus.references,
     }
     memory_payload = decision_memory or {}
+    input_budget = max(1024, int(settings.interactive_input_tokens))
     prompt = (
-        f"当前任务主题：{context.theme}\n"
-        f"当前完整报告要求：{context.user_requirements}\n"
-        f"当前页面焦点：{json.dumps(focus_payload, ensure_ascii=False)}\n"
+        f"当前任务主题：{_cap_prompt_text(context.theme, 384)}\n"
+        f"当前完整报告要求：{_cap_prompt_text(context.user_requirements, input_budget // 4)}\n"
+        f"当前页面焦点：{_cap_prompt_json(focus_payload, input_budget // 4)}\n"
         f"当前任务阶段：{context.stage_label}\n"
-        f"结构化决策记忆：{json.dumps(memory_payload, ensure_ascii=False)}\n"
-        f"最近对话：\n{history_text or '无'}\n\n"
-        f"用户本轮消息：{user_message}"
+        f"结构化决策记忆：{_cap_prompt_json(memory_payload, input_budget // 5)}\n"
+        f"最近对话：\n{_cap_prompt_text(history_text, input_budget // 5) or '无'}\n\n"
+        f"用户本轮消息：{_cap_prompt_text(user_message, input_budget // 5)}"
     )
     result = _build_agent().run_sync(
         prompt,
         deps=deps,
-        usage_limits=UsageLimits(request_limit=4, tool_calls_limit=8),
+        usage_limits=UsageLimits(
+            request_limit=settings.interactive_request_limit,
+            tool_calls_limit=settings.interactive_tool_calls_limit,
+        ),
     )
     usage = result.usage
     return TaskAgentRunResult(
@@ -422,6 +523,24 @@ def run_task_collaboration_agent(
         },
         tool_trace=list(deps.tool_trace),
     )
+
+
+def _cap_prompt_json(value: object, token_budget: int) -> str:
+    return _cap_prompt_text(json.dumps(value, ensure_ascii=False), token_budget)
+
+
+def _cap_prompt_text(value: object, token_budget: int) -> str:
+    text = str(value or "")
+    if token_budget <= 0 or count_tokens(text) <= token_budget:
+        return text
+    low, high = 0, len(text)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if count_tokens(text[:middle]) <= token_budget:
+            low = middle
+        else:
+            high = middle - 1
+    return text[:low] + "\n[已截断，详情请通过读取工具获取]"
 
 
 def _current_titles(deps: TaskAgentDeps) -> list[str]:
@@ -476,4 +595,6 @@ def _action_summary(call: AgentToolCall) -> str:
     if call.tool_name == AgentToolName.RERUN_FINAL_PLAN:
         structure = call.arguments.get("new_structure") or []
         return f"目录调整为 {len(structure)} 章"
+    if call.tool_name == AgentToolName.UPDATE_SECTION_TITLES:
+        return f"批量修改 {len(call.arguments.get('changes') or [])} 个章节标题"
     return call.reason or call.tool_name.value

@@ -66,7 +66,7 @@ async function restartServices() {
 
 <template>
   <div class="page-stack settings-page">
-    <header class="page-header"><div><h1>系统设置</h1><p>查看服务状态、任务调度与真实运行负载。</p></div><span class="updated-at">资源采样 {{ resources.data.value?.collected_at || '等待中' }}</span></header>
+    <header class="page-header"><h1>系统设置</h1><span class="updated-at">资源采样 {{ resources.data.value?.collected_at || '等待中' }}</span></header>
 
     <section class="settings-grid">
       <div class="surface section-block"><div class="section-head"><div><h2>模型服务</h2><p class="muted">核心推理服务连通状态</p></div><div class="service-actions"><span class="badge" :class="health.data.value?.error?'danger':'success'">{{health.data.value?.error?'连接异常':'服务可用'}}</span><button class="btn restart-button" :disabled="Boolean(runningTaskId)||restarting" @click="restartServices">{{restarting?'正在重启…':'重启服务'}}</button></div></div><dl><dt>网关地址</dt><dd class="mono">{{health.data.value?.gateway_url||'—'}}</dd><dt>服务版本</dt><dd>{{health.data.value?.version||'—'}}</dd><dt>运行目录</dt><dd class="mono">{{health.data.value?.runtime_root||'—'}}</dd></dl><div v-if="runningTaskId" class="restart-note">任务 <span class="mono">{{runningTaskId}}</span> 正在运行，完成后才可重启。</div><div v-else-if="restartMessage" class="restart-note">{{restartMessage}}</div><div v-if="health.data.value?.error" class="notice warning">{{health.data.value.error}}</div></div>

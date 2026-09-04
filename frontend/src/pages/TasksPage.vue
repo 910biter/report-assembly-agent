@@ -79,7 +79,7 @@ function taskType(task: TaskSummary) { return task.run_mode === "material_compar
 
 <template>
   <div class="page-stack tasks-page">
-    <header class="page-header"><div><h1>任务</h1><p>查找、跟进和管理报告任务。</p></div><RouterLink class="btn primary page-action" to="/?create=1"><AppIcon name="plus" :size="16" />新建任务</RouterLink></header>
+    <header class="page-header"><h1>任务</h1><RouterLink class="btn primary page-action" to="/?create=1"><AppIcon name="plus" :size="16" />新建任务</RouterLink></header>
     <section class="surface task-browser" :class="{ 'has-detail': selected }">
       <div class="browser-main">
         <nav class="view-tabs" aria-label="任务视图"><button v-for="item in viewItems" :key="item.key" :class="{ active: view === item.key }" @click="view = item.key">{{ item.label }}<span>{{ tasks.isLoading.value ? "—" : item.count }}</span></button></nav>

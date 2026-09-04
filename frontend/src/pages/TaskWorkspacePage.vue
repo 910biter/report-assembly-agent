@@ -1,16 +1,18 @@
 <script setup lang="ts">
 import { computed, defineAsyncComponent, ref, watch } from "vue";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/vue-query";
-import { useRoute, RouterLink } from "vue-router";
-import { api } from "@/api/http";
+import { useRoute, useRouter, RouterLink } from "vue-router";
+import { api, jsonInit } from "@/api/http";
 import type { TaskSummary } from "@/api/types";
 import StatusBadge from "@/components/StatusBadge.vue";
-import ArtifactReviewWorkspace from "@/components/ArtifactReviewWorkspace.vue";
 import MaterialComparisonWorkspace from "@/components/MaterialComparisonWorkspace.vue";
+import { useUiStore } from "@/stores/ui";
 const GraphNetwork = defineAsyncComponent(
   () => import("@/components/GraphNetwork.vue"),
 );
 const route = useRoute();
+const router = useRouter();
+const ui = useUiStore();
 const qc = useQueryClient();
 const taskId = String(route.params.taskId);
 const active = ref(String(route.query.tab || "overview"));
@@ -66,9 +68,33 @@ const versions = useQuery({
     () => active.value === "versions" && Boolean(task.data.value?.report_id),
   ),
 });
+const checkpointPlan = useQuery({
+  queryKey: ["checkpoint-plan", taskId],
+  queryFn: () => api<any>(`/api/tasks/${taskId}/review-workspace?artifact_type=final_plan&limit=1`),
+  enabled: computed(() => Boolean(task.data.value?.directory_review_pending)),
+  staleTime: 5000,
+});
 const command = useMutation({
   mutationFn: ({ path }: { path: string }) => api(path, { method: "POST" }),
   onSuccess: () => qc.invalidateQueries({ queryKey: ["task", taskId] }),
+});
+const confirmPlanning = useMutation({
+  mutationFn: () => api(`/api/tasks/${taskId}/requirements/confirm`, jsonInit("POST", {
+    theme: task.data.value?.theme || "",
+    requirements: task.data.value?.user_requirements || "",
+    feedback: "",
+  })),
+  onSuccess: () => {
+    qc.invalidateQueries({ queryKey: ["task", taskId] });
+  },
+});
+const confirmDirectory = useMutation({
+  mutationFn: () => api(`/api/tasks/${taskId}/directory/confirm`, jsonInit("POST", {
+    feedback: "",
+  })),
+  onSuccess: () => {
+    qc.invalidateQueries({ queryKey: ["task", taskId] });
+  },
 });
 const rebuildGraph = useMutation({
   mutationFn: () => api(`/api/tasks/${taskId}/graph/rebuild`, { method: "POST" }),
@@ -126,19 +152,20 @@ const stages = computed(() =>
           name: "分析规划",
           keys: [
             "material_analysis",
+            "requirement_review",
             "planning",
             "evidence",
             "conflict",
             "analysis",
           ],
         },
-        { name: "报告生成", keys: ["writing"] },
+        { name: "报告生成", keys: ["directory_review", "writing"] },
         { name: "审核完成", keys: ["review", "done"] },
       ],
 );
 const taskTabs = computed(() => isComparison.value
   ? [["comparison", "对比结果"], ["materials", "新增材料"], ["runtime", "运行详情"]]
-  : [["overview", "概览"], ["materials", "材料"], ["analysis", "分析"], ["report", "报告"], ["versions", "版本"], ["collaboration", "协作审阅"]]);
+  : [["overview", "概览"], ["materials", "材料"], ["analysis", "分析"], ["report", "报告"], ["versions", "版本"]]);
 const stageIndex = computed(() =>
   Math.max(
     0,
@@ -149,7 +176,7 @@ const stageIndex = computed(() =>
 );
 const running = computed(
   () =>
-    !["created", "review", "done", "failed", "paused"].includes(
+    !["created", "requirement_review", "directory_review", "review", "done", "failed", "paused"].includes(
       task.data.value?.stage || "created",
     ),
 );
@@ -170,6 +197,41 @@ const conflictCount = computed(() => analysis.data.value ? conflicts.value.lengt
 function run() {
   command.mutate({ path: `/api/tasks/${taskId}/run` });
 }
+function confirmPlan() {
+  confirmPlanning.mutate();
+}
+function confirmDirectoryPlan() {
+  confirmDirectory.mutate();
+}
+function openCheckpointAssistant(kind: "requirements" | "directory") {
+  const isRequirements = kind === "requirements";
+  const plan = checkpointPlan.data.value?.items?.[0] || null;
+  ui.openAssistant({
+    taskId,
+    artifact: isRequirements ? {
+      artifact_type: "task_brief",
+      object_id: taskId,
+      artifact_version: String(task.data.value?.run_revision || 1),
+      current: { theme: task.data.value?.theme || "", requirements: task.data.value?.user_requirements || "" },
+      title: "报告需求",
+    } : (plan || {
+      artifact_type: "final_plan",
+      object_id: String(task.data.value?.plan_id || ""),
+      artifact_version: String(task.data.value?.run_revision || 1),
+      current: {},
+      title: "最终目录",
+    }),
+  });
+}
+watch(() => [route.query.tab, route.query.assistant], async ([tab, assistant]) => {
+  if (tab !== "collaboration" && assistant !== "1") return;
+  active.value = "overview";
+  const query = { ...route.query };
+  delete query.tab;
+  delete query.assistant;
+  await router.replace({ query });
+  ui.openAssistant({ taskId });
+}, { immediate: true });
 function control(op: string) {
   command.mutate({ path: `/api/tasks/${taskId}/control/${op}` });
 }
@@ -228,13 +290,13 @@ function versionsList() {
       </div>
       <div class="button-row">
         <span v-if="isComparison" class="badge" :class="task.data.value.stage === 'failed' ? 'danger' : task.data.value.stage === 'review' ? 'warning' : task.data.value.stage === 'done' ? 'success' : ''">{{ task.data.value.stage === 'failed' ? '对比异常' : task.data.value.stage === 'review' ? '等待审阅' : task.data.value.stage === 'done' ? '审阅完成' : '对比中' }}</span><StatusBadge v-else :stage="task.data.value.stage" /><button
-          v-if="['created', 'failed'].includes(task.data.value.stage)"
+          v-if="['created', 'failed'].includes(task.data.value.stage) || task.data.value.requirement_review_pending"
           class="btn primary"
           :disabled="command.isPending.value"
-          @click="run"
+          @click="task.data.value.requirement_review_pending ? confirmPlan() : run()"
         >
           {{
-            task.data.value.stage === "failed" ? "重新运行" : "开始运行"
+            task.data.value.requirement_review_pending ? "确认需求并开始规划" : task.data.value.stage === "failed" ? "重新运行" : "开始运行"
           }}</button
         ><button
           v-if="running"
@@ -342,6 +404,30 @@ function versionsList() {
             "请查看运行详情后重新运行。"
           }}
         </div>
+        <div v-if="task.data.value.requirement_review_pending" class="notice planning-review">
+          <b>请确认报告需求</b>
+          <p>材料理解已完成。可先与助手讨论主题、受众、重点和篇幅；确认后才会进入分析规划。</p>
+          <dl class="checkpoint-summary"><div><dt>报告主题</dt><dd>{{ task.data.value.theme || "尚待与助手确定" }}</dd></div><div><dt>报告要求</dt><dd>{{ task.data.value.user_requirements || "尚待与助手确定" }}</dd></div></dl>
+          <div class="button-row">
+            <button class="btn" @click="openCheckpointAssistant('requirements')">查看并讨论</button>
+            <button class="btn primary" :disabled="confirmPlanning.isPending.value" @click="confirmPlan">
+              {{ confirmPlanning.isPending.value ? "正在继续…" : "确认需求并开始规划" }}
+            </button>
+          </div>
+        </div>
+        <div v-if="task.data.value.directory_review_pending" class="notice planning-review">
+          <b>请确认最终目录</b>
+          <p>事实和分析已经完成。可以查看目录，并与助手讨论章节顺序、合并拆分和重点安排。</p>
+          <ol v-if="checkpointPlan.data.value?.items?.[0]?.current?.chapter_plans" class="checkpoint-outline">
+            <li v-for="chapter in checkpointPlan.data.value.items[0].current.chapter_plans" :key="chapter.title">{{ chapter.title }}</li>
+          </ol>
+          <div class="button-row">
+            <button class="btn" @click="openCheckpointAssistant('directory')">查看并讨论</button>
+            <button class="btn primary" :disabled="confirmDirectory.isPending.value" @click="confirmDirectoryPlan">
+              {{ confirmDirectory.isPending.value ? "正在继续…" : "确认目录并开始写作" }}
+            </button>
+          </div>
+        </div>
         <div class="surface section-block">
           <div class="section-head">
             <div>
@@ -364,6 +450,10 @@ function versionsList() {
                   ? "完成审核"
                   : task.data.value.stage === "done"
                     ? "导出或增量更新"
+                    : task.data.value.stage === "requirement_review"
+                      ? "确认需求并开始规划"
+                      : task.data.value.stage === "directory_review"
+                        ? "确认目录并开始写作"
                     : running
                       ? "等待当前阶段完成"
                       : "开始运行"
@@ -687,12 +777,6 @@ function versionsList() {
           </div></template>
       </div>
     </section>
-    <ArtifactReviewWorkspace
-      v-else-if="active === 'collaboration'"
-      :task-id="taskId"
-      :report-id="task.data.value.report_id"
-      :run-revision="task.data.value.run_revision || 1"
-    />
     <section
       v-else-if="active === 'report'"
       class="surface section-block report-entry"
@@ -1137,6 +1221,23 @@ function versionsList() {
 }
 .version-row div span {
   color: var(--color-muted);
+}
+.checkpoint-summary {
+  display: grid;
+  gap: 8px;
+  margin: 14px 0;
+}
+.checkpoint-summary div {
+  padding: 9px 11px;
+  border-left: 2px solid var(--color-border-strong);
+  background: rgba(255,255,255,.52);
+}
+.checkpoint-summary dt { color: var(--color-muted); font-size: 12px; }
+.checkpoint-summary dd { margin: 3px 0 0; line-height: 1.55; }
+.checkpoint-outline {
+  margin: 12px 0;
+  padding-left: 22px;
+  line-height: 1.8;
 }
 @media (max-width: 900px) {
   .task-head,

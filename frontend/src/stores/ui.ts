@@ -6,6 +6,12 @@ export const useUiStore = defineStore("ui", {
     createOpen: false,
     draftId: "",
     taskDraft: { theme: "", requirements: "" },
+    assistant: {
+      open: false,
+      tab: "progress" as "progress" | "artifacts" | "discuss",
+      focus: null as Record<string, any> | null,
+      revision: 0,
+    },
   }),
   actions: {
     toggleNav() { this.navOpen = !this.navOpen; },
@@ -24,5 +30,13 @@ export const useUiStore = defineStore("ui", {
       const requirements = after.requirements ?? after.content;
       if (String(requirements || "").trim()) this.taskDraft.requirements = String(requirements).trim();
     },
+    openAssistant(focus: Record<string, any> = {}) {
+      this.assistant.focus = focus;
+      this.assistant.tab = "discuss";
+      this.assistant.open = true;
+      this.assistant.revision += 1;
+    },
+    closeAssistant() { this.assistant.open = false; },
+    setAssistantTab(tab: "progress" | "artifacts" | "discuss") { this.assistant.tab = tab; },
   },
 });

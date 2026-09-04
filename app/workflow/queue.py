@@ -35,6 +35,7 @@ _STATS = {
     "submitted": 0,
     "started": 0,
     "completed": 0,
+    "waiting_for_user": 0,
     "failed": 0,
     "queue_wait_seconds": 0.0,
     "max_queue_wait_seconds": 0.0,
@@ -218,6 +219,7 @@ def _worker_loop() -> None:
             daemon=True, name=f"heartbeat-{item.task_id}",
         )
         heartbeat.start()
+        outcome = None
         try:
             from app import task_control
             task_control.begin_task(item.task_id)
@@ -228,14 +230,23 @@ def _worker_loop() -> None:
                     mark_recompute_running(str(starting_task.get("run_id") or ""))
                 except Exception:
                     pass
-            WorkflowController(item.task_id).run_to_review()
-            with _LOCK:
-                _STATS["completed"] += 1
-            short_term.update_task(item.task_id, queue_status={
-                "status": "completed",
-                "queue_wait_seconds": round(wait, 1),
-                "finished_at": round(time.time(), 1),
-            })
+            outcome = WorkflowController(item.task_id).run_to_review()
+            if outcome in {"awaiting_requirements", "awaiting_directory"}:
+                with _LOCK:
+                    _STATS["waiting_for_user"] += 1
+                short_term.update_task(item.task_id, queue_status={
+                    "status": "waiting_for_user",
+                    "checkpoint": outcome,
+                    "queue_wait_seconds": round(wait, 1),
+                })
+            else:
+                with _LOCK:
+                    _STATS["completed"] += 1
+                short_term.update_task(item.task_id, queue_status={
+                    "status": "completed",
+                    "queue_wait_seconds": round(wait, 1),
+                    "finished_at": round(time.time(), 1),
+                })
         except Exception as exc:
             paused = str(exc) == "TASK_PAUSED"
             if not paused:
@@ -279,8 +290,13 @@ def _worker_loop() -> None:
                     _RUNNING_TASK_ID = None
             _QUEUE.task_done()
             try:
-                from app.interaction import dispatch_pending_revisions
-                dispatch_pending_revisions(item.task_id)
+                # A checkpoint is deliberately idle: accepted report revisions
+                # must not start competing work before the user resumes it.
+                if outcome not in {
+                    "awaiting_requirements", "awaiting_directory",
+                }:
+                    from app.interaction import dispatch_pending_revisions
+                    dispatch_pending_revisions(item.task_id)
             except Exception:
                 pass
 

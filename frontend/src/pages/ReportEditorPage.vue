@@ -3,12 +3,14 @@ import { computed, nextTick, ref, watch } from "vue";
 import { useQuery, useQueryClient } from "@tanstack/vue-query";
 import { useRoute, RouterLink } from "vue-router";
 import { api, jsonInit } from "@/api/http";
+import { useUiStore } from "@/stores/ui";
 import type { QualityIssue, ReportData, Sentence } from "@/api/types";
 import StatusBadge from "@/components/StatusBadge.vue";
 import VersionReviewWorkspace from "@/components/VersionReviewWorkspace.vue";
 import MaterialComparisonWorkspace from "@/components/MaterialComparisonWorkspace.vue";
 
 const route = useRoute();
+const ui = useUiStore();
 const queryClient = useQueryClient();
 const reportId = Number(route.params.reportId);
 const mode = ref<"edit" | "trace" | "review">("edit");
@@ -139,9 +141,7 @@ function paragraphArtifact(section: any, paragraph: any, paragraphIndex: number,
   };
 }
 function dispatchAssistant(artifact?: any, reference?: any, append = false) {
-  window.dispatchEvent(new CustomEvent("ira:assistant-focus", {
-    detail: { taskId: report.data.value?.task_id, artifact, reference, append },
-  }));
+  ui.openAssistant({ taskId: report.data.value?.task_id, artifact, reference, append });
 }
 async function locateIssue(issue: any) {
   mode.value = "review";
@@ -204,12 +204,8 @@ function choose(sentence: Sentence) {
   if (mode.value === "trace") sideTab.value = "evidence";
 }
 function handleSectionClick(section: any) {
-  if (mode.value === "review") {
-    const issue = issuesForSection(section.title)[0];
-    if (issue) void locateIssue(issue);
-    return;
-  }
-  discussSection(section);
+  const issue = issuesForSection(section.title)[0];
+  if (issue) void locateIssue(issue);
 }
 function discussParagraph(section: any, paragraph: any, paragraphIndex: number) {
   const artifact = paragraphArtifact(section, paragraph, paragraphIndex);
@@ -278,36 +274,18 @@ function sendSelectionReference() {
   selectionAction.value = null;
   window.getSelection()?.removeAllRanges();
 }
-function discussTitle() {
-  discussionScope.value = {
-    artifactType: "report_title",
-    objectId: "",
-    current: { title: report.data.value?.title || "" },
-  };
-  openTaskAssistant();
-}
-function discussSection(section: any) {
-  discussionScope.value = {
-    artifactType: "section_title",
-    objectId: section.title,
-    current: { title: section.title },
-  };
-  openTaskAssistant();
-}
 function openTaskAssistant() {
   const target = discussionTarget.value;
-  window.dispatchEvent(new CustomEvent("ira:assistant-focus", {
-    detail: {
-      taskId: report.data.value?.task_id,
-      artifact: {
+  ui.openAssistant({
+    taskId: report.data.value?.task_id,
+    artifact: {
         artifact_type: target.artifactType,
         object_id: target.objectId,
         artifact_version: String(report.data.value?.versions?.[0]?.version_no || 1),
         current: target.current,
         title: target.artifactType === "sentence" ? "当前正文句子" : target.artifactType === "section_title" ? "当前章节标题" : "报告标题",
-      },
     },
-  }));
+  });
 }
 function comparisonHandoff(payload: any) {
   incrementalMaterialIds.value = payload.material_ids || [];
@@ -594,7 +572,6 @@ function qaStatusLabel(issue: QualityIssue) {
         <h1
           :contenteditable="mode !== 'review'"
           spellcheck="false"
-          @click="mode !== 'review' && discussTitle()"
           @blur="saveTitle"
         >
           {{ report.data.value.title }}
@@ -607,7 +584,7 @@ function qaStatusLabel(issue: QualityIssue) {
             :class="{ 'qa-section': issuesForSection(section.title).length }"
             :contenteditable="mode !== 'review'"
             spellcheck="false"
-            @click="handleSectionClick(section)"
+            @click="mode === 'review' && handleSectionClick(section)"
             @blur="saveSection(section, sectionIndex, $event)"
           >
             {{ section.display_title || section.title }}

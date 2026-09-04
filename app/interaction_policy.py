@@ -62,6 +62,9 @@ _POLICIES_BY_TOOL = {
     AgentToolName.PAUSE_TASK.value: PropagationPolicy(99, "none", (), "control", "暂停当前任务"),
     AgentToolName.RESUME_TASK.value: PropagationPolicy(99, "none", (), "control", "恢复当前任务"),
     AgentToolName.RETRY_TASK.value: PropagationPolicy(99, "none", (), "control", "重试当前任务"),
+    AgentToolName.UPDATE_SECTION_TITLES.value: PropagationPolicy(
+        99, "none", ("qa", "render"), "title", "批量更新章节标题",
+    ),
 }
 
 _POLICIES_BY_ARTIFACT = {
@@ -83,6 +86,7 @@ _POLICIES_BY_ARTIFACT = {
     ),
     "report_title": PropagationPolicy(99, "none", ("qa", "render"), "title", "更新报告标题"),
     "section_title": PropagationPolicy(99, "none", ("qa", "render"), "title", "更新章节标题"),
+    "section_titles": PropagationPolicy(99, "none", ("qa", "render"), "title", "批量更新章节标题"),
     "task_control": PropagationPolicy(99, "none", (), "control", "执行任务操作"),
     "task_draft": PropagationPolicy(99, "none", (), "draft", "更新新建任务草稿"),
 }

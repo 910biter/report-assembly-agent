@@ -66,6 +66,23 @@ class TaskCollaborationAgentTests(unittest.TestCase):
         self.assertEqual(result.output, "当前目录共三章。")
         self.assertEqual(deps.tool_trace, ["get_final_plan"])
 
+    def test_agent_can_start_from_task_map(self):
+        deps = TaskAgentDeps(context=self.context(), user_message="这些材料主要讲什么？")
+        agent = _build_agent()
+        with (
+            patch("app.task_collaboration_agent.execute_read_tool", return_value={
+                "materials": [{"filename": "政策文件.pdf", "topic": "低空经济政策目标"}],
+                "counts": {"facts": 0, "inferences": 0},
+            }),
+            agent.override(model=TestModel(
+                call_tools=["read_task_map"],
+                custom_output_text="材料围绕低空经济政策目标展开。",
+            )),
+        ):
+            result = agent.run_sync("请读取任务全景", deps=deps)
+        self.assertEqual(result.output, "材料围绕低空经济政策目标展开。")
+        self.assertEqual(deps.tool_trace, ["get_task_map"])
+
 
 if __name__ == "__main__":
     unittest.main()

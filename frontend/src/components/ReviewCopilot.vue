@@ -151,6 +151,11 @@ function executionLabel(proposal: any) {
   return ({ waiting: "等待当前轮次结束", queued: "已进入后台队列", running: "正在后台重算",
     completed: "候选版本已生成", failed: "后台处理失败" } as any)[proposal.execution_status] || "已记录";
 }
+function proposalStatusLabel(proposal: any) {
+  if (proposal?.status === "rejected") return "已拒绝";
+  if (proposal?.status === "superseded") return "已被后续提案替代";
+  return proposal?.status === "proposed" ? "待确认" : "已确认";
+}
 function proposalExpanded(proposal: any) {
   return proposal?.artifact_type === "task_draft" || expandedProposalIds.value.has(Number(proposal.id));
 }
@@ -206,6 +211,7 @@ const toolLabels: Record<string, string> = {
   recheck_inference: "复核分析判断",
   rewrite_sentence: "改写所选句子", rewrite_paragraph: "改写所选段落",
   update_report_title: "修改报告标题", update_section_title: "修改章节标题",
+  update_section_titles: "批量修改章节标题",
   regenerate_chapter: "重新生成章节", rerun_final_plan: "重新规划报告结构",
 };
 const impactLabels: Record<string, string> = {
@@ -252,6 +258,7 @@ function proposalToolName(proposal: any) {
 function proposalKind(proposal: any) {
   const tool = proposalToolName(proposal);
   if (tool === "rerun_final_plan") return "structure";
+  if (tool === "update_section_titles") return "section_titles";
   if (tool === "revise_task_requirements") return "requirements";
   if (tool === "revise_analysis_plan") return "analysis";
   if (["rewrite_sentence", "rewrite_paragraph", "regenerate_chapter"].includes(tool)) return "content";
@@ -281,6 +288,16 @@ function proposalDisplayRows(proposal: any) {
       after: nextTitles.length ? numberedText(nextTitles) : `由报告规划器重新设计为 ${count || "合适数量的"} 章，标题不预设`,
       beforeLabel: "当前目录", afterLabel: "确认目标",
     }];
+  }
+  if (kind === "section_titles") {
+    const changes = Array.isArray(after.changes) ? after.changes : [];
+    return changes.map((change: any, index: number) => ({
+      key: `section-title-${index}`,
+      label: `第 ${index + 1} 章标题`,
+      before: diffValue(change?.old_title, "当前标题未识别"),
+      after: diffValue(change?.new_title, "调整后标题未识别"),
+      beforeLabel: "当前标题", afterLabel: "调整后标题",
+    }));
   }
   if (kind === "requirements") return [
     { key: "theme", label: "报告主题", before: diffValue(before.theme, "尚未填写"), after: diffValue(after.theme, "保持不变"), beforeLabel: "当前", afterLabel: "调整后" },
@@ -432,7 +449,7 @@ async function archiveCurrent() {
               <small>{{ item.role === "user" ? "你" : "助手" }}</small><p>{{ item.content }}</p>
             </div>
             <article v-else class="proposal conversation-proposal">
-              <div class="proposal-head"><div><small>变更建议</small><b>{{ item.status === "proposed" ? proposalTitle(item) : `${proposalTitle(item)} · ${item.status === "rejected" ? "已拒绝" : "已确认"}` }}</b><p>{{ item.rationale }}</p></div><span class="badge" :class="item.risk_level === 'high' ? 'danger' : item.risk_level === 'medium' ? 'warning' : ''">{{ riskLabel(item.risk_level) }}风险</span></div>
+              <div class="proposal-head"><div><small>变更建议</small><b>{{ item.status === "proposed" ? proposalTitle(item) : `${proposalTitle(item)} · ${proposalStatusLabel(item)}` }}</b><p>{{ item.rationale }}</p></div><span class="badge" :class="item.risk_level === 'high' ? 'danger' : item.risk_level === 'medium' ? 'warning' : ''">{{ riskLabel(item.risk_level) }}风险</span></div>
               <div v-if="proposalDisplayRows(item).length" class="changed-fields"><span v-for="row in proposalDisplayRows(item)" :key="row.key">{{ row.label }}</span><span class="impact-chip">{{ impactText(item) }}</span></div>
               <button v-if="proposalDisplayRows(item).length && item.artifact_type !== 'task_draft'" class="proposal-toggle" type="button" @click="toggleProposal(item)">{{ proposalExpanded(item) ? "收起详情" : "查看范围与目标" }}</button>
               <template v-if="proposalDisplayRows(item).length && proposalExpanded(item)">
@@ -446,7 +463,7 @@ async function archiveCurrent() {
                 <small class="proposal-boundary">执行边界：{{ impactText(item) }}。现有版本不会被覆盖。</small>
               </template>
               <div v-if="item.status === 'proposed'" class="button-row"><button class="btn primary" @click="decide(item, 'accepted')">接受</button><button class="btn" @click="decide(item, 'rejected')">拒绝</button></div>
-              <div v-else class="proposal-state"><span class="badge" :class="item.execution_status === 'failed' ? 'danger' : 'success'">{{ item.status === "rejected" ? "已拒绝" : executionLabel(item) }}</span><a v-if="item.candidate_version_id && item.report_id" :href="`/reports/${item.report_id}?version=${item.candidate_version_id}&review=1`">审阅候选版本</a><small v-else-if="item.candidate_version_id">候选版本已生成，可在报告版本审阅中决定最终保留内容。</small><small v-if="item.execution_error">后台修改未完成，请回到任务页查看异常并决定是否重试。</small></div>
+              <div v-else class="proposal-state"><span class="badge" :class="item.execution_status === 'failed' ? 'danger' : 'success'">{{ item.status === "superseded" ? "已替代" : item.status === "rejected" ? "已拒绝" : executionLabel(item) }}</span><a v-if="item.candidate_version_id && item.report_id" :href="`/reports/${item.report_id}?version=${item.candidate_version_id}&review=1`">审阅候选版本</a><small v-else-if="item.candidate_version_id">候选版本已生成，可在报告版本审阅中决定最终保留内容。</small><small v-if="item.execution_error && item.status !== 'superseded'">后台修改未完成，请回到任务页查看异常并决定是否重试。</small></div>
             </article>
           </template>
         </div>

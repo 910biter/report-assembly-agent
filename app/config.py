@@ -64,6 +64,8 @@ class Settings(BaseSettings):
     interactive_input_tokens: int = 8192
     interactive_history_tokens: int = 3072
     interactive_output_tokens: int = 2048
+    interactive_request_limit: int = 15  # 协作助手最多进行的模型往返次数
+    interactive_tool_calls_limit: int = 30  # 协作助手最多进行的工具调用次数
     comparison_output_tokens: int = 3200
     style_probe_output_tokens: int = 256
     style_profile_output_tokens: int = 4096

@@ -5,6 +5,7 @@ from app.control_agent import (
     AgentToolName,
     ArtifactFocus,
     TaskAgentContext,
+    execute_read_tool,
     validate_agent_tool_call,
 )
 from app.interaction import _pending_proposal_decision
@@ -71,6 +72,38 @@ class ControlAgentTests(unittest.TestCase):
             normalized = validate_agent_tool_call(section_call, self.context(), "修改第二章标题")
         self.assertEqual(normalized.arguments["old_title"], "技术路径")
 
+    def test_batch_section_titles_are_canonical_and_atomic(self):
+        from app.control_agent import AgentToolCall
+        titles = ["一、 政策规划：副标题", "二、 技术基础：副标题", "三、 风险边界：副标题"]
+        call = AgentToolCall.model_validate({
+            "tool_name": "update_section_titles",
+            "arguments": {"changes": [
+                {"old_title": "政策规划", "new_title": "政策规划"},
+                {"old_title": "技术基础", "new_title": "技术基础"},
+                {"old_title": "风险边界", "new_title": "风险边界"},
+            ]},
+        })
+        with patch("app.control_agent._load_plan", return_value={"titles": titles}):
+            normalized = validate_agent_tool_call(call, self.context(), "五个标题都去掉副标题")
+        self.assertEqual(normalized.arguments["changes"], [
+            {"old_title": titles[0], "new_title": "一、 政策规划"},
+            {"old_title": titles[1], "new_title": "二、 技术基础"},
+            {"old_title": titles[2], "new_title": "三、 风险边界"},
+        ])
+
+    def test_batch_section_titles_reject_collision_with_unchanged_title(self):
+        from app.control_agent import AgentToolCall
+        call = AgentToolCall.model_validate({
+            "tool_name": "update_section_titles",
+            "arguments": {"changes": [
+                {"old_title": "政策环境", "new_title": "技术路径"},
+                {"old_title": "风险边界", "new_title": "风险识别"},
+            ]},
+        })
+        with patch("app.control_agent._load_plan", return_value={"titles": ["政策环境", "技术路径", "风险边界"]}):
+            with self.assertRaisesRegex(ValueError, "未修改章节重复"):
+                validate_agent_tool_call(call, self.context(), "批量改标题")
+
     def test_split_keeps_unaffected_persisted_chapters_verbatim(self):
         from app.control_agent import AgentToolCall
         existing = ["政策与目标", "技术路径", "应用实践", "治理体系", "结论与展望"]
@@ -119,6 +152,15 @@ class ControlAgentTests(unittest.TestCase):
         result = _pending_proposal_decision({"proposals": [latest, older]}, "认可")
         self.assertEqual(result, (latest, "accepted"))
 
+    def test_checkpoint_tools_are_only_valid_at_the_matching_checkpoint(self):
+        from app.control_agent import AgentToolCall
+        call = AgentToolCall.model_validate({"tool_name": "confirm_directory"})
+        with self.assertRaisesRegex(ValueError, "目录确认阶段"):
+            validate_agent_tool_call(call, self.context(), "确认并继续")
+        context = self.context().model_copy(update={"directory_review_pending": True})
+        normalized = validate_agent_tool_call(call, context, "确认并继续")
+        self.assertEqual(normalized.arguments, {"feedback": ""})
+
     def test_quality_issue_gets_sentence_anchor(self):
         rows = [{
             "id": 31, "section": "第二章", "paragraph": 2,
@@ -158,6 +200,21 @@ class ControlAgentTests(unittest.TestCase):
         refreshed = attach_quality_issue_locations(1, [issue], rows=edited_rows)[0]
         self.assertEqual(refreshed["status"], "stale")
         self.assertEqual(refreshed["issue_id"], issue["issue_id"])
+
+    def test_locate_quality_issue_fetches_the_requested_page(self):
+        expected = {"issues": [{"issue_id": "qa_17", "sentence_id": 88}]}
+        with (
+            patch("app.control_agent.execute_read_tool", return_value=expected) as read,
+            patch("app.control_agent._issue_url", return_value="/reports/7?sentence=88"),
+        ):
+            result = execute_read_tool(
+                AgentToolName.LOCATE_QUALITY_ISSUE,
+                {"issue_index": 17}, self.context(),
+            )
+        read.assert_called_once_with(
+            AgentToolName.GET_QUALITY_ISSUES, {"offset": 17, "limit": 1}, self.context(),
+        )
+        self.assertEqual(result["issue"]["issue_id"], "qa_17")
 
 
 if __name__ == "__main__":

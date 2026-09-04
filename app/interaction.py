@@ -50,6 +50,33 @@ _INTERACTION_EXECUTOR = ThreadPoolExecutor(
 _PROPOSAL_RETRY_LOCK = threading.RLock()
 
 
+def reconcile_interrupted_interactions() -> int:
+    """Release turns left running when the in-process web worker restarted.
+
+    Interaction work deliberately runs outside the report queue. Unlike report
+    artifacts, a model turn is not resumable from its half-generated state, so
+    it is marked retryable instead of being left permanently pending.
+    """
+    with session_scope() as s:
+        rows = s.execute(select(ORMInteractionMessage).where(
+            ORMInteractionMessage.c.role == "user",
+        )).mappings().all()
+        interrupted = [
+            dict(row) for row in rows
+            if str(_load(row.get("metadata_json"), {}).get("status") or "") in {"queued", "running"}
+        ]
+        for row in interrupted:
+            metadata = _load(row.get("metadata_json"), {})
+            metadata.update({
+                "status": "interrupted", "retryable": True,
+                "error": "service_restart",
+            })
+            s.execute(update(ORMInteractionMessage).where(
+                ORMInteractionMessage.c.id == int(row["id"])
+            ).values(metadata_json=_dump(metadata)))
+    return len(interrupted)
+
+
 def _tool_confirmation_reply(tool_call) -> str:
     """Describe a pending action once; proposal cards own the detailed diff."""
     if tool_call.tool_name == AgentToolName.RERUN_FINAL_PLAN:
@@ -305,6 +332,9 @@ def _generate_interaction_reply(thread_id: int, content: str, request_id: str = 
     thread = get_thread(thread_id)
     if thread is None:
         raise ValueError("INTERACTION_THREAD_NOT_FOUND")
+    retry_content = _interrupted_turn_retry_content(thread, content)
+    if retry_content:
+        content = retry_content
     current = _resolve_current(thread)
     retried = _retry_failed_proposal(thread, content)
     if retried is not None:
@@ -544,13 +574,17 @@ def decide_proposal(proposal_id: int, decision: str) -> dict[str, Any]:
         if not applied:
             scheduled = _schedule_semantic_proposal(dict(row))
     status = "applied" if applied else decision
-    execution_status = "completed" if applied else ("waiting" if scheduled else "not_required")
+    execution_status = "completed" if applied else ("waiting" if scheduled else "failed" if decision == "accepted" else "not_required")
+    execution_error = ""
+    if decision == "accepted" and not applied and not scheduled:
+        execution_error = "该提案未能应用到当前权威产物；请重新生成提案或重试。"
     with session_scope() as s:
         s.execute(update(ORMChangeProposal).where(
             ORMChangeProposal.c.id == int(proposal_id)
         ).values(
             status=status,
             execution_status=execution_status,
+            execution_error=execution_error,
             decided_at=time.strftime("%Y-%m-%d %H:%M:%S"),
         ))
     if scheduled:
@@ -627,7 +661,7 @@ def _latest_failed_proposal(proposals: list[dict]) -> dict | None:
 
 
 def _create_proposal(thread: dict, current: dict, proposal: dict,
-                     source_message_id: int | None = None) -> dict:
+                      source_message_id: int | None = None) -> dict:
     artifact_type = thread["artifact_type"]
     risk = str(proposal.get("risk_level") or _default_risk(artifact_type))
     if artifact_type in {"fact", "inference", "analysis_plan", "final_plan", "narrative_plan"} and risk == "low":
@@ -636,6 +670,7 @@ def _create_proposal(thread: dict, current: dict, proposal: dict,
     if source_message_id is not None:
         impact["source_message_id"] = int(source_message_id)
     with session_scope() as s:
+        _supersede_pending_proposals(s, thread, artifact_type, str(thread.get("object_id") or ""))
         result = s.execute(insert(ORMChangeProposal).values(
             proposal_key=uuid.uuid4().hex,
             thread_id=int(thread["id"]),
@@ -658,6 +693,35 @@ def _create_proposal(thread: dict, current: dict, proposal: dict,
             ORMChangeProposal.c.id == proposal_id
         )).mappings().first()
     return _proposal_detail(row)
+
+
+def _supersede_pending_proposals(session, thread: dict, artifact_type: str, object_id: str) -> None:
+    """Keep one actionable proposal for a semantic target in a conversation.
+
+    A newer proposal expresses the user's latest wording. Leaving older pending
+    proposals actionable makes a later "确认" ambiguous and pollutes the
+    assistant's durable decision memory.
+    """
+    types = {artifact_type}
+    exact_object = object_id
+    if artifact_type == "section_titles":
+        # A batch title proposal supersedes outstanding single-title proposals
+        # in the same task-level conversation.
+        types.update({"section_title", "section_titles"})
+        exact_object = ""
+    query = update(ORMChangeProposal).where(
+        ORMChangeProposal.c.thread_id == int(thread["id"]),
+        ORMChangeProposal.c.status == "proposed",
+        ORMChangeProposal.c.artifact_type.in_(types),
+    )
+    if exact_object:
+        query = query.where(ORMChangeProposal.c.object_id == exact_object)
+    session.execute(query.values(
+        status="superseded",
+        execution_status="not_required",
+        execution_error="已被同一目标的后续提案替代。",
+        decided_at=time.strftime("%Y-%m-%d %H:%M:%S"),
+    ))
 
 
 def _create_tool_action_proposal(thread: dict, current: dict, tool_call: dict,
@@ -742,6 +806,19 @@ def _create_tool_action_proposal(thread: dict, current: dict, tool_call: dict,
         target["object_id"] = str(arguments.get("old_title") or "")
         before = {"title": target["object_id"]}
         after = {"title": str(arguments.get("new_title") or "").strip()}
+    elif tool_name == AgentToolName.UPDATE_SECTION_TITLES.value:
+        changes = [
+            {
+                "old_title": str(item.get("old_title") or "").strip(),
+                "new_title": str(item.get("new_title") or "").strip(),
+            }
+            for item in arguments.get("changes") or []
+            if isinstance(item, dict)
+        ]
+        target["artifact_type"] = "section_titles"
+        target["object_id"] = "|".join(item["old_title"] for item in changes)
+        before = {"changes": [{"old_title": item["old_title"]} for item in changes]}
+        after = {"changes": changes}
     elif tool_name == AgentToolName.RERUN_FINAL_PLAN.value:
         target["artifact_type"] = "final_plan"
         target["object_id"] = str(thread.get("task_id") or "")
@@ -797,7 +874,6 @@ def _apply_supported_proposal(row: dict) -> bool:
         AgentToolName.RERUN_FINAL_PLAN.value,
     }:
         return False
-    content = str(after.get("content") or after.get("title") or "").strip()
     report_id = row.get("report_id")
     task_id = str(row.get("task_id") or "")
     if artifact_type == "task_control":
@@ -822,7 +898,7 @@ def _apply_supported_proposal(row: dict) -> bool:
     if artifact_type == "task_brief":
         from app.memory import short_term
         task = short_term.load_task(task_id) or {}
-        if str(task.get("stage") or "created") != "created":
+        if str(task.get("stage") or "created") not in {"created", "requirement_review"}:
             return False
         values = {}
         if str(after.get("theme") or "").strip():
@@ -834,7 +910,49 @@ def _apply_supported_proposal(row: dict) -> bool:
             return False
         short_term.update_task(task_id, **values)
         return True
-    if not content or report_id is None:
+    if artifact_type == "final_plan":
+        # During the directory checkpoint, an accepted assistant proposal is
+        # applied to the current plan in place. It does not start writing and
+        # the checkpoint remains visible until the user explicitly continues.
+        task = short_term.load_task(task_id) or {}
+        if not task.get("directory_review_pending"):
+            return False
+        structure = [
+            str(item).strip() for item in (
+                after.get("required_structure") or
+                tool_call.get("arguments", {}).get("new_structure") or []
+            ) if str(item).strip()
+        ]
+        if not structure or not task.get("plan_id"):
+            return False
+        from app.workflow.controller import planner as workflow_planner
+        revised = workflow_planner.revise_final_plan_structure(
+            int(task["plan_id"]), structure,
+            instruction=str(after.get("instruction") or "按确认目录调整"),
+        )
+        short_term.update_task(
+            task_id,
+            plan_title=revised.title,
+            final_plan_frozen=True,
+            directory_review_pending=True,
+        )
+        return True
+    if artifact_type == "section_titles":
+        changes = [
+            (str(item.get("old_title") or "").strip(), str(item.get("new_title") or "").strip())
+            for item in after.get("changes") or []
+            if isinstance(item, dict)
+        ]
+        if len(changes) < 2 or any(not old or not new for old, new in changes):
+            return False
+        if not _rename_sections_in_task(task_id, int(report_id) if report_id is not None else None, changes):
+            return False
+        if report_id is not None:
+            ensure_report_version(int(report_id), task_id=task_id, status="snapshot",
+                                  change_summary=f"审阅助手提案：批量修改 {len(changes)} 个章节标题", kind="minor")
+        return True
+    content = str(after.get("content") or after.get("title") or "").strip()
+    if not content:
         return False
     if artifact_type == "report_title":
         with session_scope() as s:
@@ -846,16 +964,11 @@ def _apply_supported_proposal(row: dict) -> bool:
         old_title = str(_load(row["before_json"], {}).get("title") or row.get("object_id") or "").strip()
         if not old_title:
             return False
-        with session_scope() as s:
-            changed = s.execute(update(ORMSentence).where(
-                ORMSentence.c.report_id == int(report_id),
-                ORMSentence.c.section == old_title,
-            ).values(section=content)).rowcount
-        if not changed:
+        if not _rename_sections_in_task(task_id, int(report_id) if report_id is not None else None, [(old_title, content)]):
             return False
-        _rename_section_in_plan(int(report_id), old_title, content)
-        ensure_report_version(int(report_id), task_id=task_id, status="snapshot",
-                              change_summary="审阅助手提案：修改章节标题", kind="minor")
+        if report_id is not None:
+            ensure_report_version(int(report_id), task_id=task_id, status="snapshot",
+                                  change_summary="审阅助手提案：修改章节标题", kind="minor")
         return True
     return False
 
@@ -870,22 +983,75 @@ def _merge_draft_change(current: dict[str, Any], after: dict[str, Any]) -> dict[
     return merged
 
 
-def _rename_section_in_plan(report_id: int, old_title: str, new_title: str) -> None:
+def _rename_sections_in_task(task_id: str, report_id: int | None,
+                             changes: list[tuple[str, str]]) -> bool:
+    """Rename sections from the report plan first, with body rows kept in sync.
+
+    A final plan exists before Writer creates any sentences.  Treating sentence
+    row count as the success criterion made accepted directory-stage proposals
+    silently no-op.  The plan is the authority; rows are only a downstream view.
+    """
+    mapping = {old: new for old, new in changes if old and new and old != new}
+    if not mapping or len(mapping) != len(changes):
+        return False
+    if len(set(mapping.values())) != len(mapping):
+        return False
+    from app.memory import short_term
+
+    task = short_term.load_task(task_id) or {}
+    plan_id = int(task.get("plan_id") or 0) or None
     with session_scope() as s:
-        report = s.execute(select(ORMReport).where(ORMReport.c.id == report_id)).mappings().first()
-        if report is None:
-            return
-        plan = s.execute(select(ORMPlan).where(ORMPlan.c.id == int(report["plan_id"]))).mappings().first()
-        if plan is None:
-            return
-        structure = [new_title if str(item) == old_title else item for item in _load(plan["structure"], [])]
-        chapters = []
-        for item in _load(plan["chapter_plans"], []):
-            chapters.append({**item, "title": new_title} if str(item.get("title") or "") == old_title else item)
-        final_plan = _replace_exact_string(_load(plan.get("final_plan_json"), {}), old_title, new_title)
-        s.execute(update(ORMPlan).where(ORMPlan.c.id == int(report["plan_id"])).values(
+        report = None
+        if report_id is not None:
+            report = s.execute(select(ORMReport).where(ORMReport.c.id == report_id)).mappings().first()
+            if report is None:
+                return False
+            plan_id = int(report.get("plan_id") or 0) or plan_id
+        plan = s.execute(select(ORMPlan).where(ORMPlan.c.id == int(plan_id))).mappings().first() if plan_id else None
+        plan_titles = _stored_plan_titles(plan)
+        if plan is None or not set(mapping).issubset(plan_titles):
+            return False
+        sentence_changed = 0
+        if report_id is not None:
+            for old_title, new_title in mapping.items():
+                sentence_changed += int(s.execute(update(ORMSentence).where(
+                    ORMSentence.c.report_id == int(report_id),
+                    ORMSentence.c.section == old_title,
+                ).values(section=new_title)).rowcount or 0)
+        structure = [mapping.get(str(item), item) for item in _load(plan["structure"], [])]
+        chapters = [
+            {**item, "title": mapping.get(str(item.get("title") or ""), item.get("title"))}
+            if isinstance(item, dict) else item
+            for item in _load(plan["chapter_plans"], [])
+        ]
+        final_plan = _replace_exact_strings(_load(plan.get("final_plan_json"), {}), mapping)
+        s.execute(update(ORMPlan).where(ORMPlan.c.id == int(plan_id)).values(
             structure=_dump(structure), chapter_plans=_dump(chapters), final_plan_json=_dump(final_plan),
         ))
+    return True
+
+
+def _rename_section_in_plan(report_id: int, old_title: str, new_title: str) -> None:
+    """Compatibility wrapper for callers outside the collaboration proposal flow."""
+    with session_scope() as s:
+        report = s.execute(select(ORMReport.c.task_id).where(ORMReport.c.id == report_id)).first()
+    if report:
+        _rename_sections_in_task(str(report[0] or ""), report_id, [(old_title, new_title)])
+
+
+def _stored_plan_titles(plan: Any) -> set[str]:
+    if not plan:
+        return set()
+    titles = {str(item).strip() for item in _load(plan.get("structure"), []) if str(item).strip()}
+    for item in _load(plan.get("chapter_plans"), []):
+        if isinstance(item, dict) and str(item.get("title") or "").strip():
+            titles.add(str(item["title"]).strip())
+    final_plan = _load(plan.get("final_plan_json"), {})
+    for item in final_plan.get("chapter_plans") or final_plan.get("structure") or []:
+        title = item.get("title") if isinstance(item, dict) else item
+        if str(title or "").strip():
+            titles.add(str(title).strip())
+    return titles
 
 
 def _replace_exact_string(value: Any, old: str, new: str) -> Any:
@@ -895,6 +1061,16 @@ def _replace_exact_string(value: Any, old: str, new: str) -> Any:
         return [_replace_exact_string(item, old, new) for item in value]
     if isinstance(value, dict):
         return {key: _replace_exact_string(item, old, new) for key, item in value.items()}
+    return value
+
+
+def _replace_exact_strings(value: Any, replacements: dict[str, str]) -> Any:
+    if isinstance(value, str):
+        return replacements.get(value, value)
+    if isinstance(value, list):
+        return [_replace_exact_strings(item, replacements) for item in value]
+    if isinstance(value, dict):
+        return {key: _replace_exact_strings(item, replacements) for key, item in value.items()}
     return value
 
 
@@ -913,7 +1089,7 @@ def _schedule_semantic_proposal(row: dict) -> bool:
         task_id=task_id, report_id=row.get("report_id"), notification_type="proposal_accepted",
         title="修改建议已进入后台处理",
         message="系统将在当前轮次结束后生成候选版本，不会覆盖已有版本。",
-        action_url=f"/tasks/{task_id}?tab=collaboration",
+        action_url=f"/tasks/{task_id}?assistant=1",
         metadata={"proposal_id": int(row["id"]), "artifact_type": artifact_type},
     )
     return True
@@ -954,12 +1130,41 @@ def _pending_proposal_decision(thread: dict, message: str) -> tuple[dict, str] |
     return latest, "accepted" if accepted else "rejected"
 
 
+def _interrupted_turn_retry_content(thread: dict, message: str) -> str:
+    """Allow a concise retry command after a web-process restart."""
+    command = re.sub(r"[！!。，,\s]", "", str(message or "").strip())
+    if command not in {"重试上一轮", "重试刚才的问题", "重新回答"}:
+        return ""
+    for item in reversed(thread.get("messages") or []):
+        if item.get("role") != "user":
+            continue
+        metadata = item.get("metadata") or _load(item.get("metadata_json"), {})
+        if str(metadata.get("status") or "") != "interrupted":
+            continue
+        _update_message_metadata(int(item["id"]), {"status": "retried", "retryable": False})
+        return str(item.get("content") or "").strip()
+    return ""
+
+
 def _bounded_history(messages: list[dict], token_budget: int) -> list[dict[str, str]]:
+    """Keep the newest turns within a hard context budget.
+
+    A single pasted message used to bypass the budget because the first item was
+    always accepted. That made an interactive turn capable of crowding out the
+    tool context it needs to answer safely.
+    """
     selected: list[dict[str, str]] = []
     used = 0
     for item in reversed(messages):
         content = str(item.get("content") or "")
         cost = _estimate_tokens(content) + 8
+        remaining = max(0, int(token_budget) - used - 8)
+        if cost > remaining:
+            if not selected and remaining > 0:
+                content = _truncate_to_token_budget(content, remaining)
+                if content:
+                    selected.append({"role": str(item.get("role") or ""), "content": content})
+            break
         if selected and used + cost > token_budget:
             break
         selected.append({"role": str(item.get("role") or ""), "content": content})
@@ -971,6 +1176,25 @@ def _bounded_history(messages: list[dict], token_budget: int) -> list[dict[str, 
 
 def _estimate_tokens(text: str) -> int:
     return count_tokens(text)
+
+
+def _truncate_to_token_budget(text: str, token_budget: int) -> str:
+    """Deterministically preserve the leading user request under a token cap."""
+    if token_budget <= 0 or not text:
+        return ""
+    if _estimate_tokens(text) <= token_budget:
+        return text
+    low, high = 0, len(text)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if _estimate_tokens(text[:middle]) <= token_budget:
+            low = middle
+        else:
+            high = middle - 1
+    suffix = "\n[内容过长，已截断；请分段发送以便完整讨论]"
+    while low and _estimate_tokens(text[:low] + suffix) > token_budget:
+        low -= 1
+    return text[:low] + suffix if low else ""
 
 
 def _resolve_current(thread: dict) -> dict:
@@ -1047,12 +1271,12 @@ def _impact_for(artifact_type: str, thread: dict) -> dict:
         "invalidates": list(policy.invalidates),
         "scope": scope,
         "policy": policy.as_dict(),
-        "automatic_execution": artifact_type in {"report_title", "section_title"},
+        "automatic_execution": artifact_type in {"report_title", "section_title", "section_titles"},
     }
 
 
 def _default_risk(artifact_type: str) -> str:
-    return "low" if artifact_type in {"report_title", "section_title", "paragraph", "sentence"} else "medium"
+    return "low" if artifact_type in {"report_title", "section_title", "section_titles", "paragraph", "sentence"} else "medium"
 
 
 def _save_message(thread_id: int, role: str, content: str, metadata: dict | None = None) -> int:
@@ -1237,7 +1461,7 @@ def dispatch_pending_revisions(task_id: str) -> dict[str, Any]:
         _notify(
             task_id=task_id, report_id=task.get("report_id"), notification_type="revision_failed",
             title="后台修改任务创建失败", message=str(exc)[:240],
-            action_url=f"/tasks/{task_id}?tab=collaboration",
+            action_url=f"/tasks/{task_id}?assistant=1",
             metadata={"proposal_ids": proposal_ids},
         )
         return {"status": "failed", "error": str(exc)}
@@ -1484,7 +1708,7 @@ def fail_recompute_for_run(run_id: str, error: str) -> None:
     _notify(
         task_id=str(first["task_id"]), report_id=first["report_id"],
         notification_type="revision_failed", title="交互修改后台处理失败",
-        message=_friendly_revision_error(error), action_url=f"/tasks/{first['task_id']}?tab=collaboration",
+        message=_friendly_revision_error(error), action_url=f"/tasks/{first['task_id']}?assistant=1",
         metadata={"run_id": run_id},
     )
 

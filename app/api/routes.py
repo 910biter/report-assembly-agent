@@ -97,14 +97,22 @@ def _ui_timestamp(value) -> str:
 
 @router.post("/tasks")
 def create_task(
-    theme: str = Form(...),
+    theme: str = Form(""),
     requirements: str = Form(""),
     variant_id: int | None = Form(None),
     existing_material_ids: str = Form(""),
     interaction_draft_id: str = Form(""),
+    workflow_mode: str = Form("automatic"),
+    requirement_review: str = Form("auto"),
+    directory_review: str = Form("auto"),
     files: list[UploadFile] | None = File(default=None),
 ):
     """创建任务:上传材料 + 指定主题 + 可选模板(不选则用全局默认模板)。"""
+    workflow_mode = workflow_mode if workflow_mode in {"automatic", "collaborative"} else "automatic"
+    requirement_review = requirement_review if requirement_review in {"auto", "required"} else "auto"
+    directory_review = directory_review if directory_review in {"auto", "required"} else "auto"
+    if workflow_mode == "automatic" and not theme.strip():
+        return JSONResponse({"error": "THEME_REQUIRED"}, status_code=400)
     task_id = uuid.uuid4().hex[:12]
     try:
         material_ids = _collect_material_ids(task_id, existing_material_ids, files)
@@ -125,9 +133,19 @@ def create_task(
         "run_id": run_id,
         "run_mode": "initial",
         "run_history": [],
+        "workflow_mode": workflow_mode,
+        "requirement_review": requirement_review,
+        "directory_review": directory_review,
+        # The requirement checkpoint becomes available only after material
+        # understanding; it must not occupy the queue before that artifact exists.
+        "requirement_review_pending": False,
+        "requirement_review_completed": workflow_mode == "automatic" or requirement_review == "auto",
+        "directory_review_pending": False,
+        "directory_review_completed": directory_review == "auto" or workflow_mode == "automatic",
     })
     attach_draft_thread(interaction_draft_id, task_id)
-    return {"task_id": task_id, "material_count": len(material_ids)}
+    queue = enqueue_task(task_id) if workflow_mode == "collaborative" else {}
+    return {"task_id": task_id, "material_count": len(material_ids), "queue": queue}
 
 
 @router.post("/reports/{report_id}/incremental/tasks")
@@ -546,6 +564,7 @@ def get_task(task_id: str):
     return {
         "task_id": task_id,
         "theme": view.get("theme", ""),
+        "user_requirements": view.get("user_requirements", ""),
         "stage": view.get("stage", "created"),
         "created_at": view.get("created_at", ""),
         "updated_at": _ui_timestamp(view.get("updated_at") or view.get("last_progress_at") or view.get("created_at", "")),
@@ -555,6 +574,13 @@ def get_task(task_id: str):
         "variant_id": view.get("variant_id"),
         "run_revision": int(view.get("run_revision") or 1),
         "run_mode": view.get("run_mode") or "initial",
+        "workflow_mode": view.get("workflow_mode") or "automatic",
+        "requirement_review": view.get("requirement_review") or "auto",
+        "requirement_review_pending": bool(view.get("requirement_review_pending", view.get("planning_review_pending"))),
+        "requirement_review_completed": bool(view.get("requirement_review_completed", not view.get("planning_review_pending"))),
+        "directory_review": view.get("directory_review") or "auto",
+        "directory_review_pending": bool(view.get("directory_review_pending")),
+        "directory_review_completed": bool(view.get("directory_review_completed")),
         "queue_status": view.get("queue_status") or {},
         "parse_progress": view.get("parse_progress") or {},
         "write_progress": view.get("write_progress") or {},
@@ -571,6 +597,42 @@ def get_task(task_id: str):
             "qa_issues": len(view.get("qa_notes") or []),
         },
     }
+
+
+@router.post("/tasks/{task_id}/requirements/confirm")
+def confirm_task_requirements(task_id: str, payload: dict):
+    """确认材料理解后的任务需求，并继续 AnalysisPlan。"""
+    from app.workflow.checkpoints import CheckpointError, confirm_requirements
+    try:
+        return confirm_requirements(
+            task_id,
+            theme=str(payload.get("theme") or ""),
+            requirements=str(payload.get("requirements") or ""),
+            feedback=str(payload.get("feedback") or ""),
+        )
+    except CheckpointError as exc:
+        return _checkpoint_error_response(str(exc))
+
+
+@router.post("/tasks/{task_id}/directory/confirm")
+def confirm_task_directory(task_id: str, payload: dict):
+    """确认最终目录，并继续同一任务的报告写作。"""
+    from app.workflow.checkpoints import CheckpointError, confirm_directory
+    try:
+        return confirm_directory(task_id, feedback=str(payload.get("feedback") or ""))
+    except CheckpointError as exc:
+        return _checkpoint_error_response(str(exc))
+
+
+def _checkpoint_error_response(code: str) -> JSONResponse:
+    status = {
+        "TASK_NOT_FOUND": 404,
+        "REQUIREMENT_REVIEW_NOT_PENDING": 409,
+        "DIRECTORY_REVIEW_NOT_PENDING": 409,
+        "THEME_REQUIRED": 400,
+        "REQUIREMENTS_REQUIRED": 400,
+    }.get(code, 400)
+    return JSONResponse({"error": code}, status_code=status)
 
 
 @router.get("/tasks/{task_id}/assistant-context")
@@ -602,6 +664,9 @@ def _assistant_task_context(task_id: str, task: dict) -> dict:
         "theme": task.get("theme", ""),
         "user_requirements": task.get("user_requirements", ""),
         "stage": task.get("stage", "created"),
+        "workflow_mode": task.get("workflow_mode") or "automatic",
+        "requirement_review_pending": bool(task.get("requirement_review_pending", task.get("planning_review_pending"))),
+        "directory_review_pending": bool(task.get("directory_review_pending")),
         "run_revision": task.get("run_revision", 1),
         "queue_status": task.get("queue_status") or {},
         "parse_progress": task.get("parse_progress") or {},

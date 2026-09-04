@@ -9,8 +9,14 @@ import { useUiStore } from "@/stores/ui";
 const route = useRoute();
 const ui = useUiStore();
 ui.ensureDraftId();
-const open = ref(false);
-const tab = ref<"progress" | "artifacts" | "discuss">("progress");
+const open = computed({
+  get: () => ui.assistant.open,
+  set: (value: boolean) => { ui.assistant.open = value; },
+});
+const tab = computed({
+  get: () => ui.assistant.tab,
+  set: (value: "progress" | "artifacts" | "discuss") => ui.setAssistantTab(value),
+});
 const task = ref<any>(null);
 const report = ref<any>(null);
 const workspace = ref<any>(null);
@@ -233,15 +239,12 @@ function removeReference(index: number) {
   references.value = references.value.filter((_item, current) => current !== index);
 }
 
-function acceptExternalFocus(event: Event) {
-  const detail = (event as CustomEvent).detail;
+function applyFocus(detail: any) {
   if (!detail || (detail.taskId && taskId.value && String(detail.taskId) !== taskId.value)) return;
   if (detail.reference) addReference(detail.reference);
   if (detail.artifact) selected.value = detail.artifact;
   else if (!detail.reference) selected.value = detail;
   if (!detail.append && !detail.reference) references.value = [];
-  open.value = true;
-  tab.value = "discuss";
 }
 
 function proposalApplied(proposal: any) {
@@ -253,15 +256,15 @@ function proposalApplied(proposal: any) {
 }
 
 watch(() => route.fullPath, () => {
-  open.value = false;
+  ui.closeAssistant();
   tab.value = "progress";
   selected.value = null;
   references.value = [];
   loadContext();
 });
+watch(() => ui.assistant.revision, () => applyFocus(ui.assistant.focus));
 onMounted(() => {
   loadContext();
-  window.addEventListener("ira:assistant-focus", acceptExternalFocus);
   timer = window.setInterval(() => {
     if (open.value && taskId.value) loadContext();
   }, 5000);
@@ -269,7 +272,6 @@ onMounted(() => {
 onBeforeUnmount(() => {
   if (timer) window.clearInterval(timer);
   stopResize?.();
-  window.removeEventListener("ira:assistant-focus", acceptExternalFocus);
 });
 </script>
 
@@ -371,7 +373,7 @@ onBeforeUnmount(() => {
         </div>
       </div>
     </section>
-    <button class="assistant-orb" :aria-label="open ? '关闭报告协作助手' : '打开报告协作助手'" @click="open = !open">
+    <button v-if="!isDraft" class="assistant-orb" :aria-label="open ? '关闭报告协作助手' : '打开报告协作助手'" @click="open = !open">
       <span class="orb-mark"><i></i><i></i><i></i></span>
       <span class="orb-label">{{ isDraft ? "讨论需求" : "任务助手" }}</span>
     </button>

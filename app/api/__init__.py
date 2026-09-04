@@ -26,7 +26,9 @@ class ImmutableStaticFiles(StaticFiles):
 def create_app() -> FastAPI:
     init_db()
     from app.workflow.queue import reconcile_interrupted_tasks
+    from app.interaction import reconcile_interrupted_interactions
     reconcile_interrupted_tasks()
+    reconcile_interrupted_interactions()
     application = FastAPI(title="报告整编 Agent")
     application.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
     application.include_router(api_router)

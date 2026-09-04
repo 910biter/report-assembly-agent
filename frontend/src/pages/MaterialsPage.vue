@@ -70,7 +70,7 @@ const metadataRows = computed(() => {
 
 <template>
   <div class="page-stack materials-page">
-    <header class="page-header"><div><h1>材料库</h1><p>统一管理可复用材料，并追踪每份材料的任务使用关系。</p></div></header>
+    <header class="page-header"><h1>材料库</h1></header>
     <section class="surface material-shell" :class="{ 'has-detail': selected !== null }">
       <div class="material-list">
         <div class="filter-bar">
