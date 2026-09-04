@@ -6,6 +6,9 @@ import router from "./router";
 import "./styles/tokens.css";
 import "./styles/base.css";
 
+const savedTheme = localStorage.getItem("ira-theme");
+document.documentElement.dataset.theme = savedTheme === "light" ? "light" : "dark";
+
 const queryClient = new QueryClient({
   defaultOptions: {
     queries: { staleTime: 15_000, retry: 1, refetchOnWindowFocus: false },

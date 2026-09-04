@@ -7,17 +7,26 @@ const emit = defineEmits<{ select: [edge: any] }>();
 const host = ref<HTMLElement | null>(null);
 let graph: cytoscape.Core | null = null;
 
+function token(name: string) {
+  return getComputedStyle(document.documentElement)
+    .getPropertyValue(name)
+    .trim();
+}
+
 function render() {
   graph?.destroy();
   if (!host.value) return;
-  const nodeKeys = new Set((props.nodes || []).map((node) => String(node.key || "")));
+  const nodeKeys = new Set(
+    (props.nodes || []).map((node) => String(node.key || "")),
+  );
   const visible = new Set<string>();
   const edges = (props.edges || [])
     .filter((edge) => {
       if (!edge.subject_key || !edge.target_key) return false;
       // The API contract should provide both endpoints. Keep visualization
       // resilient while a task is being rebuilt or against older projections.
-      if (!nodeKeys.has(edge.subject_key) || !nodeKeys.has(edge.target_key)) return false;
+      if (!nodeKeys.has(edge.subject_key) || !nodeKeys.has(edge.target_key))
+        return false;
       visible.add(edge.subject_key);
       visible.add(edge.target_key);
       return true;
@@ -57,11 +66,11 @@ function render() {
       {
         selector: "node",
         style: {
-          "background-color": "#eff5fb",
-          "border-color": "#245b9e",
+          "background-color": token("--surface-raised"),
+          "border-color": token("--primary"),
           "border-width": "1px",
           label: "data(label)",
-          color: "#1f2329",
+          color: token("--foreground"),
           "font-size": "11px",
           "text-wrap": "wrap",
           "text-max-width": "88px",
@@ -75,14 +84,14 @@ function render() {
         selector: "edge",
         style: {
           width: "1.2px",
-          "line-color": "#9db5cf",
-          "target-arrow-color": "#9db5cf",
+          "line-color": token("--border-strong"),
+          "target-arrow-color": token("--border-strong"),
           "target-arrow-shape": "triangle",
           "curve-style": "bezier",
           label: "data(label)",
-          color: "#646a73",
+          color: token("--muted-foreground"),
           "font-size": "10px",
-          "text-background-color": "#fff",
+          "text-background-color": token("--card"),
           "text-background-opacity": 0.9,
           "text-background-padding": "2px",
         },
@@ -90,9 +99,9 @@ function render() {
       {
         selector: ":selected",
         style: {
-          "background-color": "#245b9e",
-          "line-color": "#245b9e",
-          "target-arrow-color": "#245b9e",
+          "background-color": token("--primary"),
+          "line-color": token("--primary"),
+          "target-arrow-color": token("--primary"),
         },
       },
     ],
@@ -111,8 +120,8 @@ onBeforeUnmount(() => graph?.destroy());
 .graph-network {
   height: 360px;
   margin: 16px 0;
-  border: 1px solid var(--color-border);
-  border-radius: 6px;
-  background: var(--color-surface-soft);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  background: var(--surface-raised);
 }
 </style>

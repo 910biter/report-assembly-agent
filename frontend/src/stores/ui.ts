@@ -2,6 +2,8 @@ import { defineStore } from "pinia";
 
 export const useUiStore = defineStore("ui", {
   state: () => ({
+    theme: (typeof localStorage !== "undefined" && localStorage.getItem("ira-theme") === "light" ? "light" : "dark") as "dark" | "light",
+    navCollapsed: typeof localStorage !== "undefined" && localStorage.getItem("ira-nav-collapsed") === "true",
     navOpen: false,
     createOpen: false,
     draftId: "",
@@ -14,7 +16,17 @@ export const useUiStore = defineStore("ui", {
     },
   }),
   actions: {
+    setTheme(theme: "dark" | "light") {
+      this.theme = theme;
+      if (typeof document !== "undefined") document.documentElement.dataset.theme = theme;
+      if (typeof localStorage !== "undefined") localStorage.setItem("ira-theme", theme);
+    },
+    toggleTheme() { this.setTheme(this.theme === "dark" ? "light" : "dark"); },
     toggleNav() { this.navOpen = !this.navOpen; },
+    toggleNavCollapsed() {
+      this.navCollapsed = !this.navCollapsed;
+      if (typeof localStorage !== "undefined") localStorage.setItem("ira-nav-collapsed", String(this.navCollapsed));
+    },
     closeNav() { this.navOpen = false; },
     ensureDraftId() {
       if (!this.draftId) {
