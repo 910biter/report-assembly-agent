@@ -615,28 +615,30 @@ onBeforeUnmount(() => {
   gap: 9px;
   height: 46px;
   padding: 0 16px 0 6px;
-  border: 1px solid rgba(255, 255, 255, 0.14);
+  border: 1px solid var(--border-strong);
   border-radius: 999px;
-  background: var(--primary-gradient);
-  color: var(--primary-foreground);
-  box-shadow: var(--shadow-float);
-  font-weight: 600;
+  background: var(--surface-raised);
+  color: var(--foreground);
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.24);
+  font-weight: 500;
   transition:
     box-shadow var(--motion-fast),
     background var(--motion-fast);
 }
 .assistant-orb:hover {
-  background: var(--primary-hover);
-  box-shadow: var(--shadow-float);
+  border-color: color-mix(in srgb, var(--primary) 65%, var(--border-strong));
+  background: var(--surface-hover);
+  box-shadow: 0 10px 26px rgba(0, 0, 0, 0.3);
 }
 .orb-mark {
   display: grid;
   place-items: center;
   width: 32px;
   height: 32px;
-  border: 1px solid rgba(255, 255, 255, 0.28);
+  border: 1px solid color-mix(in srgb, var(--primary) 45%, var(--border));
   border-radius: 50%;
-  background: rgba(255, 255, 255, 0.12);
+  background: var(--primary-soft);
+  color: var(--accent);
 }
 .orb-label {
   font-size: 13px;
@@ -651,7 +653,7 @@ onBeforeUnmount(() => {
   grid-template-rows: auto auto minmax(0, 1fr);
   overflow: hidden;
   border: 1px solid var(--border);
-  border-radius: var(--radius-feature);
+  border-radius: 12px;
   background: var(--card);
   box-shadow: var(--shadow-float);
 }
@@ -668,7 +670,7 @@ onBeforeUnmount(() => {
   display: block;
 }
 .assistant-panel > header small {
-  color: var(--primary);
+  color: var(--subtle-foreground);
   font-size: 10px;
   font-weight: 700;
   letter-spacing: 0.08em;
@@ -714,8 +716,8 @@ onBeforeUnmount(() => {
 }
 .assistant-panel > nav button.active {
   background: var(--primary-soft);
-  color: var(--primary);
-  font-weight: 700;
+  color: var(--foreground);
+  font-weight: 600;
 }
 .assistant-body {
   min-height: 0;
@@ -725,7 +727,7 @@ onBeforeUnmount(() => {
   padding: 22px;
 }
 .progress-view > small {
-  color: var(--primary);
+  color: var(--subtle-foreground);
 }
 .progress-view h3 {
   margin: 4px 0 9px;
@@ -772,7 +774,7 @@ onBeforeUnmount(() => {
 }
 .progress-view dd {
   margin: 0;
-  font-weight: 700;
+  font-weight: 600;
 }
 .ask-link {
   margin-top: 17px;
@@ -780,7 +782,7 @@ onBeforeUnmount(() => {
   border: 0;
   background: transparent;
   color: var(--primary);
-  font-weight: 700;
+  font-weight: 600;
 }
 .artifact-view {
   display: grid;
@@ -808,8 +810,8 @@ onBeforeUnmount(() => {
 }
 .artifact-types button.active {
   background: var(--card);
-  color: var(--primary);
-  box-shadow: 0 1px 2px rgba(25, 42, 61, 0.08);
+  color: var(--foreground);
+  box-shadow: none;
 }
 .artifact-types button:disabled {
   opacity: 0.38;

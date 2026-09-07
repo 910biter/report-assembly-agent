@@ -3,6 +3,7 @@ import { defineStore } from "pinia";
 export const useUiStore = defineStore("ui", {
   state: () => ({
     theme: (typeof localStorage !== "undefined" && localStorage.getItem("ira-theme") === "light" ? "light" : "dark") as "dark" | "light",
+    palette: (typeof localStorage !== "undefined" && ["violet", "steel", "graphite"].includes(localStorage.getItem("ira-palette") || "") ? localStorage.getItem("ira-palette") : "violet") as "violet" | "steel" | "graphite",
     navCollapsed: typeof localStorage !== "undefined" && localStorage.getItem("ira-nav-collapsed") === "true",
     navOpen: false,
     createOpen: false,
@@ -22,6 +23,11 @@ export const useUiStore = defineStore("ui", {
       if (typeof localStorage !== "undefined") localStorage.setItem("ira-theme", theme);
     },
     toggleTheme() { this.setTheme(this.theme === "dark" ? "light" : "dark"); },
+    setPalette(palette: "violet" | "steel" | "graphite") {
+      this.palette = palette;
+      if (typeof document !== "undefined") document.documentElement.dataset.palette = palette;
+      if (typeof localStorage !== "undefined") localStorage.setItem("ira-palette", palette);
+    },
     toggleNav() { this.navOpen = !this.navOpen; },
     toggleNavCollapsed() {
       this.navCollapsed = !this.navCollapsed;

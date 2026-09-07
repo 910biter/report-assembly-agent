@@ -38,15 +38,17 @@ defineProps<{
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
   overflow: hidden;
-  border-top: 1px solid var(--border);
-  border-bottom: 1px solid var(--border);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-panel);
+  background: var(--card);
+  box-shadow: inset 0 1px 0 var(--surface-highlight);
 }
 .ui-metric-strip__item {
   display: flex;
   align-items: center;
   gap: var(--space-3);
-  min-height: 96px;
-  padding: 16px 20px;
+  min-height: 82px;
+  padding: 13px 18px;
   border-right: 1px solid var(--border);
   transition: background var(--motion-fast);
 }
@@ -80,7 +82,7 @@ defineProps<{
 .ui-metric-strip strong {
   margin-top: 2px;
   color: var(--foreground);
-  font-size: 27px;
+  font-size: 25px;
   font-weight: 600;
   letter-spacing: -0.035em;
   line-height: 1.1;

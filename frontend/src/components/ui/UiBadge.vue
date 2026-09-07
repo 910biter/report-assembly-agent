@@ -27,7 +27,7 @@ const classes = computed(() =>
   padding: 2px 8px;
   border-radius: 999px;
   font-size: 12px;
-  font-weight: 600;
+  font-weight: 500;
   line-height: 1.4;
   white-space: nowrap;
   border: 1px solid color-mix(in srgb, currentColor 24%, transparent);
@@ -51,8 +51,8 @@ const classes = computed(() =>
 }
 .ui-badge--success {
   color: var(--foreground);
-  background: var(--success-soft);
-  border-color: color-mix(in srgb, var(--success) 40%, var(--border));
+  background: var(--muted);
+  border-color: var(--border);
 }
 .ui-badge--success::before {
   background: var(--success);

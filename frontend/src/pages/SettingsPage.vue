@@ -6,6 +6,9 @@ import UiPageHeader from "@/components/ui/UiPageHeader.vue";
 import UiPanel from "@/components/ui/UiPanel.vue";
 import UiSectionHeader from "@/components/ui/UiSectionHeader.vue";
 import UiButton from "@/components/ui/UiButton.vue";
+import { useUiStore } from "@/stores/ui";
+
+const ui = useUiStore();
 
 const health = useQuery({
   queryKey: ["health"],
@@ -187,6 +190,50 @@ async function restartServices() {
         </dl>
       </UiPanel>
     </section>
+
+    <UiPanel class="section-block appearance-panel">
+      <UiSectionHeader
+        title="界面外观"
+        description="明暗模式独立于强调色；切换后会在此设备上保留。"
+      />
+      <div class="appearance-controls">
+        <div class="appearance-group">
+          <span>显示模式</span>
+          <div class="appearance-options" role="group" aria-label="显示模式">
+            <button
+              type="button"
+              :class="{ active: ui.theme === 'dark' }"
+              @click="ui.setTheme('dark')"
+            >暗色</button>
+            <button
+              type="button"
+              :class="{ active: ui.theme === 'light' }"
+              @click="ui.setTheme('light')"
+            >亮色</button>
+          </div>
+        </div>
+        <div class="appearance-group">
+          <span>强调色</span>
+          <div class="palette-options" role="group" aria-label="强调色">
+            <button
+              type="button"
+              :class="{ active: ui.palette === 'violet' }"
+              @click="ui.setPalette('violet')"
+            ><i class="violet-swatch"></i><b>深紫 · 智能工作区</b><small>默认</small></button>
+            <button
+              type="button"
+              :class="{ active: ui.palette === 'steel' }"
+              @click="ui.setPalette('steel')"
+            ><i class="steel-swatch"></i><b>冷灰 · 钢蓝</b><small>推荐</small></button>
+            <button
+              type="button"
+              :class="{ active: ui.palette === 'graphite' }"
+              @click="ui.setPalette('graphite')"
+            ><i class="graphite-swatch"></i><b>冷灰 · 石墨</b><small>低干扰</small></button>
+          </div>
+        </div>
+      </div>
+    </UiPanel>
 
     <UiPanel class="performance-panel">
       <UiSectionHeader
@@ -378,6 +425,97 @@ dd {
 .settings-grid > .surface {
   box-shadow: var(--shadow-panel);
 }
+.appearance-panel {
+  padding: 22px 24px;
+}
+.appearance-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 28px;
+  margin-top: 20px;
+}
+.appearance-group {
+  display: grid;
+  gap: 8px;
+}
+.appearance-group > span {
+  color: var(--muted-foreground);
+  font-size: 12px;
+}
+.appearance-options,
+.palette-options {
+  display: flex;
+  gap: 6px;
+}
+.appearance-options {
+  padding: 3px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  background: var(--muted);
+}
+.appearance-options button,
+.palette-options button {
+  min-height: 34px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted-foreground);
+  font-size: 12px;
+  transition: background var(--motion-fast), border-color var(--motion-fast), color var(--motion-fast);
+}
+.appearance-options button {
+  min-width: 66px;
+  padding: 0 12px;
+}
+.appearance-options button:hover,
+.palette-options button:hover {
+  color: var(--foreground);
+  background: var(--surface-hover);
+}
+.appearance-options button.active {
+  color: var(--foreground);
+  background: var(--surface-raised);
+  border-color: var(--border-strong);
+}
+.palette-options button {
+  display: grid;
+  grid-template-columns: 18px auto;
+  align-items: center;
+  column-gap: 8px;
+  min-width: 164px;
+  padding: 7px 10px;
+  text-align: left;
+  border-color: var(--border);
+  background: var(--surface-raised);
+}
+.palette-options button.active {
+  color: var(--foreground);
+  border-color: var(--primary);
+  background: var(--primary-soft);
+}
+.palette-options b,
+.palette-options small {
+  display: block;
+  grid-column: 2;
+}
+.palette-options b {
+  font-size: 12px;
+  font-weight: 600;
+}
+.palette-options small {
+  color: var(--subtle-foreground);
+  font-size: 10px;
+}
+.palette-options i {
+  grid-row: span 2;
+  width: 16px;
+  height: 16px;
+  border: 1px solid var(--border-strong);
+  border-radius: 50%;
+}
+.violet-swatch { background: linear-gradient(135deg, #13111e 50%, #8064ff 50%); }
+.steel-swatch { background: linear-gradient(135deg, #151a20 50%, #4d7f9f 50%); }
+.graphite-swatch { background: linear-gradient(135deg, #151a20 50%, #8896a4 50%); }
 .performance-panel {
   padding: 26px;
   overflow: hidden;
@@ -556,6 +694,19 @@ dd {
   }
   .workload-layout {
     grid-template-columns: 1fr;
+  }
+}
+@media (max-width: 620px) {
+  .settings-grid {
+    grid-template-columns: 1fr;
+  }
+  .appearance-controls,
+  .palette-options {
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .palette-options button {
+    width: 100%;
   }
 }
 @media (max-width: 700px) {

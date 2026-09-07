@@ -26,9 +26,9 @@ defineProps<{ title: string; description?: string; featured?: boolean }>();
   align-items: center;
   justify-content: space-between;
   gap: var(--space-6);
-  min-height: 72px;
-  padding: 8px 0 16px;
-  border-bottom: 1px solid var(--border);
+  min-height: 64px;
+  padding: 4px 0 8px;
+  border-bottom: 0;
 }
 .ui-page-header--featured {
   border-bottom-color: var(--border);
@@ -37,12 +37,12 @@ defineProps<{ title: string; description?: string; featured?: boolean }>();
 .ui-page-header h1 {
   margin: 0;
   color: var(--foreground);
-  font-size: 26px;
+  font-size: 25px;
   font-weight: 600;
   letter-spacing: -0.025em;
 }
 .ui-page-header p {
-  margin: 5px 0 0;
+  margin: 4px 0 0;
   color: var(--muted-foreground);
   font-size: 13px;
 }
@@ -54,8 +54,8 @@ defineProps<{ title: string; description?: string; featured?: boolean }>();
 }
 @media (max-width: 640px) {
   .ui-page-header {
-    min-height: 64px;
-    padding: 8px 0 14px;
+    min-height: 56px;
+    padding: 4px 0 8px;
   }
   .ui-page-header h1 {
     font-size: 23px;

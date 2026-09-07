@@ -701,6 +701,10 @@ async function handoff() {
   border-radius: var(--radius-feature);
   background: var(--background);
   box-shadow: var(--shadow-float);
+  min-width: 0;
+}
+.comparison-workspace > * {
+  min-width: 0;
 }
 .comparison-workspace.embedded {
   position: relative;
@@ -730,6 +734,8 @@ async function handoff() {
   display: grid;
   min-height: 0;
   height: 100%;
+  min-width: 0;
+  overflow: hidden;
 }
 .comparison-shell.with-runs {
   grid-template-columns: 280px 1fr;

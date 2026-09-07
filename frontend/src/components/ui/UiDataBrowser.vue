@@ -26,13 +26,16 @@ withDefaults(defineProps<{
 <style scoped>
 .ui-data-browser {
   display: grid;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
   min-height: 620px;
   overflow: hidden;
   grid-template-columns: minmax(0, 1fr);
   border: 1px solid var(--border);
-  border-radius: var(--radius-control);
+  border-radius: var(--radius-panel);
   background: var(--card);
-  box-shadow: var(--shadow-panel);
+  box-shadow: inset 0 1px 0 var(--surface-highlight);
 }
 
 .ui-data-browser--detail-open {
@@ -41,6 +44,8 @@ withDefaults(defineProps<{
 
 .ui-data-browser__main {
   min-width: 0;
+  max-width: 100%;
+  overflow-x: hidden;
 }
 
 .ui-data-browser__detail {

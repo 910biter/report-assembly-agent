@@ -986,8 +986,9 @@ async function archiveCurrent() {
 }
 .copilot-head-actions button.new-chat {
   margin-left: 3px;
-  background: var(--primary-gradient);
-  color: var(--primary-foreground);
+  border: 1px solid var(--border-strong);
+  background: var(--surface-raised);
+  color: var(--foreground);
 }
 .copilot-head-actions span {
   display: grid;
@@ -1031,7 +1032,7 @@ async function archiveCurrent() {
 .message.user {
   justify-self: end;
   border-left: 0;
-  border-right: 2px solid var(--color-primary);
+  border-right: 2px solid var(--primary);
   background: var(--color-primary-soft);
 }
 .message small {

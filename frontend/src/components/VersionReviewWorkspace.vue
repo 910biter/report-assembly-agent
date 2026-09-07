@@ -800,6 +800,11 @@ function previewSection(section: any) {
   grid-template: 88px minmax(0, 1fr) / 250px minmax(560px, 1fr) 292px;
   background: var(--background);
   color: var(--foreground);
+  min-width: 0;
+  overflow: hidden;
+}
+.review-workspace > * {
+  min-width: 0;
 }
 button {
   font: inherit;

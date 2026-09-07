@@ -23,6 +23,8 @@ const createOpen = ref(false);
 const form = ref<HTMLFormElement>();
 const fileInput = ref<HTMLInputElement>();
 const selectedFiles = ref<string[]>([]);
+const selectedLibraryIds = ref<string[]>([]);
+const selectedTemplateId = ref("");
 const libraryOpen = ref(false);
 const error = ref("");
 const workflowMode = ref<"automatic" | "collaborative">("automatic");
@@ -49,6 +51,15 @@ const finished = computed(() =>
     (t) => t.stage === "done" || t.stage === "review",
   ),
 );
+const configuredMaterialCount = computed(
+  () => selectedFiles.value.length + selectedLibraryIds.value.length,
+);
+const selectedTemplateLabel = computed(() => {
+  const selected = (templates.data.value || []).find(
+    (item) => String(item.id) === selectedTemplateId.value,
+  );
+  return selected?.name || selected?.label || "默认模板";
+});
 const metrics = computed(() => [
   {
     label: "全部任务",
@@ -155,10 +166,11 @@ const createTask = useMutation({
         @submit.prevent="createTask.mutate()"
       >
         <div class="form-heading">
-          <div><h2>新建报告任务</h2></div>
+          <div><h2>新建任务</h2><p>选择材料、模板与工作方式，系统会自动完成后续整编。</p></div>
+          <span class="workspace-state">{{ workflowMode === "automatic" ? "直接生成" : "协作规划" }}</span>
         </div>
         <input type="hidden" name="interaction_draft_id" :value="ui.draftId" />
-        <section class="setup-section field-wide">
+        <section class="setup-section material-section">
           <div class="step-heading">
             <span class="step-number">1</span>
             <div><h3>材料来源</h3><p>上传新文件，或从材料库选择已有材料。</p></div>
@@ -173,25 +185,25 @@ const createTask = useMutation({
           </div>
           <details class="library-picker" :open="libraryOpen">
             <summary>材料库中的已有材料 <small>{{ materials.data.value?.length || 0 }} 份可选</small></summary>
-            <select name="existing_material_ids" multiple size="5">
-              <option v-for="item in materials.data.value || []" :key="item.id" :value="item.id">{{ item.filename }}</option>
+            <select v-model="selectedLibraryIds" name="existing_material_ids" multiple size="6">
+              <option v-for="item in materials.data.value || []" :key="item.id" :value="String(item.id)">{{ item.filename }}</option>
             </select>
           </details>
         </section>
-        <section class="setup-section field-wide">
+        <section class="setup-section template-section">
           <div class="step-heading">
             <span class="step-number">2</span>
             <div><h3>文档模板</h3><p>选择导出报告使用的版式与样式。</p></div>
           </div>
           <label class="field template-select"
             ><span>使用模板</span
-            ><select name="variant_id">
+            ><select v-model="selectedTemplateId" name="variant_id">
               <option value="">使用默认模板</option>
-              <option v-for="item in templates.data.value || []" :key="item.id" :value="item.id">{{ item.name || item.label || `模板 ${item.id}` }}</option>
+              <option v-for="item in templates.data.value || []" :key="item.id" :value="String(item.id)">{{ item.name || item.label || `模板 ${item.id}` }}</option>
             </select>
           </label>
         </section>
-        <section class="setup-section field-wide">
+        <section class="setup-section flow-section">
           <div class="step-heading">
             <span class="step-number">3</span>
             <div><h3>写作流程</h3><p>选择任务如何从材料理解进入报告写作。</p></div>
@@ -226,7 +238,7 @@ const createTask = useMutation({
           name="directory_review"
           :value="workflowMode === 'collaborative' ? directoryReview : 'auto'"
         />
-        <label v-if="workflowMode === 'automatic'" class="field field-wide"
+        <label v-if="workflowMode === 'automatic'" class="field task-brief-field theme-field"
           ><span>报告主题</span
           ><input
             v-model="ui.taskDraft.theme"
@@ -234,7 +246,7 @@ const createTask = useMutation({
             required
             placeholder="例如：可信执行环境远程证明机制研究综述"
         /></label>
-        <details v-else class="field-wide optional-field">
+        <details v-else class="optional-field task-brief-field theme-field">
           <summary>
             <span>报告主题</span
             ><small>{{ ui.taskDraft.theme.trim() ? "已填写" : "可选" }}</small>
@@ -247,7 +259,7 @@ const createTask = useMutation({
             />
           </label>
         </details>
-        <label v-if="workflowMode === 'automatic'" class="field field-wide"
+        <label v-if="workflowMode === 'automatic'" class="field task-brief-field requirements-field"
           ><span>报告要求</span
           ><textarea
             v-model="ui.taskDraft.requirements"
@@ -256,7 +268,7 @@ const createTask = useMutation({
             placeholder="描述用途、重点、篇幅或必须回答的问题。无需配置系统参数。"
           ></textarea>
         </label>
-        <details v-else class="field-wide optional-field">
+        <details v-else class="optional-field task-brief-field requirements-field">
           <summary>
             <span>报告要求</span
             ><small>{{
@@ -274,7 +286,7 @@ const createTask = useMutation({
         </details>
         <div
           v-if="workflowMode === 'collaborative'"
-          class="field-wide collaboration-controls"
+          class="collaboration-controls"
         >
           <UiButton
             type="button"
@@ -291,7 +303,7 @@ const createTask = useMutation({
           >
         </div>
         <div class="submit-row">
-          <span class="selection-summary"><AppIcon name="files" :size="15" />材料将随任务保存，可在后续阶段继续查看</span>
+          <span class="selection-summary"><AppIcon name="files" :size="15" />已配置 <b>{{ configuredMaterialCount }}</b> 份材料<i></i>{{ selectedTemplateLabel }}</span>
           <span v-if="error" class="error-text">{{ error }}</span
           ><UiButton type="submit" :loading="createTask.isPending.value">{{
             workflowMode === "automatic" ? "创建并进入任务" : "上传材料并开始"
@@ -374,28 +386,35 @@ const createTask = useMutation({
 .create-panel {
   overflow: hidden;
   background: var(--card);
-  border-color: var(--border-strong);
-  box-shadow: var(--shadow-panel);
+  border-color: var(--border);
+  border-radius: var(--radius-feature);
+  box-shadow: inset 0 1px 0 var(--surface-highlight);
 }
 .create-form {
   display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 20px;
-  padding: 28px;
+  grid-template-columns: repeat(12, minmax(0, 1fr));
+  gap: 0;
 }
 .setup-section {
   display: grid;
-  gap: 16px;
-  padding: 16px 20px;
+  gap: 12px;
+  padding: 20px 24px;
   border-top: 1px solid var(--border);
   background: transparent;
 }
-.setup-section:first-of-type {
-  border-top: 0;
+.material-section {
+  grid-column: 1 / 8;
+  grid-row: span 2;
+  order: 3;
 }
-.setup-section + .setup-section {
-  padding-top: 14px;
+.template-section,
+.flow-section,
+.collaboration-controls {
+  grid-column: 8 / -1;
+  border-left: 1px solid var(--border);
 }
+.template-section { order: 3; }
+.flow-section { order: 4; }
 .step-heading {
   display: flex;
   align-items: flex-start;
@@ -407,10 +426,10 @@ const createTask = useMutation({
   place-items: center;
   width: 26px;
   height: 26px;
-  border: 1px solid color-mix(in srgb, var(--primary) 45%, var(--border));
+  border: 1px solid var(--border-strong);
   border-radius: 50%;
   color: var(--primary);
-  background: var(--primary-soft);
+  background: var(--muted);
   font-size: 12px;
   font-weight: 650;
 }
@@ -455,7 +474,7 @@ const createTask = useMutation({
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   color: var(--muted-foreground);
-  background: var(--surface-hover);
+  background: var(--muted);
   font-size: 12px;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -463,7 +482,7 @@ const createTask = useMutation({
 }
 .file-chip:hover {
   border-color: var(--border-strong);
-  background: color-mix(in srgb, var(--primary-soft) 32%, var(--surface-hover));
+  background: var(--surface-hover);
 }
 .library-picker {
   border: 1px solid var(--border);
@@ -514,7 +533,7 @@ const createTask = useMutation({
   width: calc(100% - 24px);
 }
 .template-select {
-  max-width: 560px;
+  max-width: none;
 }
 .selection-summary {
   display: inline-flex;
@@ -524,25 +543,58 @@ const createTask = useMutation({
   color: var(--muted-foreground);
   font-size: 12px;
 }
+.selection-summary b {
+  color: var(--foreground);
+  font-weight: 600;
+}
+.selection-summary i {
+  width: 1px;
+  height: 13px;
+  margin: 0 2px;
+  background: var(--border-strong);
+}
 .form-heading {
   display: flex;
-  align-items: end;
+  align-items: center;
   justify-content: space-between;
-  gap: 20px;
+  gap: var(--space-4);
   grid-column: 1/-1;
-  padding-bottom: 4px;
+  padding: 22px 24px 18px;
+  border-bottom: 1px solid var(--border);
 }
 .form-heading h2 {
-  margin: 3px 0 0;
-  font-size: 20px;
+  margin: 0 0 3px;
+  font-size: 19px;
+  letter-spacing: -0.025em;
 }
-.form-caption {
+.form-heading p {
+  margin: 0;
   color: var(--subtle-foreground);
   font-size: 12px;
 }
-.field-wide,
-.submit-row {
-  grid-column: 1/-1;
+.workspace-state {
+  flex: 0 0 auto;
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--muted-foreground);
+  background: var(--muted);
+  font-size: 11px;
+}
+.task-brief-field {
+  order: 1;
+  min-width: 0;
+  margin: 8px 0 20px;
+}
+.theme-field {
+  grid-column: 1 / 7;
+  margin-left: 28px;
+  margin-right: 8px;
+}
+.requirements-field {
+  grid-column: 7 / -1;
+  margin-left: 8px;
+  margin-right: 28px;
 }
 .field-label {
   display: block;
@@ -553,28 +605,34 @@ const createTask = useMutation({
 .mode-switch {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 10px;
+  gap: 0;
+  overflow: hidden;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-control);
+  background: var(--surface-raised);
 }
 .mode-switch button {
   display: grid;
-  gap: 3px;
-  padding: 14px 16px;
-  text-align: left;
+  gap: 2px;
+  min-height: 58px;
+  padding: 10px 12px;
+  text-align: center;
   color: var(--muted-foreground);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-control);
-  background: var(--surface-raised);
-  transition: all var(--motion-fast);
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  transition: color var(--motion-fast), background var(--motion-fast);
+}
+.mode-switch button + button {
+  border-left: 1px solid var(--border);
 }
 .mode-switch button:hover {
-  border-color: var(--border-strong);
-  background: var(--muted);
+  background: var(--surface-hover);
 }
 .mode-switch button.active {
   color: var(--foreground);
-  border-color: color-mix(in srgb, var(--primary) 45%, var(--border));
-  background: var(--primary-soft);
-  box-shadow: inset 3px 0 var(--primary);
+  background: var(--surface-hover);
+  box-shadow: inset 0 -2px var(--primary);
 }
 .mode-switch button.active b,
 .mode-switch button.active small {
@@ -635,10 +693,13 @@ const createTask = useMutation({
   width: 100%;
 }
 .collaboration-controls {
+  order: 5;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 2px 0;
+  gap: var(--space-2);
+  padding: 12px 24px 20px;
+  border-top: 1px solid var(--border);
 }
 .collaboration-controls label {
   display: flex;
@@ -652,11 +713,16 @@ const createTask = useMutation({
   padding: 6px 8px;
 }
 .submit-row {
+  grid-column: 1/-1;
+  order: 6;
   display: flex;
   align-items: center;
   justify-content: flex-end;
   gap: 12px;
-  padding-top: 4px;
+  min-height: 68px;
+  padding: 14px 28px;
+  border-top: 1px solid var(--border);
+  background: var(--muted);
 }
 .dashboard-grid {
   display: grid;
@@ -664,7 +730,7 @@ const createTask = useMutation({
   gap: 24px;
 }
 .dashboard-grid > .surface {
-  box-shadow: var(--shadow-panel);
+  box-shadow: inset 0 1px 0 var(--surface-highlight);
 }
 .section-kicker {
   margin-bottom: 3px;
@@ -724,10 +790,20 @@ const createTask = useMutation({
   .create-form {
     grid-template-columns: 1fr;
   }
-  .field,
-  .field-wide,
+  .task-brief-field,
+  .material-section,
+  .template-section,
+  .flow-section,
+  .collaboration-controls,
   .submit-row {
     grid-column: 1;
+    grid-row: auto;
+    margin-inline: 0;
+  }
+  .template-section,
+  .flow-section,
+  .collaboration-controls {
+    border-left: 0;
   }
 }
 @media (max-width: 620px) {
@@ -739,10 +815,16 @@ const createTask = useMutation({
     grid-template-columns: 1fr;
   }
   .create-form {
-    padding: 20px;
+    display: grid;
+    grid-template-columns: 1fr;
   }
-  .form-caption {
-    display: none;
+  .form-heading,
+  .setup-section,
+  .submit-row {
+    padding-inline: 20px;
+  }
+  .task-brief-field {
+    margin-inline: 20px;
   }
   .collaboration-controls {
     align-items: flex-start;

@@ -1081,7 +1081,7 @@ function versionsList() {
 }
 .progress-block {
   overflow: hidden;
-  padding: 22px 26px 18px;
+  padding: 18px 22px 16px;
   border-color: var(--border);
   background: var(--card);
 }
@@ -1133,12 +1133,12 @@ function versionsList() {
   background: var(--card);
 }
 .progress-step.done > span {
-  color: var(--primary-foreground);
-  border-color: var(--color-success);
-  background: var(--color-success);
+  color: var(--foreground);
+  border-color: var(--border-strong);
+  background: var(--surface-hover);
 }
 .progress-step.current > span {
-  color: var(--primary-foreground);
+  color: var(--foreground);
   border-color: var(--color-primary);
   background: var(--color-primary);
 }
@@ -1150,7 +1150,7 @@ function versionsList() {
   overflow: hidden;
   color: var(--foreground);
   font-size: 13px;
-  font-weight: 700;
+  font-weight: 600;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -1189,7 +1189,7 @@ function versionsList() {
   top: 0;
   padding: 7px 4px 9px;
   background: color-mix(in srgb, var(--background) 92%, transparent);
-  backdrop-filter: blur(12px);
+  backdrop-filter: blur(8px);
 }
 .workspace-grid {
   display: grid;
@@ -1274,9 +1274,9 @@ function versionsList() {
   border-radius: 4px;
 }
 .analysis-nav button.active {
-  color: var(--color-primary);
+  color: var(--foreground);
   background: var(--color-primary-soft);
-  font-weight: 650;
+  font-weight: 600;
 }
 .analysis-content {
   padding: 8px 24px;

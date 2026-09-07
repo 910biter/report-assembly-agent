@@ -423,9 +423,10 @@ function taskType(task: TaskSummary) {
 }
 .filter-bar {
   display: grid;
-  grid-template-columns: minmax(260px, 1fr) 130px 150px 130px auto;
+  grid-template-columns: minmax(180px, 2fr) repeat(3, minmax(112px, 1fr)) auto;
+  min-width: 0;
   gap: 10px;
-  padding: 18px;
+  padding: 14px 18px;
 }
 .search-box {
   position: relative;
@@ -456,16 +457,17 @@ function taskType(task: TaskSummary) {
 .table-head,
 .task-row {
   display: grid;
-  grid-template-columns: minmax(240px, 1.5fr) 88px 64px minmax(
+  grid-template-columns: minmax(180px, 1.5fr) 72px 56px minmax(
       100px,
       0.7fr
-    ) 120px 42px;
+    ) 108px 38px;
+  min-width: 0;
   gap: 12px;
   align-items: center;
 }
 .table-head {
   padding: 9px 18px;
-  background: var(--muted);
+  background: transparent;
   border-block: 1px solid var(--border);
   color: var(--subtle-foreground);
   font-size: 11px;
@@ -500,7 +502,7 @@ function taskType(task: TaskSummary) {
   background: var(--primary);
 }
 .task-row:hover {
-  padding-inline: 21px 15px;
+  padding-inline: 18px;
 }
 .task-name strong,
 .task-name small {

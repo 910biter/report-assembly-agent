@@ -100,22 +100,22 @@ const nav = [
   background: var(--nav);
   border-right: 1px solid var(--border);
   box-shadow: none;
-  transition: width var(--motion-normal);
+  transition: width var(--motion-normal), border-color var(--motion-normal);
 }
 .brand {
   position: relative;
   height: var(--header-height);
   display: flex;
   align-items: center;
-  gap: 11px;
-  padding: 0 22px;
+  gap: 9px;
+  padding: 0 16px;
   border-bottom: 1px solid var(--border);
 }
 .sidebar-toggle {
   display: grid;
   place-items: center;
-  width: 28px;
-  height: 28px;
+  width: 26px;
+  height: 26px;
   margin-left: auto;
   color: var(--nav-muted);
   border: 0;
@@ -130,11 +130,12 @@ const nav = [
 .brand-mark {
   display: grid;
   place-items: center;
-  width: 32px;
-  height: 32px;
-  color: var(--primary-foreground);
-  background: var(--primary-gradient);
-  border-radius: 10px;
+  width: 30px;
+  height: 30px;
+  color: var(--accent);
+  background: var(--primary-soft);
+  border: 1px solid color-mix(in srgb, var(--primary) 32%, var(--border));
+  border-radius: 8px;
 }
 .brand strong {
   color: var(--nav-foreground);
@@ -143,16 +144,16 @@ const nav = [
 }
 nav {
   display: grid;
-  gap: 5px;
-  padding: 22px 12px;
+  gap: 3px;
+  padding: 16px 10px;
 }
 nav a {
   position: relative;
   display: flex;
   align-items: center;
-  gap: 12px;
-  min-height: 43px;
-  padding: 0 12px;
+  gap: 10px;
+  min-height: 38px;
+  padding: 0 10px;
   color: var(--nav-muted);
   border-radius: 8px;
   font-size: 13px;
@@ -166,24 +167,24 @@ nav a:hover {
 }
 nav a.active {
   color: var(--nav-foreground);
-  background: var(--nav-raised);
-  font-weight: 600;
-  box-shadow: inset 0 0 0 1px var(--border);
+  background: var(--primary-soft);
+  font-weight: 500;
+  box-shadow: none;
 }
 nav a.active::before {
   content: "";
   position: absolute;
-  left: -12px;
-  top: 10px;
-  bottom: 10px;
-  width: 3px;
-  background: var(--accent);
-  border-radius: 0 3px 3px 0;
+  left: -10px;
+  top: 9px;
+  bottom: 9px;
+  width: 2px;
+  background: var(--primary);
+  border-radius: 0 2px 2px 0;
 }
 .nav-foot {
   position: absolute;
   bottom: 22px;
-  left: 23px;
+  left: 18px;
   display: flex;
   align-items: center;
   gap: 7px;
@@ -200,19 +201,20 @@ nav a.active::before {
 }
 .shell-main {
   min-height: 100vh;
+  min-width: 0;
+  overflow-x: clip;
   margin-left: var(--nav-width);
   transition: margin-left var(--motion-normal);
 }
 .is-nav-collapsed .sidebar {
-  width: 72px;
+  width: 56px;
 }
 .is-nav-collapsed .shell-main {
-  margin-left: 72px;
+  margin-left: 56px;
 }
 .is-nav-collapsed .brand {
   justify-content: center;
-  gap: 4px;
-  padding: 0 8px;
+  padding: 0;
 }
 .is-nav-collapsed .brand strong,
 .is-nav-collapsed .nav-foot span:last-child,
@@ -220,25 +222,32 @@ nav a.active::before {
   display: none;
 }
 .is-nav-collapsed .sidebar-toggle {
-  position: static;
+  position: absolute;
+  top: 15px;
+  right: -12px;
+  z-index: 1;
   width: 24px;
   height: 24px;
   margin: 0;
+  border: 1px solid var(--border-strong);
+  border-radius: 50%;
+  background: var(--nav);
+  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.28);
 }
 .is-nav-collapsed .brand-mark {
-  width: 28px;
-  height: 28px;
-  flex: 0 0 28px;
+  width: 30px;
+  height: 30px;
+  flex: 0 0 30px;
 }
 .is-nav-collapsed nav {
-  padding-inline: 10px;
+  padding-inline: 8px;
 }
 .is-nav-collapsed nav a {
   justify-content: center;
   padding: 0;
 }
 .is-nav-collapsed nav a.active::before {
-  left: -10px;
+  left: -8px;
 }
 .is-nav-collapsed .nav-foot {
   left: 0;
@@ -254,10 +263,10 @@ nav a.active::before {
   align-items: center;
   gap: 12px;
   padding: 0 32px;
-  background: color-mix(in srgb, var(--background) 82%, transparent);
+  background: color-mix(in srgb, var(--background) 92%, transparent);
   border-bottom: 1px solid var(--border);
   box-shadow: none;
-  backdrop-filter: blur(16px) saturate(1.04);
+  backdrop-filter: blur(10px);
 }
 .topbar-title {
   display: flex;
@@ -280,15 +289,15 @@ nav a.active::before {
   height: 34px;
   margin-left: auto;
   color: var(--muted-foreground);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  background: var(--card);
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
   transition: color var(--motion-fast), background var(--motion-fast), border-color var(--motion-fast);
 }
 .theme-toggle:hover {
-  color: var(--primary);
-  border-color: var(--border-strong);
-  background: var(--primary-soft);
+  color: var(--foreground);
+  border-color: var(--border);
+  background: var(--surface-hover);
 }
 .nav-toggle {
   display: none;
@@ -296,9 +305,11 @@ nav a.active::before {
   background: transparent;
 }
 .content {
+  min-width: 0;
+  max-width: var(--content-max);
   width: min(calc(100% - 64px), var(--content-max));
   margin: 0 auto;
-  padding: 32px 0 56px;
+  padding: 28px 0 56px;
 }
 .content.editor {
   width: 100%;
@@ -340,7 +351,7 @@ nav a.active::before {
     padding: 0 12px;
   }
   .is-nav-collapsed .nav-foot {
-    left: 23px;
+  left: 18px;
     right: auto;
     justify-content: flex-start;
   }

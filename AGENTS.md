@@ -273,14 +273,14 @@ Use ONE primary brand accent.
 
 Preferred family:
 
-> Indigo / Violet / Electric Blue
+> Deep indigo / restrained violet
 
 Example visual direction:
 
 ```text
-#5E6AD2
-#6C5CE7
-#7C5CFC
+#5B40D6
+#7C5CFF
+#B5A7FF
 ```
 
 Do NOT use multiple unrelated accent colors for decoration.
@@ -1438,7 +1438,7 @@ Border > shadow
 
 Subtle contrast > strong color
 
-One accent > many colors
+One restrained indigo accent > many colors
 
 Micro-motion > flashy animation
 
@@ -1783,3 +1783,32 @@ If not, adapt the new feature to the design system rather than inventing a new v
 The desired result is:
 
 > **Quiet, technical, premium, and unmistakably intentional.**
+
+---
+
+# 61. Workspace Composition
+
+Do not force every page into the same card grid. Use one of these page archetypes:
+
+```text
+Workbench
+  One primary surface with a clear action bar.
+  Use for report configuration and task execution.
+
+Browser
+  Page header → command/filter row → dense list or table → optional detail pane.
+  Use for tasks, materials, and templates.
+
+Editor
+  Navigation/context → document canvas → evidence or quality context.
+  Use for report writing and review.
+```
+
+For a workbench with several setup steps:
+
+- Keep a single outer workspace surface.
+- Let the highest-interaction area occupy the primary column.
+- Place secondary configuration in a narrower supporting column.
+- Use dividers, alignment, and spacing between steps instead of a card for every step.
+- Keep the configuration summary and primary action together in one bottom action bar.
+- Preserve this reading order at narrow widths: intent → primary input → secondary configuration → action.

@@ -369,12 +369,13 @@ const metadataRows = computed(() => {
 }
 .filter-bar {
   display: grid;
-  grid-template-columns: minmax(250px, 1fr) 100px 120px 140px 110px 130px auto;
+  grid-template-columns: minmax(180px, 2fr) repeat(5, minmax(88px, 1fr)) auto;
+  min-width: 0;
   gap: 9px;
-  padding: 18px;
+  padding: 14px 18px;
 }
 .material-browser--detail-open .filter-bar {
-  grid-template-columns: minmax(220px, 1fr) repeat(2, minmax(105px, 120px));
+  grid-template-columns: minmax(180px, 1fr) repeat(2, minmax(96px, 120px));
 }
 .material-browser--detail-open .table-head,
 .material-browser--detail-open .file-row {
@@ -412,12 +413,14 @@ const metadataRows = computed(() => {
 .table-head,
 .file-row {
   display: grid;
-  grid-template-columns: minmax(250px, 1.5fr) 60px 82px 76px 72px 128px;
+  grid-template-columns: minmax(180px, 1.5fr) 56px 76px 68px 64px 112px;
+  min-width: 0;
   gap: 12px;
   align-items: center;
 }
 .table-head {
   padding: 9px 18px;
+  background: transparent;
   color: var(--subtle-foreground);
   background: var(--muted);
   border-block: 1px solid var(--border);
@@ -456,7 +459,7 @@ const metadataRows = computed(() => {
   background: var(--primary);
 }
 .file-row:hover {
-  padding-inline: 21px 15px;
+  padding-inline: 18px;
 }
 .file-row > span,
 .file-row time {

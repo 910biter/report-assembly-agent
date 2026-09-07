@@ -20,42 +20,42 @@
 :root {
   color-scheme: dark;
   /* Framework-neutral semantic tokens. Mirror these values in future React Tailwind variables. */
-  --background: #0b0f18;
-  --card: #151b26;
-  --surface-raised: #1b2230;
-  --surface-hover: #232b3a;
-  --muted: #1a2130;
+  --background: #0b0c10;
+  --card: #11131a;
+  --surface-raised: #171922;
+  --surface-hover: #1f212b;
+  --muted: #151720;
   --muted-foreground: rgba(255, 255, 255, 0.68);
   --foreground: rgba(255, 255, 255, 0.92);
-  --subtle-foreground: rgba(255, 255, 255, 0.5);
-  --border: rgba(173, 186, 214, 0.13);
-  --border-strong: rgba(196, 207, 231, 0.24);
-  --primary: #7044e8;
-  --primary-hover: #8256f0;
+  --subtle-foreground: rgba(255, 255, 255, 0.52);
+  --border: rgba(255, 255, 255, 0.09);
+  --border-strong: rgba(255, 255, 255, 0.15);
+  --primary: #7c5cff;
+  --primary-hover: #8a70ff;
   --primary-foreground: #ffffff;
-  --primary-gradient: linear-gradient(135deg, #4f2aa8 0%, #6e3fd2 100%);
-  --primary-soft: rgba(112, 68, 232, 0.15);
-  --secondary: #202838;
+  --primary-gradient: linear-gradient(135deg, #5b40d6 0%, #7c5cff 62%, #927bff 100%);
+  --primary-soft: rgba(124, 92, 255, 0.15);
+  --secondary: #1a1c25;
   --success: #4fb286;
   --success-soft: rgba(79, 178, 134, 0.14);
   --warning: #e4a34b;
   --warning-soft: rgba(228, 163, 75, 0.14);
   --destructive: #ef6b73;
   --destructive-soft: rgba(239, 107, 115, 0.14);
-  --info: #6b9df5;
-  --info-soft: rgba(107, 157, 245, 0.14);
-  --nav: #0d131d;
-  --nav-deep: #0b111a;
-  --nav-raised: rgba(126, 101, 232, 0.13);
+  --info: #8e7cff;
+  --info-soft: rgba(142, 124, 255, 0.14);
+  --nav: #0d0e14;
+  --nav-deep: #090a0f;
+  --nav-raised: rgba(255, 255, 255, 0.055);
   --nav-foreground: rgba(255, 255, 255, 0.92);
   --nav-muted: rgba(255, 255, 255, 0.62);
-  --accent: #a38aff;
-  --accent-soft: rgba(163, 138, 255, 0.13);
+  --accent: #b5a7ff;
+  --accent-soft: rgba(181, 167, 255, 0.12);
   --health: #4fb286;
   --health-soft: rgba(79, 178, 134, 0.16);
-  --surface-accent: rgba(255, 255, 255, 0.025);
-  --surface-highlight: rgba(255, 255, 255, 0.04);
-  --control-highlight: rgba(255, 255, 255, 0.08);
+  --surface-accent: rgba(124, 92, 255, 0.055);
+  --surface-highlight: rgba(255, 255, 255, 0.045);
+  --control-highlight: rgba(255, 255, 255, 0.07);
   --scrim: rgba(0, 0, 0, 0.42);
   /* Document paper is intentionally light: it represents the exported report, not app chrome. */
   --document-paper: #0d1118;
@@ -70,7 +70,7 @@
   --document-qa-low: #9eafc3;
   --document-paper-border: rgba(255, 255, 255, 0.11);
   --document-paper-shadow: 0 12px 40px rgba(0, 0, 0, 0.22), 0 2px 8px rgba(0, 0, 0, 0.14);
-  --ring: rgba(163, 138, 255, 0.48);
+  --ring: rgba(142, 116, 255, 0.46);
   --font-ui:
     "Geist", "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", system-ui,
     sans-serif;
@@ -87,17 +87,17 @@
   --space-12: 48px;
   --radius-sm: 6px;
   --radius-control: 8px;
-  --radius-panel: 8px;
-  --radius-feature: 12px;
+  --radius-panel: 12px;
+  --radius-feature: 16px;
   --shadow-panel: none;
   --shadow-float:
     0 24px 64px rgba(0, 0, 0, 0.46), 0 4px 16px rgba(0, 0, 0, 0.3);
   --shadow-paper:
     0 8px 24px rgba(0, 0, 0, 0.28), 0 28px 64px rgba(0, 0, 0, 0.38);
   --focus-ring: 0 0 0 3px var(--ring);
-  --nav-width: 248px;
-  --header-height: 64px;
-  --content-max: 1440px;
+  --nav-width: 220px;
+  --header-height: 56px;
+  --content-max: 1360px;
   --motion-fast: 160ms cubic-bezier(0.2, 0.8, 0.2, 1);
   --motion-normal: 220ms cubic-bezier(0.2, 0.8, 0.2, 1);
 
@@ -126,44 +126,44 @@
 
 [data-theme="light"] {
   color-scheme: light;
-  --background: #eef1f6;
-  --card: rgba(255, 255, 255, 0.74);
-  --surface-raised: rgba(255, 255, 255, 0.9);
-  --surface-hover: rgba(255, 255, 255, 0.98);
-  --muted: rgba(226, 231, 240, 0.72);
-  --muted-foreground: #556071;
-  --foreground: #1b2433;
-  --subtle-foreground: #6f7a8b;
-  --border: rgba(116, 130, 153, 0.2);
-  --border-strong: rgba(93, 108, 135, 0.3);
-  --primary: #526ac7;
-  --primary-hover: #4359b6;
+  --background: #f7f7f8;
+  --card: #ffffff;
+  --surface-raised: #f5f5f6;
+  --surface-hover: #eeeeef;
+  --muted: #f0f0f1;
+  --muted-foreground: #606167;
+  --foreground: #26272b;
+  --subtle-foreground: #77787e;
+  --border: rgba(27, 31, 38, 0.12);
+  --border-strong: rgba(27, 31, 38, 0.2);
+  --primary: #6653bc;
+  --primary-hover: #5644a5;
   --primary-foreground: #ffffff;
-  --primary-gradient: linear-gradient(135deg, #526ac7 0%, #687ee0 100%);
-  --primary-soft: rgba(82, 106, 199, 0.1);
-  --secondary: rgba(255, 255, 255, 0.74);
+  --primary-gradient: linear-gradient(135deg, #5945b2 0%, #725cd1 100%);
+  --primary-soft: rgba(102, 83, 188, 0.1);
+  --secondary: #eeeeef;
   --success: #287e61;
   --success-soft: rgba(40, 126, 97, 0.12);
   --warning: #a86c17;
   --warning-soft: rgba(168, 108, 23, 0.12);
   --destructive: #bd4c53;
   --destructive-soft: rgba(189, 76, 83, 0.1);
-  --info: #3d6fc1;
-  --info-soft: rgba(61, 111, 193, 0.11);
-  --nav: rgba(247, 249, 253, 0.82);
-  --nav-deep: #f1f4f9;
-  --nav-raised: rgba(93, 85, 216, 0.1);
-  --nav-foreground: #1b2433;
-  --nav-muted: #5f6a7b;
-  --accent: #6179d2;
-  --accent-soft: rgba(97, 121, 210, 0.1);
+  --info: #6f5fba;
+  --info-soft: rgba(111, 95, 186, 0.11);
+  --nav: #fbfbfc;
+  --nav-deep: #f4f4f5;
+  --nav-raised: rgba(27, 31, 38, 0.055);
+  --nav-foreground: #26272b;
+  --nav-muted: #65666b;
+  --accent: #6653bc;
+  --accent-soft: rgba(102, 83, 188, 0.1);
   --health: #2d8b6c;
   --health-soft: rgba(45, 139, 108, 0.13);
-  --surface-accent: rgba(93, 108, 135, 0.045);
-  --surface-highlight: rgba(255, 255, 255, 0.68);
-  --control-highlight: rgba(255, 255, 255, 0.86);
+  --surface-accent: rgba(27, 31, 38, 0.04);
+  --surface-highlight: rgba(255, 255, 255, 0.7);
+  --control-highlight: rgba(255, 255, 255, 0.8);
   --scrim: rgba(30, 38, 53, 0.22);
-  --ring: rgba(82, 106, 199, 0.3);
+  --ring: rgba(102, 83, 188, 0.3);
   --shadow-panel: none;
   --shadow-float: 0 24px 64px rgba(54, 67, 91, 0.16), 0 4px 16px rgba(54, 67, 91, 0.1);
   --shadow-paper: 0 8px 24px rgba(54, 67, 91, 0.12), 0 28px 64px rgba(54, 67, 91, 0.14);
@@ -179,4 +179,31 @@
   --document-qa-low: #6d7f91;
   --document-paper-border: rgba(255, 255, 255, 0.78);
   --document-paper-shadow: 0 3px 5px rgba(25, 42, 61, 0.04), 0 18px 42px rgba(25, 42, 61, 0.09);
+}
+
+/* Accent overrides keep the layout neutral while adapting the interaction color. */
+[data-palette="steel"] {
+  --primary: #5f8eaa;
+  --primary-hover: #709fb9;
+  --primary-gradient: linear-gradient(135deg, #416b85 0%, #5f8eaa 100%);
+  --primary-soft: rgba(95, 142, 170, 0.16);
+  --info: #77a4c0;
+  --info-soft: rgba(119, 164, 192, 0.14);
+  --accent: #9dc7df;
+  --accent-soft: rgba(157, 199, 223, 0.13);
+  --ring: rgba(112, 164, 195, 0.44);
+}
+
+/* A fully neutral alternative for users who prefer no persistent color accent. */
+[data-palette="graphite"] {
+  --primary: #8896a4;
+  --primary-hover: #a2afbb;
+  --primary-gradient: linear-gradient(135deg, #667482 0%, #8896a4 100%);
+  --primary-soft: rgba(157, 170, 182, 0.14);
+  --info: #8ea1b2;
+  --info-soft: rgba(142, 161, 178, 0.12);
+  --nav-raised: rgba(162, 175, 187, 0.11);
+  --accent: #b0bdc7;
+  --accent-soft: rgba(176, 189, 199, 0.1);
+  --ring: rgba(176, 189, 199, 0.38);
 }

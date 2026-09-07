@@ -1097,9 +1097,9 @@ function qaStatusLabel(issue: QualityIssue) {
   gap: 20px;
   min-height: 64px;
   padding: 10px 28px;
-  background: color-mix(in srgb, var(--background) 84%, transparent);
+  background: color-mix(in srgb, var(--background) 96%, transparent);
   border-bottom: 1px solid var(--border);
-  backdrop-filter: blur(16px) saturate(1.04);
+  backdrop-filter: blur(10px);
 }
 .toolbar-left,
 .toolbar-actions {
@@ -1126,10 +1126,11 @@ function qaStatusLabel(issue: QualityIssue) {
 .drawer-strip {
   display: grid;
   grid-template-columns: minmax(250px, 1fr) 260px 220px minmax(260px, 1fr) auto;
+  min-width: 0;
   align-items: end;
   gap: 14px;
   padding: 20px 30px;
-  background: var(--card);
+  background: var(--surface-raised);
   border-bottom: 1px solid var(--border);
 }
 .drawer-strip h2,
@@ -1142,6 +1143,11 @@ function qaStatusLabel(issue: QualityIssue) {
   justify-content: center;
   gap: 20px;
   padding: 28px 28px 56px;
+  min-width: 0;
+  max-width: 100%;
+}
+.editor-grid > * {
+  min-width: 0;
 }
 .toc-panel,
 .context-panel {
@@ -1152,8 +1158,8 @@ function qaStatusLabel(issue: QualityIssue) {
   overflow: auto;
   background: var(--card);
   border: 1px solid var(--border);
-  border-radius: var(--radius-panel);
-  box-shadow: var(--shadow-panel);
+  border-radius: 10px;
+  box-shadow: none;
   backdrop-filter: none;
 }
 .toc-panel {
@@ -1180,9 +1186,8 @@ function qaStatusLabel(issue: QualityIssue) {
     padding var(--motion-fast);
 }
 .toc-panel > a:hover {
-  color: var(--color-primary);
+  color: var(--foreground);
   background: var(--primary-soft);
-  padding-left: 12px;
 }
 .toc-qa-count {
   float: right;
@@ -1302,10 +1307,11 @@ function qaStatusLabel(issue: QualityIssue) {
     inset 0 -2px var(--primary);
 }
 .context-panel .tabs {
-  padding: 0 14px;
+  padding: 0 16px;
+  border-bottom: 1px solid var(--border);
 }
 .panel-body {
-  padding: 18px;
+  padding: 16px;
 }
 .selected-quote {
   padding: 13px;

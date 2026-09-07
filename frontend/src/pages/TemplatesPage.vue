@@ -353,10 +353,8 @@ onBeforeUnmount(() => window.clearTimeout(pollTimer));
             <div class="template-meta">
               <strong>{{ item.name || `模板 ${item.id}` }}</strong
               ><small
-                >{{ item.source_reports?.length || 0 }} 份来源报告 · 画像 v{{
-                  item.profile_version || 1
-                }}
-                · {{ item.exemplar_count || 0 }} 条成文样例</small
+                >{{ item.source_reports?.length || 0 }} 份来源报告 · 已学习画像 ·
+                {{ item.exemplar_count || 0 }} 条成文样例</small
               >
             </div>
             <div class="item-actions">
@@ -411,7 +409,6 @@ onBeforeUnmount(() => window.clearTimeout(pollTimer));
                 </button>
               </div>
             </div>
-            <span class="badge">v{{ selected.profile_version }}</span>
           </div>
           <UiTabs
             v-model="tab"
@@ -594,7 +591,8 @@ onBeforeUnmount(() => window.clearTimeout(pollTimer));
 <style scoped>
 .upload-bar {
   display: grid;
-  grid-template-columns: minmax(300px, 1fr) minmax(260px, 420px) auto;
+  grid-template-columns: minmax(0, 1fr) minmax(220px, 360px) auto;
+  min-width: 0;
   align-items: center;
   gap: 16px;
   padding: 20px 24px;
@@ -605,7 +603,8 @@ onBeforeUnmount(() => window.clearTimeout(pollTimer));
 }
 .template-layout {
   display: grid;
-  grid-template-columns: minmax(420px, 0.9fr) minmax(520px, 1.1fr);
+  grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr);
+  min-width: 0;
   gap: 24px;
 }
 .templates,
@@ -935,16 +934,16 @@ onBeforeUnmount(() => window.clearTimeout(pollTimer));
 }
 .asset-count {
   padding: 5px 10px;
-  border: 1px solid rgba(255, 255, 255, 0.16);
+  border: 1px solid var(--border);
   border-radius: 999px;
-  color: var(--nav-foreground);
-  background: rgba(255, 255, 255, 0.08);
+  color: var(--muted-foreground);
+  background: var(--muted);
   font-size: 12px;
   font-weight: 650;
 }
 .upload-bar {
   min-height: 112px;
-  grid-template-columns: minmax(340px, 1fr) minmax(220px, 360px) auto;
+  grid-template-columns: minmax(0, 1fr) minmax(220px, 360px) auto;
   border-color: var(--border-strong);
   background: var(--card);
 }
@@ -1034,7 +1033,7 @@ onBeforeUnmount(() => window.clearTimeout(pollTimer));
   content: "";
   position: absolute;
   inset: 0;
-  border: 1px solid rgba(255, 255, 255, 0.65);
+  border: 1px solid var(--document-paper-border);
   pointer-events: none;
 }
 .profile-body {
