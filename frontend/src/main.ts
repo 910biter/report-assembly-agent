@@ -27,6 +27,18 @@ const queryClient = new QueryClient({
   },
 });
 
+window.addEventListener("vite:preloadError", (event: Event) => {
+  event.preventDefault();
+  // Route-level recovery is implemented in router.ts. This handles preloaded
+  // chunks too, where Vite reports the error before Vue Router sees it.
+  if (sessionStorage.getItem("ira:preload-reload") !== window.location.href) {
+    sessionStorage.setItem("ira:preload-reload", window.location.href);
+    window.location.reload();
+  } else {
+    sessionStorage.removeItem("ira:preload-reload");
+  }
+});
+
 createApp(App)
   .use(createPinia())
   .use(router)

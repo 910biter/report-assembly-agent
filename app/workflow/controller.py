@@ -137,6 +137,21 @@ class WorkflowController:
             self._update(stage="paused", queue_status={"status": "paused"}, control_request="")
             raise RuntimeError("TASK_PAUSED")
 
+    def _resume_skips(self, stage: Stage) -> bool:
+        """Return true when an approved checkpoint already finished this stage."""
+        order = {
+            str(Stage.PARSING): 1,
+            str(Stage.MATERIAL_ANALYSIS): 2,
+            str(Stage.PLANNING): 3,
+            str(Stage.EVIDENCE): 4,
+            str(Stage.CONFLICT): 5,
+            str(Stage.ANALYSIS): 6,
+            "final_plan": 7,
+            str(Stage.WRITING): 8,
+        }
+        resume_from = str(self.task.get("resume_from_stage") or "")
+        return order.get(resume_from, 0) > order.get(str(stage), 99)
+
     def run_to_review(self) -> str:
         """跑完 解析→去重→规划→事实→冲突→分析→写作,停在评审阶段等待用户。
 
@@ -202,7 +217,9 @@ class WorkflowController:
                 metadata={"checkpoint": "requirements"},
             )
             return "awaiting_requirements"
-        if self.task.get("plan_id"):
+        if self._resume_skips(Stage.PLANNING):
+            self._update(stage=str(Stage.PLANNING), resume={"stage": "plan", "status": "reused_after_checkpoint"})
+        elif self.task.get("plan_id"):
             self._update(stage=str(Stage.PLANNING), resume={"stage": "plan", "status": "reused"})
         else:
             with self._token_context("planning"):
@@ -215,7 +232,15 @@ class WorkflowController:
         _mark("plan")
         self._control_boundary()
         evidence_signature = stage_input_signature("evidence", self.task, plan=self._plan())
-        if (self.task.get("incremental_update")
+        if self._resume_skips(Stage.EVIDENCE):
+            self._ensure_context_manager()
+            facts = self._facts()
+            self._update(
+                stage=str(Stage.EVIDENCE),
+                evidence_progress={"status": "reused_after_checkpoint", "fact_count": len(facts)},
+                evidence_input_signature=evidence_signature,
+            )
+        elif (self.task.get("incremental_update")
                 and not self.task.get("incremental_added_material_ids")
                 and not self.task.get("intervention_force_evidence")):
             # 增量补写模式(无新增材料):直接复用 base 任务已提取的 facts,
@@ -274,7 +299,11 @@ class WorkflowController:
         # Build the task graph from validated Facts before Analysis. A graph
         # failure is recorded and degrades to ordinary Hybrid RAG; it never
         # blocks the report path or weakens evidence requirements.
-        if settings.graph_build_before_analysis:
+        if self._resume_skips(Stage.CONFLICT):
+            # The confirmed directory is downstream of graph construction.
+            # Keep its existing graph status intact instead of overwriting it.
+            pass
+        elif settings.graph_build_before_analysis:
             with self._token_context("graph_build"):
                 self._build_task_graph(facts)
         else:
@@ -299,7 +328,9 @@ class WorkflowController:
             status=_graph_artifact_status(graph_status),
         )
         _mark("graph")
-        if self.task.get("conflict_ids"):
+        if self._resume_skips(Stage.CONFLICT):
+            self._update(stage=str(Stage.CONFLICT), resume={"stage": "conflict", "status": "reused_after_checkpoint"})
+        elif self.task.get("conflict_ids"):
             self._update(stage=str(Stage.CONFLICT), resume={"stage": "conflict", "status": "reused"})
         else:
             with self._token_context("conflict"):
@@ -334,7 +365,9 @@ class WorkflowController:
             )
             return "review"
         analysis_signature = stage_input_signature("analysis", self.task, plan=self._plan())
-        if self.task.get("analysis_done") and signature_matches(
+        if self._resume_skips(Stage.ANALYSIS):
+            self._update(stage=str(Stage.ANALYSIS), resume={"stage": "analysis", "status": "reused_after_checkpoint"})
+        elif self.task.get("analysis_done") and signature_matches(
             self.task, "analysis", analysis_signature,
         ):
             self._update(stage=str(Stage.ANALYSIS), resume={"stage": "analysis", "status": "reused"})
@@ -388,7 +421,9 @@ class WorkflowController:
         })
         _mark("analysis")
         final_plan_signature = stage_input_signature("final_plan", self.task, plan=self._plan())
-        if self.task.get("incremental_update"):
+        if self._resume_skips(Stage.WRITING):
+            self._update(stage=str(Stage.PLANNING), resume={"stage": "final_plan", "status": "reused_after_checkpoint"})
+        elif self.task.get("incremental_update"):
             # 增量 final_plan 策略:
             # - 无新增材料(补写模式):复用 base 规划,结构不变,只补写内容。
             # - 有新增材料:基于新 facts 重新规划 final_plan,让新结构参与
@@ -527,6 +562,7 @@ class WorkflowController:
             workload_profile=workload_profile,
             ttfr_seconds=ttfr,
             critical_path_done=True,
+            resume_from_stage="",
         )
         update_task_run(
             str(self.task.get("run_id") or ""), status="review",
@@ -567,6 +603,9 @@ class WorkflowController:
     # ---------- 阶段执行 ----------
 
     def parse_materials(self) -> None:
+        if self._resume_skips(Stage.PARSING):
+            self._update(resume={"stage": "parse", "status": "reused_after_checkpoint"})
+            return
         self._update(stage=str(Stage.PARSING))
         self._parse_loop()
 
@@ -893,6 +932,7 @@ class WorkflowController:
             int(plan["id"]), context_block,
             required_structure=required_structure,
             required_chapter_count=int(self.task.get("intervention_required_chapter_count") or 0),
+            document_shape_hint=((policy.get("template_policy") or {}).get("document_shape_hint") or {}),
         )
         self._update(plan_title=final_plan.title, final_plan_frozen=True)
 
@@ -901,6 +941,9 @@ class WorkflowController:
 
         结果存 material_insights,并引导 Evidence 提取(高价值材料优先、按主题聚焦)。
         """
+        if self._resume_skips(Stage.MATERIAL_ANALYSIS):
+            self._update(resume={"stage": "material_analysis", "status": "reused_after_checkpoint"})
+            return
         self._update(stage=str(Stage.MATERIAL_ANALYSIS))
         from app.agents.base import BaseAgent
 
@@ -2197,6 +2240,7 @@ class WorkflowController:
             "plan_version": row["plan_version"] if "plan_version" in row.keys() else 1,
             "analysis_plan_json": _loads(row["analysis_plan_json"]) if "analysis_plan_json" in row.keys() else {},
             "final_plan_json": _loads(row["final_plan_json"]) if "final_plan_json" in row.keys() else {},
+            "document_shape": (_loads(row["final_plan_json"]).get("document_shape", {}) if "final_plan_json" in row.keys() else {}),
             "finalized_at": row["finalized_at"] if "finalized_at" in row.keys() else None,
         }
 
@@ -2218,6 +2262,7 @@ class WorkflowController:
             "structure": plan.get("structure"),
             "chapter_plans": plan.get("chapter_plans"),
             "budget": plan.get("budget"),
+            "document_shape": plan.get("document_shape"),
             "analysis_plan_json": plan.get("analysis_plan_json"),
             "final_plan_json": plan.get("final_plan_json"),
         }

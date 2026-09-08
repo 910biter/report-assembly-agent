@@ -79,7 +79,10 @@ def run_job(job_id: str) -> None:
                 text = "\n".join(unit.content for unit in units if str(unit.content or "").strip())
                 if not text:
                     raise ValueError("NO_TEXT_CONTENT")
-                reports.append({"filename": filename, "text": text, "path": str(path)})
+                reports.append({
+                    "filename": filename, "text": text, "path": str(path),
+                    "asset_role": str(item.get("asset_role") or "auto"),
+                })
             except Exception as exc:
                 failures.append({"filename": filename, "error": str(exc)[:300]})
             _update(

@@ -49,6 +49,9 @@ _SYSTEM_PROMPT = """你是报告整编系统的任务协作助手。你的职责
 18. 同时修改两个及以上章节标题时，必须调用 propose_section_titles 形成一张完整的批量提案；不得拆成多个单章节提案，更不得只修改其中第一章。
 19. 用户询问某个结论、句子或说法是否有依据时，先调用 search_fact_evidence；如需进一步核验，再调用 read_fact_evidence。不得仅凭事实数量或摘要判断。
 20. 用户明确要求在需求讨论或目录讨论阶段“确认并继续”时，调用 propose_checkpoint_continue 形成一张控制提案；接受后才继续工作流。不要把确认意图误解为重写目录或正文。
+21. 模板问题必须调用 read_task_template；任务创建后的模板以该工具为准，不得依赖创建前对话、主题或要求猜测。
+22. 用户选中或引用某个对象时，页面传入的信息只用于定位。回答其内容、依据或质量问题前，必须调用 read_current_focus 重新读取任务内真实对象。
+23. 工具结果标记为截断时，必须说明当前覆盖范围；需要完整判断时继续浏览或检索，不得把摘要当作完整事实。
 """
 
 
@@ -110,6 +113,16 @@ def _build_agent() -> Agent[TaskAgentDeps, str]:
     def read_task_map(ctx: RunContext[TaskAgentDeps]) -> dict:
         """读取任务全景：材料主题、规划摘要、事实和推论概览、报告结构及待处理事项。"""
         return ctx.deps.read(AgentToolName.GET_TASK_MAP)
+
+    @agent.tool
+    def read_task_template(ctx: RunContext[TaskAgentDeps]) -> dict:
+        """读取当前任务实际使用模板的文体、结构策略和 Word 版式边界。"""
+        return ctx.deps.read(AgentToolName.GET_TASK_TEMPLATE)
+
+    @agent.tool
+    def read_current_focus(ctx: RunContext[TaskAgentDeps]) -> dict:
+        """按当前选中对象的 ID 重新读取任务内真实内容、引用和来源。"""
+        return ctx.deps.read(AgentToolName.GET_FOCUSED_ARTIFACT)
 
     @agent.tool
     def read_final_report_plan(ctx: RunContext[TaskAgentDeps], include_details: bool = False) -> dict:
@@ -473,10 +486,7 @@ def run_task_collaboration_agent(
     recent_history: list[dict[str, str]],
     decision_memory: dict | None = None,
 ) -> TaskAgentRunResult:
-    deps = TaskAgentDeps(
-        context=context,
-        user_message=user_message,
-    )
+    deps = TaskAgentDeps(context=context, user_message=user_message)
     # The interaction lane has a smaller context envelope than the report
     # pipeline. Bound all non-tool prompt fields so a large selection or old
     # decision record cannot starve the agent's tool calls.
@@ -488,8 +498,8 @@ def run_task_collaboration_agent(
         "artifact_type": context.current_focus.artifact_type,
         "object_id": context.current_focus.object_id,
         "title": context.current_focus.title,
-        "current": context.current_focus.current,
-        "references": context.current_focus.references,
+        "artifact_version": context.current_focus.artifact_version,
+        "has_references": bool(context.current_focus.references),
     }
     memory_payload = decision_memory or {}
     input_budget = max(1024, int(settings.interactive_input_tokens))
@@ -502,7 +512,56 @@ def run_task_collaboration_agent(
         f"最近对话：\n{_cap_prompt_text(history_text, input_budget // 5) or '无'}\n\n"
         f"用户本轮消息：{_cap_prompt_text(user_message, input_budget // 5)}"
     )
-    result = _build_agent().run_sync(
+    result = _run_agent(prompt, deps)
+    required_reads = _required_read_groups(user_message, context)
+    missing = _missing_read_groups(required_reads, deps.tool_trace)
+    retry_usage = None
+    tool_trace = list(deps.tool_trace)
+    if missing:
+        # The first turn may ignore a natural-language tool instruction. Retry once
+        # with the concrete read contract rather than letting it answer by guesswork.
+        deps = TaskAgentDeps(context=context, user_message=user_message)
+        repair_prompt = (
+            f"{prompt}\n\n校验未通过：本轮回答前必须先完成这些权威读取："
+            f"{'；'.join(missing)}。请调用相应工具后再回答；页面焦点、聊天记录和主题不是事实来源。"
+        )
+        retry_usage = result.usage
+        result = _run_agent(repair_prompt, deps)
+        tool_trace.extend(deps.tool_trace)
+        remaining = _missing_read_groups(required_reads, deps.tool_trace)
+        if remaining:
+            return TaskAgentRunResult(
+                reply=(
+                    "为避免根据页面摘要或历史对话猜测，我还没有完成本问题所需的"
+                    f"{ '、'.join(remaining) }读取。请稍后重试；原有任务和报告不会受影响。"
+                ),
+                tool_call=None,
+                usage={
+                    "requests": result.usage.requests + retry_usage.requests,
+                    "tool_calls": result.usage.tool_calls + retry_usage.tool_calls,
+                    "input_tokens": result.usage.input_tokens + retry_usage.input_tokens,
+                    "output_tokens": result.usage.output_tokens + retry_usage.output_tokens,
+                    "cache_read_tokens": result.usage.cache_read_tokens + retry_usage.cache_read_tokens,
+                },
+                tool_trace=tool_trace,
+            )
+    usage = result.usage
+    return TaskAgentRunResult(
+        reply=str(result.output or "").strip(),
+        tool_call=deps.pending_action,
+        usage={
+            "requests": usage.requests + (retry_usage.requests if retry_usage else 0),
+            "tool_calls": usage.tool_calls + (retry_usage.tool_calls if retry_usage else 0),
+            "input_tokens": usage.input_tokens + (retry_usage.input_tokens if retry_usage else 0),
+            "output_tokens": usage.output_tokens + (retry_usage.output_tokens if retry_usage else 0),
+            "cache_read_tokens": usage.cache_read_tokens + (retry_usage.cache_read_tokens if retry_usage else 0),
+        },
+        tool_trace=tool_trace,
+    )
+
+
+def _run_agent(prompt: str, deps: TaskAgentDeps):
+    return _build_agent().run_sync(
         prompt,
         deps=deps,
         usage_limits=UsageLimits(
@@ -510,19 +569,38 @@ def run_task_collaboration_agent(
             tool_calls_limit=settings.interactive_tool_calls_limit,
         ),
     )
-    usage = result.usage
-    return TaskAgentRunResult(
-        reply=str(result.output or "").strip(),
-        tool_call=deps.pending_action,
-        usage={
-            "requests": usage.requests,
-            "tool_calls": usage.tool_calls,
-            "input_tokens": usage.input_tokens,
-            "output_tokens": usage.output_tokens,
-            "cache_read_tokens": usage.cache_read_tokens,
-        },
-        tool_trace=list(deps.tool_trace),
-    )
+
+
+def _required_read_groups(message: str, context: TaskAgentContext) -> dict[str, set[str]]:
+    """Generic safety contract for questions that require authoritative state."""
+    text = re.sub(r"\s+", "", str(message or "")).lower()
+    required: dict[str, set[str]] = {}
+
+    def add(label: str, *tools: AgentToolName) -> None:
+        required[label] = {tool.value for tool in tools}
+
+    if any(term in text for term in ("模板", "版式", "文风", "写作风格", "标题编号", "格式")):
+        add("模板画像", AgentToolName.GET_TASK_TEMPLATE)
+    if any(term in text for term in ("进度", "状态", "运行到", "队列", "报错", "异常", "完成了吗")):
+        add("任务状态", AgentToolName.GET_TASK_OVERVIEW)
+    if any(term in text for term in ("材料", "文件", "讲了什么", "哪一家", "哪个主体", "材料关系")):
+        add("材料理解", AgentToolName.GET_MATERIALS)
+    if any(term in text for term in ("原文", "页码", "段落", "具体", "文件里", "材料中", "哪个企业")):
+        add("材料原文", AgentToolName.SEARCH_MATERIAL_UNITS)
+    if any(term in text for term in ("依据", "证据", "支持", "有根据", "事实有问题", "是否真实")):
+        add("事实证据", AgentToolName.SEARCH_FACT_EVIDENCE, AgentToolName.GET_FACT_EVIDENCE, AgentToolName.GET_FOCUSED_ARTIFACT)
+    if any(term in text for term in ("目录", "章节", "第几章", "标题")):
+        add("最终目录", AgentToolName.GET_FINAL_PLAN, AgentToolName.GET_FOCUSED_ARTIFACT)
+    if context.current_focus.artifact_type not in {"", "task_brief", "task_control"} and any(
+        term in text for term in ("这句", "这段", "这里", "它", "这个", "引用", "问题")
+    ):
+        add("当前引用对象", AgentToolName.GET_FOCUSED_ARTIFACT)
+    return required
+
+
+def _missing_read_groups(required: dict[str, set[str]], trace: list[str]) -> list[str]:
+    completed = set(trace)
+    return [label for label, tools in required.items() if not completed.intersection(tools)]
 
 
 def _cap_prompt_json(value: object, token_budget: int) -> str:

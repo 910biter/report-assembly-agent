@@ -16,6 +16,7 @@ class ReportPlan:
     evidence_needs: list[dict] = field(default_factory=list)  # [{need, dimension, priority}]:待证实信息需求
     required_facts: list[str] = field(default_factory=list)
     budget: dict = field(default_factory=dict)  # ReportBudget: target_words/soft_max_words/hard_max_words/summary_budget
+    document_shape: dict = field(default_factory=dict)  # semantic form + visible-heading policy
     chapter_plans: list[dict] = field(default_factory=list)  # [{title, questions, judgment, relation_to_prev, required_facts, required_inferences, exclude, next_bridge, target_words, importance, evidence_density}]
     user_requirements: str = ""
     plan_stage: str = "analysis"

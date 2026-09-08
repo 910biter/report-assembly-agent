@@ -724,7 +724,7 @@ function qaStatusLabel(issue: QualityIssue) {
       <aside class="toc-panel">
         <h3>目录</h3>
         <a
-          v-for="(section, index) in report.data.value.sections"
+          v-for="(section, index) in report.data.value.sections.filter((item) => item.show_title !== false)"
           :key="section.title"
           :href="`#section-${index}`"
           >{{ section.display_title || section.title }}
@@ -759,6 +759,7 @@ function qaStatusLabel(issue: QualityIssue) {
           v-for="(section, sectionIndex) in report.data.value.sections"
           :key="section.title"
           ><h2
+            v-if="section.show_title !== false"
             :id="`section-${sectionIndex}`"
             :class="{ 'qa-section': issuesForSection(section.title).length }"
             :contenteditable="mode !== 'review'"
@@ -811,7 +812,7 @@ function qaStatusLabel(issue: QualityIssue) {
               v-for="sentence in paragraph.sentences"
               :key="sentence.id"
               ><h3
-                v-if="sentence.source_level === 'SUBHEADING'"
+                v-if="sentence.source_level === 'SUBHEADING' && sentence.show_subheading !== false"
                 :id="`sentence-${sentence.id}`"
                 class="sentence subheading"
                 :class="[

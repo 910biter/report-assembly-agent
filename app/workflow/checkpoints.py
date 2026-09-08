@@ -31,12 +31,17 @@ def confirm_requirements(task_id: str, *, theme: str, requirements: str,
         theme=theme,
         user_requirements=requirements,
         requirement_review_feedback=str(feedback or "").strip(),
-        stage="created",
+        # Material parsing and understanding completed before this checkpoint.
+        # Resume from planning instead of re-entering the public task entry point.
+        stage="planning",
+        resume_from_stage="planning",
     )
     return _enqueue_or_raise(task_id, replan_required=True)
 
 
-def confirm_directory(task_id: str, *, feedback: str = "") -> dict[str, Any]:
+def confirm_directory(
+    task_id: str, *, feedback: str = "", structure: list[str] | None = None,
+) -> dict[str, Any]:
     """Approve the current final plan and continue into narrative/writing."""
     task = short_term.load_task(task_id)
     if task is None:
@@ -44,12 +49,24 @@ def confirm_directory(task_id: str, *, feedback: str = "") -> dict[str, Any]:
     if not task.get("directory_review_pending"):
         raise CheckpointError("DIRECTORY_REVIEW_NOT_PENDING")
     feedback = str(feedback or "").strip()
+    structure = [str(title).strip() for title in (structure or []) if str(title).strip()]
     fields: dict[str, Any] = {
         "directory_review_pending": False,
         "directory_review_completed": True,
         "directory_review_feedback": feedback,
+        "resume_from_stage": "writing",
     }
-    if feedback:
+    if structure:
+        from app.workflow.controller import planner as workflow_planner
+
+        plan_id = int(task.get("plan_id") or 0)
+        if not plan_id:
+            raise CheckpointError("DIRECTORY_PLAN_NOT_FOUND")
+        revised = workflow_planner.revise_final_plan_structure(
+            plan_id, structure, instruction=feedback or "按用户确认目录调整",
+        )
+        fields.update(plan_title=revised.title, final_plan_frozen=True)
+    if feedback and not structure:
         fields.update(
             intervention_force_final_plan=True,
             incremental_update_reason=feedback,

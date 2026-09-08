@@ -29,6 +29,8 @@ from app.workflow.queue import request_control, task_queue_status
 class AgentToolName(str, Enum):
     GET_TASK_OVERVIEW = "get_task_overview"
     GET_TASK_MAP = "get_task_map"
+    GET_TASK_TEMPLATE = "get_task_template"
+    GET_FOCUSED_ARTIFACT = "get_focused_artifact"
     GET_MATERIALS = "get_materials"
     SEARCH_MATERIAL_UNITS = "search_material_units"
     LIST_FACTS = "list_facts"
@@ -129,6 +131,8 @@ _WORKFLOW_MAP = [
 _TOOL_DEFINITIONS = {
     AgentToolName.GET_TASK_OVERVIEW: (False, "读取任务状态、进度、异常和产物数量"),
     AgentToolName.GET_TASK_MAP: (False, "读取任务全景、当前产物摘要和待处理事项"),
+    AgentToolName.GET_TASK_TEMPLATE: (False, "读取当前任务实际使用的模板画像与版式边界"),
+    AgentToolName.GET_FOCUSED_ARTIFACT: (False, "读取用户当前选中对象及其任务内真实内容、引用和来源"),
     AgentToolName.GET_MATERIALS: (False, "读取任务材料及材料理解结果"),
     AgentToolName.SEARCH_MATERIAL_UNITS: (False, "按问题检索当前任务材料的原始片段和来源位置"),
     AgentToolName.LIST_FACTS: (False, "浏览当前任务事实摘要，并按关键词或维度筛选"),
@@ -552,6 +556,10 @@ def execute_read_tool(name: AgentToolName, arguments: dict[str, Any], context: T
         }
     if name == AgentToolName.GET_TASK_MAP:
         return _load_task_map(context.task_id, context.report_id)
+    if name == AgentToolName.GET_TASK_TEMPLATE:
+        return _load_task_template(context.task_id)
+    if name == AgentToolName.GET_FOCUSED_ARTIFACT:
+        return _load_focused_artifact(context)
     if name in {AgentToolName.GET_ANALYSIS_PLAN, AgentToolName.GET_FINAL_PLAN}:
         return _load_plan(
             context.task_id,
@@ -884,6 +892,168 @@ def _report_sentence_view(row: Any) -> dict[str, Any]:
     }
 
 
+def _load_task_template(task_id: str) -> dict[str, Any]:
+    """Return the effective template profile for one task, not a UI snapshot."""
+    task = short_term.load_task(task_id) or {}
+    raw_variant_id = task.get("variant_id")
+    try:
+        variant_id = int(raw_variant_id or 0)
+    except (TypeError, ValueError):
+        variant_id = 0
+    source = "task_selected"
+    if not variant_id:
+        from app.memory import style
+
+        locked = style.get_locked_variant()
+        variant_id = int(locked.id or 0) if locked else 0
+        source = "system_default"
+    if not variant_id:
+        return {
+            "selected": False,
+            "source": "system_default",
+            "message": "当前任务未绑定专用模板，使用系统默认导出规则。",
+        }
+
+    from app.memory import style
+
+    variant = style.get_variant(variant_id)
+    if variant is None:
+        return {
+            "selected": False,
+            "source": source,
+            "message": "任务绑定的模板已不可用，当前将使用系统默认导出规则。",
+        }
+    structure = variant.structure if isinstance(variant.structure, dict) else {}
+    return {
+        "selected": True,
+        "source": source,
+        "id": int(variant.id or variant_id),
+        "name": str(variant.name or "未命名模板"),
+        "document_shape": structure.get("document_shape") or {},
+        "asset_roles": structure.get("asset_roles") or {},
+        "structure_policy": variant.structure_policy or {},
+        "writing_style": variant.writing_style or {},
+        "writing_patterns": variant.writing_patterns or {},
+        "terminology": variant.terminology or {},
+        "format_summary": _template_format_summary(variant.format_spec),
+    }
+
+
+def _template_format_summary(value: Any) -> dict[str, Any]:
+    """Expose only the export-relevant format summary to an interaction turn."""
+    spec = value if isinstance(value, dict) else {}
+    dominant = spec.get("dominant") if isinstance(spec.get("dominant"), dict) else {}
+    return {
+        key: dominant.get(key)
+        for key in ("page_size", "margins", "font", "font_size", "line_spacing", "alignment")
+        if dominant.get(key) not in (None, "", {}, [])
+    }
+
+
+def _load_focused_artifact(context: TaskAgentContext) -> dict[str, Any]:
+    """Resolve UI focus through task-scoped storage before exposing any content."""
+    focus = context.current_focus
+    primary = _load_focus_target(context, focus)
+    references = []
+    for raw in focus.references[:8]:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            reference = ArtifactFocus.model_validate(raw)
+        except Exception:
+            continue
+        references.append(_load_focus_target(context, reference))
+    return {
+        "focus": {
+            "artifact_type": focus.artifact_type,
+            "object_id": focus.object_id,
+            "title": focus.title,
+        },
+        "primary": primary,
+        "references": references,
+    }
+
+
+def _load_focus_target(context: TaskAgentContext, focus: ArtifactFocus) -> dict[str, Any]:
+    artifact_type = str(focus.artifact_type or "")
+    object_id = str(focus.object_id or "")
+    if artifact_type == "sentence" and object_id.isdigit():
+        return {"artifact_type": artifact_type, **_load_report_sentence(context.report_id, int(object_id))}
+    if artifact_type == "fact" and object_id.isdigit():
+        return {"artifact_type": artifact_type, **_load_fact_evidence(context.task_id, int(object_id))}
+    if artifact_type == "inference" and object_id.isdigit():
+        return {"artifact_type": artifact_type, **_load_inference(context.task_id, int(object_id))}
+    if artifact_type == "material_role" and object_id.isdigit():
+        return {
+            "artifact_type": artifact_type,
+            "material_id": int(object_id),
+            **_load_material_role(context.task_id, int(object_id)),
+        }
+    if artifact_type in {"analysis_plan", "final_plan"}:
+        return {
+            "artifact_type": artifact_type,
+            **_load_plan(context.task_id, "analysis" if artifact_type == "analysis_plan" else "final", True),
+        }
+    if artifact_type == "paragraph":
+        current = focus.current if isinstance(focus.current, dict) else {}
+        section = str(current.get("section") or "")
+        paragraph = int(current.get("paragraph") or 0)
+        return _load_report_paragraph(context.report_id, section, paragraph)
+    if artifact_type == "qa_issue" and object_id.isdigit():
+        issue = _load_quality_issue_at(context, int(object_id))
+        return {"artifact_type": artifact_type, **issue}
+    return {
+        "artifact_type": artifact_type or "task_brief",
+        "exists": False,
+        "message": "当前选中对象尚未形成可读取的任务产物。",
+    }
+
+
+def _load_material_role(task_id: str, material_id: int) -> dict[str, Any]:
+    with session_scope() as s:
+        row = s.execute(select(ORMInsight).where(
+            ORMInsight.c.task_id == task_id,
+            ORMInsight.c.material_id == material_id,
+        ).order_by(ORMInsight.c.id.desc())).mappings().first()
+    return {
+        "exists": row is not None,
+        "material_role": row["material_role"] if row else "",
+        "claim_support": row["claim_support"] if row else "",
+        "key_points": _json(row["key_points"], [])[:12] if row else [],
+        "missing_information": _json(row["missing_information"], [])[:8] if row else [],
+    }
+
+
+def _load_report_paragraph(report_id: int | None, section: str, paragraph: int) -> dict[str, Any]:
+    if not report_id or not section or paragraph <= 0:
+        return {"artifact_type": "paragraph", "exists": False}
+    with session_scope() as s:
+        rows = s.execute(select(ORMSentence).where(
+            ORMSentence.c.report_id == int(report_id),
+            ORMSentence.c.section == section,
+            ORMSentence.c.paragraph == paragraph,
+        ).order_by(ORMSentence.c.order_index.asc())).mappings().all()
+    return {
+        "artifact_type": "paragraph",
+        "exists": bool(rows),
+        "section": section,
+        "paragraph": paragraph,
+        "sentences": [_report_sentence_view(row) for row in rows],
+    }
+
+
+def _load_quality_issue_at(context: TaskAgentContext, index: int) -> dict[str, Any]:
+    task = short_term.load_task(context.task_id) or {}
+    issues = list(task.get("qa_notes") or [])
+    if context.report_id:
+        from app.quality import attach_quality_issue_locations
+
+        issues = attach_quality_issue_locations(context.report_id, issues)
+    if index < 0 or index >= len(issues):
+        return {"exists": False}
+    return {"exists": True, "issue": issues[index]}
+
+
 def _load_materials(task_id: str) -> dict[str, Any]:
     task = short_term.load_task(task_id) or {}
     ids = [int(item) for item in task.get("material_ids") or [] if str(item).isdigit()]
@@ -893,18 +1063,23 @@ def _load_materials(task_id: str) -> dict[str, Any]:
             ORMInsight.c.task_id == task_id, ORMInsight.c.material_id.in_(ids),
         )).mappings().all() if ids else []
     roles = {int(row["material_id"]): row for row in insights}
-    def bounded(value: Any, limit: int) -> Any:
-        """Keep collaboration context useful without copying full artifacts."""
+    def bounded(value: Any, limit: int) -> tuple[Any, bool]:
+        """Keep collaboration context bounded and disclose every truncation."""
         parsed = _json(value, value)
         if isinstance(parsed, list):
-            return parsed[:limit]
+            return parsed[:limit], len(parsed) > limit
         if isinstance(parsed, str):
-            return parsed[:2000]
-        return parsed
+            return parsed[:2000], len(parsed) > 2000
+        return parsed, False
 
     material_views = []
     for row in materials:
         insight = roles.get(int(row["id"])) or {}
+        key_sections, sections_truncated = bounded(insight.get("key_sections"), 8)
+        key_points, points_truncated = bounded(insight.get("key_points"), 12)
+        missing_information, missing_truncated = bounded(insight.get("missing_information"), 8)
+        allowed_usage, allowed_truncated = bounded(insight.get("allowed_usage"), 8)
+        forbidden_usage, forbidden_truncated = bounded(insight.get("forbidden_usage"), 8)
         material_views.append({
             "id": int(row["id"]),
             "filename": row["filename"],
@@ -912,13 +1087,27 @@ def _load_materials(task_id: str) -> dict[str, Any]:
             "material_role": insight.get("material_role", ""),
             "claim_support": insight.get("claim_support", ""),
             "topic": insight.get("topic", ""),
-            "key_sections": bounded(insight.get("key_sections"), 8),
-            "key_points": bounded(insight.get("key_points"), 12),
-            "missing_information": bounded(insight.get("missing_information"), 8),
-            "allowed_usage": bounded(insight.get("allowed_usage"), 8),
-            "forbidden_usage": bounded(insight.get("forbidden_usage"), 8),
+            "key_sections": key_sections,
+            "key_points": key_points,
+            "missing_information": missing_information,
+            "allowed_usage": allowed_usage,
+            "forbidden_usage": forbidden_usage,
+            "truncated_fields": [
+                name for name, truncated in (
+                    ("key_sections", sections_truncated),
+                    ("key_points", points_truncated),
+                    ("missing_information", missing_truncated),
+                    ("allowed_usage", allowed_truncated),
+                    ("forbidden_usage", forbidden_truncated),
+                ) if truncated
+            ],
         })
-    return {"materials": material_views}
+    return {
+        "materials": material_views,
+        "material_count": len(material_views),
+        "returned_count": len(material_views),
+        "notice": "字段标记为 truncated_fields 时，请使用 search_material_units 核验原文，不得将摘要当作完整材料。",
+    }
 
 
 def _search_material_units(task_id: str, *, query: str, material_id: int | None = None,
@@ -958,8 +1147,10 @@ def _search_material_units(task_id: str, *, query: str, material_id: int | None 
         )
         units_by_material.setdefault(unit.material_id, []).append(unit)
         by_unit[unit.id] = dict(row)
+    requested_limit = max(1, int(limit or 6))
+    effective_limit = min(requested_limit, 8)
     hits, metadata = hybrid_retrieve_units(
-        query, units_by_material, top_k=max(1, min(int(limit or 6), 8)),
+        query, units_by_material, top_k=effective_limit,
         filters={"material_id": material_ids},
     )
     filenames = {int(row["id"]): str(row["filename"]) for row in material_rows}
@@ -975,7 +1166,21 @@ def _search_material_units(task_id: str, *, query: str, material_id: int | None 
             "paragraph": row.get("paragraph"), "excerpt": _bounded_text(row.get("content"), 1000),
             "retrieval": {"source": hit.source, "score": round(float(hit.score), 4)},
         })
-    return {"query": query, "items": items, "total": len(items), "strategy": metadata}
+    candidate_count = sum(len(items) for items in units_by_material.values())
+    return {
+        "query": query,
+        "items": items,
+        "total": len(items),
+        "candidate_units": candidate_count,
+        "requested_limit": requested_limit,
+        "effective_limit": effective_limit,
+        "truncated": candidate_count > len(items),
+        "next_step": (
+            "结果仅为候选片段；如需扩大覆盖，请用更具体的问题、限定材料或分多次检索。"
+            if candidate_count > len(items) else "当前候选范围已完整返回。"
+        ),
+        "strategy": metadata,
+    }
 
 
 def _load_task_map(task_id: str, report_id: int | None) -> dict[str, Any]:
@@ -1015,6 +1220,14 @@ def _load_task_map(task_id: str, report_id: int | None) -> dict[str, Any]:
             "inferences": len(task.get("inference_ids") or []) + len(task.get("external_ids") or []),
             "conflicts": len(task.get("conflict_ids") or []),
             "quality_issues": len(task.get("qa_notes") or []),
+        },
+        "truncation": {
+            "materials": len(materials) > 12,
+            "fact_highlights": len(task.get("fact_ids") or []) > len(facts),
+            "inference_highlights": (
+                len(task.get("inference_ids") or []) + len(task.get("external_ids") or []) > len(inferences)
+            ),
+            "notice": "任务地图只用于确定下一步读取方向；需要完整材料、事实或推论时请继续调用对应浏览工具。",
         },
     }
 

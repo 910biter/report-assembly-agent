@@ -250,7 +250,8 @@ def attach_draft_thread(draft_id: str, task_id: str) -> int:
     return len(thread_ids)
 
 
-def post_message(thread_id: int, content: str, context: dict | None = None) -> dict[str, Any]:
+def post_message(thread_id: int, content: str, context: dict | None = None,
+                 draft_current: dict | None = None) -> dict[str, Any]:
     thread = get_thread(thread_id)
     if thread is None:
         raise ValueError("INTERACTION_THREAD_NOT_FOUND")
@@ -259,6 +260,7 @@ def post_message(thread_id: int, content: str, context: dict | None = None) -> d
     content = content.strip()
     if not content:
         raise ValueError("EMPTY_MESSAGE")
+    _update_draft_current(thread_id, draft_current)
     _update_thread_focus(thread_id, context)
     message_id = _save_message(thread_id, "user", content, {"status": "running"})
     try:
@@ -271,7 +273,7 @@ def post_message(thread_id: int, content: str, context: dict | None = None) -> d
 
 
 def queue_message(thread_id: int, content: str, request_id: str = "",
-                  context: dict | None = None) -> dict[str, Any]:
+                  context: dict | None = None, draft_current: dict | None = None) -> dict[str, Any]:
     """Persist a user turn and return immediately; inference continues in background."""
     thread = get_thread(thread_id)
     if thread is None:
@@ -281,6 +283,7 @@ def queue_message(thread_id: int, content: str, request_id: str = "",
     content = content.strip()
     if not content:
         raise ValueError("EMPTY_MESSAGE")
+    _update_draft_current(thread_id, draft_current)
     _update_thread_focus(thread_id, context)
     request_id = str(request_id or uuid.uuid4().hex)[:80]
     for item in thread.get("messages") or []:
@@ -306,7 +309,88 @@ def _update_thread_focus(thread_id: int, context: dict | None) -> None:
         if row is None:
             return
         scope = _load(row[0], {})
-        scope["focus"] = ArtifactFocus.model_validate(context).model_dump(mode="json")
+        # Browser focus is a locator, never an authoritative content channel.
+        # The task agent re-reads this object through task-scoped tools.
+        scope["focus"] = _focus_locator(ArtifactFocus.model_validate(context))
+        s.execute(update(ORMInteractionThread).where(
+            ORMInteractionThread.c.id == int(thread_id)
+        ).values(scope_json=_dump(scope), updated_at=time.strftime("%Y-%m-%d %H:%M:%S")))
+
+
+def _focus_locator(focus: ArtifactFocus) -> dict[str, Any]:
+    """Persist only IDs and minimal paragraph coordinates from UI focus."""
+    current = focus.current if isinstance(focus.current, dict) else {}
+    locator_current: dict[str, Any] = {}
+    if focus.artifact_type == "paragraph":
+        raw_paragraph = current.get("paragraph") or 0
+        locator_current = {
+            "section": str(current.get("section") or "")[:300],
+            "paragraph": int(raw_paragraph) if str(raw_paragraph).isdigit() else 0,
+            "sentence_ids": [
+                int(item) for item in current.get("sentence_ids") or []
+                if str(item).isdigit()
+            ][:80],
+        }
+    references = []
+    for item in focus.references[:8]:
+        if not isinstance(item, dict):
+            continue
+        try:
+            reference = ArtifactFocus.model_validate(item)
+        except Exception:
+            continue
+        references.append({
+            "artifact_type": str(reference.artifact_type or "")[:80],
+            "object_id": str(reference.object_id or "")[:120],
+            "artifact_version": str(reference.artifact_version or "")[:80],
+            "title": str(reference.title or "")[:240],
+        })
+    return {
+        "artifact_type": str(focus.artifact_type or "task_brief")[:80],
+        "object_id": str(focus.object_id or "")[:120],
+        "artifact_version": str(focus.artifact_version or "")[:80],
+        "title": str(focus.title or "当前任务")[:240],
+        "current": locator_current,
+        "references": references,
+    }
+
+
+def _update_draft_current(thread_id: int, current: dict | None) -> None:
+    """Persist only a small, user-visible pre-task configuration snapshot."""
+    if not isinstance(current, dict):
+        return
+    with session_scope() as s:
+        row = s.execute(select(
+            ORMInteractionThread.c.artifact_type, ORMInteractionThread.c.scope_json,
+        ).where(ORMInteractionThread.c.id == int(thread_id))).first()
+        if row is None or str(row[0]) != "task_draft":
+            return
+        scope = _load(row[1], {})
+        prior = dict(scope.get("current") or {})
+        template = current.get("template") if isinstance(current.get("template"), dict) else {}
+        materials = current.get("materials") if isinstance(current.get("materials"), list) else []
+        # The browser may know file names before upload, but never transfers file
+        # contents through the conversation channel.
+        scope["current"] = {
+            **prior,
+            "theme": str(current.get("theme") or "")[:500],
+            "requirements": str(current.get("requirements") or "")[:8000],
+            "workflowMode": str(current.get("workflowMode") or "automatic")[:40],
+            "template": {
+                "id": int(template["id"]) if str(template.get("id") or "").isdigit() else 0,
+                "name": str(template.get("name") or "")[:240],
+                "mode": str(template.get("mode") or "")[:40],
+            },
+            "materials": [
+                {
+                    "id": int(item["id"]) if str(item.get("id") or "").isdigit() else 0,
+                    "filename": str(item.get("filename") or "")[:300],
+                    "source": str(item.get("source") or "")[:40],
+                }
+                for item in materials[:100]
+                if isinstance(item, dict)
+            ],
+        }
         s.execute(update(ORMInteractionThread).where(
             ORMInteractionThread.c.id == int(thread_id)
         ).values(scope_json=_dump(scope), updated_at=time.strftime("%Y-%m-%d %H:%M:%S")))
@@ -1411,7 +1495,30 @@ def _task_decision_memory(task_id: str, focus: dict | None = None) -> dict[str, 
     for key in buckets:
         buckets[key] = list(reversed(buckets[key][:12]))
     focus = dict(focus or {})
+    final_plan = _current_plan(task_id, "final_plan")
+    analysis_plan = _current_plan(task_id, "analysis_plan")
+    final_titles = [
+        str(item.get("title") or "")
+        for item in (
+            final_plan.get("sections")
+            or final_plan.get("chapters")
+            or final_plan.get("structure")
+            or final_plan.get("chapter_plans")
+            or []
+        )
+        if isinstance(item, dict) and str(item.get("title") or "").strip()
+    ][:20]
     return {
+        # These are current persisted artifacts, unlike the bounded proposal log
+        # below. The agent should treat them as the durable active constraints.
+        "active_constraints": {
+            "theme": str(task.get("theme") or ""),
+            "requirements": str(task.get("user_requirements") or ""),
+            "analysis_plan_exists": bool(analysis_plan),
+            "final_directory": final_titles,
+            "requirement_review_pending": bool(task.get("requirement_review_pending")),
+            "directory_review_pending": bool(task.get("directory_review_pending")),
+        },
         "task_goal": {
             "theme": str(task.get("theme") or ""),
             "requirements": str(task.get("user_requirements") or ""),

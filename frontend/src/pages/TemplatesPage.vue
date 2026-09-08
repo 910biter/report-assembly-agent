@@ -18,6 +18,7 @@ const editingName = ref("");
 const uploading = ref(false);
 const uploadPercent = ref(0);
 const learningJob = ref<any>(null);
+const assetRole = ref("auto");
 let pollTimer: number | undefined;
 const variants = useQuery({
   queryKey: ["templates"],
@@ -93,6 +94,14 @@ function confidence(key: string) {
   if (value === "unavailable") return "暂无可用结果";
   return ({ high: "高", medium: "中", low: "低" } as any)[value] || "未完成";
 }
+function capabilitySummary(roles: any) {
+  const capabilities = [
+    roles?.editorial_reference && "文体",
+    roles?.structural_reference && "结构",
+    roles?.layout_master_available && "Word 版式",
+  ].filter(Boolean);
+  return capabilities.length ? capabilities.join(" / ") : "能力待学习";
+}
 async function saveName() {
   const name = editingName.value.trim();
   if (!name) {
@@ -155,6 +164,22 @@ const realizationRows = computed(() =>
     ],
   ].filter((item) => item[1]),
 );
+const documentShape = computed(() => selected.value?.structure?.document_shape || {});
+const documentShapeLabel = computed(() => {
+  const labels: Record<string, string> = {
+    structured_report: "正式报告",
+    research_review: "研究综述",
+    article_sections: "分节文章",
+    continuous_article: "连续文章",
+    message_push: "推送文章",
+    news_release: "新闻稿",
+  };
+  return labels[documentShape.value.kind] || "待任务确定";
+});
+const headingPolicyLabel = computed(() => {
+  const labels: Record<string, string> = { numbered: "带编号标题", plain: "普通标题", none: "不显示标题" };
+  return labels[documentShape.value.heading_policy] || "由任务决定";
+});
 const documentRoles = computed(() =>
   [
     ["document_title", "主标题"],
@@ -229,6 +254,7 @@ async function startLearning() {
   learningJob.value = null;
   const form = new FormData();
   files.forEach((file) => form.append("files", file));
+  form.append("asset_role", assetRole.value);
   try {
     learningJob.value = await uploadForm<any>(
       "/api/style/analyze-jobs",
@@ -280,12 +306,23 @@ onBeforeUnmount(() => window.clearTimeout(pollTimer));
         <span class="upload-mark">DOCX</span>
         <div>
           <h2>学习新模板</h2>
-          <p>上传 Word 模板或成熟报告，系统会提取可执行的文档与表达画像。</p>
+          <p>上传参考报告、推送或 Word 母版，系统会分别学习文体、结构和版式能力。</p>
         </div>
       </div>
-      <label class="upload-field"
-        ><span>选择 DOCX 文件</span
-        ><input ref="upload" type="file" accept=".docx" multiple /></label
+      <div class="upload-controls">
+        <label class="upload-field"
+          ><span>选择参考文件</span
+          ><input ref="upload" type="file" accept=".pdf,.docx,.doc,.pptx,.ppt,.xlsx,.xls,.csv,.html,.htm,.md,.txt,.epub" multiple /></label
+        ><label class="asset-role-select"
+          ><span>本批用途</span
+          ><select v-model="assetRole">
+            <option value="auto">自动识别</option>
+            <option value="editorial">文体参考</option>
+            <option value="structure">结构参考</option>
+            <option value="layout">Word 版式母版</option>
+          </select></label
+        >
+      </div>
       ><UiButton
         :loading="learningBusy"
         @click="startLearning"
@@ -353,8 +390,9 @@ onBeforeUnmount(() => window.clearTimeout(pollTimer));
             <div class="template-meta">
               <strong>{{ item.name || `模板 ${item.id}` }}</strong
               ><small
-                >{{ item.source_reports?.length || 0 }} 份来源报告 · 已学习画像 ·
-                {{ item.exemplar_count || 0 }} 条成文样例</small
+                >{{ item.source_reports?.length || 0 }} 份来源 ·
+                {{ item.document_shape?.kind === 'continuous_article' ? '连续文章' : item.document_shape?.kind === 'message_push' ? '推送文章' : item.document_shape?.kind === 'news_release' ? '新闻稿' : item.document_shape?.kind === 'article_sections' ? '分节文章' : item.document_shape?.kind === 'research_review' ? '研究综述' : '正式报告' }} ·
+                {{ capabilitySummary(item.asset_roles) }}</small
               >
             </div>
             <div class="item-actions">
@@ -391,7 +429,7 @@ onBeforeUnmount(() => window.clearTimeout(pollTimer));
         <template v-if="selected"
           ><div class="profile-title">
             <div>
-              <small>分层报告画像</small>
+              <small>模板画像</small>
               <div class="name-editor">
                 <input
                   v-model="editingName"
@@ -420,6 +458,15 @@ onBeforeUnmount(() => window.clearTimeout(pollTimer));
             ]"
           />
           <div v-if="tab === 'document'" class="profile-body">
+            <div class="profile-block asset-capabilities">
+              <h3>模板用途</h3>
+              <dl>
+                <dt>文体学习</dt><dd>{{ selected.structure?.asset_roles?.editorial_reference ? '可用' : '未识别' }}</dd>
+                <dt>结构参考</dt><dd>{{ selected.structure?.asset_roles?.structural_reference ? '可用' : '仅供语言参考' }}</dd>
+                <dt>Word 版式母版</dt><dd>{{ selected.structure?.asset_roles?.layout_master_available ? '可用' : '未提供，将按任务使用默认版式' }}</dd>
+              </dl>
+              <p class="schema-note">{{ selected.structure?.asset_roles?.note || '文体、结构与导出版式由系统分别处理。' }}</p>
+            </div>
             <div class="confidence-line">
               <span>导出可用性</span
               ><b>{{
@@ -465,6 +512,14 @@ onBeforeUnmount(() => window.clearTimeout(pollTimer));
             </p>
           </div>
           <div v-else-if="tab === 'editorial'" class="profile-body">
+            <div class="profile-block document-shape">
+              <h3>文档形态</h3>
+              <dl>
+                <dt>推荐形态</dt><dd>{{ documentShapeLabel }}</dd>
+                <dt>标题呈现</dt><dd>{{ headingPolicyLabel }}</dd>
+                <dt>使用原则</dt><dd>最终结构由任务目标与材料决定；该画像只提供文体与呈现建议。</dd>
+              </dl>
+            </div>
             <div v-if="editorialRows.length" class="profile-block">
               <h3>
                 表达与组织 <span>{{ confidence("editorial_style") }}</span>
@@ -552,14 +607,15 @@ onBeforeUnmount(() => window.clearTimeout(pollTimer));
             </div>
           </div>
           <div v-else class="profile-body">
-            <div class="confidence-line">
-              <span>可检索成文范例</span
-              ><b>{{ selected.exemplar_bank?.length || 0 }} 条</b>
+            <div class="examples-summary">
+              <div class="examples-summary-title">
+                <span>可检索成文范例</span>
+                <b>{{ selected.exemplar_bank?.length || 0 }} 条</b>
+              </div>
+              <p>
+                Writer 只会选取与当前章节目的匹配的范例，匹配不足时不强行注入；范例只用于组织和表达，不复制业务事实。
+              </p>
             </div>
-            <p class="muted">
-              Writer
-              只会选取与当前章节目的匹配的范例，匹配不足时不强行注入；范例只用于组织和表达，不复制业务事实。
-            </p>
             <div class="example-list">
               <article
                 v-for="item in (selected.exemplar_bank || []).slice(0, 12)"
@@ -591,11 +647,25 @@ onBeforeUnmount(() => window.clearTimeout(pollTimer));
 <style scoped>
 .upload-bar {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(220px, 360px) auto;
+  grid-template-columns: minmax(0, 1fr) minmax(280px, 380px) auto;
   min-width: 0;
   align-items: center;
   gap: 16px;
   padding: 20px 24px;
+}
+.upload-controls {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(128px, 0.55fr);
+  gap: 8px;
+}
+.asset-role-select {
+  display: grid;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--color-muted);
+}
+.asset-role-select select {
+  width: 100%;
 }
 .upload-bar h2,
 .upload-bar p {
@@ -722,6 +792,34 @@ onBeforeUnmount(() => window.clearTimeout(pollTimer));
   padding: 12px 0;
   border-bottom: 1px solid var(--color-border);
 }
+.examples-summary {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  padding: 12px 0 14px;
+  border-bottom: 1px solid var(--color-border);
+}
+.examples-summary-title {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+.examples-summary-title span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.examples-summary-title b {
+  flex: 0 0 auto;
+}
+.examples-summary p {
+  margin: 0;
+  color: var(--color-muted);
+  font-size: 12px;
+  line-height: 1.65;
+  overflow-wrap: anywhere;
+}
 .schema-list {
   border-top: 1px solid var(--color-border);
 }
@@ -817,9 +915,11 @@ onBeforeUnmount(() => window.clearTimeout(pollTimer));
   }
 }
 .example-list {
+  min-width: 0;
   border-top: 1px solid var(--color-border);
 }
 .example-list article {
+  min-width: 0;
   padding: 12px 0;
   border-bottom: 1px solid var(--color-border);
 }
@@ -827,19 +927,33 @@ onBeforeUnmount(() => window.clearTimeout(pollTimer));
   display: flex;
   justify-content: space-between;
   gap: 12px;
+  min-width: 0;
+}
+.example-list article > div b {
+  flex: 0 0 auto;
 }
 .example-list span,
 .example-list small {
   color: var(--color-muted);
   font-size: 11px;
 }
+.example-list article > div span {
+  min-width: 0;
+  overflow: hidden;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .example-list p {
   display: -webkit-box;
+  min-width: 0;
   overflow: hidden;
   margin: 7px 0 0;
   color: var(--color-text);
   font-size: 13px;
   line-height: 1.7;
+  overflow-wrap: anywhere;
+  word-break: break-word;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 3;
 }
@@ -847,6 +961,7 @@ onBeforeUnmount(() => window.clearTimeout(pollTimer));
   display: block;
   margin-top: 5px;
   color: var(--color-warning);
+  overflow-wrap: anywhere;
 }
 .learning-progress {
   display: grid;

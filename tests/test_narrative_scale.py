@@ -10,7 +10,7 @@ from app.planning.scale import (
     parse_user_scale,
     reconcile_scale_budget,
 )
-from app.writing.writer import WriterAgent, _subsection_generation_units
+from app.writing.writer import WriterAgent, _focused_unit_evidence, _subsection_generation_units
 from app.writing.scale_execution import assess_chapter_output, measure_text_words
 
 
@@ -251,6 +251,14 @@ class NarrativeScaleTests(unittest.TestCase):
         self.assertEqual(["A", "B", "C"], [unit["title"] for unit in units])
         self.assertEqual([1000, 1500, 2000], [unit["target_words"] for unit in units])
         self.assertEqual([800, 1200, 1600], [unit["minimum_words"] for unit in units])
+
+    def test_generation_unit_uses_its_assigned_evidence(self):
+        facts, inferences = _focused_unit_evidence(
+            [{"id": 1}, {"id": 2}], [{"id": 9}, {"id": 10}],
+            {"fact_ids": [2], "inference_ids": [10]}, {"primary_fact_ids": [1]},
+        )
+        self.assertEqual([2], [item["id"] for item in facts])
+        self.assertEqual([10], [item["id"] for item in inferences])
 
     def test_incremental_output_is_measured_without_automatic_acceptance(self):
         assessment = assess_chapter_output(

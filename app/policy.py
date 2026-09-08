@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 from typing import Any
+from app.document_shape import normalize_document_shape
 
 
 def build_report_policy(task: dict | None = None, template_variant: Any = None,
@@ -91,12 +92,17 @@ def _template_policy(template_variant: Any) -> dict:
     structure = getattr(template_variant, "structure", {}) or {}
     format_spec = getattr(template_variant, "format_spec", {}) or {}
     institution_rules = getattr(template_variant, "institution_rules", {}) or {}
+    asset_roles = structure.get("asset_roles") if isinstance(structure, dict) else {}
     structure_type = _structure_type(format_spec, institution_rules)
+    if structure_type == "FORMAT_ONLY" and isinstance(asset_roles, dict) and asset_roles.get("structural_reference"):
+        structure_type = "SOFT_STRUCTURE"
+    learned_shape = structure.get("document_shape") if isinstance(structure, dict) else {}
     return {
         "structure_type": structure_type,
         "structure_hint": structure if structure_type != "FORMAT_ONLY" else {},
         "institution_rules": institution_rules,
         "format_summary": _format_summary(format_spec),
+        "document_shape_hint": normalize_document_shape(learned_shape),
         "guidance": (
             "模板只控制格式与导出呈现,不得把模板目录作为报告目录。"
             if structure_type == "FORMAT_ONLY"
@@ -143,9 +149,13 @@ def _format_summary(format_spec: dict) -> dict:
     schema = dominant.get("template_schema") if isinstance(dominant, dict) else {}
     if not isinstance(schema, dict) or not schema:
         return {}
+    roles = schema.get("style", {}).get("roles", {})
     return {
         "has_template_schema": True,
         "document": schema.get("document", {}),
-        "roles": schema.get("style", {}).get("roles", {}),
+        "roles": roles,
         "numbering": schema.get("style", {}).get("numbering", {}),
+        "has_heading_hierarchy": bool(
+            isinstance(roles, dict) and (roles.get("heading_1") or roles.get("heading_2"))
+        ),
     }

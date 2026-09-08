@@ -24,7 +24,10 @@ const form = ref<HTMLFormElement>();
 const fileInput = ref<HTMLInputElement>();
 const selectedFiles = ref<string[]>([]);
 const selectedLibraryIds = ref<string[]>([]);
-const selectedTemplateId = ref("");
+const selectedTemplateId = computed({
+  get: () => String(ui.taskDraft.templateId || ""),
+  set: (value: string) => { ui.taskDraft.templateId = String(value || ""); },
+});
 const libraryOpen = ref(false);
 const error = ref("");
 const workflowMode = ref<"automatic" | "collaborative">("automatic");
@@ -59,6 +62,27 @@ const selectedTemplateLabel = computed(() => {
     (item) => String(item.id) === selectedTemplateId.value,
   );
   return selected?.name || selected?.label || "默认模板";
+});
+const selectedTemplateContext = computed(() => {
+  const selected = (templates.data.value || []).find(
+    (item) => String(item.id) === selectedTemplateId.value,
+  );
+  return selected
+    ? {
+        id: Number(selected.id),
+        name: selected.name || selected.label || `模板 ${selected.id}`,
+      }
+    : { mode: "default", name: "系统默认模板" };
+});
+const selectedMaterialContext = computed(() => {
+  const library = (materials.data.value || [])
+    .filter((item) => selectedLibraryIds.value.includes(String(item.id)))
+    .map((item) => ({ id: item.id, filename: item.filename, source: "材料库" }));
+  const uploads = selectedFiles.value.map((filename) => ({
+    filename,
+    source: "待上传文件",
+  }));
+  return [...library, ...uploads];
 });
 const metrics = computed(() => [
   {
@@ -99,6 +123,15 @@ watch(
   () => route.query.create,
   (value) => {
     if (value) createOpen.value = true;
+  },
+  { immediate: true },
+);
+watch(
+  [selectedTemplateContext, selectedMaterialContext, workflowMode],
+  ([template, materials, mode]) => {
+    ui.taskDraft.template = template;
+    ui.taskDraft.materials = materials;
+    ui.taskDraft.workflowMode = mode;
   },
   { immediate: true },
 );

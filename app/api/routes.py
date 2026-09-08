@@ -619,7 +619,11 @@ def confirm_task_directory(task_id: str, payload: dict):
     """确认最终目录，并继续同一任务的报告写作。"""
     from app.workflow.checkpoints import CheckpointError, confirm_directory
     try:
-        return confirm_directory(task_id, feedback=str(payload.get("feedback") or ""))
+        return confirm_directory(
+            task_id,
+            feedback=str(payload.get("feedback") or ""),
+            structure=payload.get("structure") if isinstance(payload.get("structure"), list) else None,
+        )
     except CheckpointError as exc:
         return _checkpoint_error_response(str(exc))
 
@@ -629,6 +633,7 @@ def _checkpoint_error_response(code: str) -> JSONResponse:
         "TASK_NOT_FOUND": 404,
         "REQUIREMENT_REVIEW_NOT_PENDING": 409,
         "DIRECTORY_REVIEW_NOT_PENDING": 409,
+        "DIRECTORY_PLAN_NOT_FOUND": 409,
         "THEME_REQUIRED": 400,
         "REQUIREMENTS_REQUIRED": 400,
     }.get(code, 400)
@@ -1098,7 +1103,10 @@ def get_report(report_id: int):
         "qa_issues": qa_issues,
         "sections": [],
     }
-    heading_strategy = _report_heading_strategy(report["style_profile_id"])
+    document_shape = _report_document_shape(report["plan_id"])
+    heading_strategy = _report_heading_strategy(
+        report["style_profile_id"], fallback_defaults=document_shape.get("heading_policy") == "numbered",
+    )
     current_section = None
     current_paragraph = None
     chapter_index = 0
@@ -1113,6 +1121,7 @@ def get_report(report_id: int):
             section = {
                 "title": row["section"],
                 "display_title": format_heading(1, [chapter_index], row["section"], heading_strategy),
+                "show_title": document_shape.get("section_policy") != "hidden",
                 "paragraphs": [],
             }
             result["sections"].append(section)
@@ -1121,12 +1130,11 @@ def get_report(report_id: int):
             section["paragraphs"].append({"sentences": []})
         if row["source_level"] == "SUBHEADING":
             subsection_index += 1
-            detail["display_content"] = format_heading(
-                2,
-                [chapter_index, subsection_index],
-                detail["content"],
-                heading_strategy,
-            )
+            detail["show_subheading"] = document_shape.get("subheading_policy") != "hidden"
+            if detail["show_subheading"]:
+                detail["display_content"] = format_heading(
+                    2, [chapter_index, subsection_index], detail["content"], heading_strategy,
+                )
         section["paragraphs"][-1]["sentences"].append(detail)
     return result
 
@@ -1441,10 +1449,14 @@ def export(report_id: int):
 def create_style_learning_job(
     background_tasks: BackgroundTasks,
     files: list[UploadFile] = File(...),
+    asset_role: str = Form("auto"),
 ):
     """Accept uploads quickly, then learn the template asynchronously."""
     if not files:
         return JSONResponse({"error": "NO_FILES"}, status_code=400)
+    asset_role = str(asset_role or "auto").lower()
+    if asset_role not in {"auto", "editorial", "structure", "layout"}:
+        return JSONResponse({"error": "INVALID_ASSET_ROLE"}, status_code=400)
     job_id = uuid.uuid4().hex[:16]
     job_dir = settings.runtime_root / "style_jobs" / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
@@ -1455,7 +1467,10 @@ def create_style_learning_job(
             target = job_dir / f"{index:03d}-{filename}"
             with target.open("wb") as handle:
                 shutil.copyfileobj(upload.file, handle)
-            stored.append({"filename": filename, "path": str(target), "size": target.stat().st_size})
+            stored.append({
+                "filename": filename, "path": str(target), "size": target.stat().st_size,
+                "asset_role": asset_role,
+            })
     except Exception as exc:
         shutil.rmtree(job_dir, ignore_errors=True)
         return JSONResponse({"error": f"UPLOAD_SAVE_FAILED:{exc}"}, status_code=500)
@@ -1642,10 +1657,12 @@ def send_interaction_message(thread_id: int, payload: dict):
                 str(payload.get("content") or ""),
                 request_id=str(payload.get("request_id") or ""),
                 context=payload.get("context") if isinstance(payload.get("context"), dict) else None,
+                draft_current=payload.get("draft_current") if isinstance(payload.get("draft_current"), dict) else None,
             )
         return post_interaction_message(
             thread_id, str(payload.get("content") or ""),
             context=payload.get("context") if isinstance(payload.get("context"), dict) else None,
+            draft_current=payload.get("draft_current") if isinstance(payload.get("draft_current"), dict) else None,
         )
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)
@@ -1931,19 +1948,38 @@ def _sentence_details_bulk(rows) -> dict[int, dict]:
     return result
 
 
-def _report_heading_strategy(style_profile_id: int | None):
+def _report_heading_strategy(style_profile_id: int | None, *, fallback_defaults: bool = False):
     variant = style.get_variant(style_profile_id) if style_profile_id else None
     dominant = variant.format_spec.get("dominant") if variant and isinstance(variant.format_spec, dict) else {}
     schema = dominant.get("template_schema") if isinstance(dominant, dict) else {}
-    return detect_numbering_strategy(schema if isinstance(schema, dict) else {})
+    return detect_numbering_strategy(
+        schema if isinstance(schema, dict) else {}, fallback_defaults=fallback_defaults,
+    )
+
+
+def _report_document_shape(plan_id: int | None) -> dict:
+    from app.document_shape import normalize_document_shape
+    if not plan_id:
+        return normalize_document_shape(None)
+    with session_scope() as s:
+        row = s.execute(
+            select(ORMPlan.c.final_plan_json).where(ORMPlan.c.id == int(plan_id))
+        ).mappings().first()
+    try:
+        payload = json.loads((row or {}).get("final_plan_json") or "{}")
+    except (TypeError, ValueError):
+        payload = {}
+    return normalize_document_shape(payload.get("document_shape"))
 
 
 def variant_fields(variant) -> dict:
+    structure = dict(variant.structure or {})
+    structure["asset_roles"] = _variant_asset_roles(variant)
     return {
         "id": variant.id,
         "name": variant.name,
         "description": variant.description,
-        "structure": variant.structure,
+        "structure": structure,
         "writing_style": variant.writing_style,
         "writing_patterns": variant.writing_patterns,
         "terminology": variant.terminology,
@@ -1977,7 +2013,54 @@ def variant_summary_fields(variant) -> dict:
         },
         "source_reports": variant.source_reports,
         "exemplar_count": len(variant.exemplar_bank or []),
+        "asset_roles": _variant_asset_roles(variant),
+        "document_shape": (variant.structure or {}).get("document_shape", {}),
     }
+
+
+def _variant_asset_roles(variant) -> dict:
+    """Expose template capabilities consistently for both new and legacy rows."""
+    structure = variant.structure if isinstance(variant.structure, dict) else {}
+    saved = structure.get("asset_roles") if isinstance(structure.get("asset_roles"), dict) else {}
+    format_spec = variant.format_spec if isinstance(variant.format_spec, dict) else {}
+    dominant = format_spec.get("dominant") if isinstance(format_spec.get("dominant"), dict) else format_spec
+    has_layout = bool(
+        saved.get("layout_master_available")
+        or dominant.get("source_template_path")
+        or dominant.get("template_schema")
+    )
+    has_structure = bool(
+        saved.get("structural_reference")
+        or structure.get("sections")
+        or structure.get("heading_patterns")
+    )
+    has_editorial = bool(
+        saved.get("editorial_reference")
+        or variant.exemplar_bank
+        or variant.style_samples
+        or variant.writing_style
+    )
+    if saved:
+        result = dict(saved)
+        result.update({
+            "editorial_reference": has_editorial,
+            "structural_reference": has_structure,
+            "layout_master_available": has_layout,
+            "layout_master": bool(saved.get("layout_master") or has_layout),
+        })
+    else:
+        result = {
+            "editorial_reference": has_editorial,
+            "structural_reference": has_structure,
+            "layout_master": has_layout,
+            "layout_master_available": has_layout,
+        }
+    result.setdefault(
+        "note",
+        "该模板包含可复用的原始 DOCX 版式母版。" if has_layout
+        else "该模板用于文体和结构参考；Word 导出将使用任务默认版式。",
+    )
+    return result
 
 
 def _task_rows() -> list:

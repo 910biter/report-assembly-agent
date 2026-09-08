@@ -21,6 +21,10 @@ _CONCRETE_RE = re.compile(
 )
 _ATTRIBUTION_RE = re.compile(r"(?:根据|依据|材料显示|数据显示|报告指出|文件明确|统计表明)")
 _JUDGMENT_RE = re.compile(r"(?:表明|说明|意味着|反映出|由此可见|预计|可能|风险|建议|需要|应当)")
+_BOILERPLATE_RE = re.compile(
+    r"(?:原文链接|点击阅读原文|扫码|关注我们|责任编辑|图片来源|文中图片|免责声明|转载|版权归)",
+    re.IGNORECASE,
+)
 
 
 def build_report_exemplars(members: list[dict], per_report_limit: int = 512) -> list[dict]:
@@ -91,6 +95,8 @@ def annotate_exemplars(exemplars: list[dict], annotations: list[dict]) -> list[d
         sample_type = str(annotation.get("sample_type") or "").strip().lower()
         tags = annotation.get("tags") if isinstance(annotation.get("tags"), list) else []
         realization_mode = str(annotation.get("realization_mode") or "").strip()
+        rhetorical_role = str(annotation.get("rhetorical_role") or sample_type).strip().lower()
+        discourse_moves = annotation.get("discourse_moves") if isinstance(annotation.get("discourse_moves"), list) else []
         if purpose:
             exemplar["purpose"] = purpose[:160]
         if sample_type in {"opening", "fact", "analysis", "risk", "conclusion", "transition"}:
@@ -98,6 +104,10 @@ def annotate_exemplars(exemplars: list[dict], annotations: list[dict]) -> list[d
         exemplar["tags"] = [str(tag)[:40] for tag in tags[:8] if str(tag).strip()]
         if realization_mode:
             exemplar["realization_mode"] = realization_mode[:80]
+        if rhetorical_role in {"opening", "fact", "analysis", "risk", "conclusion", "transition"}:
+            exemplar["rhetorical_role"] = rhetorical_role
+        if discourse_moves:
+            exemplar["discourse_moves"] = [str(move)[:32] for move in discourse_moves[:6] if str(move).strip()]
     return exemplars
 
 
@@ -140,6 +150,30 @@ def aggregate_style_metrics(exemplars: list[dict]) -> dict:
             "judgment_paragraph_ratio": round(judgment_count / len(usable), 3),
             "fact_judgment_combination_ratio": round(fact_judgment_count / len(usable), 3),
         },
+        # Observed editorial behavior guides prose organization only. It never
+        # turns incidental headings in historical articles into a new directory.
+        "editorial_contract": editorial_contract(usable),
+    }
+
+
+def editorial_contract(exemplars: list[dict]) -> dict:
+    """Extract domain-neutral discourse cues from approved prose samples."""
+    usable = [item for item in exemplars if str(item.get("content") or "").strip()]
+    if not usable:
+        return {}
+    roles = Counter(
+        str(item.get("rhetorical_role") or item.get("sample_type") or item.get("structural_role") or "body")
+        for item in usable
+    )
+    lengths = [len(str(item.get("content") or "")) for item in usable]
+    labels = sum(bool(re.match(r"^[^。！？!?]{2,28}[。]\s*", str(item.get("content") or ""))) for item in usable)
+    return {
+        "opening_mode": "event_or_data_lead" if roles.get("opening") else "natural_lead",
+        "body_progression": "facts_to_interpretation" if any(item.get("realization_mode") for item in usable) else "fact_context_analysis",
+        "paragraph_rhythm": "extended" if _percentile(lengths, 0.5) >= 360 else "compact",
+        "inline_label_policy": "optional" if labels / max(1, len(usable)) >= 0.15 else "avoid",
+        "closing_mode": "natural_assessment" if roles.get("conclusion") else "natural",
+        "source_voice": "explicit_when_materially_needed",
     }
 
 
@@ -171,8 +205,10 @@ def select_exemplars(bank: list[dict], context: dict, limit: int = 3) -> list[di
         candidate_terms = _terms(metadata + " " + str(item.get("content") or "")[:400])
         overlap = _jaccard(query_terms, candidate_terms)
         score = overlap * 5.0
-        if desired_role and desired_role == str(item.get("sample_type") or "").lower():
-            score += 3.0
+        item_role = str(item.get("rhetorical_role") or item.get("sample_type") or "").lower()
+        if desired_role and desired_role == item_role:
+            # Same rhetorical role matters more than historical topic overlap.
+            score += 6.0
         if purpose and purpose in metadata:
             score += 2.0
         if title and (title in metadata or str(item.get("section") or "") in title):
@@ -282,6 +318,8 @@ def _structural_role(section_index: int, section_count: int, paragraph_index: in
 
 def _usable_exemplar(text: str) -> bool:
     if len(text) < 24 or _PLACEHOLDER_RE.search(text):
+        return False
+    if _BOILERPLATE_RE.search(text) and len(text) < 220:
         return False
     visible = sum(1 for char in text if char.isalnum() or "\u4e00" <= char <= "\u9fff")
     return visible / max(1, len(text)) >= 0.45

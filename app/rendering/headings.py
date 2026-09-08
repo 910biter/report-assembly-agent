@@ -26,7 +26,7 @@ class HeadingNumbering:
     level_formats: dict[int, str]
 
 
-def detect_numbering_strategy(schema: dict[str, Any] | None) -> HeadingNumbering:
+def detect_numbering_strategy(schema: dict[str, Any] | None, *, fallback_defaults: bool = False) -> HeadingNumbering:
     """Infer heading numbering style from template samples."""
     roles = ((schema or {}).get("style") or {}).get("roles") or {}
     numbering = ((schema or {}).get("style") or {}).get("numbering") or {}
@@ -61,9 +61,11 @@ def detect_numbering_strategy(schema: dict[str, Any] | None) -> HeadingNumbering
         elif fmt == "arabic_level_1":
             level_formats.setdefault(1, "decimal_comma")
 
-    if 1 not in level_formats:
+    # Missing learned numbering is not an instruction to turn every document
+    # into a formal numbered report.
+    if fallback_defaults and 1 not in level_formats:
         level_formats[1] = "cjk_comma"
-    if 2 not in level_formats:
+    if fallback_defaults and 2 not in level_formats:
         level_formats[2] = "cjk_parenthesized"
     return HeadingNumbering(level_formats=level_formats)
 

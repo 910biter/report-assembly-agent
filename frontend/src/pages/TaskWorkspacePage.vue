@@ -85,6 +85,49 @@ const checkpointPlan = useQuery({
   enabled: computed(() => Boolean(task.data.value?.directory_review_pending)),
   staleTime: 5000,
 });
+const checkpointTheme = ref("");
+const checkpointRequirements = ref("");
+const checkpointStructure = ref<string[]>([]);
+let requirementsDraftKey = "";
+let directoryDraftKey = "";
+watch(
+  () => [
+    task.data.value?.requirement_review_pending,
+    task.data.value?.theme,
+    task.data.value?.user_requirements,
+  ],
+  ([pending, theme, requirements]) => {
+    const key = `${Boolean(pending)}:${theme || ""}:${requirements || ""}`;
+    if (!pending || key === requirementsDraftKey) return;
+    requirementsDraftKey = key;
+    checkpointTheme.value = String(theme || "");
+    checkpointRequirements.value = String(requirements || "");
+  },
+  { immediate: true },
+);
+watch(
+  () => [
+    task.data.value?.directory_review_pending,
+    checkpointPlan.data.value?.items?.[0]?.current?.chapter_plans,
+  ],
+  ([pending, chapters]) => {
+    if (!pending) return;
+    const titles = (chapters || [])
+      .map((chapter: any) => String(chapter?.title || "").trim())
+      .filter(Boolean);
+    const key = titles.join("\u001f");
+    if (!titles.length || key === directoryDraftKey) return;
+    directoryDraftKey = key;
+    checkpointStructure.value = titles;
+  },
+  { immediate: true, deep: true },
+);
+const checkpointStructureTitles = computed(() =>
+  checkpointStructure.value.map((title) => title.trim()).filter(Boolean),
+);
+const checkpointStructureEdited = computed(
+  () => checkpointStructureTitles.value.join("\u001f") !== directoryDraftKey,
+);
 const command = useMutation({
   mutationFn: ({ path }: { path: string }) => api(path, { method: "POST" }),
   onSuccess: () => qc.invalidateQueries({ queryKey: ["task", taskId] }),
@@ -94,8 +137,8 @@ const confirmPlanning = useMutation({
     api(
       `/api/tasks/${taskId}/requirements/confirm`,
       jsonInit("POST", {
-        theme: task.data.value?.theme || "",
-        requirements: task.data.value?.user_requirements || "",
+        theme: checkpointTheme.value.trim(),
+        requirements: checkpointRequirements.value.trim(),
         feedback: "",
       }),
     ),
@@ -109,6 +152,9 @@ const confirmDirectory = useMutation({
       `/api/tasks/${taskId}/directory/confirm`,
       jsonInit("POST", {
         feedback: "",
+        structure: checkpointStructureEdited.value
+          ? checkpointStructureTitles.value
+          : undefined,
       }),
     ),
   onSuccess: () => {
@@ -257,6 +303,13 @@ function confirmPlan() {
 }
 function confirmDirectoryPlan() {
   confirmDirectory.mutate();
+}
+function addCheckpointChapter() {
+  checkpointStructure.value.push("");
+}
+function removeCheckpointChapter(index: number) {
+  if (checkpointStructure.value.length <= 1) return;
+  checkpointStructure.value.splice(index, 1);
 }
 function openCheckpointAssistant(kind: "requirements" | "directory") {
   const isRequirements = kind === "requirements";
@@ -545,18 +598,16 @@ function versionsList() {
           <p>
             材料理解已完成。可先与助手讨论主题、受众、重点和篇幅；确认后才会进入分析规划。
           </p>
-          <dl class="checkpoint-summary">
-            <div>
-              <dt>报告主题</dt>
-              <dd>{{ task.data.value.theme || "尚待与助手确定" }}</dd>
-            </div>
-            <div>
-              <dt>报告要求</dt>
-              <dd>
-                {{ task.data.value.user_requirements || "尚待与助手确定" }}
-              </dd>
-            </div>
-          </dl>
+          <div class="checkpoint-form">
+            <label>
+              <span>报告主题</span>
+              <input v-model="checkpointTheme" placeholder="填写或在助手中讨论后补充" />
+            </label>
+            <label>
+              <span>报告要求</span>
+              <textarea v-model="checkpointRequirements" rows="4" placeholder="填写目标读者、重点、篇幅或约束" />
+            </label>
+          </div>
           <div class="button-row">
             <button
               class="btn"
@@ -585,25 +636,23 @@ function versionsList() {
           <p>
             事实和分析已经完成。可以查看目录，并与助手讨论章节顺序、合并拆分和重点安排。
           </p>
-          <ol
-            v-if="checkpointPlan.data.value?.items?.[0]?.current?.chapter_plans"
-            class="checkpoint-outline"
-          >
+          <ol v-if="checkpointStructure.length" class="checkpoint-outline checkpoint-outline-editable">
             <li
-              v-for="chapter in checkpointPlan.data.value.items[0].current
-                .chapter_plans"
-              :key="chapter.title"
+              v-for="(_title, index) in checkpointStructure"
+              :key="index"
             >
-              {{ chapter.title }}
+              <input v-model="checkpointStructure[index]" :aria-label="`第 ${index + 1} 章标题`" />
+              <button type="button" class="text-button" :disabled="checkpointStructure.length <= 1" @click="removeCheckpointChapter(index)">删除</button>
             </li>
           </ol>
+          <button type="button" class="text-button checkpoint-add" @click="addCheckpointChapter">添加章节</button>
           <div class="button-row">
             <button class="btn" @click="openCheckpointAssistant('directory')">
               查看并讨论
             </button>
             <button
               class="btn primary"
-              :disabled="confirmDirectory.isPending.value"
+              :disabled="confirmDirectory.isPending.value || (checkpointStructureEdited && !checkpointStructureTitles.length)"
               @click="confirmDirectoryPlan"
             >
               {{
@@ -1519,29 +1568,87 @@ function versionsList() {
 .version-row div span {
   color: var(--color-muted);
 }
-.checkpoint-summary {
+.checkpoint-form {
   display: grid;
   gap: 8px;
   margin: 14px 0;
 }
-.checkpoint-summary div {
+.checkpoint-form label {
+  display: grid;
+  gap: 7px;
   padding: 11px 13px;
   border-left: 2px solid var(--primary);
   border-radius: 0 8px 8px 0;
   background: color-mix(in srgb, var(--primary) 5%, var(--card));
 }
-.checkpoint-summary dt {
+.checkpoint-form label > span {
   color: var(--color-muted);
   font-size: 12px;
 }
-.checkpoint-summary dd {
-  margin: 3px 0 0;
+.checkpoint-form input,
+.checkpoint-form textarea,
+.checkpoint-outline input {
+  width: 100%;
+  min-width: 0;
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  background: var(--surface-raised);
+  color: var(--color-text);
+  font: inherit;
   line-height: 1.55;
+}
+.checkpoint-form input,
+.checkpoint-outline input {
+  height: 34px;
+  padding: 0 10px;
+}
+.checkpoint-form textarea {
+  min-height: 92px;
+  padding: 8px 10px;
+  resize: vertical;
+}
+.checkpoint-form input:focus,
+.checkpoint-form textarea:focus,
+.checkpoint-outline input:focus {
+  outline: none;
+  border-color: var(--primary);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--primary) 20%, transparent);
 }
 .checkpoint-outline {
   margin: 12px 0;
   padding-left: 22px;
   line-height: 1.8;
+}
+.checkpoint-outline-editable {
+  display: grid;
+  gap: 8px;
+  padding-left: 30px;
+}
+.checkpoint-outline-editable li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-left: 4px;
+}
+.text-button {
+  flex: 0 0 auto;
+  border: 0;
+  background: transparent;
+  color: var(--color-muted);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.text-button:hover:not(:disabled) {
+  color: var(--color-text);
+}
+.text-button:disabled {
+  cursor: not-allowed;
+  opacity: .45;
+}
+.checkpoint-add {
+  margin: -2px 0 12px;
+  text-align: left;
 }
 @media (max-width: 900px) {
   .task-head,

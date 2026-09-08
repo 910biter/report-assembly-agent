@@ -21,7 +21,9 @@ from app.config import settings
 from app.db import session_scope
 from app.infrastructure.orm import ORMReport, ORMSentence
 from sqlalchemy import select
-from app.memory.style import get_variant
+from app.memory.style import get_locked_variant, get_variant
+from app.document_shape import normalize_document_shape, visible_sections, visible_subheadings, wants_numbering
+from app.infrastructure.orm import ORMPlan
 from app.rendering.headings import detect_numbering_strategy, format_heading
 from app.template_engine import check_docx_conformance, compile_template
 from app.template_engine.compiler import COMPILER_VERSION
@@ -49,7 +51,10 @@ def export_report(report_id: int) -> Path:
                 ORMSentence.c.report_id == report_id, ORMSentence.c.selected == 1
             ).order_by(ORMSentence.c.position)
         ).mappings().all()
-    variant = _select_export_variant(report["style_profile_id"])
+        plan = s.execute(select(ORMPlan.c.final_plan_json).where(ORMPlan.c.id == report["plan_id"])).mappings().first()
+    final_plan = json.loads((plan or {}).get("final_plan_json") or "{}")
+    document_shape = normalize_document_shape(final_plan.get("document_shape"))
+    variant = _select_export_variant(report["style_profile_id"], document_shape)
     format_spec = _dominant_format(variant)
     schema = format_spec.get("template_schema") if isinstance(format_spec.get("template_schema"), dict) else {}
 
@@ -57,7 +62,9 @@ def export_report(report_id: int) -> Path:
     title_anchor = _prepare_render_body(doc, schema)
     _apply_format(doc, format_spec, schema)
     _install_semantic_styles(doc, schema, format_spec)
-    heading_strategy = detect_numbering_strategy(schema)
+    heading_strategy = detect_numbering_strategy(
+        schema, fallback_defaults=wants_numbering(document_shape, 1),
+    )
 
     if title_anchor is not None:
         _replace_role_paragraph(doc, title_anchor, report["title"], "document_title")
@@ -77,11 +84,12 @@ def export_report(report_id: int) -> Path:
             current_section = sentence["section"]
             chapter_index += 1
             subsection_index = 0
-            _add_role_paragraph(
-                doc,
-                format_heading(1, [chapter_index], current_section, heading_strategy),
-                "heading_1",
-            )
+            if visible_sections(document_shape):
+                _add_role_paragraph(
+                    doc,
+                    format_heading(1, [chapter_index], current_section, heading_strategy),
+                    "heading_1",
+                )
         elif paragraph_changed:
             _flush_paragraph(doc, paragraph_buffer)
             paragraph_buffer = []
@@ -90,16 +98,17 @@ def export_report(report_id: int) -> Path:
             _flush_paragraph(doc, paragraph_buffer)
             paragraph_buffer = []
             subsection_index += 1
-            _add_role_paragraph(
-                doc,
-                format_heading(
-                    2,
-                    [chapter_index, subsection_index],
-                    sentence["user_edit"] or sentence["content"],
-                    heading_strategy,
-                ),
-                "heading_2",
-            )
+            if visible_subheadings(document_shape):
+                _add_role_paragraph(
+                    doc,
+                    format_heading(
+                        2,
+                        [chapter_index, subsection_index],
+                        sentence["user_edit"] or sentence["content"],
+                        heading_strategy,
+                    ),
+                    "heading_2",
+                )
             continue
         paragraph_buffer.append(sentence["user_edit"] or sentence["content"])
     _flush_paragraph(doc, paragraph_buffer)
@@ -128,9 +137,23 @@ def _dominant_format(variant) -> dict:
     return result
 
 
-def _select_export_variant(style_profile_id: int | None):
-    """Use only the template explicitly bound to this report."""
-    return get_variant(style_profile_id) if style_profile_id else None
+def _select_export_variant(style_profile_id: int | None, document_shape: dict):
+    """Keep editorial style separate from the OOXML base chosen for output."""
+    selected = get_variant(style_profile_id) if style_profile_id else None
+    if document_shape.get("render_base") != "default_structured":
+        return selected
+    fallback = get_locked_variant()
+    # A style-only reference must not be reused as a fake formal template.
+    # With no compatible structured base, the semantic renderer starts a clean
+    # document and applies its deterministic fallback styles.
+    return fallback if _has_heading_hierarchy(fallback) else None
+
+
+def _has_heading_hierarchy(variant) -> bool:
+    spec = _dominant_format(variant)
+    schema = spec.get("template_schema") if isinstance(spec, dict) else {}
+    roles = schema.get("style", {}).get("roles", {}) if isinstance(schema, dict) else {}
+    return bool(isinstance(roles, dict) and (roles.get("heading_1") or roles.get("heading_2")))
 
 
 def _open_render_base(format_spec: dict, schema: dict):

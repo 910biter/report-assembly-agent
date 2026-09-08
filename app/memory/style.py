@@ -27,7 +27,7 @@ from app.memory.style_profile import (
 from app.template_engine import compile_template
 
 _SAMPLE_LENGTH = 150
-_STYLE_LEARNER_VERSION = "editorial-v4"
+_STYLE_LEARNER_VERSION = "editorial-v5-document-shape"
 _DEFAULT_PROFILE_NAME = "综合报告风格"
 _REALIZATION_KEYS = (
     "fact_expression", "judgment_expression", "fact_judgment_transition",
@@ -42,6 +42,7 @@ _HEADING_RE = re.compile(r"^(第?[一二三四五六七八九十百]+[章节部�
 _FEATURE_PROMPT = """分析以下报告的体裁与风格特征,严格输出 JSON(不要任何解释):
 {
   "topic_type": "用简短中文名概括报告体裁，只填写结果，不要复述字段说明或示例",
+  "document_shape": "formal_report/research_review/article_sections/continuous_article/message_push/news_release",
   "structure_notes": "章节组织特点(是否先结论后展开、典型章节顺序)",
   "language_notes": "语言特点(正式程度、句式、数据使用)"
 }"""
@@ -93,13 +94,23 @@ _VARIANT_PROMPT = """以下为同一机构、同一类型({type})的 {count} 份
 
 {reports}
 
-请提炼该类型报告的写作规范,严格输出 JSON(不要任何解释):
+请提炼该类型报告的写作规范,严格输出 JSON(不要任何解释)。来源用途是能力边界：文体参考只学习表达，结构参考才可提供组织建议，只有 DOCX 版式母版可用于 Word 版式复用；不得因为样例含目录就默认冻结未来报告目录:
 {{
   "name": "报告类型名(沿用 {type})",
   "structure": {{
     "sections": [{{"title": "一、…", "children": ["二级标题…"]}}],
     "summary_first": true或false,
-    "conclusion_first": true或false
+    "conclusion_first": true或false,
+    "document_shape": {{
+      "kind": "structured_report/research_review/article_sections/continuous_article/message_push/news_release",
+      "heading_policy": "numbered/plain/none",
+      "section_policy": "required/optional/hidden",
+      "subheading_policy": "numbered/plain/hidden",
+      "render_base": "selected_template/default_structured/blank_article",
+      "opening": "title_only/lead/summary",
+      "closing": "natural/conclusion/signature",
+      "rationale": "样例中可观察到的形态依据"
+    }}
   }},
   "writing_style": {{
     "tone": "正式程度",
@@ -151,7 +162,7 @@ _VARIANT_PROMPT = """以下为同一机构、同一类型({type})的 {count} 份
     "data_requirements": "数据引用要求(如:关键数字必须注明来源)"
   }},
   "sample_annotations": [
-    {{"sample_id": "输入中的样例编号", "sample_type": "opening/fact/analysis/risk/conclusion/transition", "purpose": "该段承担的表达任务", "realization_mode": "单事实展开/多事实综合/事实到判断/风险边界/建议形成", "tags": ["可检索语义标签"]}}
+    {{"sample_id": "输入中的样例编号", "sample_type": "opening/fact/analysis/risk/conclusion/transition", "rhetorical_role": "opening/fact/analysis/risk/conclusion/transition", "purpose": "该段承担的表达任务", "realization_mode": "单事实展开/多事实综合/事实到判断/风险边界/建议形成", "discourse_moves": ["事实引入", "背景补充", "影响判断"], "tags": ["可检索语义标签"]}}
   ]
 }}"""
 
@@ -202,6 +213,7 @@ def analyze_library(
             "filename": report.get("filename", ""),
             "text": text,
             "path": report.get("path"),
+            "asset_role": report.get("asset_role") or "auto",
             "headings": headings,
             "samples": samples,
             "topic_type": topic_type,
@@ -210,22 +222,28 @@ def analyze_library(
             progress_callback, "classifying", report_index, len(reports),
             str(report.get("filename") or ""),
         )
-    # 聚类:按体裁分组;体裁不明的归入"其他"组按结构再拆
-    groups: dict[str, list[dict]] = {}
-    for feature in features:
-        groups.setdefault(feature["topic_type"], []).append(feature)
-    variants = []
-    group_items = list(groups.items())
-    for group_index, (topic_type, members) in enumerate(group_items, start=1):
-        _emit_progress(
-            progress_callback, "profiling", group_index - 1, len(group_items), topic_type,
-        )
-        variants.append(_build_variant(library_id, topic_type, members))
-        _emit_progress(
-            progress_callback, "profiling", group_index, len(group_items), topic_type,
-        )
+    # A user upload is one deliberate reference set, not an instruction to
+    # create several templates merely because source documents have different
+    # genres.  Preserve per-source signals inside the profile, then produce
+    # one coherent, selectable template image for this submission.
+    topic_type = _combined_topic_type(features)
+    _emit_progress(progress_callback, "profiling", 0, 1, topic_type)
+    variants = [_build_variant(library_id, topic_type, features)]
+    _emit_progress(progress_callback, "profiling", 1, 1, topic_type)
     _record_source_hash(reports, variants)
     return variants
+
+
+def _combined_topic_type(features: list[dict]) -> str:
+    """Name a submitted reference set without splitting it into variants."""
+    labels = [str(item.get("topic_type") or "").strip() for item in features]
+    labels = [label for label in labels if label and label != _DEFAULT_PROFILE_NAME]
+    if not labels:
+        return _DEFAULT_PROFILE_NAME
+    counts = {label: labels.count(label) for label in set(labels)}
+    dominant = max(counts, key=lambda label: (counts[label], len(label)))
+    # A single topical outlier should not rename a coherent reference set.
+    return dominant if counts[dominant] * 2 >= len(features) else _DEFAULT_PROFILE_NAME
 
 
 def _emit_progress(callback, phase: str, current: int, total: int, label: str = "") -> None:
@@ -245,10 +263,11 @@ def _source_hash(report: dict) -> str:
         if path and Path(path).exists():
             digest = hashlib.sha256(Path(path).read_bytes())
             digest.update(_STYLE_LEARNER_VERSION.encode())
+            digest.update(str(report.get("asset_role") or "auto").encode())
             return digest.hexdigest()[:16]
     except Exception:
         pass
-    fallback = f"{report.get('filename') or ''}:{_STYLE_LEARNER_VERSION}"
+    fallback = f"{report.get('filename') or ''}:{report.get('asset_role') or 'auto'}:{_STYLE_LEARNER_VERSION}"
     return hashlib.sha256(fallback.encode()).hexdigest()[:16]
 
 
@@ -361,7 +380,7 @@ def _build_variant(library_id: int, topic_type: str, members: list[dict]) -> Sty
             heading_lines.append("  " * max(0, _lv - 1) + "- " + _txt)
         headings = "\n".join(heading_lines) or "(未识别标题)"
         report_blocks.append(
-            f"[{member['filename']}]\n章节结构: {headings}\n"
+            f"[{member['filename']}]\n来源用途: {_asset_role_label(member.get('asset_role'))}\n章节结构: {headings}\n"
             f"开篇: {member['samples']['opening'][:150]}\n"
             f"正文: {member['samples']['middle'][:150]}\n"
             f"结尾: {member['samples']['ending'][:150]}"
@@ -383,6 +402,10 @@ def _build_variant(library_id: int, topic_type: str, members: list[dict]) -> Sty
     )
     _validate_profile_payload(payload)
     structure = payload.get("structure") if isinstance(payload.get("structure"), dict) else {}
+    # The learner describes a reusable editorial form. It is a hint for the
+    # Final Planner, never a frozen directory copied into a new task.
+    from app.document_shape import normalize_document_shape
+    structure["document_shape"] = normalize_document_shape(structure.get("document_shape"))
     writing = payload.get("writing_style") if isinstance(payload.get("writing_style"), dict) else {}
     writing_patterns = payload.get("writing_patterns") if isinstance(payload.get("writing_patterns"), dict) else {}
     material_realization = payload.get("material_realization") if isinstance(payload.get("material_realization"), dict) else {}
@@ -401,7 +424,28 @@ def _build_variant(library_id: int, topic_type: str, members: list[dict]) -> Sty
         {"sample_type": item.get("sample_type", "fact"), "content": item.get("content", "")}
         for item in exemplar_bank[:12]
     ] or _collect_samples(members)
-    format_spec = _collect_format(members)
+    # A DOCX may be deliberately supplied as an editorial or structural
+    # reference. Only explicit layout assets (or automatic mode) may become
+    # a Word export base.
+    layout_members = _eligible_layout_members(members)
+    format_spec = _collect_format(layout_members)
+    structure["source_assets"] = _source_asset_profiles(members)
+    structure["asset_roles"] = _aggregate_asset_roles(members, structure, format_spec)
+    # Editorial-only inputs may have OCR headings, but they do not grant a
+    # reusable directory. Keep their discourse value and remove false structure.
+    if not structure["asset_roles"].get("structural_reference"):
+        structure["sections"] = []
+    shape = normalize_document_shape(structure.get("document_shape"))
+    # A non-DOCX reference can teach how to write, but it cannot faithfully be
+    # reused as a Word layout base. Preserve its editorial value and let the
+    # Renderer select a structured default or a clean article document.
+    if not format_spec:
+        shape["render_base"] = (
+            "default_structured"
+            if shape["kind"] in {"structured_report", "research_review"}
+            else "blank_article"
+        )
+    structure["document_shape"] = shape
     variant = StyleVariant(
         library_id=library_id,
         name=_normalize_profile_label(payload.get("name"), fallback=topic_type),
@@ -433,6 +477,64 @@ def _build_variant(library_id: int, topic_type: str, members: list[dict]) -> Sty
         status="draft",
     )
     return save_variant(variant)
+
+
+def _asset_role_label(value) -> str:
+    return {
+        "editorial": "文体参考",
+        "structure": "结构参考",
+        "layout": "Word 版式母版",
+    }.get(str(value or "").strip().lower(), "自动识别")
+
+
+def _eligible_layout_members(members: list[dict]) -> list[dict]:
+    return [
+        item for item in members
+        if str(item.get("asset_role") or "auto").lower() in {"auto", "layout"}
+    ]
+
+
+def _source_asset_profiles(members: list[dict]) -> list[dict]:
+    """Persist source capabilities, not an assumption that every input is DOCX."""
+    result: list[dict] = []
+    for item in members:
+        path = str(item.get("path") or "")
+        suffix = Path(path).suffix.lower().lstrip(".")
+        headings = item.get("headings") or []
+        result.append({
+            "filename": str(item.get("filename") or ""),
+            "file_type": suffix or "unknown",
+            "requested_role": str(item.get("asset_role") or "auto"),
+            "can_learn_editorial": bool(item.get("text")),
+            "can_reference_structure": bool(headings),
+            "can_be_layout_master": suffix == "docx",
+        })
+    return result
+
+
+def _aggregate_asset_roles(members: list[dict], structure: dict, format_spec: dict) -> dict:
+    assets = _source_asset_profiles(members)
+    requested = {str(item.get("requested_role") or "auto") for item in assets}
+    has_headings = any(
+        bool(item.get("can_reference_structure"))
+        and str(item.get("requested_role") or "auto") == "structure"
+        for item in assets
+    )
+    return {
+        "editorial_reference": any(bool(item.get("can_learn_editorial")) for item in assets),
+        "structural_reference": has_headings or "structure" in requested,
+        "layout_master": bool(format_spec) and ("layout" in requested or "auto" in requested),
+        "layout_master_available": bool(format_spec),
+        "note": _asset_role_note(assets, bool(format_spec)),
+    }
+
+
+def _asset_role_note(assets: list[dict], has_layout_master: bool) -> str:
+    if has_layout_master:
+        return "该画像包含可复用的原始 DOCX 版式母版。"
+    if any(item.get("requested_role") == "layout" for item in assets):
+        return "未找到可用的 DOCX 版式母版；该批文件仍会学习文体和结构，Word 导出将使用默认版式。"
+    return "非 Word 文件或仅参考用途的 Word 文件不会作为导出母版；Word 导出将按任务选择默认版式。"
 
 
 def _collect_samples(members: list[dict]) -> list[dict]:

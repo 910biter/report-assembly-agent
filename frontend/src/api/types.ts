@@ -43,7 +43,7 @@ export interface Sentence {
   [key: string]: any;
 }
 
-export interface ReportSection { title: string; display_title?: string; paragraphs: Array<{ sentences: Sentence[] }> }
+export interface ReportSection { title: string; display_title?: string; show_title?: boolean; paragraphs: Array<{ sentences: Sentence[] }> }
 export interface QualityIssue {
   issue_id: string;
   type: string;

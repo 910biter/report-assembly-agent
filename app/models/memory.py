@@ -68,6 +68,12 @@ class StyleVariant:
             if qualitative:
                 block += f"- 可复核的行文模式: {json_dumps(qualitative, limit=900)}\n"
             observed = patterns.get("observed_metrics") or {}
+            if not observed.get("editorial_contract") and self.exemplar_bank:
+                # Existing templates predate the editorial-contract field. Build
+                # it at read time so they improve without a destructive relearn.
+                from app.memory.style_profile import aggregate_style_metrics
+
+                observed = {**observed, **aggregate_style_metrics(self.exemplar_bank)}
             if observed:
                 block += (
                     "- 历史成品统计(仅作为节奏参考,不得机械凑数): "
@@ -75,12 +81,18 @@ class StyleVariant:
                     f"每段句数={json_dumps(observed.get('sentences_per_paragraph', {}), limit=180)}; "
                     f"句长={json_dumps(observed.get('sentence_chars', {}), limit=180)}\n"
                 )
+                editorial = observed.get("editorial_contract") or {}
+                if editorial:
+                    block += (
+                        "- 编辑组织契约(仅指导段落推进，不是固定目录): "
+                        f"{json_dumps(editorial, limit=420)}\n"
+                    )
         terminology = self.terminology or {}
         if terminology.get("preferred"):
             block += "- 惯用表达: " + "、".join(terminology["preferred"]) + "\n"
         if terminology.get("forbidden"):
             block += "- 避免表达: " + "、".join(terminology["forbidden"]) + "\n"
-        samples = self.select_exemplars(context, limit=3) if context else self.style_samples[:3]
+        samples = self.select_exemplars(context, limit=2) if context else self.style_samples[:2]
         if samples:
             block += "- 匹配当前写作目的的已审核软范例(只借鉴组织与表达，不复制事实):\n"
             for sample in samples:

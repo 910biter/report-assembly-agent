@@ -457,7 +457,7 @@ function taskType(task: TaskSummary) {
 .table-head,
 .task-row {
   display: grid;
-  grid-template-columns: minmax(180px, 1.5fr) 72px 56px minmax(
+  grid-template-columns: minmax(180px, 1.5fr) minmax(96px, 0.55fr) minmax(56px, 0.32fr) minmax(
       100px,
       0.7fr
     ) 108px 38px;
@@ -519,8 +519,17 @@ function taskType(task: TaskSummary) {
 }
 .task-row > span,
 .task-row time {
+  min-width: 0;
   color: var(--muted-foreground);
   font-size: 13px;
+}
+.task-row > :nth-child(2) {
+  overflow: hidden;
+}
+.task-row > :nth-child(2) :deep(.ui-badge) {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .truncate {
   overflow: hidden;
@@ -606,7 +615,7 @@ function taskType(task: TaskSummary) {
   }
   .table-head,
   .task-row {
-    grid-template-columns: minmax(220px, 1fr) 88px 84px 42px;
+    grid-template-columns: minmax(220px, 1fr) minmax(92px, auto) 84px 42px;
   }
   .table-head > *:nth-child(3),
   .table-head > *:nth-child(4),

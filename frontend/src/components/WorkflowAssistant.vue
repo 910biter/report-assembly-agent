@@ -591,7 +591,6 @@ onBeforeUnmount(() => {
       </div>
     </section>
     <button
-      v-if="!isDraft"
       class="assistant-orb"
       :aria-label="open ? '关闭报告协作助手' : '打开报告协作助手'"
       @click="open = !open"

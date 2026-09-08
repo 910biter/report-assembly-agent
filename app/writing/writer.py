@@ -332,6 +332,23 @@ def _subsection_generation_units(narrative_plan: dict, chapter_target: int,
     return result
 
 
+def _focused_unit_evidence(
+    facts: list[dict], inferences: list[dict], unit_plan: dict | None, chapter_plan: dict,
+) -> tuple[list[dict], list[dict]]:
+    """Give a unit its planned evidence instead of the entire chapter pool."""
+    unit_plan = unit_plan or {}
+    fact_ids = set(_int_ids(unit_plan.get("fact_ids")))
+    inference_ids = set(_int_ids(unit_plan.get("inference_ids")))
+    if not fact_ids:
+        fact_ids = set(_int_ids(chapter_plan.get("primary_fact_ids")))
+    if not inference_ids:
+        inference_ids = set(_int_ids(chapter_plan.get("primary_inference_ids")))
+    selected_facts = [item for item in facts if int(item.get("id") or 0) in fact_ids] if fact_ids else list(facts)
+    selected_inferences = [item for item in inferences if int(item.get("id") or 0) in inference_ids] if inference_ids else list(inferences)
+    # Older plans may not contain assignments; preserve their usable fallback.
+    return selected_facts or list(facts), selected_inferences or list(inferences)
+
+
 def _subsection_execution_hint(titles: list[str]) -> str:
     if not titles:
         return (
@@ -1307,8 +1324,11 @@ class WriterAgent(BaseAgent):
                           minimum_ratio: float | None = None,
                           style_variant=None) -> list[dict]:
         """Generate each Narrative subsection exactly once, without continuation."""
+        from app.document_shape import normalize_document_shape, visible_subheadings
+
         chapter_plan = chapter_plan or {}
         narrative_plan = narrative_plan or {}
+        document_shape = normalize_document_shape(plan.get("document_shape"))
         chapter_target = int(chapter_plan.get("target_words") or 0)
         effective_minimum_ratio = (
             settings.writer_min_budget_completion_ratio
@@ -1317,6 +1337,20 @@ class WriterAgent(BaseAgent):
         units = _subsection_generation_units(
             narrative_plan, chapter_target, effective_minimum_ratio,
         )
+        if document_shape.get("section_policy") == "hidden" and len(units) > 1:
+            # Internal evidence groups must not become separately drafted
+            # mini-articles once their headings are hidden from the reader.
+            units = [{
+                "index": 1,
+                "count": 1,
+                "title": "",
+                "target_words": max(0, chapter_target),
+                "minimum_words": round(max(0, chapter_target) * max(0.0, effective_minimum_ratio)),
+                "plan": None,
+                "evidence_status": str(narrative_plan.get("evidence_status") or "unknown"),
+                "evidence_reason": str(narrative_plan.get("evidence_reason") or ""),
+                "missing_information": list(narrative_plan.get("missing_information") or []),
+            }]
         all_results: list[dict] = []
         seen_texts: set[str] = set()
         paragraph_offset = 0
@@ -1366,9 +1400,12 @@ class WriterAgent(BaseAgent):
                 # one purpose-matched block here instead of injecting the same
                 # template twice and over-constraining prose.
                 unit_style = dynamic_style
+            unit_facts, unit_inferences = _focused_unit_evidence(
+                chapter_facts, chapter_inferences, unit.get("plan"), chapter_plan,
+            )
             generated = self._generate_chapter_pass(
                 chapter_title, chapter_index, chapter_count, structure,
-                chapter_facts, chapter_inferences, unit_style,
+                unit_facts, unit_inferences, unit_style,
                 plan, report_memory, valid_fact_ids, valid_inf_ids,
                 chapter_plan=unit_chapter_plan,
                 institution_rules=institution_rules,
@@ -1396,8 +1433,8 @@ class WriterAgent(BaseAgent):
                 "actual_words": actual_words,
                 "completion_rate": round(actual_words / unit["target_words"], 4) if unit["target_words"] else None,
                 "evidence_status": unit["evidence_status"],
-                "supplied_fact_count": len(chapter_facts),
-                "supplied_inference_count": len(chapter_inferences),
+                "supplied_fact_count": len(unit_facts),
+                "supplied_inference_count": len(unit_inferences),
                 "planned_fact_count": len(planned_fact_ids),
                 "planned_inference_count": len(planned_inference_ids),
                 "used_fact_count": len(used_fact_ids),
@@ -1426,7 +1463,10 @@ class WriterAgent(BaseAgent):
                 item = dict(item)
                 item["paragraph"] = int(item.get("paragraph") or 1) + paragraph_offset
                 accepted_for_unit.append(item)
-            if accepted_for_unit and unit["title"]:
+            # Narrative units are always useful for evidence organization, but
+            # they only become visible text headings when the chosen document
+            # form calls for them.
+            if accepted_for_unit and unit["title"] and visible_subheadings(document_shape):
                 first_paragraph = min(int(item.get("paragraph") or 1) for item in accepted_for_unit)
                 all_results.append({
                     "text": unit["title"],
@@ -1464,6 +1504,8 @@ class WriterAgent(BaseAgent):
         """
         chapter_plan = chapter_plan or {}
         generation_unit = generation_unit or {"index": 1, "count": 1, "title": "", "plan": None}
+        from app.document_shape import normalize_document_shape
+        document_shape = normalize_document_shape(plan.get("document_shape"))
         chapter_target_words = int(chapter_plan.get("target_words") or 0)
         section_plan_block = _json_dumps({
             "本章目标字数": chapter_target_words,
@@ -1506,6 +1548,8 @@ class WriterAgent(BaseAgent):
         def build_prompt(selected_facts: list[str], selected_inferences: list[str]) -> str:
             return (
             f"报告标题:{plan.get('title', '')}\n"
+            + f"文档形态:{document_shape['kind']}；一级标题:{document_shape['heading_policy']}；二级标题:{document_shape['subheading_policy']}。"
+              "内部语义单元只用于组织证据；是否显示标题由文档形态决定，不得自行添加编号或 Markdown 标题。\n"
             f"报告核心判断:{plan.get('core_judgment', '')}\n"
             f"总体叙事逻辑:{plan.get('narrative_logic', '')}\n"
             + (f"本轮更新目标:{plan.get('update_instruction', '')}\n" if plan.get("update_instruction") else "")

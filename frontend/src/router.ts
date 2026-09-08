@@ -1,7 +1,7 @@
 import { createRouter, createWebHistory } from "vue-router";
 import DashboardPage from "@/pages/DashboardPage.vue";
 
-export default createRouter({
+const router = createRouter({
   history: createWebHistory(),
   routes: [
     { path: "/", component: DashboardPage, meta: { title: "工作台" } },
@@ -16,3 +16,20 @@ export default createRouter({
   ],
   scrollBehavior: () => ({ top: 0 }),
 });
+
+// Hashed chunks change on every deployment. A tab that has kept an older SPA
+// shell open must reload once instead of leaving the user on a broken route.
+const CHUNK_RELOAD_KEY = "ira:chunk-reload";
+router.onError((error, to) => {
+  const message = String(error?.message || error);
+  if (!/dynamically imported module|module script|Failed to fetch/i.test(message)) return;
+  const target = to.fullPath || window.location.href;
+  if (sessionStorage.getItem(CHUNK_RELOAD_KEY) === target) {
+    sessionStorage.removeItem(CHUNK_RELOAD_KEY);
+    return;
+  }
+  sessionStorage.setItem(CHUNK_RELOAD_KEY, target);
+  window.location.assign(target);
+});
+
+export default router;

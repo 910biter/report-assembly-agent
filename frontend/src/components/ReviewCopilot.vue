@@ -604,11 +604,13 @@ async function send() {
       jsonInit("POST", {
         content,
         async: true,
-        request_id:
-          globalThis.crypto?.randomUUID?.() ||
-          `${Date.now()}-${Math.random().toString(16).slice(2)}`,
-        context: props.focus || {},
-      }),
+      request_id:
+        globalThis.crypto?.randomUUID?.() ||
+        `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      context: props.focus || {},
+      draft_current:
+        props.artifactType === "task_draft" ? props.current || {} : undefined,
+    }),
     );
     thread.value = result.thread;
     if (

@@ -33,6 +33,7 @@ const classes = computed(() =>
   border: 1px solid color-mix(in srgb, currentColor 24%, transparent);
 }
 .ui-badge--dot::before {
+  flex: 0 0 6px;
   content: "";
   width: 6px;
   height: 6px;
@@ -45,9 +46,17 @@ const classes = computed(() =>
   color: var(--muted-foreground);
   background: var(--muted);
 }
+.ui-badge--neutral::before {
+  background: var(--muted-foreground);
+  opacity: 0.9;
+}
 .ui-badge--info {
   color: var(--info);
   background: var(--info-soft);
+}
+.ui-badge--info::before {
+  background: var(--info);
+  opacity: 0.9;
 }
 .ui-badge--success {
   color: var(--foreground);
@@ -61,8 +70,16 @@ const classes = computed(() =>
   color: var(--warning);
   background: var(--warning-soft);
 }
+.ui-badge--warning::before {
+  background: var(--warning);
+  opacity: 0.9;
+}
 .ui-badge--danger {
   color: var(--destructive);
   background: var(--destructive-soft);
+}
+.ui-badge--danger::before {
+  background: var(--destructive);
+  opacity: 0.9;
 }
 </style>

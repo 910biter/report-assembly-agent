@@ -8,7 +8,14 @@ export const useUiStore = defineStore("ui", {
     navOpen: false,
     createOpen: false,
     draftId: "",
-    taskDraft: { theme: "", requirements: "" },
+    taskDraft: {
+      theme: "",
+      requirements: "",
+      workflowMode: "automatic",
+      templateId: "",
+      template: null as Record<string, any> | null,
+      materials: [] as Array<Record<string, any>>,
+    },
     assistant: {
       open: false,
       tab: "progress" as "progress" | "artifacts" | "discuss",
