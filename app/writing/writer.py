@@ -26,6 +26,7 @@ from app.planning.structure import serializable_memory
 from app.planning.structure import order_chapters
 from app.planning.scale import normalize_execution_plan
 from app.rendering.headings import has_heading_prefix, strip_heading_prefix
+from app.document_shape import normalize_composition_mode
 from app.task_artifacts import latest_task_artifact, save_task_artifact
 from app.token_monitor import update_call_funnel, update_call_metrics, update_call_products
 from app.config import settings
@@ -364,6 +365,23 @@ def _subsection_execution_hint(titles: list[str]) -> str:
     )
 
 
+def _paragraph_execution_hint(paragraphs: list[dict] | None) -> str:
+    """Expose the narrative paragraph contract without turning it into headings."""
+    if not paragraphs:
+        return ""
+    lines = []
+    for index, item in enumerate(paragraphs, start=1):
+        lines.append(
+            f"P{index}: {item.get('purpose', '')}；"
+            f"核心事实 {item.get('fact_ids', [])}；推断 {item.get('inference_ids', [])}；"
+            f"约 {item.get('target_words', 0)} 字"
+        )
+    return (
+        "段落执行计划(语义边界，不是小标题):\n- " + "\n- ".join(lines)
+        + "\n按上述顺序各输出一个 paragraphs 元素；不得把不同段落计划压成同一长段。"
+    )
+
+
 def _evidence_execution_hint(generation_unit: dict) -> str:
     status = str((generation_unit or {}).get("evidence_status") or "unknown").lower()
     reason = str((generation_unit or {}).get("evidence_reason") or "").strip()
@@ -510,6 +528,39 @@ def _pack_writer_evidence(
         extra, _ = take(inference_lines[len(selected_inferences):], remaining)
         selected_inferences.extend(extra)
     return selected_facts, selected_inferences
+
+
+def _article_evidence_ids(chapters: list[dict]) -> tuple[set[int], set[int]]:
+    """Collect FinalPlan evidence assignments without using title semantics."""
+    fact_ids: set[int] = set()
+    inference_ids: set[int] = set()
+    for chapter in chapters or []:
+        if not isinstance(chapter, dict):
+            continue
+        fact_ids.update(_int_ids(chapter.get("primary_fact_ids")))
+        inference_ids.update(_int_ids(chapter.get("primary_inference_ids")))
+        for subsection in chapter.get("subsections") or []:
+            if isinstance(subsection, dict):
+                fact_ids.update(_int_ids(subsection.get("primary_fact_ids") or subsection.get("fact_ids")))
+                inference_ids.update(_int_ids(subsection.get("primary_inference_ids") or subsection.get("inference_ids")))
+    return fact_ids, inference_ids
+
+
+def _article_beat_groups(beats: list[dict], safe_words: int) -> list[list[dict]]:
+    """Partition only at planned article-beat boundaries when output is physical-limit bound."""
+    groups: list[list[dict]] = []
+    current: list[dict] = []
+    current_words = 0
+    for beat in beats or []:
+        words = max(1, int(beat.get("target_words") or 0))
+        if current and current_words + words > safe_words:
+            groups.append(current)
+            current, current_words = [], 0
+        current.append(beat)
+        current_words += words
+    if current:
+        groups.append(current)
+    return groups or [[]]
 
 
 def _chapter_position(chapter_index: int, local_position: int) -> int:
@@ -673,6 +724,35 @@ class WriterAgent(BaseAgent):
         report = self._open_or_create_report(plan, profile_id, existing_report_id)
         if report_callback:
             report_callback(report)
+
+        # The FinalPlan still owns evidence allocation for every document. For
+        # editorial/continuous forms, however, its chapters are evidence arcs,
+        # not independent prose calls. Do not hide headings after drafting four
+        # self-contained mini-reports: compose one article from a document plan.
+        composition_mode = normalize_composition_mode(
+            plan.get("composition_mode"), shape=plan.get("document_shape"),
+        )
+        if composition_mode == "article_beats":
+            return self._write_article(
+                report=report,
+                plan=plan,
+                chapters=chapters,
+                facts=facts,
+                inferences=inferences,
+                style_block=style_block,
+                style_variant=style_variant,
+                valid_fact_ids=valid_fact_ids,
+                valid_inf_ids=valid_inf_ids,
+                inf_levels=inf_levels,
+                institution_rules=institution_rules,
+                task_profile=task_profile,
+                report_policy=report_policy,
+                task_id=task_id,
+                run_id=run_id,
+                progress_callback=progress_callback,
+                chapter_callback=chapter_callback,
+                minimum_ratio=minimum_ratio,
+            )
 
         target_titles = {str(title).strip() for title in (target_chapter_titles or []) if str(title).strip()}
         existing_titles = {str(chapter.get("title", "")).strip() for chapter in chapters}
@@ -964,6 +1044,298 @@ class WriterAgent(BaseAgent):
             except Exception:
                 pass
         return report
+
+    def _write_article(self, *, report: Report, plan: dict, chapters: list[dict],
+                       facts: list[dict], inferences: list[dict], style_block: str,
+                       style_variant, valid_fact_ids: set[int], valid_inf_ids: set[int],
+                       inf_levels: dict[int, str], institution_rules: dict | None,
+                       task_profile: dict | None, report_policy: dict | None,
+                       task_id: str, run_id: str, progress_callback, chapter_callback,
+                       minimum_ratio: float) -> Report:
+        """Write a continuous document from one document-level narrative plan.
+
+        ``chapters`` remain the FinalPlan's auditable evidence arcs. They are
+        deliberately not treated as model-call boundaries in this branch.
+        """
+        article_title = "__article__"
+        if progress_callback:
+            progress_callback(0, 1, "正文", "generating", 0)
+        planned_fact_ids, planned_inference_ids = _article_evidence_ids(chapters)
+        article_facts = [item for item in facts if int(item.get("id") or 0) in planned_fact_ids]
+        article_inferences = [item for item in inferences if int(item.get("id") or 0) in planned_inference_ids]
+        # Old plans can lack explicit assignments. Keep their safe, task-local
+        # fallback instead of silently producing an empty article.
+        article_facts = article_facts or list(facts)
+        if not article_inferences:
+            supplied_fact_ids = {int(item.get("id") or 0) for item in article_facts}
+            article_inferences = [
+                item for item in inferences
+                if supplied_fact_ids & set(_int_ids(item.get("based_fact_ids")))
+            ] or list(inferences)
+        article_plan = narrative_agent.plan_document(
+            task_id=task_id,
+            report_plan=plan,
+            facts=article_facts,
+            inferences=article_inferences,
+            run_id=run_id,
+        )
+        paragraph_plan = list(article_plan.get("paragraphs") or [])
+        evidence_units = paragraph_plan or list(article_plan.get("beats") or [])
+        allowed_fact_ids = {
+            fact_id for unit in evidence_units
+            for fact_id in _int_ids(unit.get("fact_ids"))
+        } or {int(item.get("id") or 0) for item in article_facts}
+        allowed_inference_ids = {
+            inference_id for unit in evidence_units
+            for inference_id in _int_ids(unit.get("inference_ids"))
+        } or {int(item.get("id") or 0) for item in article_inferences}
+        article_facts = [item for item in article_facts if int(item.get("id") or 0) in allowed_fact_ids]
+        article_inferences = [item for item in article_inferences if int(item.get("id") or 0) in allowed_inference_ids]
+        article_style = style_block
+        if style_variant is not None:
+            article_style = style_variant.writer_prompt_block({
+                "title": str(plan.get("title") or ""),
+                "purpose": str(article_plan.get("central_thread") or plan.get("core_judgment") or ""),
+                "report_type": str(plan.get("report_type") or ""),
+                "keywords": [str(beat.get("purpose") or "") for beat in article_plan.get("beats") or []],
+                "target_words": int((plan.get("budget") or {}).get("target_words") or 0),
+                "sample_type": "opening",
+            })
+        safe_words = max(
+            500,
+            int(settings.writer_output_tokens * settings.writer_visible_word_token_ratio * 0.82),
+        )
+        groups = _article_beat_groups(evidence_units, safe_words)
+        generated: list[dict] = []
+        previous_tail = ""
+        paragraph_offset = 0
+        for group_index, group in enumerate(groups, start=1):
+            group_fact_ids = {value for unit in group for value in _int_ids(unit.get("fact_ids"))}
+            group_inference_ids = {value for unit in group for value in _int_ids(unit.get("inference_ids"))}
+            group_beat_ids = {beat_id for unit in group for beat_id in unit.get("beat_ids") or []}
+            group_beats = [
+                beat for beat in article_plan.get("beats") or []
+                if not group_beat_ids or str(beat.get("beat_id")) in group_beat_ids
+            ]
+            group_plan = {
+                **article_plan,
+                "beats": group_beats,
+                "paragraphs": group if paragraph_plan else [],
+                "target_words": sum(int(unit.get("target_words") or 0) for unit in group),
+                "previous_tail": previous_tail,
+                "group_index": group_index,
+                "group_count": len(groups),
+            }
+            group_result = self._generate_article_pass(
+                plan=plan,
+                article_plan=group_plan,
+                facts=[item for item in article_facts if int(item.get("id") or 0) in group_fact_ids],
+                inferences=[item for item in article_inferences if int(item.get("id") or 0) in group_inference_ids],
+                style_block=article_style,
+                allowed_fact_ids=group_fact_ids & valid_fact_ids,
+                allowed_inference_ids=group_inference_ids & valid_inf_ids,
+                institution_rules=institution_rules,
+                task_profile=task_profile,
+                policy_block=policy_prompt_block(_writer_policy_only(report_policy or {})),
+                minimum_ratio=minimum_ratio,
+            )
+            if not group_result:
+                generated = []
+                break
+            for item in group_result:
+                item["paragraph"] = int(item.get("paragraph") or 1) + paragraph_offset
+            paragraph_offset = max(int(item.get("paragraph") or 1) for item in generated + group_result)
+            generated.extend(group_result)
+            previous_tail = "".join(item.get("text") or "" for item in group_result)[-320:]
+        if not generated:
+            raise RuntimeError("WRITER_INCOMPLETE_ARTICLE")
+
+        written_fact_ids = {fact_id for item in generated for fact_id in _int_ids(item.get("fact_ids"))}
+        written_inference_ids = {
+            inference_id for item in generated for inference_id in _int_ids(item.get("inference_ids"))
+        }
+        call_products: dict[str, dict[str, object]] = {}
+        with session_scope() as s:
+            # A coherent article replaces the prior document atomically. Keeping
+            # old chapter rows would make a hidden, stale outline leak into UI
+            # and DOCX export.
+            rows = s.execute(select(ORMSentence.c.id).where(ORMSentence.c.report_id == report.id)).mappings().all()
+            old_ids = [int(row["id"]) for row in rows]
+            if old_ids:
+                s.execute(delete(ORMSentenceFact).where(ORMSentenceFact.c.sentence_id.in_(old_ids)))
+                s.execute(delete(ORMSentenceInference).where(ORMSentenceInference.c.sentence_id.in_(old_ids)))
+                s.execute(delete(ORMSentence).where(ORMSentence.c.id.in_(old_ids)))
+            for index, item in enumerate(generated, start=1):
+                fact_ids = _int_ids(item.get("fact_ids"))
+                inference_ids = _int_ids(item.get("inference_ids"))
+                level = "MATERIAL_FACT" if fact_ids else (
+                    inf_levels.get(inference_ids[0], "MATERIAL_INFERENCE") if inference_ids else "TRANSITION"
+                )
+                origin_call_id = str(item.get("_origin_call_id") or self.last_call_id or "")
+                cursor = s.execute(ORMSentence.insert().values(
+                    report_id=report.id, section=article_title,
+                    lineage_id=uuid.uuid4().hex, paragraph=int(item.get("paragraph") or 1),
+                    position=_chapter_position(1, index), content=item["text"], source_level=level,
+                    source_refs=json.dumps({"fact_ids": fact_ids, "inference_ids": inference_ids}, ensure_ascii=False),
+                    origin_call_id=origin_call_id or None,
+                ))
+                sentence_id = int(cursor.inserted_primary_key[0])
+                for fact_id in dict.fromkeys(fact_ids):
+                    s.execute(ORMSentenceFact.insert().values(sentence_id=sentence_id, fact_id=fact_id))
+                for inference_id in dict.fromkeys(inference_ids):
+                    s.execute(ORMSentenceInference.insert().values(sentence_id=sentence_id, inference_id=inference_id))
+                if origin_call_id:
+                    product = call_products.setdefault(origin_call_id, {"fact_ids": set(), "inference_ids": set(), "chars": 0})
+                    product["fact_ids"].update(fact_ids)
+                    product["inference_ids"].update(inference_ids)
+                    product["chars"] += len(item.get("text") or "")
+        for call_id, product in call_products.items():
+            update_call_products(
+                call_id, produced_chapter_ids=[1],
+                final_used_fact_ids=sorted(product["fact_ids"]),
+                final_used_inference_ids=sorted(product["inference_ids"]),
+            )
+            update_call_metrics(call_id, stored_chars=int(product["chars"]), final_chars=int(product["chars"]))
+        article_text = "".join(item.get("text") or "" for item in generated)
+        assessment = assess_chapter_output(
+            target_words=int((plan.get("budget") or {}).get("target_words") or 0),
+            generated_text=article_text, previous_text="",
+            minimum_completion_ratio=minimum_ratio,
+            evidence_limited=not bool(article_facts or article_inferences),
+        )
+        assessment.update({
+            "generation_mode": "article_beats",
+            "generation_units": len(groups),
+            "generation_calls": len(groups),
+            "planned_fact_count": len(allowed_fact_ids),
+            "planned_inference_count": len(allowed_inference_ids),
+        })
+        try:
+            save_task_artifact(task_id, "article_draft", {"report_id": report.id}, {
+                "status": "done", "section": article_title, "article_plan": article_plan,
+                "fact_ids": sorted(written_fact_ids), "inference_ids": sorted(written_inference_ids),
+                "assessment": assessment,
+            }, run_id=run_id)
+        except Exception:
+            pass
+        if progress_callback:
+            progress_callback(1, 1, "正文", "done", 0)
+        if chapter_callback:
+            chapter_callback({
+                "report_id": report.id, "chapter": "正文", "chapter_index": 1, "chapter_count": 1,
+                "sentence_count": len(generated), "fact_ids": sorted(written_fact_ids),
+                "inference_ids": sorted(written_inference_ids), "narrative_plan": article_plan,
+                "duration_seconds": 0, "status": "done", **assessment,
+            })
+        return report
+
+    def _generate_article_pass(self, *, plan: dict, article_plan: dict,
+                               facts: list[dict], inferences: list[dict], style_block: str,
+                               allowed_fact_ids: set[int], allowed_inference_ids: set[int],
+                               institution_rules: dict | None, task_profile: dict | None,
+                               policy_block: str, minimum_ratio: float) -> list[dict]:
+        """Generate a continuous article and enforce its local evidence contract."""
+        target_words = int(
+            article_plan.get("target_words") or (plan.get("budget") or {}).get("target_words") or 0
+        )
+        fact_lines = [f"{item['id']}. {item.get('content', '')}" for item in facts]
+        inference_lines = [f"{item['id']}. ({item.get('source_level', '')}) {item.get('content', '')}" for item in inferences]
+        contract = _json_dumps(article_plan, limit=1800)
+        paragraph_contract = _json_dumps(article_plan.get("paragraphs") or [], limit=1200)
+        final_arcs = _json_dumps([
+            {"title": item.get("title"), "purpose": item.get("judgment") or item.get("core_question"), "facts": item.get("primary_fact_ids", []), "inferences": item.get("primary_inference_ids", [])}
+            for item in plan.get("chapter_plans") or []
+        ], limit=1000)
+        rules = ""
+        if institution_rules and institution_rules.get("must_include"):
+            rules = "全文硬性要求:\n- " + "\n- ".join(str(item) for item in institution_rules["must_include"]) + "\n"
+        group_index = int(article_plan.get("group_index") or 1)
+        group_count = max(1, int(article_plan.get("group_count") or 1))
+        if group_index < group_count:
+            pass_contract = (
+                f"这是连续文章的第 {group_index}/{group_count} 段写作，不是全文结尾。"
+                "只完成本批 Narrative Plan 的论证，结尾自然引向下一层问题；"
+                "不得使用‘综上’‘总之’‘结论’或给出全文性判断。"
+            )
+        else:
+            pass_contract = (
+                "这是连续文章的最后一段写作。承接上文完成剩余论证，"
+                "只在确有必要时给出一次简洁收束，不重复前文已经得出的结论。"
+            )
+
+        def build_prompt(selected_facts: list[str], selected_inferences: list[str]) -> str:
+            return (
+                f"报告标题:{plan.get('title', '')}\n"
+                f"文档形态:{(plan.get('document_shape') or {}).get('kind', '')}；本次必须写成一篇连续文章，不要章节标题、编号、Markdown 标题或分节标签。\n"
+                f"全文目标:约 {target_words} 字；证据不足时允许欠填，禁止重复或虚构。\n"
+                f"核心判断:{plan.get('core_judgment', '')}\n"
+                f"全文叙事逻辑:{plan.get('narrative_logic', '')}\n"
+                f"内部证据弧线(只用于核对覆盖，不得照抄为标题):{final_arcs}\n\n"
+                f"文章级 Narrative Plan(必须执行):\n{contract}\n\n"
+                + (
+                    "段落执行计划(按顺序每项输出一个 paragraphs 元素；不得把不同段落计划合并成一个长段):\n"
+                    f"{paragraph_contract}\n\n"
+                    if article_plan.get("paragraphs") else ""
+                )
+                + f"连续写作位置:{pass_contract}\n\n"
+                + (f"上一连续片段结尾(只用于自然承接，不得重复):{article_plan.get('previous_tail')}\n\n" if article_plan.get("previous_tail") else "")
+                + (rules + "\n" if rules else "")
+                + (f"业务边界:\n{_business_block(task_profile, {})}\n\n" if task_profile else "")
+                + (f"{policy_block}\n\n" if policy_block else "")
+                + "允许引用的事实:\n" + "\n".join(selected_facts) + "\n\n"
+                + "允许引用的推断:\n" + "\n".join(selected_inferences) + "\n\n"
+                + f"{style_block}\n"
+                + "请先按段落执行计划安排开篇、展开、转折与收束，再输出连贯正文。自然段由论证关系决定，不要逐条复述事实；每句事实性内容必须绑定下列允许 ID。"
+                  "严格输出 JSON 对象：{\"paragraphs\":[{\"sentences\":[{\"text\":\"...\",\"fact_ids\":[1],\"inference_ids\":[]}]}]}。"
+            )
+
+        empty_prompt = build_prompt([], [])
+        available = max(0, _writer_prompt_token_budget() - count_tokens(empty_prompt))
+        fact_lines, inference_lines = _pack_writer_evidence(fact_lines, inference_lines, available)
+        prompt = build_prompt(fact_lines, inference_lines)
+        publish_context_audit({
+            "stage": "writer", "tokenizer_method": tokenizer_method(),
+            "budget_tokens": _writer_prompt_token_budget(), "actual_tokens": count_tokens(prompt),
+            "composition_mode": "article_beats",
+            "sections": {"事实": {"candidate_items": len(facts), "selected_items": len(fact_lines)}, "推断": {"candidate_items": len(inferences), "selected_items": len(inference_lines)}},
+        })
+        try:
+            payload = self.generate_json(prompt)
+        except Exception:
+            return []
+        call_id = self.last_call_id
+        result: list[dict] = []
+        transition_budget = 4 if facts or inferences else 0
+        model_sentences = accepted_sentences = dropped_untraced_sentences = 0
+        seen: set[str] = set()
+        for paragraph_number, paragraph in enumerate(_coerce_paragraphs(payload), start=1):
+            for sentence in paragraph.get("sentences") or []:
+                if not isinstance(sentence, dict):
+                    dropped_untraced_sentences += 1
+                    continue
+                model_sentences += 1
+                text = str(sentence.get("text") or "").strip()
+                fact_ids = [item for item in _int_ids(sentence.get("fact_ids")) if item in allowed_fact_ids]
+                inference_ids = [item for item in _int_ids(sentence.get("inference_ids")) if item in allowed_inference_ids]
+                key = re.sub(r"\s+", "", text)
+                if not text or key in seen:
+                    continue
+                if not fact_ids and not inference_ids:
+                    if transition_budget <= 0 or len(text) > 40:
+                        dropped_untraced_sentences += 1
+                        continue
+                    transition_budget -= 1
+                seen.add(key)
+                accepted_sentences += 1
+                result.append({
+                    "text": text, "fact_ids": fact_ids, "inference_ids": inference_ids,
+                    "paragraph": paragraph_number, "source_level": "", "_origin_call_id": call_id,
+                })
+        update_call_funnel(
+            call_id, model_sentences=model_sentences, accepted_sentences=accepted_sentences,
+            dropped_untraced_sentences=dropped_untraced_sentences, split_items=0,
+        )
+        return result
 
     def rewrite_user_scope(self, *, report_id: int, scope: dict, instruction: str,
                            facts: list[dict], inferences: list[dict]) -> dict:
@@ -1340,13 +1712,24 @@ class WriterAgent(BaseAgent):
         if document_shape.get("section_policy") == "hidden" and len(units) > 1:
             # Internal evidence groups must not become separately drafted
             # mini-articles once their headings are hidden from the reader.
+            collapsed_fact_ids = [
+                value for source in units for value in _int_ids((source.get("plan") or {}).get("fact_ids"))
+            ]
+            collapsed_inference_ids = [
+                value for source in units for value in _int_ids((source.get("plan") or {}).get("inference_ids"))
+            ]
             units = [{
                 "index": 1,
                 "count": 1,
                 "title": "",
                 "target_words": max(0, chapter_target),
                 "minimum_words": round(max(0, chapter_target) * max(0.0, effective_minimum_ratio)),
-                "plan": None,
+                # Preserve the original assignment for evidence audit/statistics
+                # even though visible hidden subsections are drafted together.
+                "plan": {
+                    "fact_ids": list(dict.fromkeys(collapsed_fact_ids)),
+                    "inference_ids": list(dict.fromkeys(collapsed_inference_ids)),
+                },
                 "evidence_status": str(narrative_plan.get("evidence_status") or "unknown"),
                 "evidence_reason": str(narrative_plan.get("evidence_reason") or ""),
                 "missing_information": list(narrative_plan.get("missing_information") or []),
@@ -1527,6 +1910,12 @@ class WriterAgent(BaseAgent):
                     + "\n- ".join(str(m) for m in must) + "\n"
                 )
         unit_plan = generation_unit.get("plan") or {}
+        # Task-wide validity only proves an ID exists. The Writer must also be
+        # constrained to evidence deliberately supplied to this generation
+        # unit; otherwise a model can cite a real but out-of-scope Fact and
+        # silently corrupt allocation/coverage metrics.
+        allowed_fact_ids = {int(item.get("id") or 0) for item in chapter_facts}
+        allowed_inference_ids = {int(item.get("id") or 0) for item in chapter_inferences}
         preferred_fact_ids = set(_int_ids(unit_plan.get("fact_ids")))
         ordered_facts = sorted(
             chapter_facts,
@@ -1543,6 +1932,7 @@ class WriterAgent(BaseAgent):
         discourse_block = _discourse_plan_block(narrative_plan)
         planned_subsections = _planned_subsection_titles(narrative_plan)
         subsection_hint = _subsection_execution_hint(planned_subsections)
+        paragraph_hint = _paragraph_execution_hint(unit_plan.get("paragraphs"))
         evidence_hint = _evidence_execution_hint(generation_unit)
         current_unit_block = _json_dumps(unit_plan, limit=900) if unit_plan else ""
         def build_prompt(selected_facts: list[str], selected_inferences: list[str]) -> str:
@@ -1571,6 +1961,7 @@ class WriterAgent(BaseAgent):
             + f"Narrative Plan(优先执行,用于决定语义结构、事实主次和逻辑):\n{narrative_block}\n\n"
             + (f"当前小节计划(本次只完成这一语义单元):\n{current_unit_block}\n\n" if current_unit_block else "")
             + (f"Discourse Plan(每个话题的论证次序;可将直接相关的相邻角色自然合并,不得按事实编号罗列):\n{discourse_block}\n\n" if discourse_block else "")
+            + (f"{paragraph_hint}\n\n" if paragraph_hint else "")
             + (f"业务约束:\n{business_block}\n\n" if business_block else "")
             + (f"{policy_block}\n\n" if policy_block else "")
             + (subsection_hint + "\n" if subsection_hint else "")
@@ -1583,8 +1974,9 @@ class WriterAgent(BaseAgent):
             + "本章相关事实清单(当前小节事实优先排列,其余事实仅用于必要背景和关系校验):\n" + "\n".join(selected_facts) + "\n\n"
             + "本章相关推断清单:\n" + "\n".join(selected_inferences) + "\n\n"
             + f"{chapter_style}\n"
-            + "请严格按 Narrative Plan 和 ChapterPlan 撰写当前章节或小节。先在内部设计自然段的主题、顺序和承接关系,再输出正式、连贯、可阅读的正文;"
-              "自然段数量和每段篇幅由你根据话题关系、证据密度与阅读需要决定,不要套用固定段数;"
+            + "请严格按 Narrative Plan 和 ChapterPlan 撰写当前章节或小节。若提供段落执行计划，必须遵守其边界和顺序；"
+              "否则先在内部设计自然段的主题、顺序和承接关系，再输出正式、连贯、可阅读的正文;"
+              "自然段数量和每段篇幅由规划的语义关系、证据密度与阅读需要决定，不要套用固定段数;"
               "不要把 fact 清单改写成一串短句。输出必须是一个 JSON 对象,优先只包含 paragraphs 字段;"
               "paragraphs 每项代表一个自然段,包含 sentences 数组;sentences 每项包含 text/fact_ids/inference_ids。"
               "同一自然段内多句话应放在同一个 paragraph 中,不要每句话单独建段。"
@@ -1645,8 +2037,14 @@ class WriterAgent(BaseAgent):
                 model_sentences += 1
                 text = str(sentence.get("text", "")).strip()
                 sentence_level = str(sentence.get("source_level") or "").strip()
-                fact_ids = [i for i in _int_ids(sentence.get("fact_ids")) if i in valid_fact_ids]
-                inf_ids = [i for i in _int_ids(sentence.get("inference_ids")) if i in valid_inf_ids]
+                fact_ids = [
+                    i for i in _int_ids(sentence.get("fact_ids"))
+                    if i in valid_fact_ids and i in allowed_fact_ids
+                ]
+                inf_ids = [
+                    i for i in _int_ids(sentence.get("inference_ids"))
+                    if i in valid_inf_ids and i in allowed_inference_ids
+                ]
                 split_items_for_sentence = _split_structured_items(text)
                 split_items_count = len(split_items_for_sentence)
                 split_item_extra_count += max(0, split_items_count - 1)

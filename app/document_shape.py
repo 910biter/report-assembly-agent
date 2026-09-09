@@ -17,6 +17,7 @@ _KINDS = {
 _HEADING = {"numbered", "plain", "none"}
 _SECTION = {"required", "optional", "hidden"}
 _RENDER_BASE = {"selected_template", "default_structured", "blank_article"}
+_COMPOSITION = {"chaptered", "article_beats"}
 
 
 def normalize_document_shape(value: Any, *, fallback: dict | None = None) -> dict:
@@ -63,6 +64,27 @@ def normalize_document_shape(value: Any, *, fallback: dict | None = None) -> dic
 
 def visible_sections(shape: dict | None) -> bool:
     return normalize_document_shape(shape).get("section_policy") != "hidden"
+
+
+def normalize_composition_mode(value: Any, *, shape: dict | None = None) -> str:
+    """Keep editorial composition separate from heading visibility.
+
+    ``article_beats`` means the final plan remains available for evidence
+    allocation, but the Writer receives one document-level narrative contract.
+    No domain or template name is encoded in this decision.
+    """
+    kind = normalize_document_shape(shape).get("kind")
+    # ``continuous_article`` and ``news_release`` are semantic promises to the
+    # reader, not merely a request to hide headings after drafting. A genuinely
+    # sectioned article should be represented as ``article_sections`` instead.
+    # This also repairs legacy plans where a default ``chaptered`` value was
+    # persisted before composition became an explicit contract.
+    if kind in {"continuous_article", "news_release"}:
+        return "article_beats"
+    mode = str(value or "").strip()
+    if mode in _COMPOSITION:
+        return mode
+    return "article_beats" if kind in {"continuous_article", "message_push", "news_release"} else "chaptered"
 
 
 def visible_subheadings(shape: dict | None) -> bool:

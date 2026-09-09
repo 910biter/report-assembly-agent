@@ -1104,6 +1104,7 @@ def get_report(report_id: int):
         "sections": [],
     }
     document_shape = _report_document_shape(report["plan_id"])
+    composition_mode = _report_composition_mode(report["plan_id"])
     heading_strategy = _report_heading_strategy(
         report["style_profile_id"], fallback_defaults=document_shape.get("heading_policy") == "numbered",
     )
@@ -1121,7 +1122,10 @@ def get_report(report_id: int):
             section = {
                 "title": row["section"],
                 "display_title": format_heading(1, [chapter_index], row["section"], heading_strategy),
-                "show_title": document_shape.get("section_policy") != "hidden",
+                "show_title": (
+                    document_shape.get("section_policy") != "hidden"
+                    and composition_mode != "article_beats"
+                ),
                 "paragraphs": [],
             }
             result["sections"].append(section)
@@ -1970,6 +1974,23 @@ def _report_document_shape(plan_id: int | None) -> dict:
     except (TypeError, ValueError):
         payload = {}
     return normalize_document_shape(payload.get("document_shape"))
+
+
+def _report_composition_mode(plan_id: int | None) -> str:
+    from app.document_shape import normalize_composition_mode
+    if not plan_id:
+        return "chaptered"
+    with session_scope() as s:
+        row = s.execute(
+            select(ORMPlan.c.final_plan_json).where(ORMPlan.c.id == int(plan_id))
+        ).mappings().first()
+    try:
+        payload = json.loads((row or {}).get("final_plan_json") or "{}")
+    except (TypeError, ValueError):
+        payload = {}
+    return normalize_composition_mode(
+        payload.get("composition_mode"), shape=payload.get("document_shape"),
+    )
 
 
 def variant_fields(variant) -> dict:

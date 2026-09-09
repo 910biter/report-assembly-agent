@@ -29,6 +29,12 @@ class WorkflowStageStateTests(unittest.TestCase):
         })
         self.assertNotEqual(first, second)
 
+    def test_conflict_signature_changes_when_facts_change(self):
+        task = {"theme": "主题", "material_ids": [1], "fact_ids": [1, 2]}
+        first = stage_input_signature("conflict", task, plan={"id": 7})
+        task["fact_ids"] = [1, 2, 3]
+        self.assertNotEqual(first, stage_input_signature("conflict", task, plan={"id": 7}))
+
     def test_boolean_completion_flag_does_not_replace_input_signature(self):
         task = {"analysis_done": True}
         self.assertFalse(signature_matches(task, "analysis", "expected"))

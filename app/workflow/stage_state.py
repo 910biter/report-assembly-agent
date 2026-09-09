@@ -38,6 +38,13 @@ def stage_input_signature(stage: str, task: dict, *, plan: dict | None = None) -
             "added_material_ids": _int_list(task.get("incremental_added_material_ids")),
             "evidence_recheck": task.get("intervention_evidence_recheck") or {},
         })
+    elif stage == "conflict":
+        common.update({
+            "plan_id": _optional_int(plan.get("id") or task.get("plan_id")),
+            "fact_ids": _int_list(task.get("fact_ids")),
+            "claim_ids": _int_list(task.get("claim_ids")),
+            "incremental_inherited_conflict_ids": _int_list(task.get("incremental_inherited_conflict_ids")),
+        })
     elif stage == "analysis":
         common.update({
             "plan_id": _optional_int(plan.get("id") or task.get("plan_id")),

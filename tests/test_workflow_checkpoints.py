@@ -18,7 +18,8 @@ class WorkflowCheckpointTests(unittest.TestCase):
         update_task.assert_called_once_with(
             "task-a", requirement_review_pending=False, requirement_review_completed=True,
             theme="专题报告", user_requirements="形成可信分析报告",
-            requirement_review_feedback="", stage="planning", resume_from_stage="planning",
+            requirement_review_feedback="", replan_required=True,
+            stage="planning", resume_from_stage="planning",
         )
         enqueue.assert_called_once_with("task-a")
 

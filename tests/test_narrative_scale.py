@@ -3,18 +3,47 @@ from types import MethodType
 
 from app.context import ContextManager
 from app.context_budget import count_tokens
-from app.planning.narrative import _sanitize_plan
+from app.planning.narrative import _sanitize_document_plan, _sanitize_plan
 from app.planning.scale import (
     normalize_chapter_budgets,
     normalize_execution_plan,
     parse_user_scale,
     reconcile_scale_budget,
 )
-from app.writing.writer import WriterAgent, _focused_unit_evidence, _subsection_generation_units
+from app.writing.writer import WriterAgent, _article_evidence_ids, _focused_unit_evidence, _subsection_generation_units
 from app.writing.scale_execution import assess_chapter_output, measure_text_words
 
 
 class NarrativeScaleTests(unittest.TestCase):
+    def test_document_narrative_beats_keep_only_supplied_evidence(self):
+        plan = _sanitize_document_plan(
+            {"beats": [{"beat_id": "B1", "purpose": "开篇", "fact_ids": [1, 999], "inference_ids": [7, 888]}]},
+            {"budget": {"target_words": 1200}, "chapter_plans": []}, {1, 2}, {7},
+        )
+        self.assertEqual([1], plan["beats"][0]["fact_ids"])
+        self.assertEqual([7], plan["beats"][0]["inference_ids"])
+
+    def test_document_paragraph_plan_preserves_each_unmerged_beat(self):
+        plan = _sanitize_document_plan(
+            {"beats": [
+                {"beat_id": "B1", "purpose": "起点", "fact_ids": [1]},
+                {"beat_id": "B2", "purpose": "转折", "fact_ids": [2]},
+            ], "paragraphs": [{
+                "paragraph_id": "P1", "beat_ids": ["B1"], "purpose": "开篇", "fact_ids": [1],
+            }]},
+            {"budget": {"target_words": 800}, "chapter_plans": []}, {1, 2}, set(),
+        )
+        self.assertEqual([["B1"], ["B2"]], [item["beat_ids"] for item in plan["paragraphs"]])
+        self.assertEqual(800, sum(item["target_words"] for item in plan["paragraphs"]))
+
+    def test_article_evidence_is_collected_from_final_plan_not_titles(self):
+        fact_ids, inference_ids = _article_evidence_ids([{
+            "title": "任意标题",
+            "primary_fact_ids": [1], "primary_inference_ids": [9],
+            "subsections": [{"fact_ids": [2], "inference_ids": [10]}],
+        }])
+        self.assertEqual({1, 2}, fact_ids)
+        self.assertEqual({9, 10}, inference_ids)
     def test_final_planner_context_is_coverage_driven_and_not_first_40_inferences(self):
         manager = ContextManager({"id": "task"})
         manager.budget_tokens = MethodType(lambda self, stage="structured": 5000, manager)
@@ -186,6 +215,7 @@ class NarrativeScaleTests(unittest.TestCase):
         self.assertEqual(3, len(plan["subsections"]))
         self.assertEqual(4500, sum(item["target_words"] for item in plan["subsections"]))
         self.assertNotIn("paragraph_plan", plan)
+        self.assertTrue(all(item["paragraphs"] for item in plan["subsections"]))
 
     def test_declared_subsection_targets_are_normalized_to_chapter_budget(self):
         payload = {

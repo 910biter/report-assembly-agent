@@ -3,6 +3,7 @@ from unittest.mock import patch
 
 from app.document_shape import (
     normalize_document_shape,
+    normalize_composition_mode,
     visible_sections,
     visible_subheadings,
     wants_numbering,
@@ -20,6 +21,16 @@ class DocumentShapeTests(unittest.TestCase):
         self.assertFalse(visible_sections(shape))
         self.assertFalse(visible_subheadings(shape))
         self.assertFalse(wants_numbering(shape, 1))
+
+    def test_composition_is_independent_from_heading_visibility(self):
+        self.assertEqual(
+            "article_beats",
+            normalize_composition_mode(None, shape={"kind": "message_push", "section_policy": "optional"}),
+        )
+        self.assertEqual(
+            "chaptered",
+            normalize_composition_mode("chaptered", shape={"kind": "article_sections"}),
+        )
 
     def test_article_sections_default_to_plain_headings(self):
         shape = normalize_document_shape({"kind": "article_sections"})

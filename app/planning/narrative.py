@@ -38,6 +38,9 @@ _SYSTEM = """你是报告章节叙事规划师。你的任务不是写正文,而
         {"role": "background", "fact_ids": [1], "inference_ids": []},
         {"role": "analysis", "fact_ids": [2], "inference_ids": [3]}
       ],
+      "paragraphs": [
+        {"paragraph_id": "P1", "purpose": "本段承担的论证作用", "fact_ids": [1], "inference_ids": [], "target_words": 300}
+      ],
       "writing_hint": "一句话说明如何自然展开"
     }
   ],
@@ -63,8 +66,9 @@ _SYSTEM = """你是报告章节叙事规划师。你的任务不是写正文,而
     flow 表达论证次序而不是自然段模板；Writer 可将直接相关的相邻角色组织在同一自然段中。
 11. subsections 是唯一的成文语义单元,不要再输出重复的 topics。若有两个及以上小节,每个小节必须明确目的、
     话题、主要事实/推断和目标篇幅,各小节 target_words 总和应接近章节目标。
-12. Narrative Plan 不规划自然段数量或逐段骨架。自然段由 Writer 在小节内部根据事实关系、证据密度
-    和阅读需要自主组织,避免固定段数与事实逐条罗列。
+12. 每个小节可规划 paragraphs，paragraph 是成文时需要保持的语义边界，而不是固定段数模板。
+    只在话题、论证层次或读者阅读负担确有变化时拆段；直接相关的事实可以同段表达。每个 paragraph
+    必须说明目的和所用证据，Writer 负责把它自然写成多句正文，不得逐条罗列。
 13. evidence_status 判断“当前事实与推断能否支撑计划目的和目标篇幅”。证据有限时保留原目标预算，
     但明确缺口；不得通过重复、常识扩写或无依据概括把 limited/insufficient 伪装成 sufficient。"""
 
@@ -93,6 +97,46 @@ _QA_SYSTEM = """你是章节叙事质量评审。根据 Narrative Plan 判断本
 3. evidence_sufficient=false 且 status=missing 时,action 必须为 keep(证据不足不扩写)。
 4. target_paragraph 指向草稿中该话题所在段落编号(1 起);无对应段落的 replan 可为 0。
 5. 只判断计划内的话题,不评判文风。"""
+
+_DOCUMENT_SYSTEM = """你是连续文章的叙事总编。Facts/Inferences 已完成核验，Final ReportPlan 的 chapters 是内部证据弧线，不是必须展示给读者的标题。
+严格输出 JSON，不要正文、不要解释：
+{
+  "composition_mode": "article_beats",
+  "central_thread": "全文如何从开篇事实推进到结尾判断",
+  "beats": [
+    {
+      "beat_id": "B1",
+      "purpose": "这一段论证承担什么作用",
+      "transition": "与前一段如何自然衔接，开篇为空",
+      "fact_ids": [1, 2],
+      "inference_ids": [3],
+      "target_words": 260,
+      "detail_level": "expand/brief/reference",
+      "must_not_claim": ["不能超出哪些证据边界"]
+    }
+  ],
+  "paragraphs": [
+    {
+      "paragraph_id": "P1",
+      "beat_ids": ["B1"],
+      "purpose": "本段如何推进全文主线",
+      "transition": "与上一段的衔接，开篇为空",
+      "fact_ids": [1, 2],
+      "inference_ids": [3],
+      "target_words": 260
+    }
+  ],
+  "closing": "结尾应完成的收束，不重复前文"
+}
+要求：
+1. 只使用输入中真实存在的 fact_ids/inference_ids，不得编造编号。
+2. beat 是文章论证节拍，不是展示标题。paragraphs 是实际成文段落设计：由论证关系决定，
+   不按固定段数；除非两个 beat 确实共同回答同一问题，否则不要把它们塞进同一长段。
+3. 保留 Final ReportPlan 的全部关键证据弧线，但重新组织为读者可连续阅读的开篇、展开、核心矛盾和收束。
+4. 不平均罗列事实；每个 beat 必须有明确论证目的和与前文的关系。
+5. target_words 总和应接近全文目标。证据有限时不得用常识、重复或虚构补足。
+6. paragraphs 必须覆盖全部 beat；每段指定的 fact_ids/inference_ids 必须来自该段所含 beat。
+7. 模板的文风只影响组织与表达，不得覆盖事实边界。"""
 
 
 class NarrativeAgent(BaseAgent):
@@ -161,6 +205,57 @@ class NarrativeAgent(BaseAgent):
             )
         except Exception:
             pass
+        return plan
+
+    def plan_document(
+        self,
+        task_id: str,
+        report_plan: dict,
+        facts: list[dict],
+        inferences: list[dict],
+        run_id: str = "",
+    ) -> dict:
+        """Create an article-level contract without replacing Final ReportPlan."""
+        fact_ids = {int(item["id"]) for item in facts if item.get("id") is not None}
+        inference_ids = {int(item["id"]) for item in inferences if item.get("id") is not None}
+        from app.runtime_profiles import stage_input_budget_tokens, stage_profile
+
+        prompt, _audit = build_prompt_from_sections(
+            "narrative_document",
+            [
+                ContextSection("全文任务", [
+                    f"标题:{report_plan.get('title', '')}",
+                    f"核心判断:{report_plan.get('core_judgment', '')}",
+                    f"叙事逻辑:{report_plan.get('narrative_logic', '')}",
+                    f"目标字数:{int((report_plan.get('budget') or {}).get('target_words') or 0)}",
+                ], weight=5, required_items=2),
+                ContextSection("内部证据弧线", [json.dumps(report_plan.get("chapter_plans") or [], ensure_ascii=False)], weight=5),
+                ContextSection("可用事实", [
+                    f"{item['id']}. {item.get('content', '')}" for item in facts
+                ], weight=5, required_items=1),
+                ContextSection("可用推断", [
+                    f"{item['id']}. {item.get('content', '')}" for item in inferences
+                ], weight=3),
+            ],
+            stage_input_budget_tokens("narrative"),
+        )
+        try:
+            payload = self.generate_json(
+                prompt, system=_DOCUMENT_SYSTEM,
+                max_tokens=stage_profile("narrative").output_tokens,
+            )
+        except Exception:
+            payload = {}
+        plan = _sanitize_document_plan(payload, report_plan, fact_ids, inference_ids)
+        if task_id:
+            try:
+                save_task_artifact(
+                    task_id, "document_narrative_plan",
+                    {"plan_id": report_plan.get("id"), "fact_ids": sorted(fact_ids), "inference_ids": sorted(inference_ids)},
+                    plan, run_id=run_id,
+                )
+            except Exception:
+                pass
         return plan
 
 
@@ -293,6 +388,15 @@ def _sanitize_plan(payload: dict, chapter_plan: dict, fact_ids: set[int], infere
         topics.append(normalized)
     subsections = _sanitize_subsections(payload.get("subsections"), chapter_plan, topics, fact_ids, inference_ids)
     subsections = _normalize_subsection_targets(subsections, int(chapter_plan.get("target_words") or 0))
+    subsections = [
+        {
+            **item,
+            "paragraphs": _normalize_paragraph_targets(
+                item.get("paragraphs") or [], int(item.get("target_words") or 0),
+            ),
+        }
+        for item in subsections
+    ]
     if not topics and subsections:
         topics = _topics_from_subsections(subsections)
         for index, subsection in enumerate(subsections, start=1):
@@ -341,6 +445,16 @@ def _safe_int(value) -> int:
         return int(value or 0)
     except (TypeError, ValueError):
         return 0
+
+
+def _int_ids(values) -> list[int]:
+    result = []
+    for value in values or []:
+        try:
+            result.append(int(value))
+        except (TypeError, ValueError):
+            continue
+    return result
 
 
 def _evidence_status(value, *, has_evidence: bool) -> str:
@@ -395,6 +509,9 @@ def _sanitize_subsections(raw, chapter_plan: dict, topics: list[dict],
             "detail_level": detail,
             "completion_criteria": [str(c)[:120] for c in (item.get("completion_criteria") or []) if str(c).strip()],
             "discourse_flow": _sanitize_flow(item.get("discourse_flow"), fact_ids, inference_ids),
+            "paragraphs": _sanitize_paragraph_plan(
+                item.get("paragraphs"), fids, iids, fact_ids, inference_ids,
+            ),
             "writing_hint": str(item.get("writing_hint") or "")[:180],
         })
     return result
@@ -420,6 +537,51 @@ def _sanitize_flow(raw, fact_ids: set[int], inference_ids: set[int]) -> list[dic
                 if str(value).isdigit() and int(value) in inference_ids
             ],
         })
+    return result
+
+
+def _sanitize_paragraph_plan(raw, default_facts: list[int], default_inferences: list[int],
+                              fact_ids: set[int], inference_ids: set[int]) -> list[dict]:
+    """Keep model-designed paragraph boundaries, with one safe semantic fallback."""
+    paragraphs: list[dict] = []
+    for index, item in enumerate(raw or [], start=1):
+        if not isinstance(item, dict):
+            continue
+        fids = [value for value in _int_ids(item.get("fact_ids")) if value in fact_ids]
+        iids = [value for value in _int_ids(item.get("inference_ids")) if value in inference_ids]
+        if not fids and not iids:
+            continue
+        paragraphs.append({
+            "paragraph_id": str(item.get("paragraph_id") or f"P{index}")[:16],
+            "purpose": str(item.get("purpose") or "组织相关证据并推进当前小节")[:200],
+            "transition": str(item.get("transition") or "")[:160],
+            "fact_ids": list(dict.fromkeys(fids)),
+            "inference_ids": list(dict.fromkeys(iids)),
+            "target_words": max(0, _safe_int(item.get("target_words"))),
+        })
+    if not paragraphs and (default_facts or default_inferences):
+        paragraphs.append({
+            "paragraph_id": "P1",
+            "purpose": "完成当前语义单元的核心论证",
+            "transition": "",
+            "fact_ids": list(dict.fromkeys(default_facts)),
+            "inference_ids": list(dict.fromkeys(default_inferences)),
+            "target_words": 0,
+        })
+    return paragraphs
+
+
+def _normalize_paragraph_targets(paragraphs: list[dict], target_words: int) -> list[dict]:
+    if not paragraphs or target_words <= 0:
+        return paragraphs
+    weights = [max(1, _safe_int(item.get("target_words"))) for item in paragraphs]
+    total = sum(weights)
+    used = 0
+    result = []
+    for index, (item, weight) in enumerate(zip(paragraphs, weights)):
+        amount = target_words - used if index == len(paragraphs) - 1 else round(target_words * weight / total)
+        result.append({**item, "target_words": max(0, amount)})
+        used += max(0, amount)
     return result
 
 
@@ -512,6 +674,156 @@ def _fallback_topics(chapter_plan: dict, fact_ids: set[int], inference_ids: set[
 
 def _clean_title(text: str) -> str:
     return re.sub(r"^[一二三四五六七八九十0-9]+[、.．]\s*", "", text or "")[:40] or "本章主线"
+
+
+def _sanitize_document_plan(payload: dict, report_plan: dict,
+                             fact_ids: set[int], inference_ids: set[int]) -> dict:
+    """Validate model beats; FinalPlan provides a deterministic safe fallback."""
+    raw_beats = payload.get("beats") if isinstance(payload, dict) else []
+    beats: list[dict] = []
+    for index, item in enumerate(raw_beats or [], start=1):
+        if not isinstance(item, dict):
+            continue
+        fids = [value for value in _int_ids(item.get("fact_ids")) if value in fact_ids]
+        iids = [value for value in _int_ids(item.get("inference_ids")) if value in inference_ids]
+        if not fids and not iids:
+            continue
+        detail = str(item.get("detail_level") or "brief")
+        beats.append({
+            "beat_id": str(item.get("beat_id") or f"B{index}")[:16],
+            "purpose": str(item.get("purpose") or "组织相关证据并推进全文主线")[:220],
+            "transition": str(item.get("transition") or "")[:180],
+            "fact_ids": list(dict.fromkeys(fids)),
+            "inference_ids": list(dict.fromkeys(iids)),
+            "target_words": max(0, _safe_int(item.get("target_words"))),
+            "detail_level": detail if detail in {"expand", "brief", "reference"} else "brief",
+            "must_not_claim": [str(value)[:160] for value in item.get("must_not_claim") or [] if str(value).strip()],
+        })
+    if not beats:
+        for index, chapter in enumerate(report_plan.get("chapter_plans") or [], start=1):
+            fids = [value for value in _int_ids(chapter.get("primary_fact_ids")) if value in fact_ids]
+            iids = [value for value in _int_ids(chapter.get("primary_inference_ids")) if value in inference_ids]
+            if not fids and not iids:
+                continue
+            beats.append({
+                "beat_id": f"B{index}",
+                "purpose": str(chapter.get("judgment") or chapter.get("core_question") or chapter.get("title") or "")[:220],
+                "transition": str(chapter.get("relation_to_prev") or "")[:180],
+                "fact_ids": fids,
+                "inference_ids": iids,
+                "target_words": max(0, _safe_int(chapter.get("target_words"))),
+                "detail_level": "expand",
+                "must_not_claim": [str(value)[:160] for value in chapter.get("exclude") or [] if str(value).strip()],
+            })
+    else:
+        # A model may produce an elegant but incomplete arc. FinalPlan is the
+        # authority for required evidence, so append only the still-unassigned
+        # remainder as a new beat rather than silently dropping it.
+        assigned_facts = {value for beat in beats for value in beat["fact_ids"]}
+        assigned_inferences = {value for beat in beats for value in beat["inference_ids"]}
+        for chapter in report_plan.get("chapter_plans") or []:
+            if not isinstance(chapter, dict):
+                continue
+            missing_facts = [
+                value for value in _int_ids(chapter.get("primary_fact_ids"))
+                if value in fact_ids and value not in assigned_facts
+            ]
+            missing_inferences = [
+                value for value in _int_ids(chapter.get("primary_inference_ids"))
+                if value in inference_ids and value not in assigned_inferences
+            ]
+            if not missing_facts and not missing_inferences:
+                continue
+            beats.append({
+                "beat_id": f"B{len(beats) + 1}",
+                "purpose": str(chapter.get("judgment") or chapter.get("core_question") or "补足必要证据")[:220],
+                "transition": str(chapter.get("relation_to_prev") or "")[:180],
+                "fact_ids": missing_facts,
+                "inference_ids": missing_inferences,
+                "target_words": max(0, _safe_int(chapter.get("target_words"))),
+                "detail_level": "brief",
+                "must_not_claim": [str(value)[:160] for value in chapter.get("exclude") or [] if str(value).strip()],
+            })
+            assigned_facts.update(missing_facts)
+            assigned_inferences.update(missing_inferences)
+    if not beats and (fact_ids or inference_ids):
+        beats = [{
+            "beat_id": "B1",
+            "purpose": str(report_plan.get("core_judgment") or report_plan.get("core_question") or "组织可用证据")[:220],
+            "transition": "",
+            "fact_ids": sorted(fact_ids),
+            "inference_ids": sorted(inference_ids),
+            "target_words": 0,
+            "detail_level": "expand",
+            "must_not_claim": [],
+        }]
+    target = _safe_int((report_plan.get("budget") or {}).get("target_words"))
+    if beats and target:
+        weights = [max(1, item["target_words"]) for item in beats]
+        total_weight = sum(weights)
+        used = 0
+        for index, (beat, weight) in enumerate(zip(beats, weights)):
+            value = target - used if index == len(beats) - 1 else round(target * weight / total_weight)
+            beat["target_words"] = max(0, value)
+            used += max(0, value)
+    paragraphs = _sanitize_document_paragraphs(
+        payload.get("paragraphs") if isinstance(payload, dict) else [], beats, target,
+    )
+    return {
+        "composition_mode": "article_beats",
+        "central_thread": str(payload.get("central_thread") or report_plan.get("narrative_logic") or "")[:360] if isinstance(payload, dict) else str(report_plan.get("narrative_logic") or "")[:360],
+        "beats": beats,
+        "paragraphs": paragraphs,
+        "closing": str(payload.get("closing") or "")[:240] if isinstance(payload, dict) else "",
+        "target_words": target,
+    }
+
+
+def _sanitize_document_paragraphs(raw, beats: list[dict], target_words: int) -> list[dict]:
+    """Turn a document-level paragraph design into an auditable write contract."""
+    beat_by_id = {str(item.get("beat_id")): item for item in beats}
+    paragraphs: list[dict] = []
+    covered_beats: set[str] = set()
+    for index, item in enumerate(raw or [], start=1):
+        if not isinstance(item, dict):
+            continue
+        beat_ids = [str(value) for value in item.get("beat_ids") or [] if str(value) in beat_by_id]
+        if not beat_ids:
+            continue
+        allowed_facts = {
+            value for beat_id in beat_ids for value in _int_ids(beat_by_id[beat_id].get("fact_ids"))
+        }
+        allowed_inferences = {
+            value for beat_id in beat_ids for value in _int_ids(beat_by_id[beat_id].get("inference_ids"))
+        }
+        fids = [value for value in _int_ids(item.get("fact_ids")) if value in allowed_facts]
+        iids = [value for value in _int_ids(item.get("inference_ids")) if value in allowed_inferences]
+        paragraphs.append({
+            "paragraph_id": str(item.get("paragraph_id") or f"P{index}")[:16],
+            "beat_ids": beat_ids,
+            "purpose": str(item.get("purpose") or "推进全文叙事")[:220],
+            "transition": str(item.get("transition") or "")[:180],
+            "fact_ids": list(dict.fromkeys(fids or sorted(allowed_facts))),
+            "inference_ids": list(dict.fromkeys(iids or sorted(allowed_inferences))),
+            "target_words": max(0, _safe_int(item.get("target_words"))),
+        })
+        covered_beats.update(beat_ids)
+    # Missing a beat means missing a content boundary. Preserve it as its own
+    # paragraph rather than silently allowing the Writer to collapse it.
+    for beat in beats:
+        beat_id = str(beat.get("beat_id"))
+        if beat_id in covered_beats:
+            continue
+        paragraphs.append({
+            "paragraph_id": f"P{len(paragraphs) + 1}",
+            "beat_ids": [beat_id],
+            "purpose": str(beat.get("purpose") or "推进全文叙事")[:220],
+            "transition": str(beat.get("transition") or "")[:180],
+            "fact_ids": list(_int_ids(beat.get("fact_ids"))),
+            "inference_ids": list(_int_ids(beat.get("inference_ids"))),
+            "target_words": max(0, _safe_int(beat.get("target_words"))),
+        })
+    return _normalize_paragraph_targets(paragraphs, target_words)
 
 
 def _serializable_memory(memory: dict) -> dict:

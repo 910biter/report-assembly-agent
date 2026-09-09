@@ -15,7 +15,7 @@ from app.db import session_scope
 from app.infrastructure.orm import ORMPlan
 from sqlalchemy import select, update
 from app.models import ReportPlan
-from app.document_shape import normalize_document_shape
+from app.document_shape import normalize_document_shape, normalize_composition_mode
 from app.planning.scale import normalize_chapter_budgets, reconcile_scale_budget
 from app.planning.structure import normalize_contract
 from app.runtime_profiles import stage_input_budget_tokens
@@ -83,6 +83,7 @@ _FINAL_SYSTEM = """你是情报报告结构总规划师。现在 Evidence 与 An
     "closing": "natural/conclusion/signature",
     "rationale": "本次为何采用此文档形态"
   },
+  "composition_mode": "chaptered/article_beats",
   "report_budget": {
     "target_words": 全文最终目标字数,
     "min_words": 证据充分时可接受的最低字数,
@@ -138,7 +139,8 @@ _FINAL_SYSTEM = """你是情报报告结构总规划师。现在 Evidence 与 An
    下游不得再次静默缩减。证据不足时允许 underfill,但必须给出 underfill_reason,禁止为写满而重复或虚构。
 10. 【文档形态】先判断本次应是正式报告、研究综述、分节文章、连续文章、推送还是新闻稿。文档形态由用户目标、受众、材料和已学习文风共同决定；模板的目录样例不是默认答案。
 11. 连续文章或新闻稿可使用内部语义单元组织证据，但 section_policy 应为 hidden，导出和阅读界面不得显示章节标题或自动编号。分节文章的标题通常为 plain，只有正式报告或明确要求编号时才用 numbered。
-12. render_base 只决定导出母版：参考文档缺少可用标题层级而任务又需要正式分级报告时，选择 default_structured；纯文章/推送可选择 blank_article；其余优先 selected_template。"""
+12. composition_mode 决定 Writer 的调用边界，而非标题是否显示：正式报告/研究综述通常为 chaptered；连续文章、推送和新闻稿通常为 article_beats。article_beats 下 chapters 仍是内部证据弧线，必须保留事实归属，但不能要求 Writer 分章拼接成文。
+13. render_base 只决定导出母版：参考文档缺少可用标题层级而任务又需要正式分级报告时，选择 default_structured；纯文章/推送可选择 blank_article；其余优先 selected_template。"""
 
 _LOCAL_RESTRUCTURE_SYSTEM = """你只负责调整最终报告中发生变化的局部章节契约，不重新规划全文。
 严格输出 JSON：{"chapters":[章节契约]}。章节标题和顺序必须与用户确认的新标题完全一致。
@@ -304,6 +306,9 @@ class PlannerAgent(BaseAgent):
             required_facts=json.loads(row["required_facts"] or "[]"),
             budget=budget,
             document_shape=normalize_document_shape(old_final.get("document_shape")),
+            composition_mode=normalize_composition_mode(
+                old_final.get("composition_mode"), shape=old_final.get("document_shape"),
+            ),
             chapter_plans=chapters,
             user_requirements=str(row["user_requirements"] or ""),
             plan_stage="final",
@@ -380,6 +385,9 @@ class PlannerAgent(BaseAgent):
         document_shape = normalize_document_shape(
             payload.get("document_shape"), fallback=document_shape_hint,
         )
+        composition_mode = normalize_composition_mode(
+            payload.get("composition_mode"), shape=document_shape,
+        )
         chapters = normalize_chapter_budgets(chapters, int(final_budget.get("target_words") or 0))
         plan = ReportPlan(
             id=plan_id,
@@ -397,6 +405,7 @@ class PlannerAgent(BaseAgent):
             # already captured by the preliminary AnalysisPlan.
             budget=final_budget,
             document_shape=document_shape,
+            composition_mode=composition_mode,
             chapter_plans=chapters,
             user_requirements=previous_requirements,
             plan_stage="final",
@@ -487,6 +496,7 @@ def _plan_snapshot(plan: ReportPlan, stage: str) -> dict:
         "chapter_plans": plan.chapter_plans,
         "budget": plan.budget,
         "document_shape": plan.document_shape,
+        "composition_mode": plan.composition_mode,
         "user_requirements": plan.user_requirements,
     }
 

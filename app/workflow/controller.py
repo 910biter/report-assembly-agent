@@ -217,13 +217,15 @@ class WorkflowController:
                 metadata={"checkpoint": "requirements"},
             )
             return "awaiting_requirements"
-        if self._resume_skips(Stage.PLANNING):
+        force_replan = bool(self.task.get("replan_required"))
+        if self._resume_skips(Stage.PLANNING) and not force_replan:
             self._update(stage=str(Stage.PLANNING), resume={"stage": "plan", "status": "reused_after_checkpoint"})
-        elif self.task.get("plan_id"):
+        elif self.task.get("plan_id") and not force_replan:
             self._update(stage=str(Stage.PLANNING), resume={"stage": "plan", "status": "reused"})
         else:
             with self._token_context("planning"):
                 self.plan()  # 一次规划:ReportPlan + ChapterPlan[](核心判断/叙事逻辑/每章规划)
+            self._update(replan_required=False)
         self._record_artifact("plan", {
             "plan_id": self.task.get("plan_id"),
             "plan_title": self.task.get("plan_title", ""),
@@ -328,13 +330,17 @@ class WorkflowController:
             status=_graph_artifact_status(graph_status),
         )
         _mark("graph")
+        conflict_signature = stage_input_signature("conflict", self.task, plan=self._plan())
         if self._resume_skips(Stage.CONFLICT):
             self._update(stage=str(Stage.CONFLICT), resume={"stage": "conflict", "status": "reused_after_checkpoint"})
-        elif self.task.get("conflict_ids"):
+        elif self.task.get("conflict_ids") and signature_matches(
+            self.task, "conflict", conflict_signature,
+        ):
             self._update(stage=str(Stage.CONFLICT), resume={"stage": "conflict", "status": "reused"})
         else:
             with self._token_context("conflict"):
                 self.detect_conflicts()
+        self._update(conflict_input_signature=conflict_signature)
         self._record_artifact("conflict", {"conflict_ids": self.task.get("conflict_ids", [])})
         _mark("conflict")
         if self.task.get("run_mode") == "material_comparison":
@@ -421,7 +427,13 @@ class WorkflowController:
         })
         _mark("analysis")
         final_plan_signature = stage_input_signature("final_plan", self.task, plan=self._plan())
-        if self._resume_skips(Stage.WRITING):
+        if self.task.get("intervention_force_final_plan"):
+            # Directory feedback is also a FinalPlan input for ordinary
+            # collaborative tasks, not only for incremental revisions.
+            with self._token_context("final_planning"):
+                self.finalize_report_structure()
+            self._update(intervention_force_final_plan=False)
+        elif self._resume_skips(Stage.WRITING):
             self._update(stage=str(Stage.PLANNING), resume={"stage": "final_plan", "status": "reused_after_checkpoint"})
         elif self.task.get("incremental_update"):
             # 增量 final_plan 策略:
@@ -445,6 +457,9 @@ class WorkflowController:
         else:
             with self._token_context("final_planning"):
                 self.finalize_report_structure()
+        # FinalPlan may have been rebuilt above; persist the signature of the
+        # actual plan now, not the pre-rebuild input signature.
+        final_plan_signature = stage_input_signature("final_plan", self.task, plan=self._plan())
         self._control_boundary()
         self._update(final_plan_input_signature=final_plan_signature)
         self._record_artifact("final_plan", {
@@ -583,7 +598,8 @@ class WorkflowController:
             "ttfr_seconds", "critical_path_done", "background_jobs", "graph_stats",
             "artifact_status", "queue_status", "material_analysis_status",
             "material_analysis_errors", "intelligence_status", "qa_status", "graph_fact_ids",
-            "final_plan_frozen", "incremental_plan", "incremental_delta", "incremental_structure_review_required",
+            "final_plan_frozen", "replan_required", "intervention_force_final_plan",
+            "incremental_plan", "incremental_delta", "incremental_structure_review_required",
         }
         if set(fields) & version_fields:
             current_versions = dict(self.task.get("versions") or {})
@@ -1672,15 +1688,43 @@ class WorkflowController:
         facts = self._facts()
         inferences = self._inferences()
         variant = self._selected_variant()
+        # One-time compatibility migration for plans created before
+        # composition_mode existed. Explicit FinalPlan choices always win;
+        # only an absent value may inherit the selected template's form.
+        if not str(plan.get("composition_mode") or "").strip() and variant is not None:
+            from app.document_shape import normalize_composition_mode
+            template_shape = (variant.structure or {}).get("document_shape", {})
+            composition_mode = normalize_composition_mode(None, shape=template_shape)
+            plan = {**plan, "composition_mode": composition_mode}
+            final_snapshot = dict(plan.get("final_plan_json") or {})
+            final_snapshot["composition_mode"] = composition_mode
+            plan["final_plan_json"] = final_snapshot
+            with session_scope() as s:
+                row = s.execute(select(ORMPlan.c.final_plan_json).where(ORMPlan.c.id == int(plan["id"]))).mappings().first()
+                try:
+                    persisted = json.loads((row or {}).get("final_plan_json") or "{}")
+                except (TypeError, ValueError):
+                    persisted = {}
+                if not str(persisted.get("composition_mode") or "").strip():
+                    persisted["composition_mode"] = composition_mode
+                    s.execute(update(ORMPlan).where(ORMPlan.c.id == int(plan["id"])).values(
+                        final_plan_json=json.dumps(persisted, ensure_ascii=False),
+                    ))
         # Editorial examples are selected after Narrative Plan exists, where
         # chapter/subsection purpose is known. Keep only non-style runtime
         # context here to avoid injecting one generic example set everywhere.
         style_block = ""
         chapters = plan.get("chapter_plans") or [{"title": t} for t in (plan.get("structure") or [])]
+        from app.document_shape import normalize_composition_mode
+        composition_mode = normalize_composition_mode(
+            plan.get("composition_mode"), shape=plan.get("document_shape"),
+        )
+        progress_units = 1 if composition_mode == "article_beats" else len(chapters)
+        initial_unit = "正文" if composition_mode == "article_beats" else str(chapters[0].get("title", "")) if chapters else ""
         self._update(write_progress={
             "done": 0,
-            "total": len(chapters),
-            "chapter": str(chapters[0].get("title", "")) if chapters else "",
+            "total": progress_units,
+            "chapter": initial_unit,
             "status": "starting",
             "elapsed_seconds": 0,
         })
@@ -1752,7 +1796,12 @@ class WorkflowController:
         }
         quality_error = ""
         try:
-            issues = run_quality_check(report_id, plan.get("structure") or [], forbidden, institution_rules, qa_policy)
+            from app.document_shape import normalize_composition_mode
+            composition_mode = normalize_composition_mode(
+                plan.get("composition_mode"), shape=plan.get("document_shape"),
+            )
+            expected_sections = [] if composition_mode == "article_beats" else plan.get("structure") or []
+            issues = run_quality_check(report_id, expected_sections, forbidden, institution_rules, qa_policy)
         except Exception as exc:
             issues = []
             quality_error = str(exc)[:300]
@@ -1787,8 +1836,29 @@ class WorkflowController:
             chapter_name = str(payload.get("chapter") or "")
             if chapter_name:
                 execution_by_chapter[chapter_name] = payload
+        from app.document_shape import normalize_composition_mode
+        composition_mode = normalize_composition_mode(
+            plan.get("composition_mode"), shape=plan.get("document_shape"),
+        )
         chapter_stats = []
-        for chapter in plan.get("chapter_plans") or []:
+        if composition_mode == "article_beats":
+            execution = execution_by_chapter.get("正文") or {}
+            actual = int(actual_by_chapter.get("__article__", 0))
+            chapter_stats.append({
+                "chapter": "正文", "target_words": int((plan.get("budget") or {}).get("target_words") or 0),
+                "actual_words": actual,
+                "completion_rate": round(actual / max(int((plan.get("budget") or {}).get("target_words") or 0), 1), 4),
+                "generation_units": int(execution.get("generation_units") or 1),
+                "generation_calls": int(execution.get("generation_calls") or 1),
+                "generation_unit_stats": list(execution.get("generation_unit_stats") or []),
+                "planned_fact_count": int(execution.get("planned_fact_count") or 0),
+                "used_fact_count": len(execution.get("fact_ids") or []),
+                "unused_planned_fact_count": 0,
+                "underfill_reason": str(execution.get("underfill_reason") or ""),
+                "generated_words": int(execution.get("actual_words") or actual),
+                "previous_words": 0,
+            })
+        for chapter in ([] if composition_mode == "article_beats" else plan.get("chapter_plans") or []):
             target = int(chapter.get("target_words") or 0)
             chapter_name = str(chapter.get("title") or "")
             actual = int(actual_by_chapter.get(chapter_name, 0))
@@ -1970,6 +2040,32 @@ class WorkflowController:
         })
 
     def _normalize_report_order(self, report_id: int, plan: dict) -> None:
+        from app.document_shape import normalize_composition_mode
+
+        # A continuous article is deliberately persisted as one internal stream.
+        # Its public structure may still contain editorial beats, but those are
+        # not ORM sections and must never be treated as stale draft content.
+        composition_mode = normalize_composition_mode(
+            plan.get("composition_mode"), shape=plan.get("document_shape"),
+        )
+        if composition_mode == "article_beats":
+            with session_scope() as s:
+                rows = s.execute(
+                    select(ORMSentence.c.id)
+                    .where(
+                        ORMSentence.c.report_id == report_id,
+                        ORMSentence.c.section == "__article__",
+                    )
+                    .order_by(ORMSentence.c.position, ORMSentence.c.id)
+                ).mappings().all()
+                for position, row in enumerate(rows, start=1):
+                    s.execute(
+                        update(ORMSentence)
+                        .where(ORMSentence.c.id == row["id"])
+                        .values(position=position)
+                    )
+            return
+
         order = {
             str(title): index
             for index, title in enumerate(plan.get("structure") or [], start=1)
@@ -2179,6 +2275,38 @@ class WorkflowController:
             plan = self._plan()
         except Exception:
             return False
+        from app.document_shape import normalize_composition_mode
+        composition_mode = normalize_composition_mode(
+            plan.get("composition_mode"), shape=plan.get("document_shape"),
+        )
+        if composition_mode == "article_beats":
+            with session_scope() as s:
+                persisted = s.execute(
+                    select(ORMSentence.c.id).where(
+                        ORMSentence.c.report_id == int(report_id),
+                        ORMSentence.c.section == "__article__",
+                        ORMSentence.c.selected == 1,
+                    )
+                ).first()
+                artifacts = s.execute(
+                    select(ORMTaskArtifact.c.payload).where(
+                        ORMTaskArtifact.c.task_id == self.task_id,
+                        ORMTaskArtifact.c.run_id == str(self.task.get("run_id") or ""),
+                        ORMTaskArtifact.c.stage.like("chapter_draft:%"),
+                        ORMTaskArtifact.c.status == "done",
+                    )
+                ).mappings().all()
+            for row in artifacts:
+                try:
+                    payload = json.loads(row["payload"] or "{}")
+                except (TypeError, ValueError):
+                    continue
+                if (
+                    payload.get("chapter") == "正文"
+                    and payload.get("writing_input_signature") == writing_signature
+                ):
+                    return persisted is not None
+            return False
         expected = [
             str(c.get("title", ""))
             for c in (plan.get("chapter_plans") or [{"title": t} for t in (plan.get("structure") or [])])
@@ -2241,6 +2369,11 @@ class WorkflowController:
             "analysis_plan_json": _loads(row["analysis_plan_json"]) if "analysis_plan_json" in row.keys() else {},
             "final_plan_json": _loads(row["final_plan_json"]) if "final_plan_json" in row.keys() else {},
             "document_shape": (_loads(row["final_plan_json"]).get("document_shape", {}) if "final_plan_json" in row.keys() else {}),
+            # Keep legacy plans distinguishable from an explicit chaptered
+            # decision. Writer can then perform a one-time migration from the
+            # selected template's document form instead of silently freezing
+            # every old push/article into chaptered generation.
+            "composition_mode": (_loads(row["final_plan_json"]).get("composition_mode", "") if "final_plan_json" in row.keys() else ""),
             "finalized_at": row["finalized_at"] if "finalized_at" in row.keys() else None,
         }
 
@@ -2263,6 +2396,7 @@ class WorkflowController:
             "chapter_plans": plan.get("chapter_plans"),
             "budget": plan.get("budget"),
             "document_shape": plan.get("document_shape"),
+            "composition_mode": plan.get("composition_mode", "chaptered"),
             "analysis_plan_json": plan.get("analysis_plan_json"),
             "final_plan_json": plan.get("final_plan_json"),
         }

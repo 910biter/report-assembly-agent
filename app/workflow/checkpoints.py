@@ -31,6 +31,10 @@ def confirm_requirements(task_id: str, *, theme: str, requirements: str,
         theme=theme,
         user_requirements=requirements,
         requirement_review_feedback=str(feedback or "").strip(),
+        # The existing AnalysisPlan was created before the user confirmed the
+        # brief.  A plan id alone must not make the workflow reuse that stale
+        # contract on resume.
+        replan_required=True,
         # Material parsing and understanding completed before this checkpoint.
         # Resume from planning instead of re-entering the public task entry point.
         stage="planning",

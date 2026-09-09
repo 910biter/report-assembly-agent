@@ -22,7 +22,7 @@ from app.db import session_scope
 from app.infrastructure.orm import ORMReport, ORMSentence
 from sqlalchemy import select
 from app.memory.style import get_locked_variant, get_variant
-from app.document_shape import normalize_document_shape, visible_sections, visible_subheadings, wants_numbering
+from app.document_shape import normalize_composition_mode, normalize_document_shape, visible_sections, visible_subheadings, wants_numbering
 from app.infrastructure.orm import ORMPlan
 from app.rendering.headings import detect_numbering_strategy, format_heading
 from app.template_engine import check_docx_conformance, compile_template
@@ -54,6 +54,9 @@ def export_report(report_id: int) -> Path:
         plan = s.execute(select(ORMPlan.c.final_plan_json).where(ORMPlan.c.id == report["plan_id"])).mappings().first()
     final_plan = json.loads((plan or {}).get("final_plan_json") or "{}")
     document_shape = normalize_document_shape(final_plan.get("document_shape"))
+    composition_mode = normalize_composition_mode(
+        final_plan.get("composition_mode"), shape=document_shape,
+    )
     variant = _select_export_variant(report["style_profile_id"], document_shape)
     format_spec = _dominant_format(variant)
     schema = format_spec.get("template_schema") if isinstance(format_spec.get("template_schema"), dict) else {}
@@ -84,7 +87,7 @@ def export_report(report_id: int) -> Path:
             current_section = sentence["section"]
             chapter_index += 1
             subsection_index = 0
-            if visible_sections(document_shape):
+            if visible_sections(document_shape) and composition_mode != "article_beats":
                 _add_role_paragraph(
                     doc,
                     format_heading(1, [chapter_index], current_section, heading_strategy),
