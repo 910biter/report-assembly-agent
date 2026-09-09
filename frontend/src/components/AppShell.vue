@@ -12,6 +12,7 @@ const nav = [
   { to: "/", label: "工作台", icon: "home" },
   { to: "/tasks", label: "任务", icon: "tasks" },
   { to: "/materials", label: "材料库", icon: "files" },
+  { to: "/documents", label: "文档解析", icon: "documents" },
   { to: "/style", label: "模板中心", icon: "template" },
   { to: "/settings", label: "系统设置", icon: "settings" },
 ];

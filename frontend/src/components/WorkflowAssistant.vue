@@ -100,16 +100,11 @@ function startPanelResize(event: PointerEvent) {
 }
 
 const visible = computed(
-  () =>
-    route.path === "/" ||
-    route.path.startsWith("/tasks/") ||
-    route.path.startsWith("/reports/"),
+  () => route.path === "/" || route.path.startsWith("/tasks/") || route.path.startsWith("/reports/") || route.path === "/materials" || route.path === "/documents",
 );
-const taskId = computed(() =>
-  String(
-    route.params.taskId || task.value?.task_id || report.value?.task_id || "",
-  ),
-);
+const taskId = computed(() => String(
+  route.params.taskId || route.query.materialSession || route.query.assistantTask || route.query.task || task.value?.task_id || report.value?.task_id || "",
+));
 const reportId = computed(
   () =>
     Number(
@@ -117,6 +112,11 @@ const reportId = computed(
     ) || undefined,
 );
 const isDraft = computed(() => route.path === "/");
+const isMaterialPage = computed(() => route.path === "/materials");
+const isMaterialSession = computed(() => isMaterialPage.value && Boolean(route.query.materialSession));
+const isDocumentSession = computed(() => route.path === "/documents" && Boolean(route.query.task));
+const assistantName = computed(() => isMaterialPage.value ? "材料助手" : isDocumentSession.value ? "文档助手" : "任务协作助手");
+const assistantCaption = computed(() => isDraft.value ? "任务创建前" : isMaterialPage.value ? (isMaterialSession.value ? "已选材料" : "材料库") : isDocumentSession.value ? "文档理解" : currentStage.value.label);
 const interactionScopeReady = computed(() =>
   isDraft.value
     ? Boolean(draftId.value)
@@ -146,7 +146,7 @@ const activeArtifact = computed(() => {
         evidence_progress: task.value?.evidence_progress || {},
         write_progress: task.value?.write_progress || {},
       },
-      title: "当前任务",
+      title: isMaterialSession.value ? (task.value?.theme || "所选材料") : isDocumentSession.value ? (task.value?.theme || "文档理解结果") : "当前任务",
     }
   );
 });
@@ -166,6 +166,13 @@ const prompts = computed(() => {
       "检查这段内容的事实和引用是否匹配。",
     ];
   }
+  if (isMaterialSession.value) {
+    return [
+      "这份材料主要讲了什么？请给出清晰摘要。",
+      "请梳理这份材料的结构和关键要点。",
+      "这份材料可以证明什么，不能证明什么？",
+    ];
+  }
   return isDraft.value
     ? [
         "帮我判断当前需求是否清楚，还缺少哪些业务信息？",
@@ -180,63 +187,24 @@ const prompts = computed(() => {
 });
 
 const stageMeta: Record<string, { label: string; description: string }> = {
-  created: {
-    label: "等待开始",
-    description: "任务目标和材料已登记，尚未进入处理。",
-  },
-  parsing: {
-    label: "材料解析",
-    description: "把文件转换为带来源位置的内容单元。",
-  },
-  dedup: {
-    label: "去重归并",
-    description: "识别重复材料和重复内容，保留来源关系。",
-  },
-  material_analysis: {
-    label: "材料理解",
-    description: "判断材料角色、可证明范围和信息缺口。",
-  },
-  planning: {
-    label: "分析规划",
-    description: "确定需要回答的问题和证据提取范围。",
-  },
-  evidence: {
-    label: "事实与证据",
-    description: "提取事实并绑定原始材料位置。",
-  },
-  conflict: {
-    label: "冲突核验",
-    description: "检查多来源对同一事项是否存在矛盾。",
-  },
-  analysis: {
-    label: "综合分析",
-    description: "基于事实形成带依据和置信度的分析判断。",
-  },
-  writing: {
-    label: "报告生成",
-    description: "先组织叙事计划，再按章节生成并绑定来源。",
-  },
-  review: {
-    label: "等待审核",
-    description: "报告草稿已形成，可以审阅、讨论和修改。",
-  },
+  created: { label: "等待开始", description: "任务目标和材料已登记，尚未进入处理。" },
+  parsing: { label: "材料解析", description: "把文件转换为带来源位置的内容单元。" },
+  dedup: { label: "去重归并", description: "识别重复材料和重复内容，保留来源关系。" },
+  material_analysis: { label: "材料理解", description: "判断材料角色、可证明范围和信息缺口。" },
+  planning: { label: "分析规划", description: "确定需要回答的问题和证据提取范围。" },
+  evidence: { label: "事实与证据", description: "提取事实并绑定原始材料位置。" },
+  conflict: { label: "冲突核验", description: "检查多来源对同一事项是否存在矛盾。" },
+  analysis: { label: "综合分析", description: "基于事实形成带依据和置信度的分析判断。" },
+  writing: { label: "报告生成", description: "先组织叙事计划，再按章节生成并绑定来源。" },
+  review: { label: "等待审核", description: "当前产物已形成，可以审阅、讨论和修改。" },
   done: { label: "已完成", description: "报告已审核，可导出或进行增量更新。" },
   paused: { label: "已暂停", description: "任务停在安全边界，可继续运行。" },
-  failed: {
-    label: "运行异常",
-    description: "当前阶段未完成，请查看错误并决定是否重试。",
-  },
+  failed: { label: "运行异常", description: "当前阶段未完成，请查看错误并决定是否重试。" },
 };
-const currentStage = computed(
-  () =>
-    stageMeta[String(task.value?.stage || "created")] || {
-      label: String(task.value?.stage || "处理中"),
-      description: "系统正在处理当前任务。",
-    },
-);
+const currentStage = computed(() => stageMeta[String(task.value?.stage || "created")] || { label: String(task.value?.stage || "处理中"), description: "系统正在处理当前任务。" });
 
 async function loadContext() {
-  if (!visible.value || isDraft.value) {
+  if (!visible.value || isDraft.value || !taskId.value) {
     task.value = null;
     report.value = null;
     workspace.value = null;
@@ -246,15 +214,14 @@ async function loadContext() {
   loading.value = true;
   try {
     if (route.path.startsWith("/tasks/")) {
-      task.value = await api<any>(
-        `/api/tasks/${String(route.params.taskId)}/assistant-context`,
-      );
+      task.value = await api<any>(`/api/tasks/${String(route.params.taskId)}/assistant-context`);
       report.value = null;
-    } else {
-      report.value = await api<any>(
-        `/api/reports/${String(route.params.reportId)}/assistant-context`,
-      );
+    } else if (route.path.startsWith("/reports/")) {
+      report.value = await api<any>(`/api/reports/${String(route.params.reportId)}/assistant-context`);
       task.value = report.value;
+    } else {
+      task.value = await api<any>(`/api/tasks/${taskId.value}/assistant-context`);
+      report.value = null;
     }
     if (tab.value === "artifacts") await loadArtifacts(artifactType.value);
   } catch {
@@ -353,12 +320,19 @@ function proposalApplied(proposal: any) {
 
 watch(
   () => route.fullPath,
-  () => {
+  async () => {
     ui.closeAssistant();
     tab.value = "progress";
     selected.value = null;
     references.value = [];
-    loadContext();
+    await loadContext();
+    if (route.query.assistant === "1" && task.value) {
+      ui.openAssistant({
+        artifact_type: "material_role",
+        object_id: String(route.query.materialId || ""),
+        title: task.value.theme || "所选材料",
+      });
+    }
   },
 );
 watch(
@@ -389,8 +363,8 @@ onBeforeUnmount(() => {
       ></button>
       <header>
         <div>
-          <small>{{ isDraft ? "任务创建前" : currentStage.label }}</small
-          ><b>任务协作助手</b>
+          <small>{{ assistantCaption }}</small
+          ><b>{{ assistantName }}</b>
         </div>
         <div class="panel-actions">
           <button type="button" @click="expanded = !expanded">
@@ -406,10 +380,10 @@ onBeforeUnmount(() => {
           :class="{ active: tab === 'progress' }"
           @click="switchTab('progress')"
         >
-          {{ isDraft ? "需求" : "任务状态" }}
+          {{ isDraft ? "需求" : isMaterialPage ? "材料概览" : "任务状态" }}
         </button>
         <button
-          v-if="!isDraft"
+          v-if="!isDraft && !isMaterialPage"
           :class="{ active: tab === 'artifacts' }"
           @click="switchTab('artifacts')"
         >
@@ -439,6 +413,19 @@ onBeforeUnmount(() => {
             <button class="ask-link" @click="tab = 'discuss'">
               讨论需求是否完整
             </button>
+          </template>
+          <template v-else-if="isMaterialPage">
+            <template v-if="isMaterialSession">
+              <small>讨论范围</small>
+              <h3>{{ task?.theme?.replace("材料理解：", "") || "所选材料" }}</h3>
+              <p>助手只会检索这份材料的解析单元和材料理解结果，可用于快速了解内容、结构、关键事实及证据边界。</p>
+              <button class="ask-link" @click="tab = 'discuss'">开始讨论材料</button>
+            </template>
+            <template v-else>
+              <small>材料理解</small>
+              <h3>选择一份材料</h3>
+              <p>在材料详情中点击“与助手讨论”，即可围绕单份材料查看摘要、结构、关键事实和证据边界。</p>
+            </template>
           </template>
           <template v-else>
             <div class="stage-state">
@@ -586,7 +573,7 @@ onBeforeUnmount(() => {
             :suggested-prompts="prompts"
             @applied="proposalApplied"
           />
-          <div v-else class="assistant-empty">正在恢复当前任务的讨论记录…</div>
+          <div v-else class="assistant-empty">{{ route.path === "/materials" ? "请先在材料详情中选择“与助手讨论”。" : "正在恢复当前讨论范围…" }}</div>
         </div>
       </div>
     </section>
@@ -596,7 +583,7 @@ onBeforeUnmount(() => {
       @click="open = !open"
     >
       <span class="orb-mark"><AppIcon name="activity" :size="15" /></span>
-      <span class="orb-label">{{ isDraft ? "讨论需求" : "任务助手" }}</span>
+      <span class="orb-label">{{ isDraft ? "讨论需求" : isMaterialPage ? "材料助手" : "任务助手" }}</span>
     </button>
   </div>
 </template>

@@ -22,6 +22,7 @@ from app.infrastructure.orm import (
     ORMEvidence,
     ORMFact,
     ORMInference,
+    ORMInsight,
     ORMMaterial,
     ORMPlan,
     ORMReport,
@@ -146,6 +147,82 @@ def create_task(
     attach_draft_thread(interaction_draft_id, task_id)
     queue = enqueue_task(task_id) if workflow_mode == "collaborative" else {}
     return {"task_id": task_id, "material_count": len(material_ids), "queue": queue}
+
+
+@router.post("/documents/parse")
+def create_document_analysis(
+    files: list[UploadFile] | None = File(default=None),
+):
+    """Parse uploaded documents and stop after reusable material understanding."""
+    task_id = uuid.uuid4().hex[:12]
+    try:
+        material_ids = _collect_material_ids(task_id, files=files)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=409)
+    if not material_ids:
+        return JSONResponse({"error": "NO_MATERIALS"}, status_code=400)
+    with session_scope() as s:
+        names = [str(row["filename"]) for row in s.execute(
+            select(ORMMaterial.c.filename).where(ORMMaterial.c.id.in_(material_ids))
+        ).mappings().all()]
+    run_id = create_task_run(task_id, revision=1, run_mode="document_analysis")
+    short_term.save_task(task_id, {
+        "theme": f"文档解析：{'、'.join(names[:2])}{'等' if len(names) > 2 else ''}",
+        "user_requirements": "解析所选材料，形成可追溯的摘要、提纲与关键信息，供后续理解和复用。",
+        "material_ids": material_ids,
+        "stage": "created",
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "run_revision": 1,
+        "run_id": run_id,
+        "run_mode": "document_analysis",
+        "workflow_mode": "automatic",
+        "requirement_review_completed": True,
+        "directory_review_completed": True,
+    })
+    return {"task_id": task_id, "material_count": len(material_ids), "queue": enqueue_task(task_id)}
+
+
+@router.get("/documents")
+def list_document_analyses():
+    """List dedicated document-understanding runs without mixing them into report tasks."""
+    with session_scope() as s:
+        rows = s.execute(select(ORMShortMemory.c.task_id, ORMShortMemory.c.payload)).mappings().all()
+    items = []
+    for row in rows:
+        payload = json.loads(row["payload"])
+        if payload.get("run_mode") != "document_analysis":
+            continue
+        analysis = payload.get("document_analysis") or {}
+        items.append({
+            "task_id": row["task_id"],
+            "theme": payload.get("theme", "文档解析"),
+            "stage": payload.get("stage", "created"),
+            "created_at": payload.get("created_at", ""),
+            "updated_at": _ui_timestamp(payload.get("updated_at") or payload.get("last_progress_at") or payload.get("created_at", "")),
+            "material_ids": payload.get("material_ids") or [],
+            "material_count": len(payload.get("material_ids") or []),
+            "summary": analysis.get("summary", ""),
+        })
+    return sorted(items, key=lambda item: item["updated_at"], reverse=True)
+
+
+@router.get("/documents/{task_id}")
+def get_document_analysis(task_id: str):
+    task = short_term.load_task(task_id)
+    if task is None or task.get("run_mode") != "document_analysis":
+        return JSONResponse({"error": "DOCUMENT_ANALYSIS_NOT_FOUND"}, status_code=404)
+    return {
+        "task_id": task_id,
+        "theme": task.get("theme", "文档解析"),
+        "stage": task.get("stage", "created"),
+        "material_ids": task.get("material_ids") or [],
+        "parse_progress": task.get("parse_progress") or {},
+        "material_analysis_progress": task.get("material_analysis_progress") or {},
+        "material_analysis_status": task.get("material_analysis_status") or {},
+        "queue_status": task.get("queue_status") or {},
+        "analysis": task.get("document_analysis") or {},
+        "error": task.get("error") or task.get("failure_reason") or "",
+    }
 
 
 @router.post("/reports/{report_id}/incremental/tasks")
@@ -508,6 +585,8 @@ def list_tasks():
     tasks = []
     for row in rows:
         payload = _task_view(json.loads(row["payload"]))
+        if payload.get("run_mode") in {"document_analysis", "material_discussion"}:
+            continue
         tasks.append({
             "task_id": row["task_id"],
             "theme": payload.get("theme", ""),
@@ -1002,9 +1081,10 @@ def list_materials():
     } for r in rows]
 
 
+
 @router.get("/materials/{material_id}")
 def get_material(material_id: int):
-    """材料详情:内容单元列表(文本/表格/图片文本和解析元数据)。"""
+    """Material detail with parsed units and its reusable understanding result."""
     material_tasks = _material_task_index()
     with session_scope() as s:
         material = s.execute(
@@ -1015,18 +1095,56 @@ def get_material(material_id: int):
         units = s.execute(
             select(ORMUnit).where(ORMUnit.c.material_id == material_id).order_by(ORMUnit.c.id)
         ).mappings().all()
+        insight = s.execute(
+            select(ORMInsight).where(ORMInsight.c.material_id == material_id)
+            .order_by(ORMInsight.c.id.desc())
+        ).mappings().first()
     return {
         "id": material["id"], "filename": material["filename"], "file_type": material["file_type"],
         "parsed_at": material["parsed_at"],
         "parse_status": "ready" if units else "pending",
         "is_duplicate": material["is_duplicate"], "duplicate_of": material["duplicate_of"],
         "tasks": material_tasks.get(material["id"], []),
+        "insight": {
+            "doc_type": insight["doc_type"] if insight else "",
+            "topic": insight["topic"] if insight else "",
+            "key_points": json.loads(insight["key_points"] or "[]") if insight else [],
+            "key_sections": json.loads(insight["key_sections"] or "[]") if insight else [],
+            "entities": json.loads(insight["entities"] or "[]") if insight else [],
+            "times": json.loads(insight["times"] or "[]") if insight else [],
+            "material_role": insight["material_role"] if insight else "",
+            "missing_information": json.loads(insight["missing_information"] or "[]") if insight else [],
+        },
         "units": [{
             "id": u["id"], "kind": u["kind"], "content": u["content"],
             "page": u["page"], "image_desc": u["image_desc"],
             "metadata": json.loads(u["metadata_json"] or "{}"),
         } for u in units],
     }
+
+
+@router.post("/materials/{material_id}/assistant-session")
+def create_material_assistant_session(material_id: int):
+    """Create a material-scoped assistant context without entering report generation."""
+    with session_scope() as s:
+        material = s.execute(select(ORMMaterial).where(ORMMaterial.c.id == material_id)).mappings().first()
+    if material is None:
+        return JSONResponse({"error": "MATERIAL_NOT_FOUND"}, status_code=404)
+    task_id = uuid.uuid4().hex[:12]
+    short_term.save_task(task_id, {
+        "theme": f"材料理解：{material['filename']}",
+        "user_requirements": "解释所选材料的内容、结构、关键信息、可证明范围与缺失信息；不得引用未选材料。",
+        "material_ids": [material_id],
+        "stage": "review",
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "run_revision": 1,
+        "run_mode": "material_discussion",
+        "workflow_mode": "automatic",
+        "queue_status": {"status": "completed"},
+        "requirement_review_completed": True,
+        "directory_review_completed": True,
+    })
+    return {"task_id": task_id}
 
 
 # ---------- 报告 ----------

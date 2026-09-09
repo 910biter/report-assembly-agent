@@ -1,12 +1,14 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
 import { useQuery } from "@tanstack/vue-query";
-import { RouterLink } from "vue-router";
+import { RouterLink, useRouter } from "vue-router";
 import { api } from "@/api/http";
 import type { MaterialSummary } from "@/api/types";
 import AppIcon from "@/components/AppIcon.vue";
 import UiDataBrowser from "@/components/ui/UiDataBrowser.vue";
 import UiPageHeader from "@/components/ui/UiPageHeader.vue";
+import UiButton from "@/components/ui/UiButton.vue";
+import { useUiStore } from "@/stores/ui";
 
 const search = ref("");
 const type = ref("");
@@ -14,6 +16,9 @@ const status = ref("");
 const usage = ref("");
 const dateRange = ref("all");
 const sortBy = ref("recent");
+const router = useRouter();
+const ui = useUiStore();
+const openingAssistant = ref(false);
 const selected = ref<number | null>(null);
 const detailTab = ref("overview");
 const list = useQuery({
@@ -103,9 +108,10 @@ function resetFilters() {
   dateRange.value = "all";
   sortBy.value = "recent";
 }
-function selectMaterial(id: number) {
+async function selectMaterial(id: number) {
   selected.value = id;
   detailTab.value = "overview";
+  await discussMaterial();
 }
 function formatDate(value?: string) {
   if (!value) return "尚未解析";
@@ -143,30 +149,16 @@ function unitKindLabel(value: string) {
     )[String(value || "").toLowerCase()] || "内容"
   );
 }
-const metadataRows = computed(() => {
-  const metadata = detail.data.value?.units?.[0]?.metadata || {};
-  const labels: Record<string, string> = {
-    source_type: "内容来源",
-    language: "识别语言",
-    page_count: "页数",
-    has_ocr: "文字识别",
-    has_tables: "表格识别",
-    has_images: "图片识别",
-    title: "文档标题",
-    author: "作者",
-    created_at: "创建时间",
-  };
-  return Object.entries(metadata).flatMap(([key, value]) => {
-    if (!labels[key] || value == null || typeof value === "object") return [];
-    const display =
-      typeof value === "boolean"
-        ? value
-          ? "已启用"
-          : "未发现"
-        : String(value);
-    return [{ key, label: labels[key], value: display }];
-  });
-});
+async function discussMaterial() {
+  if (!selected.value || openingAssistant.value) return;
+  openingAssistant.value = true;
+  try {
+    const result = await api<{ task_id: string }>(`/api/materials/${selected.value}/assistant-session`, { method: "POST" });
+    await router.replace({ path: "/materials", query: { materialSession: result.task_id, materialId: String(selected.value), assistant: "1" } });
+  } finally {
+    openingAssistant.value = false;
+  }
+}
 </script>
 
 <template>
@@ -290,7 +282,6 @@ const metadataRows = computed(() => {
               v-for="tab in [
                 ['overview', '概览'],
                 ['content', '解析内容'],
-                ['meta', '元数据'],
               ]"
               :key="tab[0]"
               class="tab"
@@ -313,6 +304,14 @@ const metadataRows = computed(() => {
               <dt>关联任务</dt>
               <dd>{{ detail.data.value.tasks?.length || 0 }}</dd>
             </dl>
+            <section v-if="detail.data.value.insight?.topic || detail.data.value.insight?.key_points?.length" class="material-insight">
+              <small>材料理解</small>
+              <h3>{{ detail.data.value.insight.topic || '已解析材料' }}</h3>
+              <p v-if="detail.data.value.insight.doc_type || detail.data.value.insight.material_role">{{ [detail.data.value.insight.doc_type, detail.data.value.insight.material_role].filter(Boolean).join(' · ') }}</p>
+              <ul v-if="detail.data.value.insight.key_points?.length"><li v-for="item in detail.data.value.insight.key_points" :key="item">{{ item }}</li></ul>
+              <ol v-if="detail.data.value.insight.key_sections?.length"><li v-for="item in detail.data.value.insight.key_sections" :key="item">{{ item }}</li></ol>
+            </section>
+            <UiButton v-if="detail.data.value.parse_status === 'ready'" class="material-discuss" variant="outline" :loading="openingAssistant" @click="discussMaterial">与助手讨论</UiButton>
             <h3>使用记录</h3>
             <RouterLink
               v-for="task in detail.data.value.tasks || []"
@@ -338,24 +337,13 @@ const metadataRows = computed(() => {
               <p>{{ unit.content || unit.image_desc || "无文本内容" }}</p>
             </details>
           </div>
-          <div v-else class="detail-body metadata">
-            <dl v-if="metadataRows.length">
-              <template v-for="row in metadataRows" :key="row.key"
-                ><dt>{{ row.label }}</dt>
-                <dd>{{ row.value }}</dd></template
-              >
-            </dl>
-            <div v-else class="quiet-empty">
-              该材料没有需要额外展示的文档属性
-            </div>
-          </div>
         </template>
         <div v-else-if="detail.isLoading.value" class="detail-loading">
           <div class="loading-line"></div>
         </div>
         <div v-else class="empty">
           <div>
-            <strong>选择一份材料</strong>查看解析内容、元数据和任务关系。
+            <strong>选择一份材料</strong>查看解析内容、材料理解和任务关系。
           </div>
         </div>
       </div></template>
@@ -549,8 +537,7 @@ const metadataRows = computed(() => {
   padding: 0 22px;
 }
 .detail-body,
-.unit-list,
-.metadata {
+.unit-list {
   padding: 22px;
   margin: 0;
 }
@@ -583,6 +570,7 @@ const metadataRows = computed(() => {
   font-size: 12px;
   white-space: nowrap;
 }
+.material-insight { margin: 0 0 18px; padding: 14px 0; border-top: 1px solid var(--border); }.material-insight small { color: var(--subtle-foreground); font-size: 11px; }.material-insight h3 { margin: 4px 0; }.material-insight p, .material-insight li { color: var(--muted-foreground); line-height: 1.6; }.material-insight ul, .material-insight ol { margin: 8px 0 0; padding-left: 18px; }.material-discuss { width: 100%; margin: 2px 0 18px; }
 .quiet-empty {
   padding: 20px 0;
   color: var(--subtle-foreground);
@@ -615,11 +603,6 @@ const metadataRows = computed(() => {
   white-space: pre-wrap;
 }
 .metadata {
-  white-space: pre-wrap;
-  overflow: auto;
-  font-size: 12px;
-}
-.detail-loading {
   padding-top: 20px;
 }
 @media (max-width: 1250px) {

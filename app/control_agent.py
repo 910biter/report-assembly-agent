@@ -1015,12 +1015,23 @@ def _load_material_role(task_id: str, material_id: int) -> dict[str, Any]:
             ORMInsight.c.task_id == task_id,
             ORMInsight.c.material_id == material_id,
         ).order_by(ORMInsight.c.id.desc())).mappings().first()
+        if row is None:
+            row = s.execute(select(ORMInsight).where(
+                ORMInsight.c.material_id == material_id,
+            ).order_by(ORMInsight.c.id.desc())).mappings().first()
     return {
         "exists": row is not None,
+        "doc_type": row["doc_type"] if row else "",
+        "topic": row["topic"] if row else "",
         "material_role": row["material_role"] if row else "",
         "claim_support": row["claim_support"] if row else "",
+        "key_sections": _json(row["key_sections"], [])[:8] if row else [],
         "key_points": _json(row["key_points"], [])[:12] if row else [],
+        "entities": _json(row["entities"], [])[:12] if row else [],
+        "times": _json(row["times"], [])[:12] if row else [],
         "missing_information": _json(row["missing_information"], [])[:8] if row else [],
+        "allowed_usage": _json(row["allowed_usage"], [])[:8] if row else [],
+        "forbidden_usage": _json(row["forbidden_usage"], [])[:8] if row else [],
     }
 
 
@@ -1062,7 +1073,12 @@ def _load_materials(task_id: str) -> dict[str, Any]:
         insights = s.execute(select(ORMInsight).where(
             ORMInsight.c.task_id == task_id, ORMInsight.c.material_id.in_(ids),
         )).mappings().all() if ids else []
+        historical_insights = s.execute(select(ORMInsight).where(
+            ORMInsight.c.material_id.in_(ids),
+        ).order_by(ORMInsight.c.id.desc())).mappings().all() if ids else []
     roles = {int(row["material_id"]): row for row in insights}
+    for row in historical_insights:
+        roles.setdefault(int(row["material_id"]), row)
     def bounded(value: Any, limit: int) -> tuple[Any, bool]:
         """Keep collaboration context bounded and disclose every truncation."""
         parsed = _json(value, value)

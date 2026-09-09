@@ -201,6 +201,8 @@ class WorkflowController:
             "errors": self.task.get("material_analysis_errors", []),
         })
         _mark("material_analysis")
+        if self.task.get("run_mode") == "document_analysis":
+            return self._complete_document_analysis(_t0, _marks, _durations, llm_stats())
         if (
             self.task.get("workflow_mode") == "collaborative"
             and self.task.get("requirement_review", self.task.get("planning_review")) == "required"
@@ -587,6 +589,57 @@ class WorkflowController:
         self._start_background_graph_build(facts)
         return "review"
 
+    def _complete_document_analysis(
+        self,
+        started_at: float,
+        marks: dict[str, float],
+        durations: dict[str, float],
+        stats: dict,
+    ) -> str:
+        """Finish the document-only path after parsing and material understanding."""
+        insights = list(self.task.get("material_insights") or [])
+        documents = []
+        for item in insights:
+            points = [str(point) for point in item.get("key_points") or [] if str(point).strip()]
+            sections = [str(section) for section in item.get("key_sections") or [] if str(section).strip()]
+            documents.append({
+                "material_id": item.get("material_id"),
+                "filename": item.get("filename") or "未命名材料",
+                "title": item.get("topic") or item.get("doc_type") or "材料内容概览",
+                "doc_type": item.get("doc_type") or "",
+                "summary": "；".join(points[:3]),
+                "outline": sections,
+                "key_points": points,
+                "entities": [str(value) for value in item.get("entities") or [] if str(value).strip()],
+                "times": [str(value) for value in item.get("times") or [] if str(value).strip()],
+                "evidence_boundary": {
+                    "can_support": [str(value) for value in item.get("allowed_usage") or [] if str(value).strip()],
+                    "missing": [str(value) for value in item.get("missing_information") or [] if str(value).strip()],
+                },
+            })
+        summary = "；".join(item["summary"] or item["title"] for item in documents[:3])
+        payload = {"summary": summary or "材料已完成解析，尚未提取到足够的可概括内容。", "documents": documents}
+        self._record_artifact("document_analysis", payload)
+        run_id = str(self.task.get("run_id") or "")
+        self._update(
+            stage=str(Stage.REVIEW),
+            document_analysis=payload,
+            stage_timings=marks,
+            stage_durations=durations,
+            llm_stats=stats,
+            token_efficiency=build_token_efficiency(self.task_id, None, run_id=run_id),
+            workload_profile=build_workload_profile(self.task_id, run_id=run_id),
+            critical_path_done=True,
+            resume_from_stage="",
+        )
+        update_task_run(
+            run_id,
+            status="review",
+            metadata={"document_analysis": True, "document_count": len(documents), "ttfr_seconds": round(time.time() - started_at, 1)},
+            finished=True,
+        )
+        return "review"
+
     def _update(self, **fields) -> None:
         """更新短期记忆并同步内存快照,保证后续阶段读到最新产物。"""
         version_fields = {
@@ -594,6 +647,7 @@ class WorkflowController:
             "write_progress", "material_ids", "material_insights", "fact_ids",
             "inference_ids", "external_ids", "conflict_ids", "report_id",
             "qa_notes", "report_stats",
+            "document_analysis",
             "stage_timings", "stage_durations", "llm_stats", "token_efficiency", "workload_profile", "resource_samples", "error",
             "ttfr_seconds", "critical_path_done", "background_jobs", "graph_stats",
             "artifact_status", "queue_status", "material_analysis_status",
