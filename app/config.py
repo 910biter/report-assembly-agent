@@ -88,7 +88,9 @@ class Settings(BaseSettings):
     gateway_timeout_seconds: int = 900
     # 上下文容量配置(物理上限派生,非内容决策):
     # 单批可用 tokens = 窗口 - 输出预留 - 固定 prompt 开销 - 安全余量
-    model_context_window_tokens: int = 22528  # 必须与 vLLM max-model-len 保持一致
+    # RTX 3090 + 27B GPTQ baseline: 18,432 leaves activation headroom for
+    # long planning requests. Keep this aligned with vLLM max-model-len.
+    model_context_window_tokens: int = 18432
     generation_reserve_tokens: int = 8192  # 单次模型输出上限/预留，覆盖 Evidence 与小节成文
     structured_output_tokens: int = 3072  # Planner/Analysis/QA 等结构化阶段默认输出预算
     final_planner_output_tokens: int = 8192  # 完整章节契约优先保留输出空间；24K 窗口仍保留输入与安全余量

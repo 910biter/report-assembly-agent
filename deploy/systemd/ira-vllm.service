@@ -3,6 +3,8 @@ Description=IRA vLLM generation service
 Wants=network-online.target
 After=network-online.target remote-fs.target
 RequiresMountsFor=/home/nas511/zhangruqi/models
+StartLimitIntervalSec=300
+StartLimitBurst=4
 
 [Service]
 Type=simple
@@ -10,8 +12,13 @@ User=zhangruqi
 WorkingDirectory=/home/nas511/zhangruqi/agent-235
 EnvironmentFile=-/home/nas511/zhangruqi/agent-235/deploy/vllm.env
 ExecStart=/home/nas511/zhangruqi/agent-235/deploy/start-vllm-qwen36.sh
-Restart=on-failure
-RestartSec=15
+# Keep a durable service log beside application logs for post-failure diagnosis.
+StandardOutput=append:/home/nas511/zhangruqi/agent-235/runtime/logs/vllm-service.log
+StandardError=append:/home/nas511/zhangruqi/agent-235/runtime/logs/vllm-service.log
+# vLLM can exit cleanly after an internal shutdown signal. Keep the service
+# resident unless an operator explicitly stops it, but prevent restart loops.
+Restart=always
+RestartSec=10
 TimeoutStartSec=infinity
 TimeoutStopSec=120
 KillMode=mixed

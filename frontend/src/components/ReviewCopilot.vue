@@ -85,7 +85,7 @@ const scopeKey = computed(
 const artifactLabels: Record<string, string> = {
   task_draft: "任务需求",
   task_brief: "任务需求",
-  task_control: "任务操作",
+  task_control: "协作对话",
   material_role: "材料理解",
   analysis_plan: "分析规划",
   fact: "事实",
@@ -936,8 +936,12 @@ async function archiveCurrent() {
   display: grid;
   height: 100%;
   min-height: 0;
+  overflow: hidden;
   grid-template-rows: auto minmax(0, 1fr) auto;
   gap: 12px;
+}
+.copilot.compact {
+  gap: 8px;
 }
 .copilot-toolbar {
   display: flex;
@@ -947,12 +951,19 @@ async function archiveCurrent() {
   padding-bottom: 10px;
   border-bottom: 1px solid var(--color-border);
 }
+.copilot.compact .copilot-toolbar {
+  min-height: 30px;
+  padding-bottom: 7px;
+}
 .session-title {
   min-width: 0;
 }
 .session-title b,
 .session-title small {
   display: block;
+}
+.copilot.compact .session-title small {
+  display: none;
 }
 .session-title b {
   overflow: hidden;
@@ -1009,10 +1020,12 @@ async function archiveCurrent() {
 }
 .conversation-workspace {
   position: relative;
+  display: grid;
   min-height: 0;
   overflow: hidden;
 }
 .conversation-stream {
+  min-height: 0;
   height: 100%;
   overflow: auto;
   overscroll-behavior: contain;

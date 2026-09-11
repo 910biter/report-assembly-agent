@@ -29,68 +29,144 @@ const references = ref<any[]>([]);
 const draft = computed(() => ui.taskDraft);
 const draftId = computed(() => ui.draftId);
 const loading = ref(false);
-const expanded = ref(false);
 const savedPanelSize = (() => {
   try {
-    return JSON.parse(localStorage.getItem("ira-assistant-panel-size") || "{}");
+    return JSON.parse(localStorage.getItem("ira-assistant-panel-frame-v3") || "{}");
   } catch {
     return {};
   }
 })();
 const panelSize = ref({
-  width: Number(savedPanelSize.width) || 560,
-  height: Number(savedPanelSize.height) || 720,
+  width: Number(savedPanelSize.width) || 680,
+  height: Number(savedPanelSize.height) || 700,
 });
+const panelPosition = ref({
+  right: Number(savedPanelSize.right) || 0,
+  bottom: Number(savedPanelSize.bottom) || 60,
+});
+const resizeLabels: Record<PanelEdge, string> = {
+  left: "左侧",
+  right: "右侧",
+  top: "上侧",
+  bottom: "下侧",
+};
 const panelStyle = computed(() => {
-  if (expanded.value) {
-    return {
-      width: `${Math.min(860, window.innerWidth - 48)}px`,
-      height: `${Math.max(480, window.innerHeight - 48)}px`,
-    };
-  }
+  const viewportInset = 8;
+  const shellInset = 24;
+  const preferredRight = Math.max(0, panelPosition.value.right);
+  const preferredBottom = Math.max(0, panelPosition.value.bottom);
+  const availableWidth = Math.max(
+    1,
+    window.innerWidth - shellInset - preferredRight - viewportInset,
+  );
+  const availableHeight = Math.max(
+    1,
+    window.innerHeight - shellInset - preferredBottom - viewportInset,
+  );
+  const width = Math.min(panelSize.value.width, availableWidth);
+  const height = Math.min(
+    panelSize.value.height,
+    availableHeight,
+    Math.floor(window.innerHeight * 0.82),
+  );
   return {
-    width: `${Math.min(panelSize.value.width, window.innerWidth - 32)}px`,
-    height: `${Math.min(panelSize.value.height, window.innerHeight - 100)}px`,
+    width: `${width}px`,
+    height: `${height}px`,
+    right: `${Math.min(preferredRight, Math.max(0, window.innerWidth - shellInset - width - viewportInset))}px`,
+    bottom: `${Math.min(preferredBottom, Math.max(0, window.innerHeight - shellInset - height - viewportInset))}px`,
   };
 });
 let timer: number | undefined;
 let stopResize: (() => void) | undefined;
 
-function startPanelResize(event: PointerEvent) {
+type PanelEdge = "left" | "right" | "top" | "bottom";
+
+function persistPanelFrame() {
+  localStorage.setItem(
+    "ira-assistant-panel-frame-v3",
+    JSON.stringify({ ...panelSize.value, ...panelPosition.value }),
+  );
+}
+
+function startPanelMove(event: PointerEvent) {
   if (window.innerWidth <= 600) return;
+  if ((event.target as HTMLElement).closest("button")) return;
   event.preventDefault();
-  expanded.value = false;
-  const origin = {
-    x: event.clientX,
-    y: event.clientY,
-    width: panelSize.value.width,
-    height: panelSize.value.height,
-  };
+  const panel = (event.currentTarget as HTMLElement).closest(
+    ".assistant-panel",
+  );
+  if (!panel) return;
+  const origin = panel.getBoundingClientRect();
+  const startX = event.clientX;
+  const startY = event.clientY;
+  const margin = 8;
   const move = (next: PointerEvent) => {
-    panelSize.value = {
-      width: Math.max(
-        380,
-        Math.min(
-          window.innerWidth - 32,
-          origin.width + origin.x - next.clientX,
-        ),
+    const left = Math.max(
+      margin,
+      Math.min(
+        window.innerWidth - margin - origin.width,
+        origin.left + next.clientX - startX,
       ),
-      height: Math.max(
-        480,
-        Math.min(
-          window.innerHeight - 80,
-          origin.height + origin.y - next.clientY,
-        ),
+    );
+    const top = Math.max(
+      margin,
+      Math.min(
+        window.innerHeight - margin - origin.height,
+        origin.top + next.clientY - startY,
       ),
+    );
+    panelPosition.value = {
+      right: window.innerWidth - 24 - (left + origin.width),
+      bottom: window.innerHeight - 24 - (top + origin.height),
     };
   };
   const stop = () => {
     window.removeEventListener("pointermove", move);
     window.removeEventListener("pointerup", stop);
-    localStorage.setItem(
-      "ira-assistant-panel-size",
-      JSON.stringify(panelSize.value),
-    );
+    persistPanelFrame();
+    stopResize = undefined;
+  };
+  stopResize?.();
+  stopResize = stop;
+  window.addEventListener("pointermove", move);
+  window.addEventListener("pointerup", stop, { once: true });
+}
+
+function startPanelResize(event: PointerEvent, edge: PanelEdge) {
+  if (window.innerWidth <= 600) return;
+  event.preventDefault();
+  const panel = (event.currentTarget as HTMLElement).closest(
+    ".assistant-panel",
+  );
+  if (!panel) return;
+  const origin = panel.getBoundingClientRect();
+  const margin = 8;
+  const minimumWidth = 380;
+  const minimumHeight = 480;
+  const move = (next: PointerEvent) => {
+    let left = origin.left;
+    let right = origin.right;
+    let top = origin.top;
+    let bottom = origin.bottom;
+    if (edge === "left")
+      left = Math.max(margin, Math.min(next.clientX, right - minimumWidth));
+    if (edge === "right")
+      right = Math.min(window.innerWidth - margin, Math.max(next.clientX, left + minimumWidth));
+    if (edge === "top")
+      top = Math.max(margin, Math.min(next.clientY, bottom - minimumHeight));
+    if (edge === "bottom")
+      bottom = Math.min(window.innerHeight - margin, Math.max(next.clientY, top + minimumHeight));
+
+    panelSize.value = { width: right - left, height: bottom - top };
+    panelPosition.value = {
+      right: window.innerWidth - 24 - right,
+      bottom: window.innerHeight - 24 - bottom,
+    };
+  };
+  const stop = () => {
+    window.removeEventListener("pointermove", move);
+    window.removeEventListener("pointerup", stop);
+    persistPanelFrame();
     stopResize = undefined;
   };
   stopResize?.();
@@ -191,10 +267,12 @@ const stageMeta: Record<string, { label: string; description: string }> = {
   parsing: { label: "材料解析", description: "把文件转换为带来源位置的内容单元。" },
   dedup: { label: "去重归并", description: "识别重复材料和重复内容，保留来源关系。" },
   material_analysis: { label: "材料理解", description: "判断材料角色、可证明范围和信息缺口。" },
+  requirement_review: { label: "需求讨论", description: "材料理解已完成，等待共同明确任务主题和报告要求。" },
   planning: { label: "分析规划", description: "确定需要回答的问题和证据提取范围。" },
   evidence: { label: "事实与证据", description: "提取事实并绑定原始材料位置。" },
   conflict: { label: "冲突核验", description: "检查多来源对同一事项是否存在矛盾。" },
   analysis: { label: "综合分析", description: "基于事实形成带依据和置信度的分析判断。" },
+  directory_review: { label: "目录讨论", description: "最终目录已形成，等待审阅章节结构、顺序和重点安排。" },
   writing: { label: "报告生成", description: "先组织叙事计划，再按章节生成并绑定来源。" },
   review: { label: "等待审核", description: "当前产物已形成，可以审阅、讨论和修改。" },
   done: { label: "已完成", description: "报告已审核，可导出或进行增量更新。" },
@@ -315,6 +393,14 @@ function proposalApplied(proposal: any) {
     ui.applyDraftProposal(proposal?.after || {});
   } else {
     loadContext();
+    window.dispatchEvent(new CustomEvent("ira:task-artifact-updated", {
+      detail: {
+        taskId: taskId.value,
+        proposalId: proposal?.id,
+        status: proposal?.status || "accepted",
+        executionStatus: proposal?.execution_status || "",
+      },
+    }));
   }
 }
 
@@ -355,21 +441,21 @@ onBeforeUnmount(() => {
   <div v-if="visible" class="workflow-assistant" :class="{ open }">
     <section v-if="open" class="assistant-panel" :style="panelStyle">
       <button
+        v-for="edge in ['left', 'right', 'top', 'bottom']"
+        :key="edge"
         class="panel-resize-handle"
+        :class="`panel-resize-handle--${edge}`"
         type="button"
-        aria-label="调整助手窗口大小"
+        :aria-label="`拖动${resizeLabels[edge as PanelEdge]}边缘调整助手窗口大小`"
         title="拖动调整窗口大小"
-        @pointerdown="startPanelResize"
+        @pointerdown="startPanelResize($event, edge as PanelEdge)"
       ></button>
-      <header>
+      <header @pointerdown="startPanelMove">
         <div>
           <small>{{ assistantCaption }}</small
           ><b>{{ assistantName }}</b>
         </div>
         <div class="panel-actions">
-          <button type="button" @click="expanded = !expanded">
-            {{ expanded ? "还原" : "扩展" }}
-          </button>
           <button aria-label="关闭助手" @click="open = false">
             <AppIcon name="close" :size="17" />
           </button>
@@ -515,45 +601,27 @@ onBeforeUnmount(() => {
           <div v-else class="assistant-empty">该阶段尚未形成可审阅产物。</div>
         </div>
         <div v-else class="discussion-view">
-          <div class="discussion-scope">
-            <small>正在讨论</small><b>{{ activeArtifact.title }}</b>
-            <div v-if="selected || isDraft" class="focus-context">
-              <p>
-                {{
-                  artifactPreview(activeArtifact) ||
-                  "当前产物已作为对话上下文。"
-                }}
-              </p>
-              <button
-                v-if="selected && !isDraft"
-                type="button"
-                @click="tab = 'artifacts'"
-              >
-                返回查看产物
-              </button>
-            </div>
-            <div v-if="references.length" class="reference-list">
-              <span
-                v-for="(item, index) in references"
-                :key="referenceKey(item)"
-              >
-                <i>引用</i>{{ referenceSummary(item) }}
-                <button
-                  type="button"
-                  aria-label="移除引用"
-                  @click="removeReference(index)"
-                >
-                  ×
-                </button>
-              </span>
+          <div v-if="references.length" class="reference-list discussion-references">
+            <span
+              v-for="(item, index) in references"
+              :key="referenceKey(item)"
+            >
+              <i>引用</i>{{ referenceSummary(item) }}
               <button
                 type="button"
-                class="clear-references"
-                @click="references = []"
+                aria-label="移除引用"
+                @click="removeReference(index)"
               >
-                清除引用
+                ×
               </button>
-            </div>
+            </span>
+            <button
+              type="button"
+              class="clear-references"
+              @click="references = []"
+            >
+              清除引用
+            </button>
           </div>
           <ReviewCopilot
             v-if="interactionScopeReady"
@@ -633,10 +701,10 @@ onBeforeUnmount(() => {
   position: absolute;
   right: 0;
   bottom: 60px;
-  width: min(560px, calc(100vw - 32px));
-  height: min(720px, calc(100vh - 100px));
-  display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr);
+  width: min(680px, calc(100vw - 40px));
+  height: min(820px, calc(100vh - 32px));
+  display: flex;
+  flex-direction: column;
   overflow: hidden;
   border: 1px solid var(--border);
   border-radius: 12px;
@@ -644,12 +712,15 @@ onBeforeUnmount(() => {
   box-shadow: var(--shadow-float);
 }
 .assistant-panel > header {
+  flex: 0 0 auto;
   display: flex;
   align-items: center;
   justify-content: space-between;
   padding: 17px 18px 15px;
   border-bottom: 1px solid var(--border);
   background: var(--surface-raised);
+  cursor: grab;
+  user-select: none;
 }
 .assistant-panel > header small,
 .assistant-panel > header b {
@@ -674,12 +745,14 @@ onBeforeUnmount(() => {
   border-radius: 7px;
   background: transparent;
   color: var(--muted-foreground);
+  cursor: pointer;
 }
 .assistant-panel > header button:hover {
   background: var(--muted);
   color: var(--foreground);
 }
 .assistant-panel > nav {
+  flex: 0 0 auto;
   display: grid;
   grid-auto-flow: column;
   grid-auto-columns: 1fr;
@@ -706,8 +779,13 @@ onBeforeUnmount(() => {
   font-weight: 600;
 }
 .assistant-body {
+  flex: 1 1 auto;
   min-height: 0;
   overflow: auto;
+}
+.assistant-body.discussion-active {
+  display: flex;
+  overflow: hidden;
 }
 .progress-view {
   padding: 22px;
@@ -863,61 +941,64 @@ onBeforeUnmount(() => {
   color: var(--muted-foreground);
 }
 .discussion-view {
-  padding: 18px;
-}
-.discussion-scope {
-  padding-bottom: 13px;
-  margin-bottom: 14px;
-  border-bottom: 1px solid var(--border);
-}
-.discussion-scope small,
-.discussion-scope b {
-  display: block;
-}
-.discussion-scope small {
-  color: var(--subtle-foreground);
-}
-.discussion-scope b {
-  margin-top: 2px;
+  box-sizing: border-box;
+  padding: 14px 18px 18px;
 }
 .loading {
   padding: 20px;
   color: var(--muted-foreground);
 }
-.assistant-body.discussion-active {
-  overflow: hidden;
-}
 .discussion-view {
+  flex: 1 1 auto;
+  width: 100%;
   height: 100%;
   min-height: 0;
-  display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
+  display: flex;
+  flex-direction: column;
+}
+.discussion-view :deep(.copilot) {
+  flex: 1 1 auto;
+  width: 100%;
+  min-height: 0;
 }
 .panel-actions {
   display: flex;
   align-items: center;
   gap: 3px;
 }
-.panel-actions button:first-child {
-  width: auto;
-  min-width: 42px;
-  padding: 0 7px;
-  color: var(--color-primary);
-  font-size: 12px;
-}
 .panel-resize-handle {
   position: absolute;
-  top: -5px;
-  left: -5px;
-  z-index: 2;
-  width: 18px;
-  height: 18px;
+  z-index: 4;
   padding: 0;
   border: 0;
-  border-top: 2px solid var(--color-border-strong);
-  border-left: 2px solid var(--color-border-strong);
   background: transparent;
-  cursor: nwse-resize;
+  touch-action: none;
+}
+.panel-resize-handle--left,
+.panel-resize-handle--right {
+  top: 10px;
+  bottom: 10px;
+  width: 8px;
+  cursor: ew-resize;
+}
+.panel-resize-handle--left {
+  left: -4px;
+}
+.panel-resize-handle--right {
+  right: -4px;
+}
+.panel-resize-handle--top,
+.panel-resize-handle--bottom {
+  right: 10px;
+  left: 10px;
+  height: 8px;
+  cursor: ns-resize;
+}
+.panel-resize-handle--top {
+  top: -4px;
+}
+.panel-resize-handle--bottom {
+  bottom: -4px;
 }
 @media (max-width: 600px) {
   .workflow-assistant {
@@ -987,29 +1068,10 @@ onBeforeUnmount(() => {
   flex: 0 0 auto;
   font-size: 11px;
 }
-.focus-context {
-  display: grid;
-  gap: 6px;
-  margin-top: 9px;
-  padding: 10px 12px;
-  border-left: 2px solid var(--color-primary);
-  background: var(--color-surface-soft);
-}
-.focus-context p {
-  display: -webkit-box;
-  overflow: hidden;
+.discussion-references {
+  flex: 0 0 auto;
   margin: 0;
-  color: var(--color-text-secondary);
-  line-height: 1.55;
-  -webkit-line-clamp: 4;
-  -webkit-box-orient: vertical;
-}
-.focus-context button {
-  justify-self: start;
-  padding: 0;
-  border: 0;
-  background: transparent;
-  color: var(--color-primary);
-  font-size: 11px;
+  padding: 0 0 10px;
+  border-bottom: 1px solid var(--border);
 }
 </style>

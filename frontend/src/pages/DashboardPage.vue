@@ -802,8 +802,15 @@ const createTask = useMutation({
   background: color-mix(in srgb, var(--primary-soft) 48%, var(--surface-hover));
 }
 .compact-link span {
+  min-width: 0;
+  flex: 1 1 auto;
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.compact-link :deep(.ui-badge),
+.compact-link b {
+  flex: 0 0 auto;
   white-space: nowrap;
 }
 .compact-link b {

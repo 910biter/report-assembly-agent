@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, defineAsyncComponent, ref, watch } from "vue";
+import { computed, defineAsyncComponent, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/vue-query";
 import { useRoute, useRouter, RouterLink } from "vue-router";
 import { api, jsonInit } from "@/api/http";
@@ -16,6 +16,17 @@ const router = useRouter();
 const ui = useUiStore();
 const qc = useQueryClient();
 const taskId = String(route.params.taskId);
+function refreshAfterAssistantUpdate(event: Event) {
+  const detail = (event as CustomEvent).detail || {};
+  if (detail.taskId && String(detail.taskId) !== taskId) return;
+  qc.invalidateQueries({ queryKey: ["task", taskId] });
+  qc.invalidateQueries({ queryKey: ["task-analysis", taskId] });
+  qc.invalidateQueries({ queryKey: ["task-materials", taskId] });
+  qc.invalidateQueries({ queryKey: ["task-graph", taskId] });
+  qc.invalidateQueries({ queryKey: ["report-versions"] });
+}
+onMounted(() => window.addEventListener("ira:task-artifact-updated", refreshAfterAssistantUpdate));
+onBeforeUnmount(() => window.removeEventListener("ira:task-artifact-updated", refreshAfterAssistantUpdate));
 const active = ref(String(route.query.tab || "overview"));
 const analysisType = ref("facts");
 const detailsOpen = ref(false);
@@ -269,6 +280,28 @@ const running = computed(
       "paused",
     ].includes(task.data.value?.stage || "created"),
 );
+const stageProgress = computed(() => {
+  const stage = String(task.data.value?.stage || "created");
+  if (["evidence", "conflict", "analysis"].includes(stage)) {
+    return {
+      label: "证据提取",
+      done: task.data.value?.evidence_progress?.done || 0,
+      total: task.data.value?.evidence_progress?.total || "—",
+    };
+  }
+  if (["directory_review", "writing", "review", "done"].includes(stage)) {
+    return {
+      label: "章节写作",
+      done: task.data.value?.write_progress?.done || 0,
+      total: task.data.value?.write_progress?.total || "—",
+    };
+  }
+  return {
+    label: "材料解析",
+    done: task.data.value?.parse_progress?.done || 0,
+    total: task.data.value?.parse_progress?.total || "—",
+  };
+});
 const pauseRequested = computed(
   () => task.data.value?.queue_status?.status === "pause_requested",
 );
@@ -520,11 +553,8 @@ function versionsList() {
           ><b>{{ task.data.value.queue_status?.status || "—" }}</b>
         </div>
         <div>
-          <span>解析进度</span
-          ><b
-            >{{ task.data.value.parse_progress?.done || 0 }} /
-            {{ task.data.value.parse_progress?.total || "—" }}</b
-          >
+          <span>{{ stageProgress.label }}</span
+          ><b>{{ stageProgress.done }} / {{ stageProgress.total }}</b>
         </div>
         <div>
           <span>写作进度</span
@@ -1035,6 +1065,7 @@ function versionsList() {
     <section
       v-else-if="active === 'report'"
       class="surface section-block report-entry"
+      :class="{ 'tab-entry--empty': !task.data.value.report_id }"
     >
       <template v-if="task.data.value.report_id"
         ><div>
@@ -1062,15 +1093,19 @@ function versionsList() {
           >
         </div></template
       >
-      <div v-else class="empty">
+      <div v-else class="empty tab-empty-state">
         <div>
-          <strong>尚未生成报告</strong
-          >完成分析后，系统将按照最终报告计划开始写作。
+          <strong>尚未生成报告</strong>
+          <span>完成分析后，系统将按照最终报告计划开始写作。</span>
         </div>
       </div>
     </section>
-    <section v-else class="surface section-block">
-      <div class="section-head">
+    <section
+      v-else
+      class="surface section-block version-entry"
+      :class="{ 'tab-entry--empty': !versionsList().length }"
+    >
+      <div v-if="versionsList().length" class="section-head">
         <div>
           <h2>版本记录</h2>
           <p class="muted">每次快照和增量更新都形成可审阅的历史基线</p>
@@ -1094,9 +1129,10 @@ function versionsList() {
           >
         </div>
       </div>
-      <div v-else class="empty">
+      <div v-else class="empty tab-empty-state">
         <div>
-          <strong>暂无版本快照</strong>报告编辑器中可生成快照或启动增量更新。
+          <strong>暂无版本快照</strong>
+          <span>报告编辑器中可生成快照或启动增量更新。</span>
         </div>
       </div>
     </section>
@@ -1553,6 +1589,40 @@ function versionsList() {
   align-items: center;
   justify-content: space-between;
   gap: 24px;
+}
+.tab-entry--empty {
+  display: grid;
+  min-height: 260px;
+}
+.report-entry.tab-entry--empty,
+.version-entry.tab-entry--empty {
+  min-height: 260px;
+  grid-template-columns: minmax(0, 1fr);
+}
+.tab-empty-state {
+  width: 100%;
+  min-width: 0;
+  min-height: 0;
+  padding: 24px;
+  display: grid;
+  place-items: center;
+  text-align: center;
+}
+.tab-empty-state > div {
+  width: min(100%, 460px);
+  margin-inline: auto;
+  justify-self: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+}
+.tab-empty-state > div > span {
+  display: block;
+  margin-top: 4px;
+}
+.version-entry {
+  min-height: 0;
 }
 .report-entry h2,
 .report-entry p {

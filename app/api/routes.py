@@ -662,6 +662,7 @@ def get_task(task_id: str):
         "directory_review_completed": bool(view.get("directory_review_completed")),
         "queue_status": view.get("queue_status") or {},
         "parse_progress": view.get("parse_progress") or {},
+        "evidence_progress": view.get("evidence_progress") or {},
         "write_progress": view.get("write_progress") or {},
         "graph_status": view.get("graph_status") or {},
         "error": view.get("error") or "",

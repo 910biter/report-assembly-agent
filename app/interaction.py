@@ -12,6 +12,7 @@ from typing import Any
 from sqlalchemy import insert, select, update
 
 from app.db import session_scope
+from app.memory import short_term
 from app.infrastructure.orm import (
     ORMChangeProposal,
     ORMFact,
@@ -650,6 +651,20 @@ def decide_proposal(proposal_id: int, decision: str) -> dict[str, Any]:
     if row is None:
         raise ValueError("CHANGE_PROPOSAL_NOT_FOUND")
     if row["status"] != "proposed":
+        # Older builds could persist a confirmed proposal as
+        # ``accepted + waiting`` before applying the directory mutation. Make
+        # that state recoverable and idempotent instead of leaving it stuck
+        # forever until a new proposal is created.
+        if row["status"] == "accepted" and row.get("execution_status") == "waiting":
+            if _apply_supported_proposal(dict(row)):
+                with session_scope() as s:
+                    s.execute(update(ORMChangeProposal).where(
+                        ORMChangeProposal.c.id == int(proposal_id)
+                    ).values(execution_status="completed"))
+                with session_scope() as s:
+                    row = s.execute(select(ORMChangeProposal).where(
+                        ORMChangeProposal.c.id == int(proposal_id)
+                    )).mappings().first()
         return _proposal_detail(row)
     applied = False
     scheduled = False
@@ -955,7 +970,6 @@ def _apply_supported_proposal(row: dict) -> bool:
         AgentToolName.REWRITE_SENTENCE.value,
         AgentToolName.REWRITE_PARAGRAPH.value,
         AgentToolName.REGENERATE_CHAPTER.value,
-        AgentToolName.RERUN_FINAL_PLAN.value,
     }:
         return False
     report_id = row.get("report_id")
@@ -980,7 +994,6 @@ def _apply_supported_proposal(row: dict) -> bool:
             ).values(scope_json=_dump(scope)))
         return True
     if artifact_type == "task_brief":
-        from app.memory import short_term
         task = short_term.load_task(task_id) or {}
         if str(task.get("stage") or "created") not in {"created", "requirement_review"}:
             return False
@@ -995,30 +1008,29 @@ def _apply_supported_proposal(row: dict) -> bool:
         short_term.update_task(task_id, **values)
         return True
     if artifact_type == "final_plan":
-        # During the directory checkpoint, an accepted assistant proposal is
-        # applied to the current plan in place. It does not start writing and
-        # the checkpoint remains visible until the user explicitly continues.
+        # An accepted directory proposal is applied to the current plan in
+        # place. The plan must become visible immediately; downstream writing
+        # may still be queued separately by the normal revision workflow.
         task = short_term.load_task(task_id) or {}
-        if not task.get("directory_review_pending"):
-            return False
+        plan_id = _resolve_task_plan_id(task_id, task)
         structure = [
             str(item).strip() for item in (
                 after.get("required_structure") or
                 tool_call.get("arguments", {}).get("new_structure") or []
             ) if str(item).strip()
         ]
-        if not structure or not task.get("plan_id"):
+        if not structure or not plan_id:
             return False
         from app.workflow.controller import planner as workflow_planner
         revised = workflow_planner.revise_final_plan_structure(
-            int(task["plan_id"]), structure,
+            int(plan_id), structure,
             instruction=str(after.get("instruction") or "按确认目录调整"),
+            refine=False,
         )
         short_term.update_task(
             task_id,
             plan_title=revised.title,
             final_plan_frozen=True,
-            directory_review_pending=True,
         )
         return True
     if artifact_type == "section_titles":
@@ -1083,7 +1095,7 @@ def _rename_sections_in_task(task_id: str, report_id: int | None,
     from app.memory import short_term
 
     task = short_term.load_task(task_id) or {}
-    plan_id = int(task.get("plan_id") or 0) or None
+    plan_id = _resolve_task_plan_id(task_id, task)
     with session_scope() as s:
         report = None
         if report_id is not None:
@@ -1113,6 +1125,36 @@ def _rename_sections_in_task(task_id: str, report_id: int | None,
             structure=_dump(structure), chapter_plans=_dump(chapters), final_plan_json=_dump(final_plan),
         ))
     return True
+
+
+def _resolve_task_plan_id(task_id: str, task: dict[str, Any] | None = None) -> int | None:
+    """Resolve a task's plan across running and checkpointed workflow states.
+
+    Before a report row exists, collaborative tasks may not copy ``plan_id``
+    into short-term task state. The plan artifact is still authoritative and
+    contains the same id, so directory proposals must be able to find it.
+    """
+    payload = task or {}
+    try:
+        direct = int(payload.get("plan_id") or 0)
+    except (TypeError, ValueError):
+        direct = 0
+    if direct:
+        return direct
+    with session_scope() as s:
+        rows = s.execute(select(ORMTaskArtifact).where(
+            ORMTaskArtifact.c.task_id == str(task_id),
+            ORMTaskArtifact.c.stage.in_(("plan", "final_plan")),
+        ).order_by(ORMTaskArtifact.c.id.desc()).limit(8)).mappings().all()
+    for row in rows:
+        artifact = _load(row.get("payload"), {})
+        try:
+            plan_id = int(artifact.get("plan_id") or 0)
+        except (TypeError, ValueError):
+            plan_id = 0
+        if plan_id:
+            return plan_id
+    return None
 
 
 def _rename_section_in_plan(report_id: int, old_title: str, new_title: str) -> None:

@@ -238,7 +238,7 @@ class PlannerAgent(BaseAgent):
         return save_plan(plan)
 
     def revise_final_plan_structure(self, plan_id: int, required_structure: list[str],
-                                    instruction: str = "") -> ReportPlan:
+                                    instruction: str = "", refine: bool = True) -> ReportPlan:
         """Apply an approved structure diff without regenerating unchanged chapters."""
         from app.config import settings
         from app.rendering.headings import strip_heading_prefix
@@ -260,7 +260,7 @@ class PlannerAgent(BaseAgent):
         affected_titles = [title for title in titles if title not in old_by_title]
         changed_chapters = _fallback_local_restructure(affected_old, affected_titles)
 
-        if affected_titles:
+        if affected_titles and refine:
             prompt = (
                 f"用户修改要求：{instruction or '按用户确认目录调整局部章节'}\n"
                 f"需要输出的新章节标题：{json.dumps(affected_titles, ensure_ascii=False)}\n"

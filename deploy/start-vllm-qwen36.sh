@@ -24,10 +24,12 @@ args=(
   --port "$PORT"
   --served-model-name qwen3.6-27b
   --trust-remote-code
-  --max-model-len "${IRA_VLLM_MAX_MODEL_LEN:-22528}"
+  --max-model-len "${IRA_VLLM_MAX_MODEL_LEN:-18432}"
   --max-num-seqs "${IRA_VLLM_MAX_NUM_SEQS:-2}"
-  --max-num-batched-tokens "${IRA_VLLM_MAX_BATCHED_TOKENS:-8192}"
-  --gpu-memory-utilization "${IRA_VLLM_GPU_MEMORY_UTILIZATION:-0.98}"
+  # Keep activation headroom for long planning / tool calls. Chunked prefill
+  # preserves the context window while avoiding a single oversized forward pass.
+  --max-num-batched-tokens "${IRA_VLLM_MAX_BATCHED_TOKENS:-4096}"
+  --gpu-memory-utilization "${IRA_VLLM_GPU_MEMORY_UTILIZATION:-0.94}"
   --limit-mm-per-prompt '{"image":0,"video":0}'
   --enable-prefix-caching
   --enable-chunked-prefill
