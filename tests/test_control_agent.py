@@ -1,10 +1,14 @@
 import unittest
+from contextlib import contextmanager
 from unittest.mock import patch
 
 from app.control_agent import (
     AgentToolName,
     ArtifactFocus,
     TaskAgentContext,
+    _load_material_role,
+    _load_materials,
+    _load_report_paragraph,
     execute_read_tool,
     validate_agent_tool_call,
 )
@@ -30,11 +34,11 @@ class ControlAgentTests(unittest.TestCase):
         from app.control_agent import AgentToolCall
         call = AgentToolCall.model_validate({
             "tool_name": "rerun_final_plan",
-            "arguments": {"new_structure": ["政策环境", "技术路径", "实施建议"]},
+            "arguments": {"new_structure": ["政策环境", "技术路径", "实施建议"], "required_chapter_count": 5},
         })
         with patch("app.control_agent._load_plan", return_value={"titles": []}):
             with self.assertRaisesRegex(ValueError, "用户要求 5 章"):
-                validate_agent_tool_call(call, self.context(), "请调整为5章")
+                validate_agent_tool_call(call, self.context(), "请调整为任意数量")
 
     def test_mutating_tool_discards_undeclared_arguments(self):
         from app.control_agent import AgentToolCall
@@ -215,6 +219,122 @@ class ControlAgentTests(unittest.TestCase):
             AgentToolName.GET_QUALITY_ISSUES, {"offset": 17, "limit": 1}, self.context(),
         )
         self.assertEqual(result["issue"]["issue_id"], "qa_17")
+
+    def test_report_paragraph_uses_position_order(self):
+        from sqlalchemy import create_engine
+        from app.infrastructure.orm import ORMSentence
+
+        engine = create_engine("sqlite:///:memory:")
+        ORMSentence.create(engine)
+        with engine.begin() as connection:
+            connection.execute(ORMSentence.insert(), [
+                {
+                    "id": 2, "report_id": 7, "section": "第一章", "paragraph": 1,
+                    "position": 2, "content": "第二句", "source_level": "FACT",
+                },
+                {
+                    "id": 1, "report_id": 7, "section": "第一章", "paragraph": 1,
+                    "position": 1, "content": "第一句", "source_level": "FACT",
+                },
+            ])
+
+        from sqlalchemy.orm import Session
+
+        @contextmanager
+        def session_scope():
+            with Session(engine) as session:
+                yield session
+
+        with patch("app.control_agent.session_scope", session_scope):
+            result = _load_report_paragraph(7, "第一章", 1)
+
+        self.assertEqual([item["id"] for item in result["sentences"]], [1, 2])
+
+    def test_missing_material_insight_is_not_reused_from_another_task(self):
+        old_insight = {
+            "id": 9, "material_id": 11, "task_id": "other-task",
+            "doc_type": "旧任务判断", "material_role": "不应泄漏",
+        }
+
+        class Result:
+            def __init__(self, rows):
+                self.rows = rows
+
+            def mappings(self):
+                return self
+
+            def first(self):
+                return self.rows[0] if self.rows else None
+
+            def all(self):
+                return list(self.rows)
+
+        class Session:
+            def __init__(self):
+                self.calls = []
+
+            def execute(self, statement):
+                self.calls.append(str(statement))
+                if len(self.calls) == 1:
+                    return Result([])
+                return Result([old_insight])
+
+        session = Session()
+
+        @contextmanager
+        def session_scope():
+            yield session
+
+        with patch("app.control_agent.session_scope", session_scope):
+            result = _load_material_role("current-task", 11)
+
+        self.assertFalse(result["exists"])
+        self.assertEqual(result["status"], "missing")
+        self.assertEqual(result["material_role"], "")
+        self.assertEqual(len(session.calls), 1)
+
+    def test_material_list_marks_missing_insight_and_supports_paging(self):
+        from app.infrastructure.orm import ORMMaterial
+
+        material = {
+            "id": 11, "filename": "材料.pdf", "file_type": "pdf",
+        }
+
+        class Result:
+            def __init__(self, rows):
+                self.rows = rows
+
+            def mappings(self):
+                return self
+
+            def all(self):
+                return list(self.rows)
+
+            def scalar_one(self):
+                return len(self.rows)
+
+        class Session:
+            def execute(self, statement):
+                table_name = str(statement.get_final_froms()[0].name)
+                if table_name == ORMMaterial.name:
+                    return Result([material])
+                return Result([])
+
+        @contextmanager
+        def session_scope():
+            yield Session()
+
+        with (
+            patch("app.control_agent.short_term.load_task", return_value={"material_ids": [11]}),
+            patch("app.control_agent.session_scope", session_scope),
+        ):
+            result = _load_materials("current-task", offset=0, limit=1)
+
+        self.assertEqual(result["total"], 1)
+        self.assertEqual(result["returned_count"], 1)
+        self.assertFalse(result["truncated"])
+        self.assertEqual(result["materials"][0]["insight_status"], "missing")
+        self.assertTrue(result["materials"][0]["insight_missing"])
 
 
 if __name__ == "__main__":

@@ -59,41 +59,54 @@ function render() {
       name: "cose",
       animate: false,
       padding: 24,
-      nodeRepulsion: () => 5200,
-      idealEdgeLength: () => 115,
+      nodeRepulsion: () => 12000,
+      idealEdgeLength: () => 180,
+      componentSpacing: 100,
+      nodeOverlap: 30,
     },
     style: [
       {
         selector: "node",
         style: {
-          "background-color": token("--surface-raised"),
-          "border-color": token("--primary"),
+          "background-color": token("--graph-node-fill"),
+          "border-color": token("--graph-node-border"),
           "border-width": "1px",
           label: "data(label)",
-          color: token("--foreground"),
-          "font-size": "11px",
+          color: token("--graph-node-text"),
+          "font-size": "12px",
+          "font-weight": 600,
           "text-wrap": "wrap",
-          "text-max-width": "88px",
+          "text-max-width": "150px",
           "text-valign": "center",
           "text-halign": "center",
-          width: "58px",
-          height: "58px",
+          "text-background-color": token("--graph-node-fill"),
+          "text-background-opacity": 1,
+          "text-background-padding": "5px",
+          shape: "roundrectangle",
+          width: "label",
+          height: "label",
+          padding: "12px",
         },
       },
       {
         selector: "edge",
         style: {
           width: "1.2px",
-          "line-color": token("--border-strong"),
-          "target-arrow-color": token("--border-strong"),
+          "line-color": token("--graph-edge"),
+          "target-arrow-color": token("--graph-edge"),
+          "arrow-scale": 0.8,
           "target-arrow-shape": "triangle",
           "curve-style": "bezier",
           label: "data(label)",
-          color: token("--muted-foreground"),
-          "font-size": "10px",
-          "text-background-color": token("--card"),
-          "text-background-opacity": 0.9,
-          "text-background-padding": "2px",
+          color: token("--graph-edge-text"),
+          "font-size": "11px",
+          "font-weight": 600,
+          "text-background-color": token("--graph-label-bg"),
+          "text-background-opacity": 1,
+          "text-background-padding": "4px",
+          "text-border-color": token("--graph-label-border"),
+          "text-border-width": 1,
+          "text-border-opacity": 1,
         },
       },
       {
@@ -118,10 +131,11 @@ onBeforeUnmount(() => graph?.destroy());
 
 <style scoped>
 .graph-network {
-  height: 360px;
+  height: 500px;
   margin: 16px 0;
+  overflow: hidden;
   border: 1px solid var(--border);
   border-radius: var(--radius-control);
-  background: var(--surface-raised);
+  background: var(--graph-canvas);
 }
 </style>

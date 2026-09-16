@@ -24,9 +24,8 @@ def normalize_document_shape(value: Any, *, fallback: dict | None = None) -> dic
     """Validate a model-selected shape without injecting business semantics."""
     raw = dict(value) if isinstance(value, dict) else {}
     base = dict(fallback) if isinstance(fallback, dict) else {}
-    kind = str(raw.get("kind") or base.get("kind") or "structured_report").strip()
-    if kind not in _KINDS:
-        kind = "structured_report"
+    raw_kind = str(raw.get("raw_kind") or raw.get("kind") or base.get("raw_kind") or base.get("kind") or "structured_report").strip()
+    kind = raw_kind if raw_kind in _KINDS else "unknown"
     heading_policy = str(raw.get("heading_policy") or base.get("heading_policy") or "").strip()
     section_policy = str(raw.get("section_policy") or base.get("section_policy") or "").strip()
     subheading_policy = str(raw.get("subheading_policy") or base.get("subheading_policy") or "").strip()
@@ -38,6 +37,7 @@ def normalize_document_shape(value: Any, *, fallback: dict | None = None) -> dic
         "continuous_article": ("none", "hidden", "hidden"),
         "message_push": ("plain", "optional", "plain"),
         "news_release": ("none", "hidden", "hidden"),
+        "unknown": ("none", "optional", "hidden"),
     }
     default_heading, default_section, default_subheading = defaults[kind]
     if heading_policy not in _HEADING:
@@ -52,6 +52,7 @@ def normalize_document_shape(value: Any, *, fallback: dict | None = None) -> dic
         render_base = "selected_template"
     return {
         "kind": kind,
+        "raw_kind": raw_kind,
         "heading_policy": heading_policy,
         "section_policy": section_policy,
         "subheading_policy": subheading_policy,
@@ -84,7 +85,7 @@ def normalize_composition_mode(value: Any, *, shape: dict | None = None) -> str:
     mode = str(value or "").strip()
     if mode in _COMPOSITION:
         return mode
-    return "article_beats" if kind in {"continuous_article", "message_push", "news_release"} else "chaptered"
+    return "article_beats" if kind in {"continuous_article", "message_push", "news_release", "unknown"} else "chaptered"
 
 
 def visible_subheadings(shape: dict | None) -> bool:

@@ -5,6 +5,7 @@ import { api } from "@/api/http";
 import AppIcon from "@/components/AppIcon.vue";
 import ReviewCopilot from "@/components/ReviewCopilot.vue";
 import { useUiStore } from "@/stores/ui";
+import { stageMeta } from "@/domain/workflowStages";
 
 const route = useRoute();
 const ui = useUiStore();
@@ -262,23 +263,6 @@ const prompts = computed(() => {
       ];
 });
 
-const stageMeta: Record<string, { label: string; description: string }> = {
-  created: { label: "等待开始", description: "任务目标和材料已登记，尚未进入处理。" },
-  parsing: { label: "材料解析", description: "把文件转换为带来源位置的内容单元。" },
-  dedup: { label: "去重归并", description: "识别重复材料和重复内容，保留来源关系。" },
-  material_analysis: { label: "材料理解", description: "判断材料角色、可证明范围和信息缺口。" },
-  requirement_review: { label: "需求讨论", description: "材料理解已完成，等待共同明确任务主题和报告要求。" },
-  planning: { label: "分析规划", description: "确定需要回答的问题和证据提取范围。" },
-  evidence: { label: "事实与证据", description: "提取事实并绑定原始材料位置。" },
-  conflict: { label: "冲突核验", description: "检查多来源对同一事项是否存在矛盾。" },
-  analysis: { label: "综合分析", description: "基于事实形成带依据和置信度的分析判断。" },
-  directory_review: { label: "目录讨论", description: "最终目录已形成，等待审阅章节结构、顺序和重点安排。" },
-  writing: { label: "报告生成", description: "先组织叙事计划，再按章节生成并绑定来源。" },
-  review: { label: "等待审核", description: "当前产物已形成，可以审阅、讨论和修改。" },
-  done: { label: "已完成", description: "报告已审核，可导出或进行增量更新。" },
-  paused: { label: "已暂停", description: "任务停在安全边界，可继续运行。" },
-  failed: { label: "运行异常", description: "当前阶段未完成，请查看错误并决定是否重试。" },
-};
 const currentStage = computed(() => stageMeta[String(task.value?.stage || "created")] || { label: String(task.value?.stage || "处理中"), description: "系统正在处理当前任务。" });
 
 async function loadContext() {

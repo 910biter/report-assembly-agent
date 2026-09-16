@@ -73,6 +73,7 @@ CREATE TABLE IF NOT EXISTS facts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     content TEXT NOT NULL,
     dimension TEXT NOT NULL DEFAULT '',
+    fact_type TEXT NOT NULL DEFAULT 'unknown',
     need_id INTEGER NOT NULL DEFAULT 0,
     source_level TEXT NOT NULL DEFAULT 'MATERIAL_FACT',
     evidence_ids TEXT NOT NULL DEFAULT '[]',
@@ -106,6 +107,7 @@ CREATE TABLE IF NOT EXISTS conflicts (
     conflict_type TEXT NOT NULL DEFAULT 'needs_verification',
     reason TEXT NOT NULL DEFAULT '',
     confidence TEXT NOT NULL DEFAULT 'medium',
+    claim_ids TEXT NOT NULL DEFAULT '[]',
     task_id TEXT NOT NULL DEFAULT '',
     origin_call_id TEXT NOT NULL DEFAULT ''
 );
@@ -117,6 +119,7 @@ CREATE TABLE IF NOT EXISTS inferences (
     based_fact_ids TEXT NOT NULL DEFAULT '[]',
     reasoning_chain TEXT NOT NULL DEFAULT '',
     dimension TEXT NOT NULL DEFAULT '',
+    analysis_type TEXT NOT NULL DEFAULT '',
     confidence_level TEXT NOT NULL DEFAULT 'medium',
     confidence_reason TEXT NOT NULL DEFAULT '',
     uncertainty TEXT NOT NULL DEFAULT '',
@@ -144,6 +147,9 @@ CREATE TABLE IF NOT EXISTS style_variants (
     format_spec_json TEXT NOT NULL DEFAULT '{}',
     writing_patterns_json TEXT NOT NULL DEFAULT '{}',
     style_samples_json TEXT NOT NULL DEFAULT '[]',
+    chapter_styles_json TEXT NOT NULL DEFAULT '[]',
+    reasoning_profile_json TEXT NOT NULL DEFAULT '{}',
+    institution_rules_json TEXT NOT NULL DEFAULT '{}',
     source_reports TEXT NOT NULL DEFAULT '[]',
     confidence REAL NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'draft',
@@ -260,7 +266,7 @@ CREATE TABLE IF NOT EXISTS claims (
     content TEXT NOT NULL,
     quote TEXT NOT NULL DEFAULT '',
     source TEXT NOT NULL DEFAULT '',
-    fact_type TEXT NOT NULL DEFAULT 'STATEMENT',
+    fact_type TEXT NOT NULL DEFAULT 'unknown',
     dimension TEXT NOT NULL DEFAULT '',
     need_id INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'pending',
@@ -410,6 +416,7 @@ CREATE TABLE IF NOT EXISTS report_plans (
 CREATE TABLE IF NOT EXISTS reports (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     plan_id INTEGER NOT NULL REFERENCES report_plans(id),
+    task_id TEXT NOT NULL DEFAULT '',
     title TEXT NOT NULL,
     style_profile_id INTEGER,
     status TEXT NOT NULL DEFAULT 'draft',
@@ -441,6 +448,16 @@ CREATE TABLE IF NOT EXISTS report_versions (
     change_summary TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
     UNIQUE(report_id, version_no)
+);
+
+CREATE TABLE IF NOT EXISTS report_ownership_audits (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    report_id INTEGER NOT NULL REFERENCES reports(id),
+    status TEXT NOT NULL DEFAULT 'orphaned',
+    reason TEXT NOT NULL DEFAULT '',
+    candidate_task_ids TEXT NOT NULL DEFAULT '[]',
+    checked_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+    UNIQUE(report_id)
 );
 
 CREATE TABLE IF NOT EXISTS report_version_deltas (
@@ -506,7 +523,8 @@ CREATE TABLE IF NOT EXISTS short_memory (
 
 CREATE TABLE IF NOT EXISTS long_memory (
     key TEXT PRIMARY KEY,
-    value TEXT NOT NULL
+    value TEXT NOT NULL,
+    scope TEXT NOT NULL DEFAULT 'institution'
 );
 
 CREATE TABLE IF NOT EXISTS entities (
@@ -542,7 +560,7 @@ CREATE TABLE IF NOT EXISTS kg_entities (
     entity_key TEXT NOT NULL UNIQUE,
     workspace_id TEXT NOT NULL DEFAULT 'default',
     canonical_name TEXT NOT NULL,
-    entity_type TEXT NOT NULL DEFAULT 'other',
+    entity_type TEXT NOT NULL DEFAULT 'unknown',
     aliases_json TEXT NOT NULL DEFAULT '[]',
     status TEXT NOT NULL DEFAULT 'active',
     created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
@@ -662,7 +680,7 @@ _MIGRATED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ('style_variants', 'source_hash', "TEXT NOT NULL DEFAULT ''"),
     ('report_sentences', 'paragraph', 'INTEGER NOT NULL DEFAULT 1'),
     ('report_sentences', 'edit_history', "TEXT NOT NULL DEFAULT '[]'"),
-    ('facts', 'fact_type', "TEXT NOT NULL DEFAULT 'STATEMENT'"),
+    ('facts', 'fact_type', "TEXT NOT NULL DEFAULT 'unknown'"),
     ('facts', 'task_id', "TEXT NOT NULL DEFAULT ''"),
     ('facts', 'origin_call_id', "TEXT NOT NULL DEFAULT ''"),
     ('facts', 'disposition', "TEXT NOT NULL DEFAULT 'UNASSIGNED'"),
@@ -734,6 +752,8 @@ _MIGRATED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ('report_plans', 'analysis_plan_json', "TEXT NOT NULL DEFAULT '{}'"),
     ('report_plans', 'final_plan_json', "TEXT NOT NULL DEFAULT '{}'"),
     ('report_plans', 'finalized_at', 'TEXT'),
+    ('reports', 'task_id', "TEXT NOT NULL DEFAULT ''"),
+    ('report_versions', 'task_id', "TEXT NOT NULL DEFAULT ''"),
     ('llm_call_logs', 'returned_chars', 'INTEGER NOT NULL DEFAULT 0'),
     ('llm_call_logs', 'valid_json_chars', 'INTEGER NOT NULL DEFAULT 0'),
     ('llm_call_logs', 'stored_chars', 'INTEGER NOT NULL DEFAULT 0'),
@@ -833,11 +853,21 @@ def _build_tables_from_schema() -> None:
             else:
                 Table(name, Base.metadata, *cols, *table_constraints)
             created.add(name)
-        # 合并迁移补充列(内置清单;新库 create_all 直接含,结构 100% 对齐)
+        # Keep additive migrations equivalent to the canonical schema. This
+        # path is only for a column absent from an older schema; fresh tables
+        # are defined above and therefore never take this branch.
         for _table, _col, _ddl in _MIGRATED_COLUMNS:
             if _table in Base.metadata.tables and _col not in Base.metadata.tables[_table].c:
                 _ctype = _type_map.get(_ddl.split()[0], String)
-                Base.metadata.tables[_table].append_column(Column(_col, _ctype))
+                _nullable = "NOT NULL" not in _ddl.upper()
+                Base.metadata.tables[_table].append_column(
+                    Column(
+                        _col,
+                        _ctype,
+                        nullable=_nullable,
+                        server_default=_server_default(_ddl),
+                    )
+                )
 
 
 _build_tables_from_schema()

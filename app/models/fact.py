@@ -8,7 +8,7 @@ class Fact:
     dimension: str = ""
     need_id: int = 0  # EvidenceNeed 归属(0=开放发现)
     source_level: str = "MATERIAL_FACT"
-    fact_type: str = "STATEMENT"  # EVENT / PERSON / LOCATION / TIME / NUMBER / STATEMENT
+    fact_type: str = "unknown"  # Open semantic label; legacy rows may contain canonical values
     evidence_ids: list[int] = field(default_factory=list)
     conflict_ids: list[int] = field(default_factory=list)
     id: int | None = None

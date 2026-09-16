@@ -61,16 +61,9 @@ curl -fsS http://127.0.0.1:8000/api/health
 
 `start_services.sh` 会检查 Qdrant 和 vLLM，只重启应用进程；常驻 vLLM 的生命周期优先由 systemd 管理。
 
-## 6. 可选 Neo4j
+## 6. 知识图谱
 
-Neo4j 只保存 PostgreSQL 已确认知识关系的可重建查询投影，不是第二事实库。先使用 `shadow` 验证，再切换为 `active`：
-
-```dotenv
-IRA_GRAPH_MODE=shadow
-IRA_NEO4J_URI=bolt://127.0.0.1:7687
-IRA_NEO4J_USER=neo4j
-IRA_NEO4J_PASSWORD=<password>
-```
+知识图谱能力默认可用，但不会自动阻塞主流程。用户在任务的“关系网络”栏点击构建，任务级状态完成后，Analysis、增量对比和助手按状态选择性使用；Neo4j 仅作为可重建查询投影，不是第二事实库。
 
 ## 7. 验证
 

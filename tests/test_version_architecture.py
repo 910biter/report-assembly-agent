@@ -8,6 +8,7 @@ from app.report_versions import (
     _review_scopes_overlap,
     _sequence_diff,
     _version_label,
+    _restore_plan_values,
 )
 
 
@@ -51,6 +52,21 @@ class VersionArchitectureTests(unittest.TestCase):
         self.assertIn("version_major", versions.c)
         self.assertIn("version_minor", versions.c)
         self.assertIn("task_runs", Base.metadata.tables)
+
+    def test_restore_plan_values_include_final_plan_snapshot(self):
+        values = _restore_plan_values(
+            {
+                "title": "旧计划",
+                "structure": ["旧章节"],
+                "chapter_plans": [{"title": "旧章节"}],
+                "final_plan_json": {"composition_mode": "chaptered"},
+                "budget": {"target_words": 3000},
+            },
+            {"target_words": 1000},
+            "旧标题",
+        )
+
+        self.assertEqual(values["final_plan_json"], '{"composition_mode": "chaptered"}')
 
     def test_inline_diff_marks_only_changed_chinese_span(self):
         result = _inline_text_diff("应于九月提交材料。", "应于九月十日前提交材料。")

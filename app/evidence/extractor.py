@@ -25,7 +25,6 @@ from app.retrieval import vector_store
 from app.retrieval.embedder import embed_texts
 from app.token_monitor import current_context, log_pipeline_event, update_call_funnel, update_call_metrics, update_call_products
 
-_FACT_TYPES = ("EVENT", "PERSON", "LOCATION", "TIME", "NUMBER", "STATEMENT")
 _FACT_PERSIST_LOCK = threading.RLock()
 
 
@@ -45,12 +44,12 @@ def _assert_not_paused(task_id: str) -> None:
 
 _SYSTEM = """你是情报事实提取员。从材料中提取可溯源的陈述(Claim),严格区分事实与推断。
 严格输出 JSON,不要任何解释:
-{"claims": [{"content": "陈述内容", "unit_id": 材料单元编号, "short_quote": "30字以内原文短摘", "fact_type": "EVENT/PERSON/LOCATION/TIME/NUMBER/STATEMENT"}, ...]}
+{"claims": [{"content": "陈述内容", "unit_id": 材料单元编号, "short_quote": "30字以内原文短摘", "fact_type": "模型判断的开放标签或 unknown"}, ...]}
 
 要求:
 1. unit_id 必须来自材料文本标注的 U编号;short_quote 必须逐字摘自该单元,不得改写
 2. content 是对 quote 的忠实表述(允许同义改述)
-3. fact_type 按陈述性质:事件EVENT/人物PERSON/地点LOCATION/时间TIME/数字NUMBER/一般陈述STATEMENT
+3. fact_type 是便于检索和展示的开放标签；可使用材料中的专业类别，无法判断时写 unknown，不得为了符合枚举改写陈述
 4. 只输出有原文支撑的陈述;没有支撑就少输出
 5. 禁止输出推断、评价、总结(那些属于"分析人士认为"类观点时,content 须注明是来源观点)
 6. 分析维度和优先事实类别只是检索/提取重点,不是排除边界;材料中与用户目标明显相关的高价值事实即使不在维度内也应提取
@@ -684,9 +683,9 @@ class EvidenceAgent(BaseAgent):
             if not content or not quote:
                 continue
             valid_field_claims += 1
-            fact_type = str(item.get("fact_type", "STATEMENT")).upper()
-            if fact_type not in _FACT_TYPES:
-                fact_type = "STATEMENT"
+            # Keep the model's semantic label. Protocol consumers may map it
+            # later, but extraction must not discard an unfamiliar category.
+            fact_type = str(item.get("fact_type") or "unknown").strip()[:64]
             # 维度归属:模型标注 need_id(0=开放发现),无标注回退首个 need 的维度
             try:
                 need_idx = int(item.get("need_id", 0))
@@ -898,7 +897,7 @@ class EvidenceAgent(BaseAgent):
         candidate_ids = {cid for group in candidate_groups for cid in group.get("claim_ids", [])}
         candidate_claims = [c for c in candidate_claims if int(c.get("id") or 0) in candidate_ids]
         claim_lines = [
-            f"{c['id']}. [{c.get('source', '')}|{c.get('fact_type', 'STATEMENT')}] {c['content']}"
+            f"{c['id']}. [{c.get('source', '')}|{c.get('fact_type', 'unknown')}] {c['content']}"
             for c in candidate_claims
         ]
         group_lines = [

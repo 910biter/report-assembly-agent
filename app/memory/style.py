@@ -42,7 +42,8 @@ _HEADING_RE = re.compile(r"^(第?[一二三四五六七八九十百]+[章节部�
 _FEATURE_PROMPT = """分析以下报告的体裁与风格特征,严格输出 JSON(不要任何解释):
 {
   "topic_type": "用简短中文名概括报告体裁，只填写结果，不要复述字段说明或示例",
-  "document_shape": "formal_report/research_review/article_sections/continuous_article/message_push/news_release",
+  "document_shape": "模型根据样例概括的开放文档形态标签；无法确定时写 unknown",
+  "raw_document_shape": "模型原始判断，必须保留",
   "structure_notes": "章节组织特点(是否先结论后展开、典型章节顺序)",
   "language_notes": "语言特点(正式程度、句式、数据使用)"
 }"""
@@ -61,11 +62,12 @@ class _StyleProfileAgent(BaseAgent):
 def _normalize_profile_label(value, fallback: str = _DEFAULT_PROFILE_NAME) -> str:
     """Accept a concise model label, but never persist prompt/schema text as data."""
     label = re.sub(r"\s+", "", str(value or "").strip().strip('"\''))
-    protocol_markers = ("报告类型,", "报告类型名", "用2-4字", "用简短中文名", "如:", "如：", "沿用{")
+    # Validate the value as a compact identifier only; its meaning is learned
+    # from the current reference set rather than a fixed business vocabulary.
     if (
         not label
         or len(label) > 24
-        or any(marker in label for marker in protocol_markers)
+        or any(char in label for char in "{}[]")
         or label.count("/") >= 2
     ):
         return fallback
@@ -102,7 +104,8 @@ _VARIANT_PROMPT = """以下为同一机构、同一类型({type})的 {count} 份
     "summary_first": true或false,
     "conclusion_first": true或false,
     "document_shape": {{
-      "kind": "structured_report/research_review/article_sections/continuous_article/message_push/news_release",
+      "kind": "模型根据样例概括的开放文档形态标签；无法确定时写 unknown",
+      "raw_kind": "模型的原始形态判断，必须保留",
       "heading_policy": "numbered/plain/none",
       "section_policy": "required/optional/hidden",
       "subheading_policy": "numbered/plain/hidden",
@@ -162,7 +165,7 @@ _VARIANT_PROMPT = """以下为同一机构、同一类型({type})的 {count} 份
     "data_requirements": "数据引用要求(如:关键数字必须注明来源)"
   }},
   "sample_annotations": [
-    {{"sample_id": "输入中的样例编号", "sample_type": "opening/fact/analysis/risk/conclusion/transition", "rhetorical_role": "opening/fact/analysis/risk/conclusion/transition", "purpose": "该段承担的表达任务", "realization_mode": "单事实展开/多事实综合/事实到判断/风险边界/建议形成", "discourse_moves": ["事实引入", "背景补充", "影响判断"], "tags": ["可检索语义标签"]}}
+    {{"sample_id": "输入中的样例编号", "sample_type": "模型判断的开放表达功能标签或 unknown", "rhetorical_role": "模型判断的开放修辞角色或 unknown", "purpose": "该段承担的表达任务", "realization_mode": "模型判断的开放实现方式", "discourse_moves": ["模型识别的论述动作"], "tags": ["可检索语义标签"]}}
   ]
 }}"""
 

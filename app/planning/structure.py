@@ -8,6 +8,77 @@ class StructureError(ValueError):
     """Invalid chapter structure."""
 
 
+def normalize_text_list(value: Any) -> list[str]:
+    """Return prompt-safe text values without silently dropping legacy data."""
+    if value is None:
+        return []
+    values = value if isinstance(value, (list, tuple, set)) else [value]
+    result: list[str] = []
+    for item in values:
+        if item is None:
+            continue
+        text = str(item).strip()
+        if text and text not in result:
+            result.append(text)
+    return result
+
+
+def normalize_id_list(value: Any) -> list[int]:
+    """Normalize ID collections while rejecting booleans and malformed values."""
+    if value is None:
+        return []
+    values = value if isinstance(value, (list, tuple, set)) else [value]
+    result: list[int] = []
+    for item in values:
+        if isinstance(item, bool):
+            continue
+        try:
+            parsed = int(item)
+        except (TypeError, ValueError):
+            continue
+        if parsed not in result:
+            result.append(parsed)
+    return result
+
+
+_TEXT_LIST_FIELDS = (
+    "questions",
+    "required_facts",
+    "required_inferences",
+    "exclude",
+    "evidence_requirements",
+    "completion_criteria",
+    "allowed_roles",
+    "missing_information",
+)
+_ID_LIST_FIELDS = (
+    "primary_fact_ids",
+    "supporting_fact_ids",
+    "fact_ids",
+    "primary_inference_ids",
+    "inference_ids",
+)
+
+
+def _normalize_subsections(value: Any) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for raw in value if isinstance(value, list) else []:
+        if not isinstance(raw, dict):
+            continue
+        item = dict(raw)
+        for field in ("title", "purpose", "core_question", "core_message", "judgment"):
+            if field in item and item[field] is not None:
+                item[field] = str(item[field]).strip()
+        for field in _TEXT_LIST_FIELDS:
+            if field in item:
+                item[field] = normalize_text_list(item[field])
+        for field in _ID_LIST_FIELDS:
+            if field in item:
+                item[field] = normalize_id_list(item[field])
+        result.append(item)
+    return result
+
+
 def order_chapters(chapters: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Validate chapter titles and keep the planner's narrative order.
 
@@ -25,19 +96,33 @@ def order_chapters(chapters: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def normalize_contract(plan: dict[str, Any]) -> dict[str, Any]:
     """Normalize final-plan chapters into one Narrative Contract schema."""
     result = dict(plan or {})
+    for field in ("dimensions", "required_facts", "required_inferences"):
+        if field in result:
+            result[field] = normalize_text_list(result[field])
     chapters = result.get("chapter_plans") or result.get("chapters") or []
     normalized = []
     for raw in chapters:
+        if not isinstance(raw, dict):
+            continue
         c = dict(raw or {})
+        for field in _TEXT_LIST_FIELDS:
+            if field in c:
+                c[field] = normalize_text_list(c[field])
+        for field in _ID_LIST_FIELDS:
+            if field in c:
+                c[field] = normalize_id_list(c[field])
         c["title"] = str(c.get("title") or "").strip()
-        c["core_question"] = str(c.get("core_question") or (c.get("questions") or [""])[0])
+        c["core_question"] = str(c.get("core_question") or (c.get("questions") or [""])[0]).strip()
         c["core_message"] = str(c.get("core_message") or c.get("judgment") or "")
         c.pop("dependencies", None)
         c.pop("depends_on", None)
-        c["evidence_requirements"] = list(c.get("evidence_requirements") or c.get("required_facts") or [])
+        c["evidence_requirements"] = normalize_text_list(
+            c.get("evidence_requirements") or c.get("required_facts")
+        )
         c["expected_content"] = str(c.get("expected_content") or c.get("judgment") or "")
-        c["completion_criteria"] = list(c.get("completion_criteria") or [])
+        c["completion_criteria"] = normalize_text_list(c.get("completion_criteria"))
         c["discourse_plan"] = c.get("discourse_plan") or c.get("discourse_flow") or []
+        c["subsections"] = _normalize_subsections(c.get("subsections"))
         normalized.append(c)
     result["chapter_plans"] = order_chapters(normalized)
     result["chapters"] = result["chapter_plans"]
@@ -81,4 +166,12 @@ def serializable_memory(memory: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-__all__ = ["StructureError", "order_chapters", "normalize_contract", "normalize_topic", "serializable_memory"]
+__all__ = [
+    "StructureError",
+    "order_chapters",
+    "normalize_text_list",
+    "normalize_id_list",
+    "normalize_contract",
+    "normalize_topic",
+    "serializable_memory",
+]

@@ -5,6 +5,7 @@ import re
 from dataclasses import dataclass, field
 
 from app.models import Unit
+from app.planning.structure import normalize_text_list
 from app.retrieval.embedder import embed_texts
 from app.retrieval.store import vector_store
 
@@ -33,8 +34,8 @@ def hybrid_retrieve_units(
     3. rerank by semantic score + term coverage + material diversity;
     4. expand candidate count once when required term coverage is weak.
     """
-    required = _terms(" ".join(required_terms or []))
-    keyword_terms = _terms(" ".join(keywords or []))
+    required = _terms(" ".join(normalize_text_list(required_terms)))
+    keyword_terms = _terms(" ".join(normalize_text_list(keywords)))
     query_terms = _terms(query)
     target_terms = list(dict.fromkeys(required + keyword_terms + query_terms))
 

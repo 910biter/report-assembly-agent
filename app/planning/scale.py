@@ -8,6 +8,8 @@ from __future__ import annotations
 import re
 from copy import deepcopy
 
+from app.planning.structure import normalize_contract, normalize_text_list
+
 
 _NUMBER = r"\d+(?:\.\d+)?"
 
@@ -110,7 +112,10 @@ def normalize_chapter_budgets(chapters: list[dict], target_words: int) -> list[d
 
 def normalize_execution_plan(plan: dict) -> dict:
     """Recover and apply one scale contract for current and historical plans."""
-    result = deepcopy(plan or {})
+    result = normalize_contract(deepcopy(plan or {}))
+    for field in ("dimensions", "required_facts"):
+        if field in result:
+            result[field] = normalize_text_list(result[field])
     chapters = result.get("chapter_plans") or [
         {"title": title} for title in (result.get("structure") or [])
     ]
@@ -128,6 +133,7 @@ def normalize_execution_plan(plan: dict) -> dict:
     result["chapter_plans"] = normalize_chapter_budgets(
         chapters, _positive_int(budget.get("target_words")),
     )
+    result["chapters"] = result["chapter_plans"]
     result["structure"] = [
         str(item.get("title") or "") for item in result["chapter_plans"] if item.get("title")
     ]

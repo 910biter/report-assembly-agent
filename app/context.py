@@ -3,6 +3,7 @@
 from app.runtime_profiles import stage_input_budget_tokens, stage_profile
 from app.context_budget import ContextSection, build_prompt_from_sections, count_tokens, truncate_tokens
 from app.models import Unit
+from app.planning.structure import normalize_text_list
 from app.retrieval.query_compiler import QueryCompiler, RetrievalQuery
 from app.retrieval import embed_texts, vector_store
 from app.retrieval.rag import hybrid_retrieve_units
@@ -246,12 +247,12 @@ class ContextManager:
         if insights:
             insight_lines.append("材料摘要(按价值排序,含候选事实要点):")
             for insight in insights:
-                points = " / ".join(str(value) for value in insight.get("key_points", []))
+                points = " / ".join(normalize_text_list(insight.get("key_points")))
                 insight_lines.append(
                     f"- [{insight.get('value_rank', '?')}级] {insight.get('doc_type', '')} "
                     f"{insight.get('topic', '')} 候选事实:{points or '无'} "
-                    f"关键实体:{'、'.join(str(value) for value in insight.get('entities', []))} "
-                    f"时间:{'、'.join(str(value) for value in insight.get('times', []))}"
+                    f"关键实体:{'、'.join(normalize_text_list(insight.get('entities')))} "
+                    f"时间:{'、'.join(normalize_text_list(insight.get('times')))}"
                 )
         prompt, _audit = build_prompt_from_sections(
             "planner",
@@ -277,19 +278,20 @@ class ContextManager:
         is_open_discovery = "开放发现" in (dimension or "")
         insight_terms: list[str] = []
         for insight in insights or []:
-            keywords.extend(insight.get("entities", [])[:4])
-            keywords.extend(insight.get("times", [])[:3])
-            insight_terms.extend(insight.get("key_points", [])[:2])
-            insight_terms.extend([insight.get("topic", ""), insight.get("material_role", "")])
+            keywords.extend(normalize_text_list(insight.get("entities"))[:4])
+            keywords.extend(normalize_text_list(insight.get("times"))[:3])
+            insight_terms.extend(normalize_text_list(insight.get("key_points"))[:2])
+            insight_terms.extend(normalize_text_list([insight.get("topic", ""), insight.get("material_role", "")]))
+        required = normalize_text_list(required_facts)
         if is_open_discovery:
             dimension_text = " ".join(
-                [self.task.get("theme", ""), self.task.get("user_requirements", "")]
+                normalize_text_list([self.task.get("theme", ""), self.task.get("user_requirements", "")])
                 + insight_terms
-                + list(required_facts or [])
+                + required
             )
             top_k = 12
         else:
-            dimension_text = f"{dimension} {' '.join(required_facts or [])}"
+            dimension_text = f"{dimension} {' '.join(required)}"
             top_k = 8
         blocks, unit_meta = self.retrieve_units_with_meta(dimension_text, top_k=top_k, keywords=keywords)
         retrieval_strategy = {}
@@ -353,8 +355,8 @@ class ContextManager:
         per_batch_tokens = _evidence_batch_budget()
         keywords: list[str] = []
         for insight in insights or []:
-            keywords.extend(insight.get("entities", [])[:4])
-            keywords.extend(insight.get("times", [])[:3])
+            keywords.extend(normalize_text_list(insight.get("entities"))[:4])
+            keywords.extend(normalize_text_list(insight.get("times"))[:3])
 
         # 向量混合检索:预加载单位向量 + 每查询 embed(失败自动回退纯文本)
         unit_vectors: dict = {}
@@ -368,6 +370,7 @@ class ContextManager:
         except Exception:
             unit_vectors = {}
 
+        queries = normalize_text_list(queries)
         need_text = " ".join(queries)
         # 检索候选:Qdrant 粗召回(查询相关)→ rerank;Qdrant 不可用时回退 Python 打分
         per_material: list[tuple[int, list[tuple[float, object]]]] = []
@@ -476,9 +479,9 @@ class ContextManager:
         per_batch_tokens = _evidence_batch_budget()
         keywords: list[str] = []
         for insight in insights or []:
-            keywords.extend(insight.get("entities", [])[:4])
-            keywords.extend(insight.get("times", [])[:3])
-        queries = [dimension] + [rf for rf in (required_facts or []) if rf]
+            keywords.extend(normalize_text_list(insight.get("entities"))[:4])
+            keywords.extend(normalize_text_list(insight.get("times"))[:3])
+        queries = [str(dimension or "")] + normalize_text_list(required_facts)
 
         # 向量混合检索:预加载单位向量 + 每个查询 embed(失败自动回退纯文本)
         unit_vectors: dict = {}

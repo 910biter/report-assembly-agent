@@ -36,6 +36,7 @@ class Report:
     title: str
     style_profile_id: int | None = None
     status: str = "draft"
+    task_id: str = ""
     id: int | None = None
 
 

@@ -50,7 +50,7 @@ class Claim:
     unit_id: int | None = None
     quote: str = ""
     source: str = ""
-    fact_type: str = "STATEMENT"  # EVENT / PERSON / LOCATION / TIME / NUMBER / STATEMENT
+    fact_type: str = "unknown"  # Open semantic label; legacy rows may contain canonical values
     dimension: str = ""
     need_id: int = 0  # EvidenceNeed 归属(0=开放发现)
     status: str = "pending"  # pending / promoted / rejected

@@ -47,6 +47,7 @@ from app.interaction import mark_notification_read, review_workspace
 from app.interaction import post_message as post_interaction_message
 from app.interaction import queue_message as queue_interaction_message
 from app.interaction import attach_draft_thread
+from app.interaction import rename_sections_in_task
 from app.material_comparison import (
     accepted_update_handoff,
     create_comparison_run,
@@ -55,7 +56,6 @@ from app.material_comparison import (
     list_comparisons,
     update_comparison_item,
 )
-from app.parsing import parse_file
 from app.rendering.headings import detect_numbering_strategy, format_heading, strip_heading_prefix
 from app.report_versions import (
     create_incremental_delta,
@@ -1002,19 +1002,19 @@ def rebuild_task_graph(task_id: str, background_tasks: BackgroundTasks):
     if task is None:
         return JSONResponse({"error": "TASK_NOT_FOUND"}, status_code=404)
     from app.graph import graph_service
-    if graph_service.mode == "off":
-        return JSONResponse({"error": "GRAPH_MODE_OFF"}, status_code=409)
     jobs = task.get("background_jobs") or {}
     active_job = jobs.get("graph_rebuild") or jobs.get("graph_build") or {}
     if _graph_job_active(active_job):
         return {"status": "already_running", "task_id": task_id}
-    if not task.get("fact_ids"):
+    from app.workflow.controller import WorkflowController
+    facts = WorkflowController(task_id)._facts()
+    if not facts:
         return JSONResponse({"error": "TASK_HAS_NO_FACTS"}, status_code=409)
     jobs = dict(jobs)
     jobs["graph_rebuild"] = {"status": "queued", "queued_at": round(time.time(), 1)}
     short_term.update_task(task_id, graph_status={"status": "queued"}, background_jobs=jobs)
     background_tasks.add_task(_run_graph_rebuild, task_id)
-    return {"status": "queued", "task_id": task_id, "fact_count": len(task.get("fact_ids") or [])}
+    return {"status": "queued", "task_id": task_id, "fact_count": len(facts)}
 
 
 @router.get("/tasks/{task_id}/graph/changesets")
@@ -1287,55 +1287,38 @@ def update_report_meta(report_id: int, payload: dict):
 
 @router.put("/reports/{report_id}/sections")
 def update_report_section(report_id: int, payload: dict):
-    """在线编辑章节标题:同步句子 section 与 ReportPlan 结构。"""
-    old_title = str(payload.get("old_title", "")).strip()
+    """在线编辑章节标题:复用协作修改的单一写入路径。"""
+    old_title = strip_heading_prefix(str(payload.get("old_title", "")).strip())
     new_title = strip_heading_prefix(str(payload.get("new_title", "")).strip())
     if not old_title or not new_title:
         return JSONResponse({"error": "SECTION_TITLE_REQUIRED"}, status_code=400)
+    with session_scope() as s:
+        report = s.execute(
+            select(ORMReport.c.task_id).where(ORMReport.c.id == report_id)
+        ).first()
+    if report is None:
+        return JSONResponse({"error": "REPORT_NOT_FOUND"}, status_code=404)
+    task_id = str(report[0] or "")
     if old_title == new_title:
         return {
             "ok": True,
             "title": new_title,
             "display_title": _display_section_title(report_id, new_title, payload.get("section_index")),
         }
-    from app.infrastructure.orm import ORMSentence, ORMPlan, ORMReport, Base
-    from sqlalchemy import select, update
-    with session_scope() as s:
-        report = s.execute(
-            select(ORMReport.c.plan_id, ORMReport.c.style_profile_id).where(ORMReport.c.id == report_id)
-        ).first()
-        if report is None:
-            return JSONResponse({"error": "REPORT_NOT_FOUND"}, status_code=404)
-        result = s.execute(
-            update(ORMSentence).where(
-                ORMSentence.c.report_id == report_id, ORMSentence.c.section == old_title
-            ).values(section=new_title)
-        )
-        if result.rowcount == 0:
-            return JSONResponse({"error": "SECTION_NOT_FOUND"}, status_code=404)
-        plan = s.execute(
-            select(ORMPlan.c.structure, ORMPlan.c.chapter_plans).where(ORMPlan.c.id == report[0])
-        ).first()
-        if plan is not None:
-            structure = json.loads(plan[0] or "[]")
-            chapter_plans = json.loads(plan[1] or "[]")
-            structure = [new_title if str(item) == old_title else item for item in structure]
-            for chapter in chapter_plans:
-                if str(chapter.get("title", "")) == old_title:
-                    chapter["title"] = new_title
-            s.execute(
-                update(ORMPlan).where(ORMPlan.c.id == report[0]).values(
-                    structure=json.dumps(structure, ensure_ascii=False),
-                    chapter_plans=json.dumps(chapter_plans, ensure_ascii=False),
-                )
-            )
-        user_memory = Base.metadata.tables["user_memory"]
-        s.execute(user_memory.insert().values(
-            note_type="edit", summary="用户修改了章节标题",
-            content=f"{old_title} → {new_title}",
-        ))
-    display_title = _display_section_title(report_id, new_title, payload.get("section_index"))
-    return {"ok": True, "old_title": old_title, "title": new_title, "display_title": display_title}
+    if not task_id:
+        return JSONResponse({"error": "REPORT_NOT_FOUND"}, status_code=404)
+    if not rename_sections_in_task(task_id, report_id, [(old_title, new_title)]):
+        return JSONResponse({"error": "SECTION_NOT_FOUND"}, status_code=404)
+    ensure_report_version(
+        report_id, task_id=task_id, status="snapshot",
+        change_summary="在线编辑：修改章节标题", kind="minor",
+    )
+    return {
+        "ok": True,
+        "old_title": old_title,
+        "title": new_title,
+        "display_title": _display_section_title(report_id, new_title, payload.get("section_index")),
+    }
 
 
 def _display_section_title(report_id: int, title: str, section_index) -> str:
@@ -1608,39 +1591,6 @@ def style_learning_job(job_id: str):
     if job is None:
         return JSONResponse({"error": "STYLE_JOB_NOT_FOUND"}, status_code=404)
     return job
-
-@router.post("/style/analyze")
-def analyze_style(files: list[UploadFile] = File(...)):
-    """上传模板或参考成品报告 → 提取文档格式与写作风格 → 生成可复核模板。
-
-    每份 docx 报告的硬排版格式(字体/字号/行距/页边距)被真实提取,
-    结构化 Schema 与原始 DOCX 双轨保存,供导出器稳定复用。
-    """
-    reports: list[dict] = []
-    tmp_files: list[Path] = []
-    settings.ensure_dirs()
-    for upload in files:
-        filename = Path(upload.filename).name
-        tmp = settings.materials_dir / f"_style_{filename}"
-        tmp_files.append(tmp)
-        with tmp.open("wb") as fh:
-            shutil.copyfileobj(upload.file, fh)
-        try:
-            units = parse_file(tmp)
-        except Exception:
-            continue
-        text = "\n".join(u.content for u in units if u.content.strip())
-        if text:
-            reports.append({"filename": filename, "text": text, "path": str(tmp)})
-    try:
-        variants = style.analyze_library(reports) if reports else []
-    finally:
-        for tmp in tmp_files:
-            tmp.unlink(missing_ok=True)
-    if not variants:
-        return JSONResponse({"error": "NO_PARSEABLE_FILES"}, status_code=400)
-    return {"variants": [variant_fields(v) for v in variants]}
-
 
 @router.get("/style/variants")
 def list_style_variants():
@@ -1996,31 +1946,14 @@ def _resource_snapshot() -> dict:
 # ---------- 辅助 ----------
 
 def _find_task_by_report(report_id: int) -> str | None:
-    """Return the task that owns the report via the indexed report_versions row."""
-    from app.infrastructure.orm import ORMReportVersion
+    """Return the direct task owner of a report."""
+    from app.infrastructure.orm import ORMReport
     with session_scope() as s:
         row = s.execute(
-            select(ORMReportVersion.c.task_id)
-            .where(ORMReportVersion.c.report_id == int(report_id))
-            .order_by(ORMReportVersion.c.id.desc())
-            .limit(1)
+            select(ORMReport.c.task_id).where(ORMReport.c.id == int(report_id))
         ).mappings().first()
     task_id = str(row["task_id"] or "") if row else ""
-    return task_id if task_id else _find_task_by_short_memory(report_id)
-
-
-def _find_task_by_short_memory(report_id: int) -> str | None:
-    from app.infrastructure.orm import ORMShortMemory
-    with session_scope() as s:
-        rows = s.execute(select(ORMShortMemory.c.task_id, ORMShortMemory.c.payload)).all()
-    for task_id, payload_text in rows:
-        try:
-            payload = json.loads(payload_text or "{}")
-        except (TypeError, ValueError):
-            continue
-        if payload.get("report_id") == int(report_id):
-            return task_id
-    return None
+    return task_id or None
 
 
 def _sentence_details_bulk(rows) -> dict[int, dict]:

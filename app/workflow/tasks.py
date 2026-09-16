@@ -1,18 +1,14 @@
 """任务阶段定义与推进。"""
 from app.models import Stage
 
-_STAGE_ORDER = [
-    Stage.PARSING, Stage.MATERIAL_ANALYSIS, Stage.PLANNING,
-    Stage.EVIDENCE, Stage.CONFLICT, Stage.ANALYSIS, Stage.WRITING,
-    Stage.REVIEW, Stage.DONE,
-]
+from app.workflow.stages import STAGE_ORDER
 
-
-def next_stage(stage: Stage) -> Stage | None:
+def next_stage(stage: Stage | str) -> Stage | None:
     try:
-        index = _STAGE_ORDER.index(stage)
+        current = Stage(stage)
+        index = STAGE_ORDER.index(current)
     except ValueError:
         return None
-    if index + 1 >= len(_STAGE_ORDER):
+    if index + 1 >= len(STAGE_ORDER):
         return None
-    return _STAGE_ORDER[index + 1]
+    return STAGE_ORDER[index + 1]

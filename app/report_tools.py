@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 import re
 
+from app.planning.structure import normalize_text_list
+
 ACTUAL_SUPPORT = {"actual"}
 NON_ACTUAL_SUPPORT = {"normative", "template", "reference", "unknown"}
 
@@ -151,10 +153,6 @@ def build_chapter_evidence_matrix(plan: dict, profile: dict, facts: list[dict],
     }
 
 
-def looks_like_template_meta(text: str) -> bool:
-    return any(key in (text or "") for key in ("模板要求", "报告模板", "报告编制规范", "工作要求对", "需围绕"))
-
-
 def _match_requirement(requirement: str, facts: list[dict], allowed_roles: list[str]) -> list[dict]:
     terms = _terms(requirement)
     allowed = set(allowed_roles or [])
@@ -207,8 +205,8 @@ def _fact_match_text(fact: dict) -> str:
             fact.get("dimension", ""),
             fact.get("fact_type", ""),
             fact.get("content", ""),
-            " ".join(fact.get("source_roles") or []),
-            " ".join(fact.get("source_files") or []),
+            " ".join(normalize_text_list(fact.get("source_roles"))),
+            " ".join(normalize_text_list(fact.get("source_files"))),
         ]
     )
 
@@ -272,10 +270,6 @@ def _ngram_similarity(left: str, right: str, n: int = 2) -> float:
     if not grams_a or not grams_b:
         return 0.0
     return len(grams_a & grams_b) / max(len(grams_a), 1)
-
-
-def _looks_like_result_claim(text: str) -> bool:
-    return bool(re.search(r"(取得|形成|完成|实现|提升|增长|降低|达成|产出|获得).{0,12}(成果|成效|结果|指标|数据|影响|收益)", text or ""))
 
 
 def _dedup_text(items: list[str]) -> list[str]:

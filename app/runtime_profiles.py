@@ -1,4 +1,8 @@
-"""Stage-specific LLM capacity contracts derived from one physical window."""
+"""Workload-specific LLM capacity contracts derived from one physical window.
+
+These names describe model workload profiles, not persisted workflow stages.
+The workflow state protocol lives in ``app.workflow.stages``.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass

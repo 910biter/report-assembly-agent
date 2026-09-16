@@ -63,7 +63,8 @@ _POLICIES_BY_TOOL = {
     AgentToolName.RESUME_TASK.value: PropagationPolicy(99, "none", (), "control", "恢复当前任务"),
     AgentToolName.RETRY_TASK.value: PropagationPolicy(99, "none", (), "control", "重试当前任务"),
     AgentToolName.UPDATE_SECTION_TITLES.value: PropagationPolicy(
-        99, "none", ("qa", "render"), "title", "批量更新章节标题",
+        5, "writing", ("narrative_plan", "writing", "qa", "render"),
+        "title", "在写作阶段统一更新章节标题",
     ),
 }
 
@@ -85,8 +86,14 @@ _POLICIES_BY_ARTIFACT = {
         5, "writing", ("incremental_update_proposal",), "comparison", "更新该材料变化项",
     ),
     "report_title": PropagationPolicy(99, "none", ("qa", "render"), "title", "更新报告标题"),
-    "section_title": PropagationPolicy(99, "none", ("qa", "render"), "title", "更新章节标题"),
-    "section_titles": PropagationPolicy(99, "none", ("qa", "render"), "title", "批量更新章节标题"),
+    "section_title": PropagationPolicy(
+        5, "writing", ("narrative_plan", "writing", "qa", "render"),
+        "title", "在写作阶段统一更新章节标题",
+    ),
+    "section_titles": PropagationPolicy(
+        5, "writing", ("narrative_plan", "writing", "qa", "render"),
+        "title", "在写作阶段统一更新章节标题",
+    ),
     "task_control": PropagationPolicy(99, "none", (), "control", "执行任务操作"),
     "task_draft": PropagationPolicy(99, "none", (), "draft", "更新新建任务草稿"),
 }

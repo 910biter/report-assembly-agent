@@ -34,6 +34,25 @@ _NUM_HEADING_2 = re.compile(r"^\d+\.\d+(?:\.(?!\d)|[、\s])\s*\S+")
 _NUM_HEADING_3 = re.compile(r"^\d+\.\d+\.\d+[、\s]?\s*\S+")
 _NUM_HEADING = re.compile(r"^\d+(?:\.\d+)*[.、]?\s*\S+")
 _PLACEHOLDER = re.compile(r"(\{\{[^}]+\}\}|《[^》]+》|【[^】]+】|________+|_{4,})")
+_EXPLICIT_PLACEHOLDER = re.compile(r"(\{\{[^}]+\}\}|【(?:填写|说明|占位)[^】]*】|________+|_{4,}|[×xX]{2,})")
+
+# These are resource boundaries, not semantic rules. Every bounded scan is
+# exposed in the compiled schema so callers can distinguish a complete scan
+# from an intentionally limited one.
+_SCAN_LIMITS = {
+    "title_paragraphs": 8,
+    "heading_patterns": 20,
+    "tables": 10,
+    "table_rows": 5,
+    "table_cells": 8,
+    "heading_tree": 30,
+    "template_instructions": 50,
+    "metadata_fields": 20,
+    "signature_fields": 8,
+    "physical_placeholders": 50,
+    "header_footer_chars": 500,
+    "sample_chars": 120,
+}
 
 
 def compile_template(path) -> dict:
@@ -73,6 +92,7 @@ def compile_template(path) -> dict:
         },
         "components": _components(doc, role_paragraphs),
     }
+    schema["scan_audit"] = _template_scan_audit(doc)
     schema["quality"] = _quality(schema)
     return schema
 
@@ -84,6 +104,35 @@ def _sha256(path: Path) -> str:
             h.update(chunk)
     return h.hexdigest()
 
+
+
+def _template_scan_audit(doc) -> dict:
+    """Report bounded scans so resource limits never look like missing data."""
+    observed = {
+        "title_paragraphs": len([p for p in doc.paragraphs if p.text.strip()]),
+        "heading_patterns": sum(bool(_heading_items(p)) for p in doc.paragraphs),
+        "tables": len(doc.tables),
+        "table_rows": max((len(table.rows) for table in doc.tables), default=0),
+        "table_cells": max(
+            (max((len(row.cells) for row in table.rows), default=0) for table in doc.tables),
+            default=0,
+        ),
+        "template_instructions": sum(
+            1 for p in doc.paragraphs for chunk in _split_heading_instruction_chunks(p.text)
+            if chunk["role"] == "TEMPLATE_INSTRUCTION"
+        ),
+        "physical_placeholders": sum(
+            len(_PLACEHOLDER.findall(p.text)) for p in doc.paragraphs
+        ) + sum(
+            len(_PLACEHOLDER.findall(cell.text))
+            for table in doc.tables for row in table.rows for cell in row.cells
+        ),
+    }
+    truncated = [
+        key for key, value in observed.items()
+        if key in _SCAN_LIMITS and value > _SCAN_LIMITS[key]
+    ]
+    return {"limits": dict(_SCAN_LIMITS), "observed": observed, "truncated": truncated}
 
 def _document_layout(doc) -> dict:
     sections = []
@@ -135,7 +184,7 @@ def _document_structure(doc, role_paragraphs: dict) -> dict:
     title_para = role_paragraphs.get(ROLE_DOCUMENT_TITLE)
     return {
         "roles_detected": sorted(k for k, v in role_paragraphs.items() if v is not None),
-        "heading_patterns": headings[:20],
+        "heading_patterns": headings[:_SCAN_LIMITS["heading_patterns"]],
         "heading_tree": _heading_tree(headings),
         "template_instructions": _template_instructions(doc),
         "metadata_fields": _metadata_fields(doc),
@@ -165,7 +214,7 @@ def _detect_role_paragraphs(paragraphs: list) -> dict:
         ROLE_BODY: None,
         ROLE_SIGNATURE: None,
     }
-    title = _best_title_paragraph(paragraphs[:8])
+    title = _best_title_paragraph(paragraphs[:_SCAN_LIMITS["title_paragraphs"]])
     roles[ROLE_DOCUMENT_TITLE] = title
     body_candidates = [para for para in paragraphs if para is not title]
     roles[ROLE_BODY] = _best_body_paragraph(body_candidates)
@@ -175,7 +224,7 @@ def _detect_role_paragraphs(paragraphs: list) -> dict:
             roles[role] = para
     for para in body_candidates:
         text = para.text.strip()
-        if roles[ROLE_SIGNATURE] is None and re.search(r"(单位|日期|年\s*月\s*日|盖章|署名)", text):
+        if roles[ROLE_SIGNATURE] is None and _looks_like_signature(para):
             roles[ROLE_SIGNATURE] = para
     if roles[ROLE_BODY] is None and body_candidates:
         roles[ROLE_BODY] = next((p for p in body_candidates if _paragraph_role(p) == ROLE_BODY), body_candidates[0])
@@ -244,8 +293,6 @@ def _body_candidate_score(para) -> int:
         score -= 8
     if _looks_like_non_body_meta(text):
         score -= 20
-    if re.search(r"(报告|方案|综述|总结)$", text) and len(text) <= 28:
-        score -= 10
     return score
 
 
@@ -546,7 +593,7 @@ def _default_number(value, fallback: float):
 
 def _tables(doc) -> list[dict]:
     tables = []
-    for idx, table in enumerate(doc.tables[:10]):
+    for idx, table in enumerate(doc.tables[:_SCAN_LIMITS["tables"]]):
         tables.append({
             "index": idx,
             "rows": len(table.rows),
@@ -560,8 +607,8 @@ def _tables(doc) -> list[dict]:
 
 def _table_cells(table) -> list[dict]:
     cells = []
-    for r_idx, row in enumerate(table.rows[:5]):
-        for c_idx, cell in enumerate(row.cells[:8]):
+    for r_idx, row in enumerate(table.rows[:_SCAN_LIMITS["table_rows"]]):
+        for c_idx, cell in enumerate(row.cells[:_SCAN_LIMITS["table_cells"]]):
             text = "\n".join(p.text.strip() for p in cell.paragraphs if p.text.strip())
             cells.append({
                 "row": r_idx,
@@ -712,7 +759,7 @@ def _heading_tree(headings: list[dict]) -> list[dict]:
         else:
             roots.append(node)
         stack.append(node)
-    return roots[:30]
+    return roots[:_SCAN_LIMITS["heading_tree"]]
 
 
 def _looks_like_body_sample(para) -> bool:
@@ -732,20 +779,28 @@ def _looks_like_body_sample(para) -> bool:
 
 
 def _looks_like_non_body_meta(text: str) -> bool:
+    """Detect explicit placeholders, not domain-shaped prose."""
     stripped = text.strip()
     if not stripped:
         return True
-    if "××" in stripped or "XXX" in stripped.upper():
+    if _EXPLICIT_PLACEHOLDER.search(stripped):
         return True
     if re.fullmatch(r"[（(]?\d{4}\s*年度[）)]?", stripped):
         return True
     if re.fullmatch(r"[×xX]{1,4}\s*年\s*[×xX]?\s*月\s*[×xX]?\s*日", stripped):
         return True
-    if re.fullmatch(r".{1,20}(单位|部门|委员会|办公室)", stripped):
-        return True
-    if re.fullmatch(r"[（(].{1,30}[）)]", stripped):
-        return True
     return False
+
+
+def _looks_like_signature(para) -> bool:
+    text = para.text.strip()
+    style = (para.style.name or "").lower() if para.style is not None else ""
+    if any(marker in style for marker in ("signature", "落款", "签章", "署名")):
+        return True
+    return bool(
+        _EXPLICIT_PLACEHOLDER.search(text)
+        and re.search(r"(?:年\s*月\s*日|日期|date)", text, re.IGNORECASE)
+    )
 
 
 def _is_template_instruction(text: str) -> bool:
@@ -755,8 +810,7 @@ def _is_template_instruction(text: str) -> bool:
         or re.search(r"[【\[]\s*(?:填写|说明|关键词|占位|按需)[^】\]]*[】\]]", stripped)
         or ("填写" in stripped and "按《" in stripped)
         or ("填写" in stripped and ("[" in stripped or "。" in stripped))
-        or stripped.startswith(("示例：", "示例:", "范例：", "范例:"))
-        or "说明" in stripped
+        or stripped.startswith(("示例：", "示例:", "范例：", "范例:", "说明：", "说明:"))
     )
 
 
@@ -773,26 +827,26 @@ def _template_instructions(doc) -> list[dict]:
                     "paragraph_index": paragraph_index,
                     "render": False,
                 })
-    return instructions[:50]
+    return instructions[:_SCAN_LIMITS["template_instructions"]]
 
 
 def _role_sample_text(role: str, text: str) -> str:
     samples = _role_samples(role, text)
     if samples:
-        return samples[0][:120]
-    return text.strip()[:120]
+        return samples[0][:_SCAN_LIMITS["sample_chars"]]
+    return text.strip()[:_SCAN_LIMITS["sample_chars"]]
 
 
 def _role_samples(role: str, text: str) -> list[str]:
     if role in {ROLE_HEADING_1, ROLE_HEADING_2, ROLE_HEADING_3}:
-        return [item["text_pattern"] for item in _heading_items(text) if item["role"] == role] or [text.strip()[:120]]
+        return [item["text_pattern"] for item in _heading_items(text) if item["role"] == role] or [text.strip()[:_SCAN_LIMITS["sample_chars"]]]
     if role == ROLE_BODY:
         return [
-            chunk["text"][:120]
+            chunk["text"][:_SCAN_LIMITS["sample_chars"]]
             for chunk in _split_heading_instruction_chunks(text)
             if chunk["role"] == "TEMPLATE_INSTRUCTION" or not _heading_items(chunk["text"])
-        ][:3] or [text.strip()[:120]]
-    return [text.strip()[:120]]
+        ][:3] or [text.strip()[:_SCAN_LIMITS["sample_chars"]]]
+    return [text.strip()[:_SCAN_LIMITS["sample_chars"]]]
 
 
 def _split_heading_instruction_chunks(text: str) -> list[dict]:
@@ -806,7 +860,7 @@ def _split_heading_instruction_chunks(text: str) -> list[dict]:
             chunks.append({"role": current_heading, "text": line})
         else:
             chunks.append({
-                "role": "TEMPLATE_INSTRUCTION" if current_heading or _is_template_instruction(line) else ROLE_BODY,
+                "role": "TEMPLATE_INSTRUCTION" if _is_template_instruction(line) else ROLE_BODY,
                 "text": line,
             })
     return chunks
@@ -822,52 +876,59 @@ def _logical_lines(text: str) -> list[str]:
 
 
 def _metadata_fields(doc) -> list[dict]:
+    """Learn metadata fields from table structure, retaining unfamiliar labels."""
     fields = []
-    labels = ("报告单位", "报告时间", "报告主题", "报告编号")
+    canonical = {
+        "报告单位": "report_unit", "报告时间": "report_date",
+        "报告主题": "report_title", "报告编号": "report_no",
+    }
     for table in doc.tables:
         for row in table.rows:
-            for cell in row.cells:
-                text = cell.text.strip()
-                for label in labels:
-                    if label in text:
-                        fields.append({
-                            "label": label,
-                            "placeholder": _placeholder_name(label, "metadata"),
-                            "component": "METADATA_BLOCK",
-                            "text_pattern": _text_pattern(text),
-                        })
-                        break
+            cells = [cell.text.strip() for cell in row.cells]
+            for index, label in enumerate(cells):
+                if not label or len(label) > 40:
+                    continue
+                value = cells[index + 1] if index + 1 < len(cells) else ""
+                is_known = label in canonical
+                looks_like_field = not value or bool(_EXPLICIT_PLACEHOLDER.search(value)) or is_known
+                if not looks_like_field:
+                    continue
+                fields.append({
+                    "label": label,
+                    "raw_label": label,
+                    "canonical_label": canonical.get(label),
+                    "placeholder": canonical.get(label) or f"metadata_{len(fields) + 1}",
+                    "component": "METADATA_BLOCK",
+                    "text_pattern": _text_pattern(f"{label} {value}"),
+                })
     deduped = []
     seen = set()
     for field in fields:
-        key = (field["label"], field["text_pattern"])
+        key = (field["raw_label"], field["text_pattern"])
         if key not in seen:
             seen.add(key)
             deduped.append(field)
-    return deduped[:20]
+    return deduped[:_SCAN_LIMITS["metadata_fields"]]
 
 
 def _signature_fields(doc) -> list[dict]:
+    """Detect signature blocks structurally, not by organization vocabulary."""
     fields = []
     for para in doc.paragraphs:
         text = para.text.strip()
+        style = (para.style.name or "").lower() if para.style is not None else ""
         if not text:
             continue
-        if re.search(r"(×××单位|盖章|单位)", text) and re.search(r"(×年×月×日|年\s*月\s*日|日期)", text):
-            fields.append({
-                "placeholder": "signature_unit",
-                "component": "SIGNATURE_BLOCK",
-                "text_pattern": _text_pattern(text),
-            })
-            fields.append({
-                "placeholder": "signature_date",
-                "component": "SIGNATURE_BLOCK",
-                "text_pattern": _text_pattern(text),
-            })
-        elif re.search(r"(×××单位|盖章|单位)", text):
-            fields.append({"placeholder": "signature_unit", "component": "SIGNATURE_BLOCK", "text_pattern": _text_pattern(text)})
-        elif re.search(r"(×年×月×日|年\s*月\s*日|日期)", text):
-            fields.append({"placeholder": "signature_date", "component": "SIGNATURE_BLOCK", "text_pattern": _text_pattern(text)})
+        explicit_style = any(marker in style for marker in ("signature", "落款", "签章", "署名"))
+        has_placeholder = bool(_EXPLICIT_PLACEHOLDER.search(text))
+        has_date = bool(re.search(r"(?:年\s*月\s*日|日期|date)", text, re.IGNORECASE))
+        if not explicit_style and not (has_placeholder and has_date):
+            continue
+        pattern = _text_pattern(text)
+        if has_date:
+            fields.append({"placeholder": "signature_date", "component": "SIGNATURE_BLOCK", "text_pattern": pattern})
+        if explicit_style or has_placeholder:
+            fields.append({"placeholder": "signature_unit", "component": "SIGNATURE_BLOCK", "text_pattern": pattern})
     deduped = []
     seen = set()
     for field in fields:
@@ -875,7 +936,7 @@ def _signature_fields(doc) -> list[dict]:
         if key not in seen:
             seen.add(key)
             deduped.append(field)
-    return deduped[:8]
+    return deduped[:_SCAN_LIMITS["signature_fields"]]
 
 
 def _physical_placeholders(doc) -> list[dict]:
@@ -888,7 +949,7 @@ def _physical_placeholders(doc) -> list[dict]:
             for c_idx, cell in enumerate(row.cells):
                 for match in _PLACEHOLDER.findall(cell.text):
                     found.append({"text": match, "location": "table", "table": t_idx, "row": r_idx, "col": c_idx})
-    return found[:50]
+    return found[:_SCAN_LIMITS["physical_placeholders"]]
 
 
 def _placeholder_registry(doc, role_paragraphs: dict) -> dict:
@@ -953,7 +1014,7 @@ def _normalize_placeholder(text: str) -> str:
 
 
 def _header_footer_text(part) -> str:
-    return "\n".join(p.text.strip() for p in part.paragraphs if p.text.strip())[:500]
+    return "\n".join(p.text.strip() for p in part.paragraphs if p.text.strip())[:_SCAN_LIMITS["header_footer_chars"]]
 
 
 def _paragraph_style_from_any(para) -> dict:
@@ -1294,4 +1355,4 @@ def _text_pattern(text: str) -> str:
     text = re.sub(r"\d{4}年\d{1,2}月\d{1,2}日", "{{date}}", text)
     text = re.sub(r"\d+", "{{number}}", text)
     text = _PLACEHOLDER.sub("{{placeholder}}", text)
-    return text[:120]
+    return text[:_SCAN_LIMITS["sample_chars"]]

@@ -9,6 +9,7 @@ import json
 import re
 import threading
 import time
+from copy import deepcopy
 
 import numpy as np
 from sqlalchemy import delete, func, insert, select, update
@@ -17,7 +18,7 @@ from app.analysis.analyzer import AnalysisAgent
 from app.evidence.extractor import EvidenceAgent, load_evidence_quotes
 from app.planning.planner import PlannerAgent
 from app.writing.writer import WriterAgent, _chapter_position
-from app.report_tools import build_task_profile, business_block, looks_like_template_meta
+from app.report_tools import build_task_profile, business_block
 from app.cache import get_cached, set_cached, stable_hash
 from app.config import settings
 from app.db import session_scope
@@ -53,10 +54,11 @@ from app.task_runs import update_task_run
 from app.token_monitor import build_token_efficiency, build_workload_profile, token_context
 from app.context_budget import count_tokens, publish_context_audit, tokenizer_method, truncate_tokens
 from app.workflow.stage_state import stage_input_signature, signature_matches
+from app.workflow.stages import stage_rank
 
 _MATERIAL_ANALYSIS_PROMPT = """你是材料分析师。理解一份情报材料,输出 JSON:
 {
-  "doc_type": "材料类型(政策文件/新闻报道/研究报告/通知公告/统计资料等)",
+  "doc_type": "模型根据当前材料判断的开放材料形态标签；无法确定时写 unknown",
   "topic": "核心主题(一句话)",
   "key_points": ["核心观点或关键事实(2-4 条)"],
   "key_sections": ["重要章节或段落主题"],
@@ -78,6 +80,34 @@ analysis_agent = AnalysisAgent()
 writer_agent = WriterAgent()
 
 
+def _apply_section_title_changes_to_plan(plan: dict, changes: list[dict]) -> dict:
+    """Return a writing-only plan with approved title changes applied."""
+    mapping = {
+        str(item.get("old_title") or "").strip(): str(item.get("new_title") or "").strip()
+        for item in changes or []
+        if isinstance(item, dict)
+        and str(item.get("old_title") or "").strip()
+        and str(item.get("new_title") or "").strip()
+    }
+    if not mapping:
+        return deepcopy(plan or {})
+
+    def replace(value):
+        if isinstance(value, str):
+            return mapping.get(value, value)
+        if isinstance(value, list):
+            return [replace(item) for item in value]
+        if isinstance(value, dict):
+            return {key: replace(item) for key, item in value.items()}
+        return value
+
+    result = deepcopy(plan or {})
+    for key in ("structure", "chapter_plans", "analysis_plan_json", "final_plan_json"):
+        if key in result:
+            result[key] = replace(result[key])
+    return result
+
+
 def _analysis_groups(facts: list[dict], max_group_size: int | None = None) -> dict[str, list[dict]]:
     """Group facts for local analysis without domain-specific keywords."""
     max_group_size = max(1, int(max_group_size or settings.analysis_facts_per_batch))
@@ -93,7 +123,7 @@ def _analysis_groups(facts: list[dict], max_group_size: int | None = None) -> di
         buckets: dict[str, list[dict]] = {}
         for fact in items:
             need_id = int(fact.get("need_id") or 0)
-            fact_type = str(fact.get("fact_type") or "STATEMENT")
+            fact_type = str(fact.get("fact_type") or "unknown")
             key = f"{dimension} / need:{need_id or 'open'} / type:{fact_type}"
             buckets.setdefault(key, []).append(fact)
         for key, bucket in buckets.items():
@@ -139,18 +169,8 @@ class WorkflowController:
 
     def _resume_skips(self, stage: Stage) -> bool:
         """Return true when an approved checkpoint already finished this stage."""
-        order = {
-            str(Stage.PARSING): 1,
-            str(Stage.MATERIAL_ANALYSIS): 2,
-            str(Stage.PLANNING): 3,
-            str(Stage.EVIDENCE): 4,
-            str(Stage.CONFLICT): 5,
-            str(Stage.ANALYSIS): 6,
-            "final_plan": 7,
-            str(Stage.WRITING): 8,
-        }
         resume_from = str(self.task.get("resume_from_stage") or "")
-        return order.get(resume_from, 0) > order.get(str(stage), 99)
+        return stage_rank(resume_from) > stage_rank(stage)
 
     def run_to_review(self) -> str:
         """跑完 解析→去重→规划→事实→冲突→分析→写作,停在评审阶段等待用户。
@@ -313,9 +333,7 @@ class WorkflowController:
         else:
             from app.graph import graph_service
 
-            if graph_service.mode == "off":
-                self._update(graph_status={"status": "skipped", "reason": "graph_mode_off"})
-            elif (graph_service.has_task_graph(self.task_id)
+            if (graph_service.has_task_graph(self.task_id)
                   and self._graph_covers_facts(facts)):
                 stats = graph_service.task_graph(self.task_id).get("stats") or {}
                 self._update(graph_status={"status": "reused", **stats})
@@ -436,7 +454,7 @@ class WorkflowController:
                 self.finalize_report_structure()
             self._update(intervention_force_final_plan=False)
         elif self._resume_skips(Stage.WRITING):
-            self._update(stage=str(Stage.PLANNING), resume={"stage": "final_plan", "status": "reused_after_checkpoint"})
+            self._update(stage=str(Stage.FINAL_PLAN), resume={"stage": "final_plan", "status": "reused_after_checkpoint"})
         elif self.task.get("incremental_update"):
             # 增量 final_plan 策略:
             # - 无新增材料(补写模式):复用 base 规划,结构不变,只补写内容。
@@ -448,14 +466,14 @@ class WorkflowController:
             elif not self.task.get("incremental_added_material_ids"):
                 # A no-material revision deliberately inherits the approved
                 # structure unless the interaction explicitly forces replanning.
-                self._update(stage=str(Stage.PLANNING), resume={"stage": "final_plan", "status": "reused"})
+                self._update(stage=str(Stage.FINAL_PLAN), resume={"stage": "final_plan", "status": "reused"})
             else:
                 with self._token_context("final_planning"):
                     self.finalize_report_structure()
         elif self.task.get("final_plan_frozen") and signature_matches(
             self.task, "final_plan", final_plan_signature,
         ):
-            self._update(stage=str(Stage.PLANNING), resume={"stage": "final_plan", "status": "reused"})
+            self._update(stage=str(Stage.FINAL_PLAN), resume={"stage": "final_plan", "status": "reused"})
         else:
             with self._token_context("final_planning"):
                 self.finalize_report_structure()
@@ -488,7 +506,10 @@ class WorkflowController:
             )
             return "awaiting_directory"
         target_chapters = self._prepare_incremental_write_scope()
-        writing_signature = stage_input_signature("writing", self.task, plan=self._plan())
+        writing_plan = _apply_section_title_changes_to_plan(
+            self._plan(), self.task.get("intervention_section_title_changes") or [],
+        )
+        writing_signature = stage_input_signature("writing", self.task, plan=writing_plan)
         self._active_writing_signature = writing_signature
         targeted_revision = dict(self.task.get("intervention_target_scope") or {})
         if targeted_revision:
@@ -562,7 +583,20 @@ class WorkflowController:
                 if self.task.get("incremental_delta_id"):
                     attach_delta_version(int(self.task["incremental_delta_id"]), version.version_id, status="applied")
             except Exception as exc:
-                self._update(version_error=str(exc)[:200])
+                error = f"REPORT_VERSION_PERSIST_FAILED: {str(exc)[:400]}"
+                self._update(
+                    stage=str(Stage.FAILED),
+                    error=error,
+                    version_error=error,
+                    critical_path_done=False,
+                )
+                update_task_run(
+                    str(self.task.get("run_id") or ""),
+                    status="failed",
+                    metadata={"error": error, "stage": "writing"},
+                    finished=True,
+                )
+                raise RuntimeError(error) from exc
         _mark("write")
         ttfr = round(_time.time() - _t0, 1)
         run_id = str(self.task.get("run_id") or "")
@@ -966,7 +1000,7 @@ class WorkflowController:
 
     def finalize_report_structure(self) -> None:
         """Freeze final chapters after Evidence + Analysis, not before."""
-        self._update(stage=str(Stage.PLANNING))
+        self._update(stage=str(Stage.FINAL_PLAN))
         required_structure = list(self.task.get("intervention_required_structure") or [])
         if required_structure and self.task.get("intervention_force_final_plan"):
             final_plan = planner.revise_final_plan_structure(
@@ -1600,6 +1634,35 @@ class WorkflowController:
         from app.evidence.extractor import load_conflict_records
         return load_conflict_records(conflict_ids)
 
+    def _persist_section_title_plan(self, plan: dict, changes: list[dict]) -> None:
+        """Commit the plan view after the controller has written new sections."""
+        if not changes or not plan.get("id"):
+            return
+        with session_scope() as s:
+            row = s.execute(
+                select(ORMPlan).where(ORMPlan.c.id == int(plan["id"])).with_for_update()
+            ).mappings().first()
+            if row is None:
+                raise ValueError("PLAN_NOT_FOUND_AFTER_TITLE_REVISION")
+            try:
+                plan_version = int(row.get("plan_version") or 0) + 1
+            except (TypeError, ValueError):
+                plan_version = 1
+            analysis_snapshot = deepcopy(plan.get("analysis_plan_json") or {})
+            final_snapshot = deepcopy(plan.get("final_plan_json") or {})
+            if isinstance(analysis_snapshot, dict) and analysis_snapshot:
+                analysis_snapshot["plan_version"] = plan_version
+            if isinstance(final_snapshot, dict) and final_snapshot:
+                final_snapshot["plan_version"] = plan_version
+            values = {
+                "structure": json.dumps(plan.get("structure") or [], ensure_ascii=False),
+                "chapter_plans": json.dumps(plan.get("chapter_plans") or [], ensure_ascii=False),
+                "analysis_plan_json": json.dumps(analysis_snapshot, ensure_ascii=False),
+                "final_plan_json": json.dumps(final_snapshot, ensure_ascii=False),
+                "plan_version": plan_version,
+            }
+            s.execute(update(ORMPlan).where(ORMPlan.c.id == int(plan["id"])).values(**values))
+
     def _remove_intervention_obsolete_sections(self) -> None:
         """Remove replaced chapters only after their replacement finished successfully."""
         report_id = int(self.task.get("report_id") or 0)
@@ -1727,7 +1790,7 @@ class WorkflowController:
         }
 
     def write(self, target_chapter_titles: list[str] | None = None) -> None:
-        self._update(stage=str(Stage.WRITING), write_progress={
+        self._update(stage=str(Stage.NARRATIVE), write_progress={
             "done": 0,
             "total": 0,
             "chapter": "",
@@ -1737,6 +1800,8 @@ class WorkflowController:
         from app.planning.scale import normalize_execution_plan
 
         plan = normalize_execution_plan(self._plan())
+        section_title_changes = list(self.task.get("intervention_section_title_changes") or [])
+        plan = _apply_section_title_changes_to_plan(plan, section_title_changes)
         if self.task.get("incremental_update_reason"):
             plan = {**plan, "update_instruction": str(self.task.get("incremental_update_reason") or "")}
         facts = self._facts()
@@ -1782,6 +1847,21 @@ class WorkflowController:
             "status": "starting",
             "elapsed_seconds": 0,
         })
+        def _write_progress(done, total, chapter, status, elapsed):
+            # Narrative planning happens inside Writer immediately before the
+            # first chapter output; expose that boundary without changing the
+            # Writer API or its per-chapter callback contract.
+            self._update(
+                stage=str(Stage.WRITING),
+                write_progress={
+                    "done": done,
+                    "total": total,
+                    "chapter": chapter,
+                    "status": status,
+                    "elapsed_seconds": elapsed,
+                },
+            )
+
         report = writer_agent.write(
             plan, facts, inferences,
             style_block,
@@ -1790,13 +1870,7 @@ class WorkflowController:
             institution_rules=self._effective_institution_rules(variant),
             task_profile=self.task.get("task_profile") or {},
             report_policy=self.task.get("report_policy") or {},
-            progress_callback=lambda done, total, chapter, status, elapsed: self._update(write_progress={
-                "done": done,
-                "total": total,
-                "chapter": chapter,
-                "status": status,
-                "elapsed_seconds": elapsed,
-            }),
+            progress_callback=_write_progress,
             existing_report_id=self.task.get("report_id"),
             report_callback=lambda report: self._update(report_id=report.id),
             chapter_callback=self._record_chapter_artifact,
@@ -1805,6 +1879,8 @@ class WorkflowController:
             run_id=str(self.task.get("run_id") or ""),
         )
         self._update(report_id=report.id)
+        if section_title_changes:
+            self._persist_section_title_plan(plan, section_title_changes)
         # 验证闭环:只执行确定性、可逆修复；事实与数字疑点保留原文并进入复核。
         self._auto_revision(report.id, plan, facts, inferences, variant)
         self._normalize_report_order(report.id, plan)
@@ -1836,6 +1912,7 @@ class WorkflowController:
 
     def _run_quality_check(self, variant, plan: dict, report_id: int) -> None:
         """报告质量检查:重复/模板缺失/术语违规/机构规则/逻辑跳跃 → qa_notes 供人工审核。"""
+        self._update(stage=str(Stage.QA))
         from app.quality import run_quality_check
 
         forbidden = (variant.terminology or {}).get("forbidden", []) if variant else []
@@ -2058,7 +2135,6 @@ class WorkflowController:
             quote_by_fact.setdefault(ev["fact_id"], []).append(ev["quote"])
         untraced_issues = 0
         numeric_issues = 0
-        template_meta_issues = 0
         for row in rows:
             try:
                 refs = _json.loads(row["source_refs"] or "{}")
@@ -2070,12 +2146,6 @@ class WorkflowController:
                 if row["source_level"] in {"TRANSITION", "SUBHEADING"}:
                     continue
                 untraced_issues += 1
-                continue
-            if (
-                (self.task.get("task_profile") or {}).get("report_mode") == "requirement_summary"
-                and looks_like_template_meta(row["content"])
-            ):
-                template_meta_issues += 1
                 continue
             sentence_digits = set(digit_re.findall(row["content"]))
             fact_digits: set[str] = set()
@@ -2090,7 +2160,6 @@ class WorkflowController:
             "deterministic_fixes": 0,
             "untraced_issues": untraced_issues,
             "numeric_issues": numeric_issues,
-            "template_meta_issues": template_meta_issues,
         })
 
     def _normalize_report_order(self, report_id: int, plan: dict) -> None:

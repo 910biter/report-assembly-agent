@@ -52,9 +52,10 @@ _SYSTEM = """你是情报报告分析规划师。根据用户主题、材料摘�
 3. dimensions/required_facts 只是优先检索与重点发现方向,不是事实边界;Evidence 必须允许材料中出现的高价值新事实进入
 4. 初步分析假设不是最终叙事逻辑,后续 Final Planner 不需要继承,应以真实 Facts/Inferences 为准
 5. 规模预算依据:用户明确字数要求(如有)、报告类型档位
-   (简要约2000-4000字/标准约5000-10000字/深度约10000-20000字)、材料信息量、章节数与重要性。
+   用户明确篇幅（如有）、材料信息量、章节数与重要性；未明确时不要套用预设字数档位。
 6. 最终报告结构将在 Evidence + Analysis 后另行生成,届时由真实 Fact/Inference 和核心结论决定。
-7. 【证据需求拆分——最重要的要求】evidence_needs 应覆盖完成用户目标所需的可查证问题:
+    7. handles_missing_information 必须根据本章目的判断是否需要主动说明材料缺口;不要根据标题关键词猜测。
+    8. 【证据需求拆分——最重要的要求】evidence_needs 应覆盖完成用户目标所需的可查证问题:
    - 根据当前主题和材料实时识别关键方面,每个独立且可查证的方面形成一个 need；
      数量由任务复杂度和材料信息量决定,不使用固定下限或领域维度清单
    - 每个 need 必须是"可被材料证实/证伪的一句话子问题",避免宽泛无法查证的表述
@@ -74,7 +75,8 @@ _FINAL_SYSTEM = """你是情报报告结构总规划师。现在 Evidence 与 An
   "core_judgment": "报告核心判断/主线结论",
   "narrative_logic": "最终叙事逻辑:章节如何递进",
   "document_shape": {
-    "kind": "structured_report/research_review/article_sections/continuous_article/message_push/news_release",
+    "kind": "模型根据用户目标、材料和文风概括的开放文档形态标签；无法确定时写 unknown",
+    "raw_kind": "模型的原始形态判断，必须保留，不得为符合枚举改写",
     "heading_policy": "numbered/plain/none",
     "section_policy": "required/optional/hidden",
     "subheading_policy": "numbered/plain/hidden",
@@ -101,6 +103,8 @@ _FINAL_SYSTEM = """你是情报报告结构总规划师。现在 Evidence 与 An
       "relation_to_prev": "与上一章关系",
       "required_facts": ["本章需要覆盖的事实主题"],
       "required_inferences": ["本章需要覆盖的分析判断"],
+      "handles_missing_information": true,
+      "missing_information": ["本章需要明确说明的证据缺口"],
       "primary_fact_ids": [1, 2],
       "primary_inference_ids": [3],
       "subsections": [
@@ -498,6 +502,7 @@ def _plan_snapshot(plan: ReportPlan, stage: str) -> dict:
         "document_shape": plan.document_shape,
         "composition_mode": plan.composition_mode,
         "user_requirements": plan.user_requirements,
+        "plan_version": plan.plan_version,
     }
 
 
@@ -535,8 +540,23 @@ def update_plan(plan: ReportPlan) -> ReportPlan:
     plan.structure = [c.get("title", "") for c in plan.chapter_plans]
     with session_scope() as s:
         # plan_version 自增 + finalized_at(原 SQL 语义)
-        row = s.execute(select(ORMPlan.c.plan_version).where(ORMPlan.c.id == plan.id)).first()
+        row = s.execute(
+            select(ORMPlan.c.plan_version)
+            .where(ORMPlan.c.id == plan.id)
+            .with_for_update()
+        ).first()
         next_version = int(row[0] or 1) + 1 if row else 1
+        plan.plan_version = next_version
+        plan.plan_stage = "final"
+        final_payload = dict(plan.final_plan_json or _plan_snapshot(plan, "final"))
+        final_payload.update({
+            "stage": "final",
+            "plan_version": next_version,
+            "structure": plan.structure,
+            "chapter_plans": plan.chapter_plans,
+            "budget": plan.budget,
+        })
+        plan.final_plan_json = final_payload
         s.execute(
             update(ORMPlan)
             .where(ORMPlan.c.id == plan.id)
@@ -549,7 +569,7 @@ def update_plan(plan: ReportPlan) -> ReportPlan:
                 budget=json.dumps(plan.budget, ensure_ascii=False),
                 plan_stage="final",
                 plan_version=next_version,
-                final_plan_json=json.dumps(plan.final_plan_json or _plan_snapshot(plan, "final"), ensure_ascii=False),
+                final_plan_json=json.dumps(final_payload, ensure_ascii=False),
                 finalized_at=_time.strftime("%Y-%m-%d %H:%M:%S"),
             )
         )

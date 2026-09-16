@@ -99,13 +99,13 @@ def annotate_exemplars(exemplars: list[dict], annotations: list[dict]) -> list[d
         discourse_moves = annotation.get("discourse_moves") if isinstance(annotation.get("discourse_moves"), list) else []
         if purpose:
             exemplar["purpose"] = purpose[:160]
-        if sample_type in {"opening", "fact", "analysis", "risk", "conclusion", "transition"}:
-            exemplar["sample_type"] = sample_type
+        if sample_type:
+            exemplar["sample_type"] = sample_type[:64]
         exemplar["tags"] = [str(tag)[:40] for tag in tags[:8] if str(tag).strip()]
         if realization_mode:
             exemplar["realization_mode"] = realization_mode[:80]
-        if rhetorical_role in {"opening", "fact", "analysis", "risk", "conclusion", "transition"}:
-            exemplar["rhetorical_role"] = rhetorical_role
+        if rhetorical_role:
+            exemplar["rhetorical_role"] = rhetorical_role[:64]
         if discourse_moves:
             exemplar["discourse_moves"] = [str(move)[:32] for move in discourse_moves[:6] if str(move).strip()]
     return exemplars

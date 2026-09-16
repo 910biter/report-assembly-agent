@@ -1,4 +1,4 @@
-export type TaskStage = "created" | "parsing" | "dedup" | "material_analysis" | "requirement_review" | "planning" | "evidence" | "conflict" | "analysis" | "directory_review" | "writing" | "review" | "done" | "failed" | "paused" | string;
+export type TaskStage = "created" | "parsing" | "material_analysis" | "requirement_review" | "planning" | "evidence" | "conflict" | "analysis" | "final_plan" | "directory_review" | "narrative" | "writing" | "qa" | "review" | "done" | "failed" | "paused" | string;
 
 export interface TaskSummary {
   task_id: string;

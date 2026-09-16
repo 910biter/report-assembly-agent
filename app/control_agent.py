@@ -11,7 +11,7 @@ from enum import Enum
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.db import session_scope
 from app.infrastructure.orm import (
@@ -24,6 +24,7 @@ from app.retrieval.rag import hybrid_retrieve_units
 from app.retrieval.embedder import embed_texts
 from app.retrieval.store import vector_store
 from app.workflow.queue import request_control, task_queue_status
+from app.workflow.stages import STAGE_LABELS, workflow_map
 
 
 class AgentToolName(str, Enum):
@@ -105,35 +106,12 @@ class AgentToolCall(BaseModel):
     reason: str = ""
 
 
-_STAGE_LABELS = {
-    "created": "等待开始", "parsing": "材料解析", "dedup": "去重归并",
-    "material_analysis": "材料理解", "requirement_review": "需求讨论", "planning": "分析规划", "evidence": "事实与证据",
-    "conflict": "冲突核验", "analysis": "综合分析", "directory_review": "目录讨论", "writing": "报告生成",
-    "review": "等待审核", "done": "已完成",
-    "paused": "已暂停", "failed": "运行异常",
-}
-
-_WORKFLOW_MAP = [
-    {"stage": "parsing", "purpose": "将材料转换为带页码和来源位置的内容单元", "artifact": "Units"},
-    {"stage": "material_analysis", "purpose": "判断材料角色、可证明范围和缺失信息", "artifact": "MaterialInsight"},
-    {"stage": "requirement_review", "purpose": "基于材料理解与用户共同确定报告目标和要求", "artifact": "TaskRequirements"},
-    {"stage": "planning", "purpose": "规划分析问题与证据需求，不提前冻结最终目录", "artifact": "AnalysisPlan"},
-    {"stage": "evidence", "purpose": "提取事实并绑定原始证据", "artifact": "Fact/Evidence"},
-    {"stage": "conflict", "purpose": "核验多来源对同一事项的矛盾", "artifact": "Conflict"},
-    {"stage": "analysis", "purpose": "基于事实形成带置信度的推论", "artifact": "Inference"},
-    {"stage": "final_plan", "purpose": "根据事实和推论形成最终内容结构", "artifact": "FinalReportPlan"},
-    {"stage": "directory_review", "purpose": "让用户审阅并调整最终目录", "artifact": "FinalReportPlan"},
-    {"stage": "narrative", "purpose": "组织章节主线、话题和逻辑顺序", "artifact": "NarrativePlan"},
-    {"stage": "writing", "purpose": "调用 Writer 按章节自然成文并绑定来源", "artifact": "Report/ChapterDraft"},
-    {"stage": "qa", "purpose": "发现事实、结构、语言和格式问题", "artifact": "QAResult"},
-]
-
 _TOOL_DEFINITIONS = {
     AgentToolName.GET_TASK_OVERVIEW: (False, "读取任务状态、进度、异常和产物数量"),
     AgentToolName.GET_TASK_MAP: (False, "读取任务全景、当前产物摘要和待处理事项"),
     AgentToolName.GET_TASK_TEMPLATE: (False, "读取当前任务实际使用的模板画像与版式边界"),
     AgentToolName.GET_FOCUSED_ARTIFACT: (False, "读取用户当前选中对象及其任务内真实内容、引用和来源"),
-    AgentToolName.GET_MATERIALS: (False, "读取任务材料及材料理解结果"),
+    AgentToolName.GET_MATERIALS: (False, "读取任务材料及任务内材料理解结果"),
     AgentToolName.SEARCH_MATERIAL_UNITS: (False, "按问题检索当前任务材料的原始片段和来源位置"),
     AgentToolName.LIST_FACTS: (False, "浏览当前任务事实摘要，并按关键词或维度筛选"),
     AgentToolName.SEARCH_FACT_EVIDENCE: (False, "按问题混合检索任务事实及其证据"),
@@ -217,6 +195,11 @@ def tool_manifest() -> list[dict[str, Any]]:
                 "reference_fact_ids": ["用户额外引用的事实 ID"],
                 "reference_inference_ids": ["用户额外引用的推论 ID"],
             }
+        elif name == AgentToolName.GET_MATERIALS:
+            item["arguments"] = {
+                "offset": "结果偏移量，默认 0",
+                "limit": "本次返回数量，默认 24，最多 50",
+            }
         elif name == AgentToolName.REGENERATE_CHAPTER:
             item["arguments"] = {"chapter_title": "现有章节标题", "instruction": "本轮具体修改要求"}
         elif name == AgentToolName.UPDATE_REPORT_TITLE:
@@ -297,7 +280,7 @@ def build_task_agent_context(task_id: str, focus: dict | None = None) -> TaskAge
         theme=str(task.get("theme") or ""),
         user_requirements=str(task.get("user_requirements") or ""),
         stage=str(task.get("stage") or "created"),
-        stage_label=_STAGE_LABELS.get(str(task.get("stage") or "created"), str(task.get("stage") or "处理中")),
+        stage_label=STAGE_LABELS.get(str(task.get("stage") or "created"), str(task.get("stage") or "处理中")),
         workflow_mode=str(task.get("workflow_mode") or "automatic"),
         requirement_review_pending=bool(task.get("requirement_review_pending", task.get("planning_review_pending"))),
         directory_review_pending=bool(task.get("directory_review_pending")),
@@ -310,7 +293,7 @@ def build_task_agent_context(task_id: str, focus: dict | None = None) -> TaskAge
         },
         artifact_counts=artifact_counts,
         available_artifacts=available,
-        workflow_map=_WORKFLOW_MAP,
+        workflow_map=workflow_map(),
         current_focus=ArtifactFocus.model_validate(focus or {}),
         error=str(task.get("error") or task.get("failure_reason") or ""),
     )
@@ -329,9 +312,7 @@ def validate_agent_tool_call(call: AgentToolCall, context: TaskAgentContext,
         arguments["updated_theme"] = str(arguments.get("updated_theme") or context.theme).strip()
     elif call.tool_name == AgentToolName.REVISE_ANALYSIS_PLAN:
         dimensions = _clean_text_list(arguments.get("required_dimensions"))
-        expected = _positive_int(arguments.get("required_dimension_count")) or next((
-            value for value in (_declared_count(message, unit) for unit in ("维度", "方面", "问题")) if value
-        ), 0)
+        expected = _positive_int(arguments.get("required_dimension_count"))
         if dimensions and expected and len(dimensions) != expected:
             raise ValueError(f"分析维度数量不一致：用户要求 {expected} 个，提案识别到 {len(dimensions)} 个")
         arguments.update(required_dimensions=dimensions, required_dimension_count=expected)
@@ -344,9 +325,7 @@ def validate_agent_tool_call(call: AgentToolCall, context: TaskAgentContext,
         )
         if context.directory_review_pending and not structure:
             raise ValueError("目录讨论阶段需要助手先形成完整的新目录提案")
-        expected = _positive_int(arguments.get("required_chapter_count")) or next((
-            value for value in (_declared_count(message, unit) for unit in ("章", "部分")) if value
-        ), 0) or len(structure)
+        expected = _positive_int(arguments.get("required_chapter_count")) or len(structure)
         if structure and expected and len(structure) != expected:
             raise ValueError(f"章节数量不一致：用户要求 {expected} 章，提案识别到 {len(structure)} 章")
         arguments.update(new_structure=structure, required_chapter_count=expected)
@@ -524,25 +503,6 @@ def _positive_int(value: Any) -> int:
     return parsed if parsed > 0 else 0
 
 
-def _declared_count(message: str, unit: str) -> int:
-    match = re.search(rf"(?:划分|分成|调整为|改为|保留|形成|共)?\s*([一二三四五六七八九十\d]+)\s*个?{unit}", str(message or ""))
-    if not match:
-        return 0
-    raw = match.group(1)
-    if raw.isdigit():
-        return int(raw)
-    numerals = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6,
-                "七": 7, "八": 8, "九": 9, "十": 10}
-    if raw in numerals:
-        return numerals[raw]
-    if raw.startswith("十"):
-        return 10 + numerals.get(raw[1:], 0)
-    if "十" in raw:
-        left, right = raw.split("十", 1)
-        return numerals.get(left, 0) * 10 + numerals.get(right, 0)
-    return 0
-
-
 def execute_read_tool(name: AgentToolName, arguments: dict[str, Any], context: TaskAgentContext) -> dict[str, Any]:
     if name == AgentToolName.GET_TASK_OVERVIEW:
         queue = task_queue_status()
@@ -567,7 +527,11 @@ def execute_read_tool(name: AgentToolName, arguments: dict[str, Any], context: T
             include_details=bool(arguments.get("include_details")),
         )
     if name == AgentToolName.GET_MATERIALS:
-        return _load_materials(context.task_id)
+        return _load_materials(
+            context.task_id,
+            offset=int(arguments.get("offset") or 0),
+            limit=int(arguments.get("limit") or 24),
+        )
     if name == AgentToolName.SEARCH_MATERIAL_UNITS:
         return _search_material_units(
             context.task_id,
@@ -1015,12 +979,10 @@ def _load_material_role(task_id: str, material_id: int) -> dict[str, Any]:
             ORMInsight.c.task_id == task_id,
             ORMInsight.c.material_id == material_id,
         ).order_by(ORMInsight.c.id.desc())).mappings().first()
-        if row is None:
-            row = s.execute(select(ORMInsight).where(
-                ORMInsight.c.material_id == material_id,
-            ).order_by(ORMInsight.c.id.desc())).mappings().first()
     return {
         "exists": row is not None,
+        "status": "available" if row else "missing",
+        "message": "已找到当前任务的材料理解结果。" if row else "当前任务尚未生成该材料的理解结果，不能使用其他任务的判断。",
         "doc_type": row["doc_type"] if row else "",
         "topic": row["topic"] if row else "",
         "material_role": row["material_role"] if row else "",
@@ -1043,7 +1005,7 @@ def _load_report_paragraph(report_id: int | None, section: str, paragraph: int) 
             ORMSentence.c.report_id == int(report_id),
             ORMSentence.c.section == section,
             ORMSentence.c.paragraph == paragraph,
-        ).order_by(ORMSentence.c.order_index.asc())).mappings().all()
+        ).order_by(ORMSentence.c.position.asc())).mappings().all()
     return {
         "artifact_type": "paragraph",
         "exists": bool(rows),
@@ -1065,20 +1027,21 @@ def _load_quality_issue_at(context: TaskAgentContext, index: int) -> dict[str, A
     return {"exists": True, "issue": issues[index]}
 
 
-def _load_materials(task_id: str) -> dict[str, Any]:
+def _load_materials(task_id: str, *, offset: int = 0, limit: int = 24) -> dict[str, Any]:
     task = short_term.load_task(task_id) or {}
     ids = [int(item) for item in task.get("material_ids") or [] if str(item).isdigit()]
+    page_offset, page_limit = _clamp_page(offset, limit, maximum=50)
     with session_scope() as s:
-        materials = s.execute(select(ORMMaterial).where(ORMMaterial.c.id.in_(ids))).mappings().all() if ids else []
+        materials = s.execute(select(ORMMaterial).where(
+            ORMMaterial.c.id.in_(ids),
+        ).order_by(ORMMaterial.c.id).offset(page_offset).limit(page_limit)).mappings().all() if ids else []
         insights = s.execute(select(ORMInsight).where(
             ORMInsight.c.task_id == task_id, ORMInsight.c.material_id.in_(ids),
         )).mappings().all() if ids else []
-        historical_insights = s.execute(select(ORMInsight).where(
-            ORMInsight.c.material_id.in_(ids),
-        ).order_by(ORMInsight.c.id.desc())).mappings().all() if ids else []
+        total = s.execute(select(func.count()).select_from(ORMMaterial).where(
+            ORMMaterial.c.id.in_(ids),
+        )).scalar_one() if ids else 0
     roles = {int(row["material_id"]): row for row in insights}
-    for row in historical_insights:
-        roles.setdefault(int(row["material_id"]), row)
     def bounded(value: Any, limit: int) -> tuple[Any, bool]:
         """Keep collaboration context bounded and disclose every truncation."""
         parsed = _json(value, value)
@@ -1108,6 +1071,8 @@ def _load_materials(task_id: str) -> dict[str, Any]:
             "missing_information": missing_information,
             "allowed_usage": allowed_usage,
             "forbidden_usage": forbidden_usage,
+            "insight_status": "available" if insight else "missing",
+            "insight_missing": not bool(insight),
             "truncated_fields": [
                 name for name, truncated in (
                     ("key_sections", sections_truncated),
@@ -1121,8 +1086,13 @@ def _load_materials(task_id: str) -> dict[str, Any]:
     return {
         "materials": material_views,
         "material_count": len(material_views),
+        "total": int(total),
+        "offset": page_offset,
+        "limit": page_limit,
         "returned_count": len(material_views),
-        "notice": "字段标记为 truncated_fields 时，请使用 search_material_units 核验原文，不得将摘要当作完整材料。",
+        "next_offset": page_offset + page_limit if page_offset + page_limit < int(total) else None,
+        "truncated": page_offset + len(material_views) < int(total),
+        "notice": "字段标记为 truncated_fields 时，请使用 search_material_units 核验原文；insight_status=missing 表示当前任务尚未完成材料理解，不得借用其他任务结果。",
     }
 
 

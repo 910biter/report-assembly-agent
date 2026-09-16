@@ -55,6 +55,14 @@
   --health-soft: rgba(79, 178, 134, 0.16);
   --surface-accent: rgba(124, 92, 255, 0.055);
   --surface-highlight: rgba(255, 255, 255, 0.045);
+  --graph-canvas: #101217;
+  --graph-node-fill: #273448;
+  --graph-node-border: #83a9d2;
+  --graph-node-text: #ffffff;
+  --graph-edge: #9aafc5;
+  --graph-edge-text: #ffffff;
+  --graph-label-bg: #171922;
+  --graph-label-border: rgba(255, 255, 255, 0.2);
   --control-highlight: rgba(255, 255, 255, 0.07);
   --scrim: rgba(0, 0, 0, 0.42);
   /* Document paper is intentionally light: it represents the exported report, not app chrome. */
@@ -161,6 +169,14 @@
   --health-soft: rgba(45, 139, 108, 0.13);
   --surface-accent: rgba(27, 31, 38, 0.04);
   --surface-highlight: rgba(255, 255, 255, 0.7);
+  --graph-canvas: #f1f4f8;
+  --graph-node-fill: #e1ebf5;
+  --graph-node-border: #426f9b;
+  --graph-node-text: #203246;
+  --graph-edge: #526d86;
+  --graph-edge-text: #263747;
+  --graph-label-bg: #ffffff;
+  --graph-label-border: rgba(27, 31, 38, 0.2);
   --control-highlight: rgba(255, 255, 255, 0.8);
   --scrim: rgba(30, 38, 53, 0.22);
   --ring: rgba(102, 83, 188, 0.3);

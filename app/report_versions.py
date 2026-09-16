@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 from collections import defaultdict
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
 
@@ -41,14 +42,32 @@ class VersionSnapshot:
 
 
 def ensure_report_version(report_id: int, task_id: str = "", status: str = "snapshot",
-                          change_summary: str = "", kind: str = "major") -> VersionSnapshot:
+                          change_summary: str = "", kind: str = "major", _session=None) -> VersionSnapshot:
     """Create a new immutable version unless the latest snapshot is identical.
 
     ``version_no`` is a monotonic database sequence. Human-facing major/minor
     components are stored separately, so v2.10 never collapses into v2.1.
     """
-    snapshot = build_report_snapshot(report_id, task_id=task_id)
-    with session_scope() as s:
+    manager = session_scope() if _session is None else nullcontext(_session)
+    with manager as s:
+        report = s.execute(
+            select(ORMReport.c.id, ORMReport.c.task_id)
+            .where(ORMReport.c.id == report_id)
+            .with_for_update()
+        ).mappings().first()
+        if report is None:
+            raise ValueError("REPORT_NOT_FOUND")
+        owner = str(report.get("task_id") or "")
+        if owner and task_id and owner != task_id:
+            raise ValueError("REPORT_TASK_MISMATCH")
+        if task_id and not owner:
+            s.execute(
+                update(ORMReport)
+                .where(ORMReport.c.id == report_id)
+                .values(task_id=task_id)
+            )
+            owner = task_id
+        snapshot = build_report_snapshot(report_id, task_id=owner or task_id, _session=s)
         latest = s.execute(
             select(ORMReportVersion)
             .where(ORMReportVersion.c.report_id == report_id)
@@ -117,14 +136,18 @@ def latest_report_version(report_id: int) -> dict[str, Any] | None:
     return _version_detail(row) if row is not None else None
 
 
-def build_report_snapshot(report_id: int, task_id: str = "") -> dict[str, Any]:
+def build_report_snapshot(report_id: int, task_id: str = "", *, _session=None) -> dict[str, Any]:
     """Read the current mutable report state and convert it into a snapshot."""
-    with session_scope() as s:
+    manager = session_scope() if _session is None else nullcontext(_session)
+    with manager as s:
         report = s.execute(select(ORMReport).where(ORMReport.c.id == report_id)).mappings().first()
         if report is None:
             raise ValueError("REPORT_NOT_FOUND")
         plan = s.execute(select(ORMPlan).where(ORMPlan.c.id == report["plan_id"])).mappings().first()
-        task_id = task_id or _find_task_by_report_in_session(s, report_id) or ""
+        owner = str(report.get("task_id") or "")
+        if owner and task_id and owner != task_id:
+            raise ValueError("REPORT_TASK_MISMATCH")
+        task_id = owner or task_id or ""
         task_payload = _task_payload_in_session(s, task_id)
         material_ids = [int(mid) for mid in (task_payload.get("material_ids") or []) if str(mid).isdigit()]
         fact_ids = [int(fid) for fid in (task_payload.get("fact_ids") or []) if str(fid).isdigit()]
@@ -204,7 +227,8 @@ def get_report_version(version_id: int) -> dict[str, Any] | None:
 
 
 def create_incremental_delta(report_id: int, added_material_ids: list[int],
-                             update_reason: str = "", run_id: str = "") -> dict[str, Any]:
+                             update_reason: str = "", run_id: str = "",
+                             _session=None) -> dict[str, Any]:
     """Create a conservative delta preview for future incremental update runs.
 
     This does not rewrite the report. It records deterministic material changes
@@ -212,7 +236,8 @@ def create_incremental_delta(report_id: int, added_material_ids: list[int],
     the planner a safe handoff object for the next implementation step.
     """
     added_material_ids = [int(mid) for mid in added_material_ids if str(mid).isdigit()]
-    with session_scope() as s:
+    manager = session_scope() if _session is None else nullcontext(_session)
+    with manager as s:
         latest = s.execute(
             select(ORMReportVersion)
             .where(ORMReportVersion.c.report_id == report_id)
@@ -220,7 +245,7 @@ def create_incremental_delta(report_id: int, added_material_ids: list[int],
         ).mappings().first()
         if latest is None:
             raise ValueError("REPORT_VERSION_REQUIRED")
-        current = build_report_snapshot(report_id, task_id=latest["task_id"])
+        current = build_report_snapshot(report_id, task_id=latest["task_id"], _session=s)
         old_materials = _json_load(latest["material_fingerprints"], [])
         old_facts = _json_load(latest["fact_snapshot"], [])
         old_inferences = _json_load(latest["inference_snapshot"], [])
@@ -261,7 +286,7 @@ def create_incremental_delta(report_id: int, added_material_ids: list[int],
             )
         )
         delta_id = int(cur.inserted_primary_key[0])
-    return get_report_delta(delta_id) or {"id": delta_id}
+    return get_report_delta(delta_id) or {"id": delta_id} if _session is None else {"id": delta_id}
 
 
 def attach_delta_version(delta_id: int, version_id: int, status: str = "applied") -> None:
@@ -545,6 +570,38 @@ def _plan_snapshot(plan) -> dict[str, Any]:
     }
 
 
+def _restore_plan_values(
+    plan_snapshot: dict[str, Any],
+    scale_snapshot: dict[str, Any] | None = None,
+    fallback_title: str = "",
+    fallback_requirements: str = "",
+) -> dict[str, Any]:
+    """Build one consistent set of mutable plan fields for version restore."""
+    snapshot = dict(plan_snapshot or {})
+    final_plan = snapshot.get("final_plan_json")
+    return {
+        "title": snapshot.get("title") or fallback_title,
+        "structure": _dump(snapshot.get("structure") or []),
+        "dimensions": _dump(snapshot.get("dimensions") or []),
+        "objective": snapshot.get("objective") or "",
+        "audience": snapshot.get("audience") or "",
+        "report_type": snapshot.get("report_type") or "",
+        "core_question": snapshot.get("core_question") or "",
+        "core_judgment": snapshot.get("core_judgment") or "",
+        "narrative_logic": snapshot.get("narrative_logic") or "",
+        "chapter_plans": _dump(snapshot.get("chapter_plans") or []),
+        "budget": _dump(snapshot.get("budget") or scale_snapshot or {}),
+        "required_facts": _dump(snapshot.get("required_facts") or []),
+        "evidence_needs": _dump(snapshot.get("evidence_needs") or []),
+        "user_requirements": snapshot.get("user_requirements") or fallback_requirements,
+        "plan_stage": snapshot.get("plan_stage") or "final",
+        "plan_version": int(snapshot.get("plan_version") or 1),
+        "analysis_plan_json": _dump(snapshot.get("analysis_plan_json") or {}),
+        "final_plan_json": _dump(final_plan or {}),
+        "finalized_at": snapshot.get("finalized_at"),
+    }
+
+
 def _object_delta(old_items: list[dict[str, Any]], new_items: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
     def identity(item: dict[str, Any]) -> str:
         item_id = item.get("id")
@@ -695,15 +752,14 @@ def restore_report_version(version_id: int) -> dict[str, Any] | None:
         ))
         plan_snapshot = version.get("report_plan_snapshot") or {}
         if report_row is not None and plan_snapshot:
+            plan_values = _restore_plan_values(
+                plan_snapshot,
+                version.get("scale_plan_snapshot") or {},
+                version.get("title", ""),
+                version.get("user_requirements", ""),
+            )
             s.execute(update(ORMPlan).where(ORMPlan.c.id == report_row["plan_id"]).values(
-                title=plan_snapshot.get("title") or version.get("title", ""),
-                structure=_dump(plan_snapshot.get("structure") or []),
-                chapter_plans=_dump(plan_snapshot.get("chapter_plans") or []),
-                budget=_dump(plan_snapshot.get("budget") or version.get("scale_plan_snapshot") or {}),
-                core_question=plan_snapshot.get("core_question", ""),
-                core_judgment=plan_snapshot.get("core_judgment", ""),
-                narrative_logic=plan_snapshot.get("narrative_logic", ""),
-                user_requirements=version.get("user_requirements", ""),
+                **plan_values,
             ))
     return {"report_id": report_id, "restored_version_id": version_id, "sentence_count": len(sentences)}
 
@@ -780,7 +836,7 @@ def diff_report_version_sentences(version_id: int, task_id: str = "") -> dict[st
     }
 
 
-def restore_report_version_scope(version_id: int, scope: dict[str, Any]) -> dict[str, Any] | None:
+def restore_report_version_scope(version_id: int, scope: dict[str, Any], *, _session=None) -> dict[str, Any] | None:
     """Restore selected sentence/paragraph/section content from a version commit."""
     version = get_report_version(version_id)
     if version is None:
@@ -808,7 +864,8 @@ def restore_report_version_scope(version_id: int, scope: dict[str, Any]) -> dict
         targets.extend(old_groups[section].get(int(paragraph), []))
     if not targets:
         return {"report_id": report_id, "restored": 0, "reason": "no_target"}
-    with session_scope() as s:
+    manager = session_scope() if _session is None else nullcontext(_session)
+    with manager as s:
         sentence_ids: list[int] = []
         if current_sentence_id is not None:
             sentence_ids = [int(current_sentence_id)] if str(current_sentence_id).isdigit() else []
@@ -955,29 +1012,31 @@ def apply_report_change_decisions(version_id: int, candidate_hash: str) -> dict[
         change_summary="应用差异决策前自动快照", kind="minor",
     )
     applied_ids: list[int] = []
-    for decision in decisions:
-        if decision["decision"] == "use_base":
-            scope = dict(decision.get("scope") or {})
-            if scope.get("change_type") == "added":
-                _delete_current_scope(report_id, scope)
-            else:
-                restore_report_version_scope(version_id, scope)
-        applied_ids.append(int(decision["id"]))
+    # Keep report mutations and review state in one transaction.
     with session_scope() as s:
+        for decision in decisions:
+            if decision["decision"] == "use_base":
+                scope = dict(decision.get("scope") or {})
+                if scope.get("change_type") == "added":
+                    _delete_current_scope(report_id, scope, _session=s)
+                else:
+                    restore_report_version_scope(version_id, scope, _session=s)
+            applied_ids.append(int(decision["id"]))
         if applied_ids:
             s.execute(update(ORMReportChangeDecision).where(
                 ORMReportChangeDecision.c.id.in_(applied_ids)
             ).values(status="applied", applied_at=func.current_timestamp()))
-    _normalize_sentence_positions(report_id)
-    result_version = ensure_report_version(
-        report_id, task_id=str(version.get("task_id") or ""), status="draft",
-        change_summary="应用逐句版本审阅决策", kind="minor",
-    )
+        _normalize_sentence_positions(report_id, _session=s)
+        result_version = ensure_report_version(
+            report_id, task_id=str(version.get("task_id") or ""), status="draft",
+            change_summary="应用逐句版本审阅决策", kind="minor", _session=s,
+        )
     return {"report_id": report_id, "applied": len(applied_ids), "version_id": result_version.version_id}
 
 
-def _delete_current_sentence(report_id: int, sentence_id: int) -> None:
-    with session_scope() as s:
+def _delete_current_sentence(report_id: int, sentence_id: int, *, _session=None) -> None:
+    manager = session_scope() if _session is None else nullcontext(_session)
+    with manager as s:
         exists = s.execute(select(ORMSentence.c.id).where(
             ORMSentence.c.id == sentence_id, ORMSentence.c.report_id == report_id,
         )).scalar()
@@ -988,11 +1047,12 @@ def _delete_current_sentence(report_id: int, sentence_id: int) -> None:
         s.execute(ORMSentence.delete().where(ORMSentence.c.id == sentence_id))
 
 
-def _delete_current_scope(report_id: int, scope: dict[str, Any]) -> None:
+def _delete_current_scope(report_id: int, scope: dict[str, Any], *, _session=None) -> None:
     """Delete a candidate-only sentence, paragraph, or section with lineage rows."""
     section = str(scope.get("section") or "")
     level = str(scope.get("level") or "sentence")
-    with session_scope() as s:
+    manager = session_scope() if _session is None else nullcontext(_session)
+    with manager as s:
         query = select(ORMSentence.c.id).where(ORMSentence.c.report_id == report_id)
         if level == "section":
             query = query.where(ORMSentence.c.section == section)
@@ -1046,8 +1106,9 @@ def _review_scopes_overlap(left: dict[str, Any], right: dict[str, Any]) -> bool:
     return "paragraph" in {left_level, right_level}
 
 
-def _normalize_sentence_positions(report_id: int) -> None:
-    with session_scope() as s:
+def _normalize_sentence_positions(report_id: int, *, _session=None) -> None:
+    manager = session_scope() if _session is None else nullcontext(_session)
+    with manager as s:
         rows = s.execute(select(ORMSentence.c.id).where(
             ORMSentence.c.report_id == report_id
         ).order_by(ORMSentence.c.position, ORMSentence.c.id)).mappings().all()
@@ -1449,15 +1510,6 @@ def _text_overlap(left: str, right: str) -> float:
     grams_a = {a[i:i + 2] for i in range(len(a) - 1)}
     grams_b = {b[i:i + 2] for i in range(len(b) - 1)}
     return len(grams_a & grams_b) / max(len(grams_a), 1)
-
-def _find_task_by_report_in_session(s, report_id: int) -> str | None:
-    rows = s.execute(select(ORMShortMemory.c.task_id, ORMShortMemory.c.payload)).all()
-    for task_id, payload_text in rows:
-        payload = _json_load(payload_text, {})
-        if payload.get("report_id") == report_id:
-            return task_id
-    return None
-
 
 def _task_payload_in_session(s, task_id: str) -> dict[str, Any]:
     if not task_id:

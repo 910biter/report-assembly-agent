@@ -253,11 +253,23 @@ def _worker_loop() -> None:
                 with _LOCK:
                     _STATS["failed"] += 1
             task = short_term.load_task(item.task_id) or {}
+            rollback_error = ""
+            base_version_id = task.get("incremental_base_version_id")
+            if not paused and base_version_id and (
+                str(task.get("run_mode") or "") == "interaction_revision"
+                or bool(task.get("incremental_update"))
+            ):
+                try:
+                    from app.report_versions import restore_report_version
+                    if restore_report_version(int(base_version_id)) is None:
+                        rollback_error = "BASE_VERSION_NOT_FOUND"
+                except Exception as rollback_exc:
+                    rollback_error = str(rollback_exc)[:400]
             from app.task_runs import update_task_run
             update_task_run(
                 str(task.get("run_id") or ""),
                 status="paused" if paused else "failed",
-                metadata={"error": "" if paused else str(exc)[:500]},
+                metadata={"error": "" if paused else str(exc)[:500], "rollback_error": rollback_error},
                 finished=not paused,
             )
             interaction_revision = not paused and str(task.get("run_mode") or "") == "interaction_revision"
@@ -267,14 +279,18 @@ def _worker_loop() -> None:
                     fail_recompute_for_run(str(task.get("run_id") or ""), str(exc))
                 except Exception:
                     pass
-            # A candidate revision is isolated from the last reviewable report.
-            # Its failure must not turn that existing report into a failed task.
+            # A revision runs against the current report and is versioned on success.
+            # Its failure must restore the last reviewable report.
             next_stage = "paused" if paused else ("review" if interaction_revision else "failed")
             short_term.update_task(
                 item.task_id,
                 stage=next_stage,
                 error="" if (paused or interaction_revision) else str(exc),
-                revision_error=str(exc) if interaction_revision else "",
+                revision_error=(
+                    f"{str(exc)}; rollback_error={rollback_error}"
+                    if interaction_revision and rollback_error else str(exc)
+                    if interaction_revision else ""
+                ),
                 queue_status={
                 "status": "paused" if paused else "failed",
                 "queue_wait_seconds": round(wait, 1),

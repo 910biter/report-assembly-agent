@@ -214,7 +214,7 @@ function executionLabel(proposal: any) {
         waiting: "等待当前轮次结束",
         queued: "已进入后台队列",
         running: "正在后台重算",
-        completed: "候选版本已生成",
+        completed: "新版本已生成",
         failed: "后台处理失败",
       } as any
     )[proposal.execution_status] || "已记录"
@@ -825,9 +825,9 @@ async function archiveCurrent() {
                 ><a
                   v-if="item.candidate_version_id && item.report_id"
                   :href="`/reports/${item.report_id}?version=${item.candidate_version_id}&review=1`"
-                  >审阅候选版本</a
+                  >审阅新版本</a
                 ><small v-else-if="item.candidate_version_id"
-                  >候选版本已生成，可在报告版本审阅中决定最终保留内容。</small
+                  >新版本已生成，可在报告版本审阅中决定最终保留内容。</small
                 ><small
                   v-if="item.execution_error && item.status !== 'superseded'"
                   >后台修改未完成，请回到任务页查看异常并决定是否重试。</small

@@ -14,16 +14,12 @@ from app.models import Inference
 from app.token_monitor import current_context, update_call_metrics, update_call_products
 from app.runtime_profiles import stage_input_budget_tokens
 
-_ANALYSIS_TYPES = (
-    "OBSERVATION", "CAUSE", "IMPACT", "RISK", "TREND", "PREDICTION",
-    "COMPARISON", "CONSTRAINT", "UNCERTAINTY", "SYNTHESIS",
-)
 _SYSTEM = """你是情报分析员。基于事实清单、来源冲突与历史知识做综合分析,禁止无依据结论。
 严格输出 JSON,不要任何解释:
 {
   "inferences": [
     {"content": "综合判断", "based_fact_ids": [1, 2], "short_rationale": "60字以内依据说明",
-     "dimension": "所属维度", "analysis_type": "OBSERVATION/CAUSE/IMPACT/RISK/TREND/PREDICTION/COMPARISON/CONSTRAINT/UNCERTAINTY/SYNTHESIS"}
+     "dimension": "所属维度", "analysis_type": "模型判断的开放类型标签或 unknown"}
   ],
   "external_notes": [
     {"content": "模型常识/外部知识补充,与材料无关"}
@@ -45,7 +41,7 @@ _GLOBAL_SYSTEM = """你是情报报告综合研判师。基于各维度局部推
 {
   "inferences": [
     {"content": "跨维度综合判断", "based_fact_ids": [1, 2], "short_rationale": "60字以内依据说明",
-     "dimension": "全局综合", "analysis_type": "SYNTHESIS/TREND/IMPACT/RISK/CONSTRAINT/UNCERTAINTY"}
+     "dimension": "全局综合", "analysis_type": "模型判断的开放类型标签或 unknown"}
   ],
   "external_notes": [{"content": "模型常识/外部知识补充,与材料无关"}],
   "critical_fact_ids": [1],
@@ -181,13 +177,11 @@ class AnalysisAgent(BaseAgent):
             else:
                 content = str(item.get("content", "")).strip()
                 based = [i for i in _int_ids(item.get("based_fact_ids")) if i in valid_ids]
-                analysis_type = str(item.get("analysis_type", "")).upper()
+                analysis_type = str(item.get("analysis_type") or "unknown").strip()[:64]
                 reasoning = str(item.get("short_rationale") or item.get("reasoning") or "")[:80]
                 dimension = str(item.get("dimension", ""))
             if not content or not based:
                 continue  # 硬约束:推断必须挂依据事实
-            if analysis_type not in _ANALYSIS_TYPES:
-                analysis_type = ""
             confidence, confidence_reason = _confidence_from_facts(based)
             inference = Inference(
                 content=content,

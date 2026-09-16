@@ -22,7 +22,7 @@ from app.infrastructure.orm import Base, ORMReport, ORMSentence, ORMTaskArtifact
 from sqlalchemy import select, update, delete
 from app.models import Report
 from app.policy import policy_prompt_block
-from app.planning.structure import serializable_memory
+from app.planning.structure import normalize_text_list, serializable_memory
 from app.planning.structure import order_chapters
 from app.planning.scale import normalize_execution_plan
 from app.rendering.headings import has_heading_prefix, strip_heading_prefix
@@ -59,7 +59,7 @@ _SYSTEM = """你是情报报告撰稿人。依据 Narrative Plan、ChapterPlan �
 5. 正文不得出现来源标签、内部编号或证据标注;引用关系只写在 JSON 的 fact_ids/inference_ids 中
 6. 只撰写当前指定章节,不要输出其他章节内容
 7. 承上启下、章节导语等过渡句可以没有引用,但应保持少量且不得编造事实
-8. 若当前材料包缺少真实成果材料,不得写成“已取得显著成效/完成某项成果/满意度提升”等未被材料直接证明的结论
+8. 对材料未直接证明的成效、完成状态、数量变化或评价,不得写成既成事实；必须保留证据边界或明确标注待补充
 9. 段落、句式、详略、表格或分项表达由 ChapterPlan、模板风格、材料信息量和分层策略共同决定;不要机械套用固定格式
 10. 不要把无关 Fact 压缩拼接进同一句;一段一主题,一个句子通常只承担一个核心事实或一个直接相关的事实组
 11. 具体事实优先,少使用“机制完善、顶层定标、全面就位”等没有新增信息的抽象套话
@@ -102,24 +102,27 @@ def _business_block(task_profile: dict | None, chapter_plan: dict) -> str:
         lines.append("如果材料只能证明规则、结构、字段、标准或缺失项，应写成连贯的说明、边界判断和后续动作建议,不能退化为事实清单。")
         lines.append("模板材料主要用于版式、结构和写作口吻学习；除确有内容约束外，不应作为正文事实反复表述。")
     if chapter_plan.get("allowed_roles"):
-        lines.append("本章允许使用的材料角色: " + "、".join(chapter_plan.get("allowed_roles") or []))
-    if task_profile.get("missing_inputs") and _chapter_likely_handles_gaps(chapter_plan):
-        lines.append("本章可结合规划目标说明当前缺失信息: " + "；".join(task_profile.get("missing_inputs") or []))
+        lines.append("本章允许使用的材料角色: " + "、".join(normalize_text_list(chapter_plan.get("allowed_roles"))))
+    if task_profile.get("missing_inputs") and chapter_handles_information_gaps(chapter_plan):
+        lines.append("本章可结合规划目标说明当前缺失信息: " + "；".join(normalize_text_list(task_profile.get("missing_inputs"))))
     return "\n".join(lines)
 
 
-def _chapter_likely_handles_gaps(chapter_plan: dict) -> bool:
-    """Infer whether missing-information guidance belongs here from runtime plan text."""
-    text = " ".join(
-        str(item)
-        for item in [
-            chapter_plan.get("title", ""),
-            chapter_plan.get("judgment", ""),
-            *(chapter_plan.get("questions") or []),
-            *(chapter_plan.get("required_facts") or []),
-        ]
-    )
-    return any(term in text for term in ("缺失", "不足", "待补", "风险", "边界", "限制", "后续", "建议"))
+def chapter_handles_information_gaps(chapter_plan: dict | None) -> bool:
+    """Read the runtime plan's explicit gap-handling decision.
+
+    Older plans may not have the boolean yet. Their structured
+    ``missing_information`` field is the only safe fallback; prose titles and
+    questions must never decide this behavior.
+    """
+    if not isinstance(chapter_plan, dict):
+        return False
+    explicit = chapter_plan.get("handles_missing_information")
+    if isinstance(explicit, bool):
+        return explicit
+    if explicit is not None:
+        return str(explicit).strip().lower() in {"1", "true", "yes", "是", "需要"}
+    return bool(chapter_plan.get("missing_information"))
 
 
 def _merge_required_facts(chapter_facts: list[dict], all_facts: list[dict],
@@ -721,7 +724,9 @@ class WriterAgent(BaseAgent):
             report_memory["used_fact_ids"] = {int(x) for x in saved.get("used_fact_ids", [])}
             report_memory["used_inference_ids"] = {int(x) for x in saved.get("used_inference_ids", [])}
 
-        report = self._open_or_create_report(plan, profile_id, existing_report_id)
+        report = self._open_or_create_report(
+            plan, profile_id, existing_report_id, task_id=task_id,
+        )
         if report_callback:
             report_callback(report)
 
@@ -784,9 +789,9 @@ class WriterAgent(BaseAgent):
             # 1. 信息需求 → 检索 query(标题+核心问题+核心判断+所需事实,而非仅标题)
             query = " ".join(filter(None, [
                 chapter_title,
-                " ".join(chapter_plan.get("questions") or []),
-                chapter_plan.get("judgment", ""),
-                " ".join(chapter_plan.get("required_facts") or []),
+                " ".join(normalize_text_list(chapter_plan.get("questions"))),
+                str(chapter_plan.get("judgment") or ""),
+                " ".join(normalize_text_list(chapter_plan.get("required_facts"))),
             ]))
             support_fact_ids = set(int(x) for x in (chapter_plan.get("primary_fact_ids") or []))
             if cm is not None:
@@ -1567,12 +1572,16 @@ class WriterAgent(BaseAgent):
         return assignments
 
     def _open_or_create_report(self, plan: dict, profile_id: int | None,
-                               existing_report_id: int | None = None) -> Report:
+                               existing_report_id: int | None = None,
+                               task_id: str = "") -> Report:
         if existing_report_id is not None:
             with session_scope() as s:
                 row = s.execute(
                     select(ORMReport).where(ORMReport.c.id == int(existing_report_id))
                 ).mappings().first()
+                owner = str((row or {}).get("task_id") or "")
+                if owner and task_id and owner != task_id:
+                    raise ValueError("REPORT_TASK_MISMATCH")
                 if row is not None and int(row["plan_id"]) != int(plan["id"]):
                     # A revision can create a new FinalPlan while retaining the
                     # same report workspace. Keep the report-to-plan pointer in
@@ -1580,6 +1589,10 @@ class WriterAgent(BaseAgent):
                     s.execute(update(ORMReport).where(
                         ORMReport.c.id == int(existing_report_id)
                     ).values(plan_id=int(plan["id"])))
+                if row is not None and task_id and not owner:
+                    s.execute(update(ORMReport).where(
+                        ORMReport.c.id == int(existing_report_id)
+                    ).values(task_id=task_id))
             if row is not None:
                 return Report(
                     id=row["id"],
@@ -1587,16 +1600,19 @@ class WriterAgent(BaseAgent):
                     title=row["title"],
                     style_profile_id=row["style_profile_id"],
                     status=row["status"],
+                    task_id=owner or task_id,
                 )
         report = Report(
             plan_id=plan["id"],
             title=plan.get("title", ""),
             style_profile_id=profile_id,
+            task_id=task_id,
         )
         with session_scope() as s:
             result = s.execute(
                 ORMReport.insert().values(
                     plan_id=report.plan_id, title=report.title,
+                    task_id=task_id,
                     style_profile_id=report.style_profile_id, status="draft",
                 )
             )
@@ -2168,7 +2184,7 @@ class WriterAgent(BaseAgent):
 
         budget = stage_input_budget_tokens("writer")
         topic_block = json.dumps(topic, ensure_ascii=False)
-        missing = "、".join(qa_item.get("missing_aspects") or []) or "按 Topic 计划完善表达"
+        missing = "、".join(normalize_text_list(qa_item.get("missing_aspects"))) or "按 Topic 计划完善表达"
         prompt, _audit = build_prompt_from_sections(
             "writer",
             [
@@ -2280,7 +2296,7 @@ class WriterAgent(BaseAgent):
         # 未解决问题:全部注入(后续章节优先回应)
         unresolved = report_memory.get("unresolved_issues", [])
         if unresolved:
-            lines.append(f"尚未解决的问题(后续章节如有证据优先回应): {'; '.join(unresolved[-4:])}")
+            lines.append(f"尚未解决的问题(后续章节如有证据优先回应): {'; '.join(normalize_text_list(unresolved)[-4:])}")
         # 章节摘要:按自然顺序注入最近前文章节,避免依赖图字段造成规划失败。
         summaries = report_memory.get("chapter_summaries", [])
         relevant = summaries[-2:]
@@ -2292,7 +2308,7 @@ class WriterAgent(BaseAgent):
         # 已表达观点:避免原样重复(注入最近几条)
         points = report_memory.get("expressed_points", [])
         if points:
-            lines.append(f"前文已表达观点(避免原样重复,如需引用须换角度): {'; '.join(points[-4:])}")
+            lines.append(f"前文已表达观点(避免原样重复,如需引用须换角度): {'; '.join(normalize_text_list(points)[-4:])}")
         # Fact 角色:复用须承担新逻辑作用
         roles = report_memory.get("fact_roles", {})
         if roles:

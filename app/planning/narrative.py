@@ -19,6 +19,7 @@ _SYSTEM = """你是报告章节叙事规划师。你的任务不是写正文,而
   "central_message": "本章中心意思",
   "evidence_status": "sufficient/limited/insufficient",
   "evidence_reason": "证据对本章目标的承载判断",
+  "handles_missing_information": true,
   "missing_information": ["当前材料仍缺少什么"],
   "logic_order": ["话题1", "话题2", "..."],
   "subsections": [
@@ -31,6 +32,7 @@ _SYSTEM = """你是报告章节叙事规划师。你的任务不是写正文,而
       "target_words": 1200,
       "evidence_status": "sufficient/limited/insufficient",
       "evidence_reason": "为什么能够或不能支撑目标篇幅",
+      "handles_missing_information": true,
       "missing_information": ["该小节仍缺少什么"],
       "detail_level": "expand/brief/reference",
       "completion_criteria": ["表达什么才算完成,如:说明入口", "说明操作主体", "说明关键步骤"],
@@ -423,9 +425,13 @@ def _sanitize_plan(payload: dict, chapter_plan: dict, fact_ids: set[int], infere
         "central_message": str(payload.get("central_message") or chapter_plan.get("judgment") or "")[:240],
         "logic_order": logic_order,
         "target_words": int(chapter_plan.get("target_words") or 0),
-        "evidence_status": evidence_status,
-        "evidence_limited": evidence_status in {"limited", "insufficient"},
-        "evidence_reason": str(payload.get("evidence_reason") or "")[:240],
+    "evidence_status": evidence_status,
+    "evidence_limited": evidence_status in {"limited", "insufficient"},
+    "evidence_reason": str(payload.get("evidence_reason") or "")[:240],
+    "handles_missing_information": _coerce_bool(
+        payload.get("handles_missing_information"),
+        fallback=bool(payload.get("missing_information")),
+    ),
         "missing_information": [
             str(item)[:160] for item in payload.get("missing_information") or [] if str(item).strip()
         ],
@@ -445,6 +451,14 @@ def _safe_int(value) -> int:
         return int(value or 0)
     except (TypeError, ValueError):
         return 0
+
+
+def _coerce_bool(value, *, fallback: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return fallback
+    return str(value).strip().lower() in {"1", "true", "yes", "是", "需要"}
 
 
 def _int_ids(values) -> list[int]:
@@ -503,6 +517,10 @@ def _sanitize_subsections(raw, chapter_plan: dict, topics: list[dict],
                 item.get("evidence_status"), has_evidence=bool(fids or iids)
             ),
             "evidence_reason": str(item.get("evidence_reason") or "")[:240],
+            "handles_missing_information": _coerce_bool(
+                item.get("handles_missing_information"),
+                fallback=bool(item.get("missing_information")),
+            ),
             "missing_information": [
                 str(value)[:160] for value in item.get("missing_information") or [] if str(value).strip()
             ],

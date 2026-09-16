@@ -6,10 +6,11 @@ import re
 import threading
 import time
 import uuid
+from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
-from sqlalchemy import insert, select, update
+from sqlalchemy import delete, insert, select, update
 
 from app.db import session_scope
 from app.memory import short_term
@@ -23,7 +24,9 @@ from app.infrastructure.orm import (
     ORMInteractionThread,
     ORMPlan,
     ORMReport,
+    ORMReportVersionDelta,
     ORMSentence,
+    ORMTaskRun,
     ORMTaskArtifact,
 )
 from app.llm_scheduler import invoke
@@ -441,7 +444,7 @@ def _generate_interaction_reply(thread_id: int, content: str, request_id: str = 
                 reply = "已将这份需求写入新建任务草稿。你仍可继续调整，确认无误后再创建任务。"
             else:
                 state = "已执行" if result.get("status") == "applied" else "已进入后台处理"
-                reply = f"已确认该操作，{state}。现有报告不会被静默覆盖；语义修改完成后会生成候选版本供审阅。"
+                reply = f"已确认该操作，{state}。成功后将形成新报告版本并保留历史基线；若执行失败，系统会自动回滚。"
         else:
             reply = "已取消该操作，现有任务和报告不会发生变化。"
         metadata = {"status": "completed", "intent": "execute", "proposal_id": int(proposal["id"])}
@@ -661,10 +664,12 @@ def decide_proposal(proposal_id: int, decision: str) -> dict[str, Any]:
                     s.execute(update(ORMChangeProposal).where(
                         ORMChangeProposal.c.id == int(proposal_id)
                     ).values(execution_status="completed"))
-                with session_scope() as s:
-                    row = s.execute(select(ORMChangeProposal).where(
-                        ORMChangeProposal.c.id == int(proposal_id)
-                    )).mappings().first()
+            else:
+                dispatch_pending_revisions(str(row.get("task_id") or ""))
+            with session_scope() as s:
+                row = s.execute(select(ORMChangeProposal).where(
+                    ORMChangeProposal.c.id == int(proposal_id)
+                )).mappings().first()
         return _proposal_detail(row)
     applied = False
     scheduled = False
@@ -994,77 +999,28 @@ def _apply_supported_proposal(row: dict) -> bool:
             ).values(scope_json=_dump(scope)))
         return True
     if artifact_type == "task_brief":
-        task = short_term.load_task(task_id) or {}
-        if str(task.get("stage") or "created") not in {"created", "requirement_review"}:
-            return False
-        values = {}
-        if str(after.get("theme") or "").strip():
-            values["theme"] = str(after["theme"]).strip()
-        requirements = after.get("requirements")
-        if str(requirements or "").strip():
-            values["user_requirements"] = str(requirements).strip()
-        if not values:
-            return False
-        short_term.update_task(task_id, **values)
-        return True
+        # Requirements are user-owned inputs, but accepting them must also
+        # invalidate every derived artifact. The revision preparation applies
+        # this patch before rebuilding the affected stages.
+        return False
     if artifact_type == "final_plan":
-        # An accepted directory proposal is applied to the current plan in
-        # place. The plan must become visible immediately; downstream writing
-        # may still be queued separately by the normal revision workflow.
-        task = short_term.load_task(task_id) or {}
-        plan_id = _resolve_task_plan_id(task_id, task)
-        structure = [
-            str(item).strip() for item in (
-                after.get("required_structure") or
-                tool_call.get("arguments", {}).get("new_structure") or []
-            ) if str(item).strip()
-        ]
-        if not structure or not plan_id:
-            return False
-        from app.workflow.controller import planner as workflow_planner
-        revised = workflow_planner.revise_final_plan_structure(
-            int(plan_id), structure,
-            instruction=str(after.get("instruction") or "按确认目录调整"),
-            refine=False,
-        )
-        short_term.update_task(
-            task_id,
-            plan_title=revised.title,
-            final_plan_frozen=True,
-        )
-        return True
-    if artifact_type == "section_titles":
-        changes = [
-            (str(item.get("old_title") or "").strip(), str(item.get("new_title") or "").strip())
-            for item in after.get("changes") or []
-            if isinstance(item, dict)
-        ]
-        if len(changes) < 2 or any(not old or not new for old, new in changes):
-            return False
-        if not _rename_sections_in_task(task_id, int(report_id) if report_id is not None else None, changes):
-            return False
-        if report_id is not None:
-            ensure_report_version(int(report_id), task_id=task_id, status="snapshot",
-                                  change_summary=f"审阅助手提案：批量修改 {len(changes)} 个章节标题", kind="minor")
-        return True
+        # A directory proposal changes the workflow inputs, not the current
+        # plan in place.  It must go through the revision run so the controller
+        # can regenerate the plan and downstream prose together.
+        return False
+    if artifact_type in {"section_title", "section_titles"}:
+        # Title changes are workflow inputs. They must be consumed by the
+        # controller's revision writer, never applied to the formal report here.
+        return False
     content = str(after.get("content") or after.get("title") or "").strip()
     if not content:
         return False
     if artifact_type == "report_title":
-        with session_scope() as s:
-            s.execute(update(ORMReport).where(ORMReport.c.id == int(report_id)).values(title=content))
-        ensure_report_version(int(report_id), task_id=row.get("task_id") or "", status="snapshot",
-                              change_summary="审阅助手提案：修改报告标题", kind="minor")
-        return True
-    if artifact_type == "section_title":
-        old_title = str(_load(row["before_json"], {}).get("title") or row.get("object_id") or "").strip()
-        if not old_title:
-            return False
-        if not _rename_sections_in_task(task_id, int(report_id) if report_id is not None else None, [(old_title, content)]):
-            return False
         if report_id is not None:
             ensure_report_version(int(report_id), task_id=task_id, status="snapshot",
-                                  change_summary="审阅助手提案：修改章节标题", kind="minor")
+                                  change_summary="审阅助手提案前快照：修改报告标题", kind="minor")
+        with session_scope() as s:
+            s.execute(update(ORMReport).where(ORMReport.c.id == int(report_id)).values(title=content))
         return True
     return False
 
@@ -1103,28 +1059,48 @@ def _rename_sections_in_task(task_id: str, report_id: int | None,
             if report is None:
                 return False
             plan_id = int(report.get("plan_id") or 0) or plan_id
-        plan = s.execute(select(ORMPlan).where(ORMPlan.c.id == int(plan_id))).mappings().first() if plan_id else None
+        plan = s.execute(
+            select(ORMPlan).where(ORMPlan.c.id == int(plan_id)).with_for_update()
+        ).mappings().first() if plan_id else None
         plan_titles = _stored_plan_titles(plan)
         if plan is None or not set(mapping).issubset(plan_titles):
             return False
-        sentence_changed = 0
         if report_id is not None:
             for old_title, new_title in mapping.items():
-                sentence_changed += int(s.execute(update(ORMSentence).where(
+                s.execute(update(ORMSentence).where(
                     ORMSentence.c.report_id == int(report_id),
                     ORMSentence.c.section == old_title,
-                ).values(section=new_title)).rowcount or 0)
-        structure = [mapping.get(str(item), item) for item in _load(plan["structure"], [])]
-        chapters = [
-            {**item, "title": mapping.get(str(item.get("title") or ""), item.get("title"))}
-            if isinstance(item, dict) else item
-            for item in _load(plan["chapter_plans"], [])
-        ]
-        final_plan = _replace_exact_strings(_load(plan.get("final_plan_json"), {}), mapping)
+                ).values(section=new_title))
+        try:
+            current_version = int(plan.get("plan_version") or 0)
+        except (TypeError, ValueError):
+            current_version = 0
+        synchronized = _synchronize_plan_title_payloads(
+            dict(plan), mapping, next_version=max(1, current_version + 1),
+        )
         s.execute(update(ORMPlan).where(ORMPlan.c.id == int(plan_id)).values(
-            structure=_dump(structure), chapter_plans=_dump(chapters), final_plan_json=_dump(final_plan),
+            structure=_dump(synchronized["structure"]),
+            chapter_plans=_dump(synchronized["chapter_plans"]),
+            analysis_plan_json=_dump(synchronized["analysis_plan_json"]),
+            final_plan_json=_dump(synchronized["final_plan_json"]),
+            plan_version=int(synchronized["plan_version"]),
         ))
     return True
+
+
+def rename_sections_in_task(task_id: str = "", report_id: int | None = None,
+                            changes: list[tuple[str, str]] | None = None) -> bool:
+    """Canonical chapter-title mutation used by API edits and proposals."""
+    resolved_task_id = str(task_id or "")
+    if not resolved_task_id and report_id is not None:
+        with session_scope() as s:
+            row = s.execute(select(ORMReport.c.task_id).where(
+                ORMReport.c.id == int(report_id)
+            )).first()
+        resolved_task_id = str(row[0] or "") if row else ""
+    return _rename_sections_in_task(
+        resolved_task_id, report_id, list(changes or []),
+    )
 
 
 def _resolve_task_plan_id(task_id: str, task: dict[str, Any] | None = None) -> int | None:
@@ -1155,14 +1131,6 @@ def _resolve_task_plan_id(task_id: str, task: dict[str, Any] | None = None) -> i
         if plan_id:
             return plan_id
     return None
-
-
-def _rename_section_in_plan(report_id: int, old_title: str, new_title: str) -> None:
-    """Compatibility wrapper for callers outside the collaboration proposal flow."""
-    with session_scope() as s:
-        report = s.execute(select(ORMReport.c.task_id).where(ORMReport.c.id == report_id)).first()
-    if report:
-        _rename_sections_in_task(str(report[0] or ""), report_id, [(old_title, new_title)])
 
 
 def _stored_plan_titles(plan: Any) -> set[str]:
@@ -1200,12 +1168,71 @@ def _replace_exact_strings(value: Any, replacements: dict[str, str]) -> Any:
     return value
 
 
+def _json_copy(value: Any, default: Any) -> Any:
+    """Copy either decoded JSON or the JSON stored in a database row."""
+    if isinstance(value, (dict, list)):
+        return deepcopy(value)
+    return deepcopy(_load(value, default))
+
+
+def _synchronize_plan_title_payloads(plan: dict, replacements: dict[str, str],
+                                     next_version: int | None = None) -> dict[str, Any]:
+    """Apply a title rename to every persisted plan representation.
+
+    ``structure`` and ``chapter_plans`` are the normalized fields used by the
+    writer, while the two JSON snapshots are audit/read models. Keeping all
+    four in one pure transformation prevents a title edit from creating two
+    different plan truths.
+    """
+    current = deepcopy(plan or {})
+    structure = _replace_exact_strings(
+        _json_copy(current.get("structure"), []), replacements,
+    )
+    chapters = _replace_exact_strings(
+        _json_copy(current.get("chapter_plans"), []), replacements,
+    )
+    try:
+        version = int(next_version if next_version is not None
+                      else current.get("plan_version") or 0)
+        if next_version is None:
+            version += 1
+        version = version or 1
+    except (TypeError, ValueError):
+        version = 1
+
+    analysis = _replace_exact_strings(
+        _json_copy(current.get("analysis_plan_json"), {}), replacements,
+    )
+    final = _replace_exact_strings(
+        _json_copy(current.get("final_plan_json"), {}), replacements,
+    )
+    if isinstance(analysis, dict) and analysis:
+        analysis["plan_version"] = version
+        if "structure" in analysis:
+            analysis["structure"] = deepcopy(structure)
+        if "chapter_plans" in analysis:
+            analysis["chapter_plans"] = deepcopy(chapters)
+    if isinstance(final, dict) and final:
+        final["plan_version"] = version
+        final["structure"] = deepcopy(structure)
+        final["chapter_plans"] = deepcopy(chapters)
+    current.update({
+        "structure": structure,
+        "chapter_plans": chapters,
+        "analysis_plan_json": analysis,
+        "final_plan_json": final,
+        "plan_version": version,
+    })
+    return current
+
+
 def _schedule_semantic_proposal(row: dict) -> bool:
     """Mark semantic changes for asynchronous, versioned recomputation."""
     artifact_type = str(row.get("artifact_type") or "")
     if artifact_type not in {
         "task_brief", "analysis_plan", "fact", "inference",
         "final_plan", "narrative_plan", "paragraph", "sentence",
+        "section_title", "section_titles",
     }:
         return False
     task_id = str(row.get("task_id") or "")
@@ -1214,7 +1241,7 @@ def _schedule_semantic_proposal(row: dict) -> bool:
     _notify(
         task_id=task_id, report_id=row.get("report_id"), notification_type="proposal_accepted",
         title="修改建议已进入后台处理",
-        message="系统将在当前轮次结束后生成候选版本，不会覆盖已有版本。",
+        message="系统将在当前轮次结束后生成新报告版本；历史基线会保留，执行失败时自动回滚。",
         action_url=f"/tasks/{task_id}?assistant=1",
         metadata={"proposal_id": int(row["id"]), "artifact_type": artifact_type},
     )
@@ -1397,7 +1424,7 @@ def _impact_for(artifact_type: str, thread: dict) -> dict:
         "invalidates": list(policy.invalidates),
         "scope": scope,
         "policy": policy.as_dict(),
-        "automatic_execution": artifact_type in {"report_title", "section_title", "section_titles"},
+        "automatic_execution": artifact_type == "report_title",
     }
 
 
@@ -1591,22 +1618,18 @@ def dispatch_pending_revisions(task_id: str) -> dict[str, Any]:
         or not task.get("report_id")
     ):
         return {"status": "waiting"}
-    with session_scope() as s:
-        rows = s.execute(select(ORMChangeProposal).where(
-            ORMChangeProposal.c.task_id == task_id,
-            ORMChangeProposal.c.status == "accepted",
-            ORMChangeProposal.c.execution_status == "waiting",
-        ).order_by(ORMChangeProposal.c.id)).mappings().all()
+    with _PROPOSAL_RETRY_LOCK:
+        rows = _claim_revision_proposals(task_id)
     if not rows:
         return {"status": "empty"}
+    previous_task = deepcopy(task)
     try:
         prepared = _prepare_revision_run(task_id, [dict(row) for row in rows])
     except Exception as exc:
         proposal_ids = [int(row["id"]) for row in rows]
-        with session_scope() as s:
-            s.execute(update(ORMChangeProposal).where(
-                ORMChangeProposal.c.id.in_(proposal_ids)
-            ).values(execution_status="failed", execution_error=str(exc)[:1000]))
+        _mark_revision_preparation_failed(
+            task_id, proposal_ids, error=str(exc), restore_task=previous_task,
+        )
         _notify(
             task_id=task_id, report_id=task.get("report_id"), notification_type="revision_failed",
             title="后台修改任务创建失败", message=str(exc)[:240],
@@ -1614,8 +1637,68 @@ def dispatch_pending_revisions(task_id: str) -> dict[str, Any]:
             metadata={"proposal_ids": proposal_ids},
         )
         return {"status": "failed", "error": str(exc)}
-    queue = enqueue_task(task_id)
+    try:
+        queue = enqueue_task(task_id)
+    except Exception as exc:
+        _mark_revision_preparation_failed(
+            task_id, [int(row["id"]) for row in rows], error=str(exc),
+            restore_task=previous_task, prepared=prepared,
+        )
+        _notify(
+            task_id=task_id, report_id=task.get("report_id"), notification_type="revision_failed",
+            title="后台修改任务排队失败", message=str(exc)[:240],
+            action_url=f"/tasks/{task_id}?assistant=1",
+            metadata={"proposal_ids": [int(row["id"]) for row in rows]},
+        )
+        return {"status": "failed", "error": str(exc)}
     return {**prepared, "queue": queue}
+
+
+def _claim_revision_proposals(task_id: str) -> list[dict]:
+    """Claim one task's accepted proposals before creating any Run records.
+
+    The short-lived ``preparing`` state makes the multi-store preparation
+    recoverable.  A second request in the same process cannot create a second
+    Run for the same proposal batch while the first request is preparing it.
+    """
+    with session_scope() as s:
+        rows = s.execute(select(ORMChangeProposal).where(
+            ORMChangeProposal.c.task_id == task_id,
+            ORMChangeProposal.c.status == "accepted",
+            ORMChangeProposal.c.execution_status.in_(("waiting", "preparing")),
+        ).order_by(ORMChangeProposal.c.id).with_for_update()).mappings().all()
+        if not rows:
+            return []
+        waiting_ids = [int(row["id"]) for row in rows if row["execution_status"] == "waiting"]
+        if waiting_ids:
+            s.execute(update(ORMChangeProposal).where(
+                ORMChangeProposal.c.id.in_(waiting_ids),
+                ORMChangeProposal.c.execution_status == "waiting",
+            ).values(execution_status="preparing", execution_error=""))
+        return [dict(row) for row in s.execute(select(ORMChangeProposal).where(
+            ORMChangeProposal.c.id.in_([int(row["id"]) for row in rows])
+        ).order_by(ORMChangeProposal.c.id)).mappings().all()]
+
+
+def _mark_revision_preparation_failed(task_id: str, proposal_ids: list[int], *,
+                                      error: str, restore_task: dict | None = None,
+                                      prepared: dict | None = None) -> None:
+    """Leave a failed preparation retryable without an active/ghost Run."""
+    if restore_task is not None:
+        short_term.save_task(task_id, restore_task)
+    prepared = prepared or {}
+    run_id = str(prepared.get("run_id") or "")
+    delta_id = prepared.get("delta_id")
+    with session_scope() as s:
+        if delta_id:
+            s.execute(delete(ORMReportVersionDelta).where(
+                ORMReportVersionDelta.c.id == int(delta_id)
+            ))
+        if run_id:
+            s.execute(delete(ORMTaskRun).where(ORMTaskRun.c.run_id == run_id))
+        s.execute(update(ORMChangeProposal).where(
+            ORMChangeProposal.c.id.in_([int(value) for value in proposal_ids])
+        ).values(execution_status="failed", execution_error=str(error)[:1000]))
 
 
 def _prepare_revision_run(task_id: str, proposals: list[dict]) -> dict[str, Any]:
@@ -1641,9 +1724,7 @@ def _prepare_revision_run(task_id: str, proposals: list[dict]) -> dict[str, Any]
         for item in proposals
     ]
     policies = [
-        propagation_policy(
-            str(call.get("tool_name") or ""), str(item.get("artifact_type") or ""),
-        )
+        propagation_policy(str(call.get("tool_name") or ""), str(item.get("artifact_type") or ""))
         for item, call in zip(proposals, tool_calls)
     ]
     earliest_policy = min(policies, key=lambda item: item.recompute_rank)
@@ -1652,14 +1733,27 @@ def _prepare_revision_run(task_id: str, proposals: list[dict]) -> dict[str, Any]
     analysis_constraints = []
     evidence_rechecks = []
     inference_rechecks = []
+    section_title_changes = []
     for item, tool_call in zip(proposals, tool_calls):
         after = _load(item.get("after_json"), {})
         arguments = tool_call.get("arguments") if isinstance(tool_call.get("arguments"), dict) else {}
         tool_name = str(tool_call.get("tool_name") or "")
-        if str(item.get("artifact_type") or "") == "final_plan":
-            structure_constraints.append(list(
-                after.get("required_structure") or arguments.get("new_structure") or []
-            ))
+        artifact_type = str(item.get("artifact_type") or "")
+        if artifact_type == "section_title":
+            old_title = str(arguments.get("old_title") or item.get("object_id") or "").strip()
+            new_title = str(arguments.get("new_title") or after.get("title") or "").strip()
+            if old_title and new_title and old_title != new_title:
+                section_title_changes.append({"old_title": old_title, "new_title": new_title})
+        elif artifact_type == "section_titles":
+            for change in after.get("changes") or arguments.get("changes") or []:
+                if not isinstance(change, dict):
+                    continue
+                old_title = str(change.get("old_title") or "").strip()
+                new_title = str(change.get("new_title") or "").strip()
+                if old_title and new_title and old_title != new_title:
+                    section_title_changes.append({"old_title": old_title, "new_title": new_title})
+        if artifact_type == "final_plan":
+            structure_constraints.append(list(after.get("required_structure") or arguments.get("new_structure") or []))
             chapter_count_constraints.append(int(
                 after.get("required_chapter_count") or arguments.get("required_chapter_count") or 0
             ))
@@ -1686,6 +1780,14 @@ def _prepare_revision_run(task_id: str, proposals: list[dict]) -> dict[str, Any]
                 "based_fact_ids": list(before.get("based_fact_ids") or []),
                 "instruction": str(arguments.get("instruction") or after.get("instruction") or "复核该推论及其依据"),
             })
+    unique_title_changes = []
+    seen_title_pairs = set()
+    for change in section_title_changes:
+        pair = (change["old_title"], change["new_title"])
+        if pair not in seen_title_pairs:
+            seen_title_pairs.add(pair)
+            unique_title_changes.append(change)
+    section_title_changes = unique_title_changes
     required_structure = next((item for item in reversed(structure_constraints) if item), [])
     required_chapter_count = next((item for item in reversed(chapter_count_constraints) if item > 0), 0)
     if required_structure and not required_chapter_count:
@@ -1697,6 +1799,8 @@ def _prepare_revision_run(task_id: str, proposals: list[dict]) -> dict[str, Any]
     old_structure = [str(item) for item in plan_snapshot.get("structure") or [] if str(item).strip()]
     structure_rewrite_sections = [title for title in required_structure if title not in set(old_structure)]
     obsolete_sections = [title for title in old_structure if title not in set(required_structure)] if required_structure else []
+    title_old_sections = [item["old_title"] for item in section_title_changes]
+    title_new_sections = [item["new_title"] for item in section_title_changes]
     explicit_chapters = [
         str((call.get("arguments") or {}).get("chapter_title") or "")
         for call in tool_calls
@@ -1709,100 +1813,119 @@ def _prepare_revision_run(task_id: str, proposals: list[dict]) -> dict[str, Any]
     } for call in reversed(tool_calls) if str(call.get("tool_name") or "") in {
         AgentToolName.REWRITE_SENTENCE.value, AgentToolName.REWRITE_PARAGRAPH.value,
     }), {})
-    update_reason = "根据用户已批准的交互提案生成候选版本：\n" + "\n".join(instructions)
+    update_reason = "根据用户已批准的交互提案生成新报告版本：\n" + "\n".join(instructions)
     revision = max(1, int(base_task.get("run_revision") or 1)) + 1
-    run_id = create_task_run(
-        task_id, revision=revision, run_mode="interaction_revision",
-        base_version_id=int(base_version["id"]), update_reason=update_reason,
-    )
-    delta = create_incremental_delta(report_id, [], update_reason=update_reason, run_id=run_id)
-    old_fact_ids = _snapshot_ids(base_version.get("fact_snapshot") or [])
-    inference_rows = base_version.get("inference_snapshot") or []
-    old_inference_ids = [int(item["id"]) for item in inference_rows
-                         if item.get("id") is not None and item.get("source_level") != "EXTERNAL_INFORMATION"]
-    old_external_ids = [int(item["id"]) for item in inference_rows
-                        if item.get("id") is not None and item.get("source_level") == "EXTERNAL_INFORMATION"]
-    old_conflict_ids = _snapshot_ids(base_version.get("conflict_snapshot") or [])
-    force_evidence = any(item.force_evidence for item in policies)
-    force_analysis = any(item.force_analysis for item in policies)
-    force_final_plan = any(item.force_final_plan for item in policies)
-    rerun_initial_plan = any(item.rerun_initial_plan for item in policies)
-    run_history = list(base_task.get("run_history") or [])
-    run_history.append({
-        "revision": int(base_task.get("run_revision") or 1),
-        "mode": str(base_task.get("run_mode") or "initial"),
-        "stage": str(base_task.get("stage") or ""),
-        "report_version_id": int(base_version["id"]),
-        "finished_at": (base_task.get("queue_status") or {}).get("finished_at"),
-    })
-    # Apply approved user-owned context only after the revision snapshot and
-    # run records exist. The active workflow therefore never observes a
-    # half-applied requirement version.
-    for proposal in proposals:
-        _apply_approved_context_patch(proposal)
-    base_task = short_term.load_task(task_id) or base_task
-    next_payload = dict(base_task)
-    next_payload.update({
-        "stage": "created", "run_revision": revision, "run_id": run_id,
-        "run_mode": "interaction_revision", "run_history": run_history[-50:],
-        "report_id": report_id,
-        "plan_id": None if rerun_initial_plan else base_task.get("plan_id"),
-        "plan_title": plan_snapshot.get("title") or base_task.get("plan_title", ""),
-        "fact_ids": [] if force_evidence else old_fact_ids,
-        "inference_ids": [] if force_analysis else old_inference_ids,
-        "external_ids": [] if force_analysis else old_external_ids,
-        "conflict_ids": [] if force_evidence else old_conflict_ids,
-        "incremental_update": True,
-        "incremental_base_task_id": task_id,
-        "incremental_base_version_id": int(base_version["id"]),
-        "incremental_delta_id": delta.get("id"),
-        "incremental_added_material_ids": [],
-        "incremental_update_reason": update_reason,
-        "incremental_inherited_fact_ids": [] if force_evidence else old_fact_ids,
-        "incremental_inherited_inference_ids": [] if force_analysis else old_inference_ids,
-        "incremental_inherited_external_ids": [] if force_analysis else old_external_ids,
-        "incremental_inherited_conflict_ids": [] if force_evidence else old_conflict_ids,
-        "incremental_new_fact_ids": [],
-        "incremental_generated_inference_ids": [],
-        "incremental_generated_external_ids": [],
-        "incremental_plan": {}, "incremental_delta": {},
-        "incremental_structure_review_required": False,
-        "analysis_done": not force_analysis,
-        "final_plan_frozen": not force_final_plan and bool(plan_snapshot.get("structure")),
-        "intervention_proposal_ids": proposal_ids,
-        "intervention_recompute_from": earliest_policy.recompute_from,
-        "intervention_propagation_policy": earliest_policy.as_dict(),
-        "intervention_force_evidence": force_evidence,
-        "intervention_force_analysis": force_analysis,
-        "intervention_force_final_plan": force_final_plan,
-        "intervention_required_structure": required_structure,
-        "intervention_required_chapter_count": required_chapter_count,
-        "intervention_analysis_constraint": analysis_constraint,
-        "intervention_evidence_recheck": evidence_recheck,
-        "intervention_inference_recheck": inference_recheck,
-        "intervention_tool_calls": [item for item in tool_calls if item],
-        "intervention_target_scope": targeted_revision,
-        "intervention_rewrite_sections": list(dict.fromkeys([*structure_rewrite_sections, *explicit_chapters])),
-        "intervention_obsolete_sections": obsolete_sections,
-        "intervention_scope_locked": bool(required_structure or explicit_chapters or targeted_revision),
-        "intervention_rewrite_all": False,
-        "parse_progress": {}, "evidence_progress": {}, "write_progress": {},
-        "qa_notes": [], "stage_timings": {}, "stage_durations": {},
-        "llm_stats": {}, "token_efficiency": {}, "workload_profile": {},
-        "resource_samples": [], "artifact_status": {},
-        "queue_status": {"status": "created"}, "control_request": "", "error": "",
-        "critical_path_done": False,
-    })
-    short_term.save_task(task_id, next_payload)
-    with session_scope() as s:
-        s.execute(update(ORMChangeProposal).where(
-            ORMChangeProposal.c.id.in_(proposal_ids)
-        ).values(
-            execution_status="queued", execution_run_id=run_id,
-            base_version_id=int(base_version["id"]), execution_error="",
-        ))
-    return {"status": "queued", "run_id": run_id, "proposal_ids": proposal_ids,
-            "base_version_id": int(base_version["id"]), "recompute_from": next_payload["intervention_recompute_from"]}
+    previous_task = deepcopy(base_task)
+    run_id = ""
+    delta: dict[str, Any] = {}
+    try:
+        with session_scope() as tx:
+            run_id = create_task_run(
+                task_id, revision=revision, run_mode="interaction_revision",
+                base_version_id=int(base_version["id"]), update_reason=update_reason,
+                _session=tx,
+            )
+            delta = create_incremental_delta(
+                report_id, [], update_reason=update_reason, run_id=run_id, _session=tx,
+            )
+            tx.execute(update(ORMChangeProposal).where(
+                ORMChangeProposal.c.id.in_(proposal_ids),
+                ORMChangeProposal.c.execution_status == "preparing",
+            ).values(
+                execution_status="queued", execution_run_id=run_id,
+                base_version_id=int(base_version["id"]), execution_error="",
+            ))
+        old_fact_ids = _snapshot_ids(base_version.get("fact_snapshot") or [])
+        inference_rows = base_version.get("inference_snapshot") or []
+        old_inference_ids = [int(item["id"]) for item in inference_rows
+                             if item.get("id") is not None and item.get("source_level") != "EXTERNAL_INFORMATION"]
+        old_external_ids = [int(item["id"]) for item in inference_rows
+                            if item.get("id") is not None and item.get("source_level") == "EXTERNAL_INFORMATION"]
+        old_conflict_ids = _snapshot_ids(base_version.get("conflict_snapshot") or [])
+        force_evidence = any(item.force_evidence for item in policies)
+        force_analysis = any(item.force_analysis for item in policies)
+        force_final_plan = any(item.force_final_plan for item in policies)
+        rerun_initial_plan = any(item.rerun_initial_plan for item in policies)
+        run_history = list(base_task.get("run_history") or [])
+        run_history.append({
+            "revision": int(base_task.get("run_revision") or 1),
+            "mode": str(base_task.get("run_mode") or "initial"),
+            "stage": str(base_task.get("stage") or ""),
+            "report_version_id": int(base_version["id"]),
+            "finished_at": (base_task.get("queue_status") or {}).get("finished_at"),
+        })
+        for proposal in proposals:
+            _apply_approved_context_patch(proposal)
+        current_task = short_term.load_task(task_id) or base_task
+        next_payload = dict(current_task)
+        next_payload.update({
+            "stage": "created", "run_revision": revision, "run_id": run_id,
+            "run_mode": "interaction_revision", "run_history": run_history[-50:],
+            "report_id": report_id,
+            "plan_id": None if rerun_initial_plan else current_task.get("plan_id"),
+            "plan_title": plan_snapshot.get("title") or current_task.get("plan_title", ""),
+            "fact_ids": [] if force_evidence else old_fact_ids,
+            "inference_ids": [] if force_analysis else old_inference_ids,
+            "external_ids": [] if force_analysis else old_external_ids,
+            "conflict_ids": [] if force_evidence else old_conflict_ids,
+            "incremental_update": True,
+            "incremental_base_task_id": task_id,
+            "incremental_base_version_id": int(base_version["id"]),
+            "incremental_delta_id": delta.get("id"),
+            "incremental_added_material_ids": [],
+            "incremental_update_reason": update_reason,
+            "incremental_inherited_fact_ids": [] if force_evidence else old_fact_ids,
+            "incremental_inherited_inference_ids": [] if force_analysis else old_inference_ids,
+            "incremental_inherited_external_ids": [] if force_analysis else old_external_ids,
+            "incremental_inherited_conflict_ids": [] if force_evidence else old_conflict_ids,
+            "incremental_new_fact_ids": [],
+            "incremental_generated_inference_ids": [],
+            "incremental_generated_external_ids": [],
+            "incremental_plan": {}, "incremental_delta": {},
+            "incremental_structure_review_required": False,
+            "analysis_done": not force_analysis,
+            "final_plan_frozen": not force_final_plan and bool(plan_snapshot.get("structure")),
+            "intervention_proposal_ids": proposal_ids,
+            "intervention_recompute_from": earliest_policy.recompute_from,
+            "intervention_propagation_policy": earliest_policy.as_dict(),
+            "intervention_force_evidence": force_evidence,
+            "intervention_force_analysis": force_analysis,
+            "intervention_force_final_plan": force_final_plan,
+            "intervention_required_structure": required_structure,
+            "intervention_required_chapter_count": required_chapter_count,
+            "intervention_analysis_constraint": analysis_constraint,
+            "intervention_evidence_recheck": evidence_recheck,
+            "intervention_inference_recheck": inference_recheck,
+            "intervention_tool_calls": [item for item in tool_calls if item],
+            "intervention_target_scope": targeted_revision,
+            "intervention_section_title_changes": section_title_changes,
+            "intervention_rewrite_sections": list(dict.fromkeys([
+                *structure_rewrite_sections, *explicit_chapters, *title_new_sections,
+            ])),
+            "intervention_obsolete_sections": list(dict.fromkeys([
+                *obsolete_sections, *title_old_sections,
+            ])),
+            "intervention_scope_locked": bool(
+                required_structure or explicit_chapters or targeted_revision or section_title_changes
+            ),
+            "intervention_rewrite_all": False,
+            "parse_progress": {}, "evidence_progress": {}, "write_progress": {},
+            "qa_notes": [], "stage_timings": {}, "stage_durations": {},
+            "llm_stats": {}, "token_efficiency": {}, "workload_profile": {},
+            "resource_samples": [], "artifact_status": {},
+            "queue_status": {"status": "created"}, "control_request": "", "error": "",
+            "critical_path_done": False,
+        })
+        short_term.save_task(task_id, next_payload)
+        return {"status": "queued", "run_id": run_id, "proposal_ids": proposal_ids,
+                "base_version_id": int(base_version["id"]), "delta_id": delta.get("id"),
+                "recompute_from": next_payload["intervention_recompute_from"]}
+    except Exception as exc:
+        _mark_revision_preparation_failed(
+            task_id, proposal_ids, error=str(exc), restore_task=previous_task,
+            prepared={"run_id": run_id, "delta_id": delta.get("id")},
+        )
+        raise
 
 
 def complete_recompute_for_run(run_id: str, candidate_version_id: int) -> None:
@@ -1823,8 +1946,8 @@ def complete_recompute_for_run(run_id: str, candidate_version_id: int) -> None:
     first = rows[0]
     _notify(
         task_id=str(first["task_id"]), report_id=first["report_id"],
-        notification_type="candidate_ready", title="交互修改候选版本已生成",
-        message="后台重算已完成，请在版本审阅中比较并决定保留哪些变化。",
+        notification_type="candidate_ready", title="交互修改新版本已生成",
+        message="后台重算已完成，请在版本审阅中比较新旧版本。",
         action_url=f"/reports/{first['report_id']}?version={int(candidate_version_id)}",
         metadata={"run_id": run_id, "candidate_version_id": int(candidate_version_id),
                   "proposal_ids": [int(row["id"]) for row in rows]},
@@ -1874,12 +1997,12 @@ def _friendly_interaction_error(error: Exception) -> str:
 def _friendly_revision_error(error: str) -> str:
     raw = str(error or "")
     if "FINAL_PLAN_CHAPTER_COUNT_MISMATCH" in raw:
-        return "候选目录没有满足你确认的章节数量，因此系统已拒绝该候选，原报告保持不变。"
+        return "新目录没有满足你确认的章节数量，因此系统已拒绝该候选，原报告保持不变。"
     if "ANALYSIS_DIMENSION_COUNT_MISMATCH" in raw:
         return "候选分析规划没有满足你确认的维度数量，因此系统已拒绝该候选，原报告保持不变。"
     if "MODEL_OUTPUT_TRUNCATED" in raw:
-        return "候选版本未完整生成，系统已保留原报告，可缩小修改范围后重试。"
-    return "候选版本处理失败，系统已保留原报告和历史版本。"
+        return "新版本未完整生成，系统已保留原报告，可缩小修改范围后重试。"
+    return "新版本处理失败，系统已保留原报告和历史版本。"
 
 
 def list_notifications(*, task_id: str = "", report_id: int | None = None) -> list[dict[str, Any]]:
@@ -1930,18 +2053,37 @@ def review_workspace(task_id: str, artifact_type: str = "task_brief", query: str
 
 def _review_groups(task_id: str, task: dict) -> list[dict]:
     with session_scope() as s:
-        narrative_count = s.execute(select(ORMTaskArtifact.c.id).where(
+        plan_id = int(task.get("plan_id") or 0)
+        plan_row = s.execute(select(
+            ORMPlan.c.analysis_plan_json, ORMPlan.c.final_plan_json,
+            ORMPlan.c.chapter_plans, ORMPlan.c.plan_stage, ORMPlan.c.plan_version,
+        ).where(ORMPlan.c.id == plan_id)).mappings().first() if plan_id else None
+        narrative_rows = s.execute(select(
+            ORMTaskArtifact.c.stage, ORMTaskArtifact.c.run_id, ORMTaskArtifact.c.status,
+        ).where(
             ORMTaskArtifact.c.task_id == task_id,
             ORMTaskArtifact.c.stage.like("narrative_plan:%"),
-        )).all()
+        ).order_by(ORMTaskArtifact.c.id.desc())).mappings().all()
+    current_run_id = str(task.get("run_id") or "")
+    if not current_run_id:
+        current_run_id = next(
+            (str(row.get("run_id") or "") for row in narrative_rows if str(row.get("run_id") or "")),
+            "",
+        )
+    if current_run_id:
+        narrative_rows = [row for row in narrative_rows if str(row.get("run_id") or "") == current_run_id]
+    narrative_stages = {
+        str(row["stage"]) for row in narrative_rows if str(row.get("status") or "") == "done"
+    }
+    analysis_plan_exists, final_plan_exists, plan_version = _plan_review_state(plan_row)
     counts = {
         "task_brief": 1,
         "material_role": len(task.get("material_insights") or []),
-        "analysis_plan": 1 if task.get("plan_id") else 0,
+        "analysis_plan": 1 if analysis_plan_exists else 0,
         "fact": len(task.get("fact_ids") or []),
         "inference": len(task.get("inference_ids") or []) + len(task.get("external_ids") or []),
-        "final_plan": 1 if task.get("final_plan_frozen") else 0,
-        "narrative_plan": len(narrative_count),
+        "final_plan": 1 if final_plan_exists else 0,
+        "narrative_plan": len(narrative_stages),
         "qa_issue": len(task.get("qa_notes") or []),
     }
     labels = {
@@ -1951,7 +2093,30 @@ def _review_groups(task_id: str, task: dict) -> list[dict]:
         "qa_issue": "质量问题",
     }
     return [{"artifact_type": key, "label": labels[key], "count": value,
-             "available": bool(value)} for key, value in counts.items()]
+             "available": bool(value),
+             **({"version": plan_version} if key in {"analysis_plan", "final_plan"} and plan_version else {})}
+            for key, value in counts.items()]
+
+
+def _plan_review_state(plan_row: dict | None) -> tuple[bool, bool, int]:
+    """Return presence/version for the one current plan row.
+
+    A plan id alone is not proof that either stage produced a reviewable
+    artifact. The JSON snapshots are the authoritative presence markers;
+    ``chapter_plans`` is only a controlled fallback for old finalized rows.
+    """
+    if not plan_row:
+        return False, False, 0
+    analysis_exists = bool(_load(plan_row.get("analysis_plan_json"), {}))
+    final_exists = bool(_load(plan_row.get("final_plan_json"), {})) or (
+        str(plan_row.get("plan_stage") or "") == "final"
+        and bool(_load(plan_row.get("chapter_plans"), []))
+    )
+    try:
+        version = int(plan_row.get("plan_version") or 0)
+    except (TypeError, ValueError):
+        version = 0
+    return analysis_exists, final_exists, version
 
 
 def _review_items(task_id: str, task: dict, artifact_type: str) -> list[dict]:
@@ -1971,7 +2136,7 @@ def _review_items(task_id: str, task: dict, artifact_type: str) -> list[dict]:
         current = _current_plan(task_id, artifact_type)
         return [_review_item(artifact_type, str(task.get("plan_id") or ""),
                              "分析范围与问题" if artifact_type == "analysis_plan" else "最终报告结构",
-                             current, version)] if current else []
+                             current, str(current.get("plan_version") or version))] if current else []
     if artifact_type == "fact":
         ids = [int(value) for value in task.get("fact_ids") or [] if str(value).isdigit()]
         with session_scope() as s:
@@ -2035,12 +2200,16 @@ def _current_plan(task_id: str, artifact_type: str) -> dict:
     key = "analysis_plan_json" if artifact_type == "analysis_plan" else "final_plan_json"
     explicit = _load(row.get(key), {})
     if explicit:
+        explicit.setdefault("plan_version", int(row.get("plan_version") or 1))
+        explicit.setdefault("plan_stage", str(row.get("plan_stage") or ""))
         return explicit
     return {
         "title": row["title"], "objective": row["objective"], "core_question": row["core_question"],
         "core_judgment": row["core_judgment"], "narrative_logic": row["narrative_logic"],
         "dimensions": _load(row["dimensions"], []), "structure": _load(row["structure"], []),
         "chapter_plans": _load(row["chapter_plans"], []), "budget": _load(row["budget"], {}),
+        "plan_version": int(row.get("plan_version") or 1),
+        "plan_stage": str(row.get("plan_stage") or ""),
     }
 
 

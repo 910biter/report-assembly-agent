@@ -35,7 +35,7 @@ from app.infrastructure.orm import (
 _GRAPH_SYSTEM = """你是证据约束的关系抽取员。只根据给定事实抽取实体和关系，不推断、不补全。
 严格输出 JSON：
 {
-  "entities": [{"name":"实体原文","type":"人物/机构/地点/项目/技术/事件/其他","fact_ids":[1]}],
+  "entities": [{"name":"实体原文","type":"模型判断的开放实体类型标签或 unknown","fact_ids":[1]}],
   "assertions": [{
     "subject":"实体原文", "predicate":"简短关系", "object":"实体原文或明确值",
     "object_kind":"entity/value", "event_name":"可选事件", "valid_from":"可选时间",
@@ -168,7 +168,7 @@ class Neo4jProjector:
                         "MERGE (s)-[r:ASSERTS {assertion_key:$assertion_key}]->"
                         "(target:KGEntity {entity_key:$target_key}) "
                         "ON CREATE SET target.name=$target_name,"
-                        "target.entity_type=CASE WHEN $object_key IS NULL THEN 'value' ELSE 'other' END "
+                        "target.entity_type=CASE WHEN $object_key IS NULL THEN 'value' ELSE 'unknown' END "
                         "SET r.predicate=$predicate,r.status=$status,r.confidence=$confidence,"
                         "r.fact_ids=reduce(ids=coalesce(r.fact_ids,[]), fid IN $fact_ids | CASE WHEN fid IN ids THEN ids ELSE ids + fid END),"
                         "r.task_ids=reduce(ids=coalesce(r.task_ids,[]), tid IN $task_ids | CASE WHEN tid IN ids THEN ids ELSE ids + tid END),"
@@ -279,11 +279,20 @@ class GraphService:
 
     @property
     def mode(self) -> str:
-        return str(settings.graph_mode or "off").strip().lower()
+        """Compatibility label; Graph execution is not controlled by this value."""
+        return "active"
+    def capability_status(self) -> dict[str, dict[str, str]]:
+        """Report canonical PG Graph RAG and optional Neo4j projection separately."""
+        return {
+            "graph_rag": {"status": "available", "backend": "postgresql"},
+            "neo4j_projection": {
+                "status": "configured" if self.projector.available() else "not_configured",
+            },
+        }
 
     def build_task_graph(self, task_id: str, facts: list[dict], workspace_id: str = "",
                          active_fact_ids: set[int] | None = None) -> GraphBuildResult:
-        if self.mode == "off" or not facts:
+        if not facts:
             return GraphBuildResult(status="skipped")
         workspace_id = workspace_id or settings.graph_workspace_id
         started = time.time()
@@ -341,7 +350,7 @@ class GraphService:
                         active_fact_ids if active_fact_ids is not None else valid_fact_ids,
                     )
                     changes = self._enqueue_projection(s, task_id, workspace_id)
-            projected = self.project_pending(limit=1) if self.mode == "active" and persisted_batches else 0
+            projected = self.project_pending(limit=1) if persisted_batches else 0
             status = "ready" if not failures else "partial_ready" if persisted_batches else "degraded"
             error = ""
             if failures:
@@ -393,7 +402,7 @@ class GraphService:
                 key = "ent-" + _stable_key(workspace_id, normalized)
                 result = s.execute(ORMKGEntity.insert().values(
                     entity_key=key, workspace_id=workspace_id, canonical_name=name,
-                    entity_type=str(item.get("type") or "other")[:64], aliases_json=json.dumps([name], ensure_ascii=False),
+                    entity_type=str(item.get("type") or "unknown").strip()[:64], aliases_json=json.dumps([name], ensure_ascii=False),
                 ))
                 entity_id = int(result.inserted_primary_key[0])
             else:
@@ -555,8 +564,6 @@ class GraphService:
         return len(assertion_ids)
 
     def context_for_analysis(self, task_id: str, facts: list[dict], limit: int = 12) -> str:
-        if self.mode != "active":
-            return ""
         fact_ids = [int(item["id"]) for item in facts if item.get("id") is not None]
         rows = self.projector.neighborhood_for_fact_ids(task_id, fact_ids, limit=limit)
         if not rows:
@@ -597,9 +604,12 @@ class GraphService:
     def task_graph(self, task_id: str) -> dict:
         records = _projection_records(task_id)
         nodes = _visualization_nodes(records)
+        capability = self.capability_status()
         return {
             "mode": self.mode,
-            "neo4j_configured": self.projector.available(),
+            "neo4j_configured": capability["neo4j_projection"]["status"] == "configured",
+            "graph_rag_status": capability["graph_rag"],
+            "neo4j_projection_status": capability["neo4j_projection"],
             "nodes": nodes,
             "edges": records["assertions"],
             "stats": {"entity_count": len(nodes), "assertion_count": len(records["assertions"])},

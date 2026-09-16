@@ -7,6 +7,7 @@ import type { TaskSummary } from "@/api/types";
 import StatusBadge from "@/components/StatusBadge.vue";
 import MaterialComparisonWorkspace from "@/components/MaterialComparisonWorkspace.vue";
 import UiPageHeader from "@/components/ui/UiPageHeader.vue";
+import { stageGroups } from "@/domain/workflowStages";
 import { useUiStore } from "@/stores/ui";
 const GraphNetwork = defineAsyncComponent(
   () => import("@/components/GraphNetwork.vue"),
@@ -31,6 +32,7 @@ const active = ref(String(route.query.tab || "overview"));
 const analysisType = ref("facts");
 const detailsOpen = ref(false);
 const selectedGraphEdge = ref<any>(null);
+const graphBuildError = ref("");
 const task = useQuery({
   queryKey: ["task", taskId],
   queryFn: () => api<TaskSummary>(`/api/tasks/${taskId}`),
@@ -175,7 +177,10 @@ const confirmDirectory = useMutation({
 const rebuildGraph = useMutation({
   mutationFn: () =>
     api(`/api/tasks/${taskId}/graph/rebuild`, { method: "POST" }),
+  onMutate: () => { graphBuildError.value = ""; },
+  onError: (error: any) => { graphBuildError.value = String(error?.message || error || "构建请求失败"); },
   onSuccess: async () => {
+    graphBuildError.value = "";
     await Promise.all([
       qc.invalidateQueries({ queryKey: ["task", taskId] }),
       qc.invalidateQueries({ queryKey: ["task-graph", taskId] }),
@@ -214,36 +219,8 @@ const graphBuildMessage = computed(() => {
 });
 const stages = computed(() =>
   task.data.value?.run_mode === "material_comparison"
-    ? [
-        {
-          name: "新增材料准备",
-          keys: [
-            "created",
-            "parsing",
-            "dedup",
-            "material_analysis",
-            "planning",
-          ],
-        },
-        { name: "证据与变化分析", keys: ["evidence", "conflict", "analysis"] },
-        { name: "变化审阅", keys: ["review", "done"] },
-      ]
-    : [
-        { name: "材料准备", keys: ["created", "parsing", "dedup"] },
-        {
-          name: "分析规划",
-          keys: [
-            "material_analysis",
-            "requirement_review",
-            "planning",
-            "evidence",
-            "conflict",
-            "analysis",
-          ],
-        },
-        { name: "报告生成", keys: ["directory_review", "writing"] },
-        { name: "审核完成", keys: ["review", "done"] },
-      ],
+    ? stageGroups.comparison
+    : stageGroups.standard,
 );
 const taskTabs = computed(() =>
   isComparison.value
@@ -323,11 +300,6 @@ const inferenceCount = computed(() =>
     ? inferences.value.length
     : Number(artifactCounts.value.inferences || 0),
 );
-const conflictCount = computed(() =>
-  analysis.data.value
-    ? conflicts.value.length
-    : Number(artifactCounts.value.conflicts || 0),
-);
 function run() {
   command.mutate({ path: `/api/tasks/${taskId}/run` });
 }
@@ -390,40 +362,6 @@ function confidence(x: any) {
     { high: "高", medium: "中", low: "低" }[
       String(x.confidence_level || "").toLowerCase()
     ] || "需人工复核"
-  );
-}
-const conflictTypeLabels: Record<string, string> = {
-  direct_contradiction: "直接矛盾",
-  temporal_difference: "时间变化",
-  scope_difference: "适用范围不同",
-  metric_difference: "统计口径不同",
-  qualification: "补充限定",
-  needs_verification: "待核验",
-};
-function conflictType(item: any) {
-  return conflictTypeLabels[item.conflict_type] || "待核验";
-}
-function conflictConfidence(item: any) {
-  return (
-    (
-      { high: "高置信", medium: "中置信", low: "低置信" } as Record<
-        string,
-        string
-      >
-    )[item.confidence] || "置信度未定"
-  );
-}
-function sourceLocation(entry: any) {
-  const location = [
-    entry.file || "来源文件未记录",
-    entry.page ? `第 ${entry.page} 页` : "",
-    entry.paragraph ? `第 ${entry.paragraph} 段` : "",
-  ].filter(Boolean);
-  return location.join(" · ");
-}
-function isPairwiseConflict(item: any) {
-  return (
-    (item.entries || []).length === 2 && (item.claim_ids || []).length === 2
   );
 }
 function versionsList() {
@@ -750,10 +688,6 @@ function versionsList() {
               <strong>{{ inferenceCount }}</strong
               ><span>分析判断</span>
             </div>
-            <div class="metric">
-              <strong>{{ conflictCount }}</strong
-              ><span>待核验</span>
-            </div>
           </div>
         </div>
       </div>
@@ -874,7 +808,6 @@ function versionsList() {
             ['facts', `事实 ${facts.length}`],
             ['inferences', `分析判断 ${inferences.length}`],
             ['graph', `关系网络 ${graphAssertionCount}`],
-            ['conflicts', `冲突与待核验 ${conflicts.length}`],
           ]"
           :key="item[0]"
           :class="{ active: analysisType === item[0] }"
@@ -895,8 +828,8 @@ function versionsList() {
                 ev.quote
               }}
             </blockquote>
-          </details></template
-        ><template v-else-if="analysisType === 'inferences'"
+          </details></template>
+        <template v-else-if="analysisType === 'inferences'"
           ><article
             v-for="item in inferences"
             :key="item.id"
@@ -913,8 +846,8 @@ function versionsList() {
             <blockquote v-if="item.reasoning_chain">
               {{ item.reasoning_chain }}
             </blockquote>
-          </article></template
-        ><template v-else-if="analysisType === 'graph'"
+          </article></template>
+        <template v-else-if="analysisType === 'graph'"
           ><div class="graph-summary">
             <span
               class="badge"
@@ -927,6 +860,8 @@ function versionsList() {
                   : "图谱观测模式"
               }}</span
             ><small>关系只保存有事实依据的实体联系。</small
+            ><span v-if="graphBuildError" class="graph-build-error">{{ graphBuildError }}</span
+            ><button class="btn graph-build-button" :disabled="rebuildGraph.isPending.value || graphBuildActive" @click="rebuildGraph.mutate()">{{ graphBuildActive ? "正在构建" : "构建知识图谱" }}</button
             ><span v-if="graphBuildActive" class="badge warning">正在构建</span
             ><span
               v-else-if="graphBuildStatus === 'partial_ready'"
@@ -980,86 +915,10 @@ function versionsList() {
           <div v-if="!graph.data.value?.edges?.length" class="empty">
             <div>
               <strong>尚未形成可展示的关系网络</strong
-              ><span>{{ graphBuildMessage }}</span
-              ><button
-                v-if="graph.data.value?.mode !== 'off'"
-                class="btn"
-                :disabled="rebuildGraph.isPending.value || graphBuildActive"
-                @click="rebuildGraph.mutate()"
-              >
-                {{ graphBuildActive ? "正在重建" : "重新构建关系网络" }}
-              </button>
+              ><span>{{ graphBuildMessage }}</span>
             </div>
-          </div></template
-        ><template v-else-if="analysisType === 'conflicts'"
-          ><article
-            v-for="item in conflicts"
-            :key="item.id"
-            class="conflict-review"
-          >
-            <header>
-              <div>
-                <span class="conflict-type" :class="item.conflict_type">{{
-                  conflictType(item)
-                }}</span>
-                <small>{{ conflictConfidence(item) }}</small>
-              </div>
-              <b>{{ item.fact_key }}</b>
-            </header>
-            <div v-if="isPairwiseConflict(item)" class="conflict-pair">
-              <section
-                v-for="(entry, index) in item.entries || []"
-                :key="entry.claim_id || index"
-              >
-                <div class="conflict-side">
-                  <span>说法 {{ index === 0 ? "A" : "B" }}</span
-                  ><small
-                    >Fact {{ entry.fact_id || "—" }} · Claim
-                    {{ entry.claim_id || "—" }}</small
-                  >
-                </div>
-                <strong>{{ entry.statement }}</strong>
-                <blockquote v-if="entry.quote">{{ entry.quote }}</blockquote>
-                <footer>
-                  {{ sourceLocation(entry)
-                  }}<span v-if="entry.unit_id">
-                    · Unit {{ entry.unit_id }}</span
-                  >
-                </footer>
-              </section>
-              <div class="conflict-relation">
-                <span>{{ conflictType(item) }}</span>
-                <b>{{ item.reason || "模型未提供明确的比较说明" }}</b>
-              </div>
-            </div>
-            <div v-else class="conflict-ambiguous">
-              <strong>历史记录未保存两两配对关系</strong>
-              <p>
-                以下内容只是同一候选组，无法判断其中哪两条构成矛盾。系统不会将其解释为“其余说法与某一条矛盾”。重新运行冲突核验后才会形成明确的
-                A/B 对照。
-              </p>
-              <div class="conflict-candidates">
-                <section
-                  v-for="(entry, index) in item.entries || []"
-                  :key="entry.claim_id || index"
-                >
-                  <small
-                    >候选 {{ Number(index) + 1 }} · Fact
-                    {{ entry.fact_id || "—" }}</small
-                  >
-                  <b>{{ entry.statement }}</b>
-                  <footer>{{ sourceLocation(entry) }}</footer>
-                </section>
-              </div>
-            </div>
-          </article>
-          <div v-if="!conflicts.length" class="empty">
-            <div>
-              <strong>未发现需要核验的来源差异</strong
-              >系统仅将可比口径下不能同时成立的说法标为直接矛盾。
-            </div>
-          </div></template
-        >
+          </div></template>
+
       </div>
     </section>
     <section
@@ -1091,8 +950,7 @@ function versionsList() {
             :href="`/api/reports/${task.data.value.report_id}/export`"
             >导出 Word</a
           >
-        </div></template
-      >
+        </div></template>
       <div v-else class="empty tab-empty-state">
         <div>
           <strong>尚未生成报告</strong>
@@ -1353,14 +1211,23 @@ function versionsList() {
 .analysis-nav button {
   width: 100%;
   padding: 11px 12px;
-  border: 0;
-  background: transparent;
+  border: 1px solid transparent;
+  background: var(--surface-raised);
+  color: var(--foreground);
   text-align: left;
-  border-radius: 4px;
+  font-size: 13px;
+  font-weight: 550;
+  border-radius: var(--radius-sm);
+  transition: background-color var(--motion-fast), border-color var(--motion-fast);
+}
+.analysis-nav button:hover {
+  background: var(--surface-hover);
+  border-color: var(--border-strong);
 }
 .analysis-nav button.active {
   color: var(--foreground);
-  background: var(--color-primary-soft);
+  background: var(--primary-soft);
+  border-color: color-mix(in srgb, var(--primary) 58%, var(--border));
   font-weight: 600;
 }
 .analysis-content {
