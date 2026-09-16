@@ -59,6 +59,7 @@ from app.material_comparison import (
 from app.rendering.headings import detect_numbering_strategy, format_heading, strip_heading_prefix
 from app.report_versions import (
     create_incremental_delta,
+    compare_report_versions,
     diff_report_version_to_current,
     diff_report_version_sentences,
     ensure_report_version,
@@ -1456,6 +1457,21 @@ def report_version_diff_current(version_id: int, granularity: str = "section"):
         diff = diff_report_version_sentences(version_id, task_id=task_id)
     else:
         diff = diff_report_version_to_current(version_id, task_id=task_id)
+    return diff or JSONResponse({"error": "REPORT_VERSION_NOT_FOUND"}, status_code=404)
+
+
+@router.get("/report-versions/{base_version_id}/diff/{target_version_id}")
+def report_version_diff(base_version_id: int, target_version_id: int):
+    """Compare two immutable report versions without creating review decisions."""
+    base = get_report_version(base_version_id)
+    target = get_report_version(target_version_id)
+    if base is None or target is None or int(base["report_id"]) != int(target["report_id"]):
+        return JSONResponse({"error": "REPORT_VERSION_NOT_FOUND"}, status_code=404)
+    diff = compare_report_versions(
+        base_version_id,
+        target_version_id=target_version_id,
+        task_id=str(base.get("task_id") or ""),
+    )
     return diff or JSONResponse({"error": "REPORT_VERSION_NOT_FOUND"}, status_code=404)
 
 

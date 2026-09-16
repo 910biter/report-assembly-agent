@@ -7,6 +7,7 @@ updates should compare against a version snapshot instead of mutating history.
 from __future__ import annotations
 
 import json
+import re
 from collections import defaultdict
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -648,50 +649,6 @@ def _affected_chapters(sentences: list[dict[str, Any]], added_facts: list[dict[s
 
 
 
-def diff_report_version_to_current(version_id: int, task_id: str = "") -> dict[str, Any] | None:
-    """Compare an immutable version snapshot with the current mutable report."""
-    base = get_report_version(version_id)
-    if base is None:
-        return None
-    current = build_report_snapshot(int(base["report_id"]), task_id=task_id or base.get("task_id") or "")
-    old_sections = _sections_from_sentences(base.get("sentence_snapshot") or [])
-    new_sections = _sections_from_sentences(current.get("sentence_snapshot") or [])
-    old_titles = list(old_sections.keys())
-    new_titles = list(new_sections.keys())
-    section_diffs = []
-    for title in new_titles:
-        if title not in old_sections:
-            section_diffs.append({"section": title, "change_type": "added", "old_text": "", "new_text": new_sections[title]})
-        else:
-            old_text = old_sections[title]
-            new_text = new_sections[title]
-            if _stable_json_hash(old_text) != _stable_json_hash(new_text):
-                section_diffs.append({
-                    "section": title,
-                    "change_type": "modified",
-                    "old_text": old_text,
-                    "new_text": new_text,
-                    "old_chars": len(old_text),
-                    "new_chars": len(new_text),
-                })
-    for title in old_titles:
-        if title not in new_sections:
-            section_diffs.append({"section": title, "change_type": "removed", "old_text": old_sections[title], "new_text": ""})
-    return {
-        "base_version_id": version_id,
-        "report_id": base["report_id"],
-        "old_title": base.get("title", ""),
-        "new_title": current.get("title", ""),
-        "structure_changes": _structure_changes(old_titles, new_titles),
-        "section_diffs": section_diffs,
-        "summary": {
-            "added_sections": sum(1 for d in section_diffs if d["change_type"] == "added"),
-            "modified_sections": sum(1 for d in section_diffs if d["change_type"] == "modified"),
-            "removed_sections": sum(1 for d in section_diffs if d["change_type"] == "removed"),
-        },
-    }
-
-
 def restore_report_version(version_id: int) -> dict[str, Any] | None:
     """Restore a version snapshot into the current mutable report.
 
@@ -763,77 +720,102 @@ def restore_report_version(version_id: int) -> dict[str, Any] | None:
             ))
     return {"report_id": report_id, "restored_version_id": version_id, "sentence_count": len(sentences)}
 
+def _section_text(paragraphs: dict[int, list[dict[str, Any]]]) -> str:
+    return "".join(str(item.get("text") or "") for items in paragraphs.values() for item in items)
 
-def _sections_from_sentences(sentences: list[dict[str, Any]]) -> dict[str, str]:
-    sections: dict[str, list[str]] = {}
-    for sentence in sentences:
-        if not sentence.get("selected", 1):
+def _normalize_section_title(title: str) -> str:
+    value = re.sub(r"^\s*(?:第\s*)?[\d０-９]+(?:\.[\d０-９]+)*\s*[章节篇]?\s*", "", str(title or ""))
+    value = re.sub(r"^\s*[一二三四五六七八九十百千万]+\s*[、.．:：]\s*", "", value)
+    return re.sub(r"[\s\-—_·,，。；;:：()（）\[\]【】]", "", value).casefold()
+
+def _pair_sections(old_sections: dict[str, dict[int, list[dict[str, Any]]]],
+                   new_sections: dict[str, dict[int, list[dict[str, Any]]]]) -> list[dict[str, Any]]:
+    """Pair logical sections without using display titles as identity."""
+    old_titles, new_titles = list(old_sections), list(new_sections)
+    old_pos = {title: index for index, title in enumerate(old_titles)}
+    new_pos = {title: index for index, title in enumerate(new_titles)}
+    unused_old = set(old_titles)
+    matches: dict[str, str] = {}
+    match_methods: dict[str, str] = {}
+    for new_title in new_titles:
+        candidates = [title for title in unused_old
+                      if _normalize_section_title(title) == _normalize_section_title(new_title)]
+        if candidates:
+            old_title = min(candidates, key=lambda title: abs(old_pos[title] - new_pos[new_title]))
+            matches[new_title] = old_title
+            match_methods[new_title] = "title"
+            unused_old.remove(old_title)
+    for new_title in new_titles:
+        if new_title in matches:
             continue
-        section = str(sentence.get("section") or "")
-        if not section:
-            continue
-        text = str(sentence.get("rendered_text") or sentence.get("user_edit") or sentence.get("content") or "")
-        sections.setdefault(section, []).append(text)
-    return {section: "".join(texts) for section, texts in sections.items()}
-
-
-def diff_report_version_sentences(version_id: int, task_id: str = "") -> dict[str, Any] | None:
-    """Sentence/paragraph-level diff between a version commit and current draft."""
-    base = get_report_version(version_id)
-    if base is None:
-        return None
-    current = build_report_snapshot(int(base["report_id"]), task_id=task_id or base.get("task_id") or "")
-    old_sections = _sentence_groups(base.get("sentence_snapshot") or [])
-    new_sections = _sentence_groups(current.get("sentence_snapshot") or [])
-    section_titles = list(dict.fromkeys(list(old_sections.keys()) + list(new_sections.keys())))
-    sections = []
-    for title in section_titles:
-        old_paras = old_sections.get(title, {})
-        new_paras = new_sections.get(title, {})
-        paragraphs = []
-        for old_para_no, new_para_no in _align_paragraphs(old_paras, new_paras):
-            old_items = old_paras.get(old_para_no, []) if old_para_no is not None else []
-            new_items = new_paras.get(new_para_no, []) if new_para_no is not None else []
-            sentence_diffs = _sequence_diff(old_items, new_items)
+        candidates = []
+        for old_title in unused_old:
+            score = _sentence_similarity(_section_text(old_sections[old_title]), _section_text(new_sections[new_title]))
+            if score >= 0.18:
+                candidates.append((score, abs(old_pos[old_title] - new_pos[new_title]), old_title))
+        if candidates:
+            _score, _distance, old_title = max(candidates, key=lambda item: (item[0], -item[1]))
+            matches[new_title] = old_title
+            match_methods[new_title] = "content"
+            unused_old.remove(old_title)
+    remaining_new = [title for title in new_titles if title not in matches]
+    remaining_old = [title for title in old_titles if title in unused_old]
+    if len(remaining_new) == len(remaining_old):
+        for new_title, old_title in zip(remaining_new, remaining_old):
+            matches[new_title] = old_title
+            match_methods[new_title] = "position"
+            unused_old.remove(old_title)
+    result = []
+    for new_index, new_title in enumerate(new_titles):
+        old_title = matches.get(new_title)
+        old_paragraphs = old_sections.get(old_title, {}) if old_title else {}
+        new_paragraphs = new_sections[new_title]
+        old_text, new_text = _section_text(old_paragraphs), _section_text(new_paragraphs)
+        title_changed = bool(old_title and old_title != new_title)
+        content_changed = old_text != new_text
+        old_index = old_pos.get(old_title) if old_title else None
+        order_changed = old_index is not None and old_index != new_index
+        if old_title is None:
+            change_type = "added"
+        elif title_changed and not content_changed:
+            change_type = "renamed"
+        elif content_changed:
+            change_type = "rewritten" if title_changed else "modified"
+        elif order_changed:
+            change_type = "reordered"
+        else:
             change_type = "unchanged"
-            if any(item["change_type"] != "unchanged" for item in sentence_diffs):
-                change_type = "modified"
-            if old_items and not new_items:
-                change_type = "removed"
-            elif new_items and not old_items:
-                change_type = "added"
-            paragraphs.append({
-                "paragraph": new_para_no if new_para_no is not None else old_para_no,
-                "old_paragraph": old_para_no,
-                "new_paragraph": new_para_no,
-                "change_key": "paragraph:" + _stable_json_hash({
-                    "section": title, "old": old_para_no, "new": new_para_no,
-                }),
-                "change_type": change_type,
-                "old_text": "".join(item["text"] for item in old_items),
-                "new_text": "".join(item["text"] for item in new_items),
-                "sentences": sentence_diffs,
-            })
-        section_change = "unchanged"
-        if title not in old_sections:
-            section_change = "added"
-        elif title not in new_sections:
-            section_change = "removed"
-        elif any(p["change_type"] != "unchanged" for p in paragraphs):
-            section_change = "modified"
-        sections.append({
-            "section": title,
-            "change_key": "section:" + _stable_json_hash({"section": title}),
-            "change_type": section_change,
-            "paragraphs": paragraphs,
+        result.append({
+            "section": old_title or new_title, "old_title": old_title or "", "new_title": new_title,
+            "old_index": old_index, "new_index": new_index, "title_changed": title_changed,
+            "content_changed": content_changed, "order_changed": order_changed,
+            "match_method": match_methods.get(new_title, "unmatched"),
+            "match_confidence": (
+                "high" if match_methods.get(new_title) == "title"
+                else "medium" if match_methods.get(new_title) == "content"
+                else "low" if match_methods.get(new_title) == "position"
+                else "none"
+            ),
+            "change_type": change_type,
+            "change_kinds": [kind for kind, active in (("rename", title_changed), ("rewrite", content_changed), ("reorder", order_changed)) if active],
+            "old_paragraphs": old_paragraphs, "new_paragraphs": new_paragraphs,
         })
-    return {
-        "base_version_id": version_id,
-        "report_id": base["report_id"],
-        "candidate_hash": current.get("metadata", {}).get("snapshot_hash", ""),
-        "sections": sections,
-        "summary": _fine_diff_summary(sections),
-    }
+    for old_title in unused_old:
+        result.append({
+            "section": old_title, "old_title": old_title, "new_title": "",
+            "old_index": old_pos[old_title], "new_index": None, "title_changed": False,
+            "content_changed": True, "order_changed": False, "match_method": "unmatched",
+            "match_confidence": "none",
+            "change_type": "removed", "change_kinds": ["remove"],
+            "old_paragraphs": old_sections[old_title], "new_paragraphs": {},
+        })
+    return sorted(
+        result,
+        key=lambda item: (
+            item.get("new_index") is None,
+            item.get("new_index") if item.get("new_index") is not None else item.get("old_index") or 0,
+        ),
+    )
 
 
 def restore_report_version_scope(version_id: int, scope: dict[str, Any], *, _session=None) -> dict[str, Any] | None:
@@ -842,7 +824,8 @@ def restore_report_version_scope(version_id: int, scope: dict[str, Any], *, _ses
     if version is None:
         return None
     report_id = int(version["report_id"])
-    section = str(scope.get("section") or "")
+    section = str(scope.get("base_section") or scope.get("section") or "")
+    current_section = str(scope.get("current_section") or scope.get("section") or section)
     paragraph = scope.get("old_paragraph", scope.get("paragraph"))
     current_paragraph = scope.get("new_paragraph", scope.get("paragraph"))
     level = str(scope.get("level") or ("sentence" if scope.get("old_sentence_id") is not None else "paragraph" if paragraph is not None else "section"))
@@ -871,7 +854,7 @@ def restore_report_version_scope(version_id: int, scope: dict[str, Any], *, _ses
             sentence_ids = [int(current_sentence_id)] if str(current_sentence_id).isdigit() else []
         elif level == "section":
             rows = s.execute(
-                select(ORMSentence.c.id).where(ORMSentence.c.report_id == report_id, ORMSentence.c.section == section)
+                select(ORMSentence.c.id).where(ORMSentence.c.report_id == report_id, ORMSentence.c.section == current_section)
             ).mappings().all()
             sentence_ids = [int(r["id"]) for r in rows]
         elif level == "paragraph":
@@ -879,7 +862,7 @@ def restore_report_version_scope(version_id: int, scope: dict[str, Any], *, _ses
                 rows = s.execute(
                     select(ORMSentence.c.id).where(
                         ORMSentence.c.report_id == report_id,
-                        ORMSentence.c.section == section,
+                        ORMSentence.c.section == current_section,
                         ORMSentence.c.paragraph == int(current_paragraph),
                     ).order_by(ORMSentence.c.position, ORMSentence.c.id)
                 ).mappings().all()
@@ -900,7 +883,7 @@ def restore_report_version_scope(version_id: int, scope: dict[str, Any], *, _ses
                     report_id=report_id,
                     lineage_id=item.get("lineage_id") or f"restored-{version_id}-{item.get('id')}",
                     parent_sentence_id=item.get("parent_sentence_id"),
-                    section=section,
+                    section=current_section if level != "section" else section,
                     paragraph=int(current_paragraph or item.get("paragraph") or paragraph or 1),
                     position=position,
                     content=item.get("content", ""),
@@ -922,6 +905,8 @@ def restore_report_version_scope(version_id: int, scope: dict[str, Any], *, _ses
         "report_id": report_id,
         "restored": len(targets),
         "section": section,
+        "base_section": section,
+        "current_section": current_section,
         "paragraph": paragraph,
         "current_paragraph": current_paragraph,
         "old_sentence_id": old_sentence_id,
@@ -1049,7 +1034,7 @@ def _delete_current_sentence(report_id: int, sentence_id: int, *, _session=None)
 
 def _delete_current_scope(report_id: int, scope: dict[str, Any], *, _session=None) -> None:
     """Delete a candidate-only sentence, paragraph, or section with lineage rows."""
-    section = str(scope.get("section") or "")
+    section = str(scope.get("current_section") or scope.get("section") or "")
     level = str(scope.get("level") or "sentence")
     manager = session_scope() if _session is None else nullcontext(_session)
     with manager as s:
@@ -1088,7 +1073,15 @@ def _review_scope_level(scope: dict[str, Any]) -> str:
 
 def _review_scopes_overlap(left: dict[str, Any], right: dict[str, Any]) -> bool:
     """A granularity switch replaces parent/child choices in the same scope."""
-    if str(left.get("section") or "") != str(right.get("section") or ""):
+    left_sections = {
+        str(left.get("base_section") or left.get("section") or ""),
+        str(left.get("current_section") or left.get("section") or ""),
+    }
+    right_sections = {
+        str(right.get("base_section") or right.get("section") or ""),
+        str(right.get("current_section") or right.get("section") or ""),
+    }
+    if not (left_sections & right_sections):
         return False
     left_level, right_level = _review_scope_level(left), _review_scope_level(right)
     if "section" in {left_level, right_level}:
@@ -1194,7 +1187,7 @@ def _sequence_diff(old_items: list[dict[str, Any]], new_items: list[dict[str, An
         new = new_items[new_idx]
         old_text = old.get("text", "")
         new_text = new.get("text", "")
-        change = "unchanged" if old_text == new_text else "modified"
+        change = "unchanged" if old_text == new_text and _source_signature(old) == _source_signature(new) else "provenance_changed" if old_text == new_text else "modified"
         result.append(_diff_item(old_idx, new_idx, old, new, change, score))
         old_cursor = old_idx + 1
         new_cursor = new_idx + 1
@@ -1293,6 +1286,18 @@ def _sentence_similarity(left: str, right: str) -> float:
     return max(overlap * 0.75 + len_ratio * 0.25, seq * 0.85 + len_ratio * 0.15)
 
 
+def _source_signature(item: dict[str, Any]) -> tuple:
+    refs = item.get("source_refs") or {}
+    if isinstance(refs, str):
+        refs = _json_load(refs, {})
+    if not isinstance(refs, dict):
+        refs = {}
+    return (
+        tuple(sorted(str(value) for value in refs.get("fact_ids") or [])),
+        tuple(sorted(str(value) for value in refs.get("inference_ids") or [])),
+        str(item.get("source_level") or ""),
+    )
+
 def _match_threshold(left: str, right: str) -> float:
     shortest = min(len(left or ""), len(right or ""))
     if shortest <= 10:
@@ -1305,7 +1310,8 @@ def _match_threshold(left: str, right: str) -> float:
 
 
 def _fine_diff_summary(sections: list[dict[str, Any]]) -> dict[str, int]:
-    counts = {"sections_changed": 0, "paragraphs_changed": 0, "sentences_added": 0, "sentences_modified": 0, "sentences_removed": 0}
+    counts = {"sections_changed": 0, "paragraphs_changed": 0, "sentences_added": 0, "sentences_modified": 0, "sentences_removed": 0,
+              "sentences_provenance_changed": 0}
     for section in sections:
         if section.get("change_type") != "unchanged":
             counts["sections_changed"] += 1
@@ -1613,6 +1619,180 @@ def _stable_json_hash(value: Any) -> str:
     return sha256(_dump(value).encode("utf-8")).hexdigest()
 
 
+def _build_sentence_diff(base: dict[str, Any], target: dict[str, Any], *,
+                         base_version_id: int, target_version_id: int | None,
+                         comparison_mode: str, can_apply: bool) -> dict[str, Any]:
+    old_sections = _sentence_groups(base.get("sentence_snapshot") or [])
+    new_sections = _sentence_groups(target.get("sentence_snapshot") or [])
+    sections: list[dict[str, Any]] = []
+    for pair in _pair_sections(old_sections, new_sections):
+        old_title = pair.get("old_title") or ""
+        new_title = pair.get("new_title") or ""
+        old_paras = pair.get("old_paragraphs") or {}
+        new_paras = pair.get("new_paragraphs") or {}
+        paragraphs: list[dict[str, Any]] = []
+        for old_para_no, new_para_no in _align_paragraphs(old_paras, new_paras):
+            old_items = old_paras.get(old_para_no, []) if old_para_no is not None else []
+            new_items = new_paras.get(new_para_no, []) if new_para_no is not None else []
+            sentence_diffs = _sequence_diff(old_items, new_items)
+            if old_items and not new_items:
+                paragraph_type = "removed"
+            elif new_items and not old_items:
+                paragraph_type = "added"
+            else:
+                changed = [item["change_type"] for item in sentence_diffs if item["change_type"] != "unchanged"]
+                if not changed:
+                    paragraph_type = "unchanged"
+                elif set(changed) == {"provenance_changed"}:
+                    paragraph_type = "provenance_changed"
+                else:
+                    paragraph_type = "modified"
+            paragraphs.append({
+                "paragraph": new_para_no if new_para_no is not None else old_para_no,
+                "old_paragraph": old_para_no,
+                "new_paragraph": new_para_no,
+                "change_key": "paragraph:" + _stable_json_hash({
+                    "base_section": old_title,
+                    "current_section": new_title,
+                    "old": old_para_no,
+                    "new": new_para_no,
+                }),
+                "change_type": paragraph_type,
+                "old_text": "".join(item["text"] for item in old_items),
+                "new_text": "".join(item["text"] for item in new_items),
+                "sentences": sentence_diffs,
+            })
+        paragraph_changes = [item["change_type"] for item in paragraphs if item["change_type"] != "unchanged"]
+        section_type = pair.get("change_type") or "unchanged"
+        if section_type == "unchanged" and paragraph_changes:
+            section_type = "provenance_changed" if set(paragraph_changes) == {"provenance_changed"} else "modified"
+        sections.append({
+            "section": old_title or new_title,
+            "base_section": old_title,
+            "current_section": new_title,
+            "old_title": old_title,
+            "new_title": new_title,
+            "old_index": pair.get("old_index"),
+            "new_index": pair.get("new_index"),
+            "title_changed": bool(pair.get("title_changed")),
+            "content_changed": bool(pair.get("content_changed")),
+            "order_changed": bool(pair.get("order_changed")),
+            "match_method": pair.get("match_method"),
+            "match_confidence": pair.get("match_confidence", "none"),
+            "change_type": section_type,
+            "change_kinds": pair.get("change_kinds") or [],
+            "change_key": "section:" + _stable_json_hash({
+                "base_section": old_title,
+                "current_section": new_title,
+                "old_index": pair.get("old_index"),
+                "new_index": pair.get("new_index"),
+            }),
+            "paragraphs": paragraphs,
+        })
+    return {
+        "base_version_id": base_version_id,
+        "target_version_id": target_version_id,
+        "comparison_mode": comparison_mode,
+        "can_apply": can_apply,
+        "report_id": base["report_id"],
+        "old_title": base.get("title", ""),
+        "new_title": target.get("title", ""),
+        "candidate_hash": target.get("metadata", {}).get("snapshot_hash", ""),
+        "sections": sections,
+        "summary": _fine_diff_summary(sections),
+    }
+
+
+def compare_report_versions(base_version_id: int, target_version_id: int | None = None,
+                            task_id: str = "") -> dict[str, Any] | None:
+    """Compare two immutable versions, or a version with the current draft."""
+    base = get_report_version(base_version_id)
+    if base is None:
+        return None
+    report_id = int(base["report_id"])
+    if target_version_id is None:
+        target = build_report_snapshot(report_id, task_id=task_id or base.get("task_id") or "")
+        return _build_sentence_diff(
+            base, target, base_version_id=base_version_id, target_version_id=None,
+            comparison_mode="current_draft", can_apply=True,
+        )
+    target = get_report_version(target_version_id)
+    if target is None or int(target["report_id"]) != report_id:
+        return None
+    return _build_sentence_diff(
+        base, target, base_version_id=base_version_id, target_version_id=target_version_id,
+        comparison_mode="version", can_apply=False,
+    )
+
+
+def _paired_structure_changes(sections: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Expose structural changes without splitting a logical rename into add/remove."""
+    changes: list[dict[str, Any]] = []
+    for section in sections:
+        change_type = section.get("change_type")
+        old_title = str(section.get("old_title") or "")
+        new_title = str(section.get("new_title") or "")
+        display_title = new_title or old_title
+        if change_type == "added":
+            changes.append({"type": "added_section", "section": display_title, "severity": "major"})
+        elif change_type == "removed":
+            changes.append({"type": "removed_section", "section": old_title, "severity": "major"})
+        elif change_type == "renamed":
+            changes.append({
+                "type": "renamed_section",
+                "from": old_title,
+                "to": new_title,
+                "section": display_title,
+                "severity": "minor",
+            })
+        elif change_type == "rewritten":
+            changes.append({
+                "type": "rewritten_section",
+                "from": old_title,
+                "to": new_title,
+                "section": display_title,
+                "severity": "minor",
+            })
+        elif change_type == "reordered":
+            changes.append({
+                "type": "reordered_section",
+                "section": display_title,
+                "from_index": section.get("old_index"),
+                "to_index": section.get("new_index"),
+                "severity": "minor",
+            })
+    return changes
+
+
+def diff_report_version_to_current(version_id: int, task_id: str = "") -> dict[str, Any] | None:
+    """Compatibility view of the unified version-to-current comparator."""
+    detailed = compare_report_versions(version_id, task_id=task_id)
+    if detailed is None:
+        return None
+    section_diffs = [{
+        "section": section["section"],
+        "old_title": section["old_title"],
+        "new_title": section["new_title"],
+        "change_type": section["change_type"],
+        "old_text": "".join(p["old_text"] for p in section["paragraphs"]),
+        "new_text": "".join(p["new_text"] for p in section["paragraphs"]),
+        "old_chars": sum(len(p["old_text"]) for p in section["paragraphs"]),
+        "new_chars": sum(len(p["new_text"]) for p in section["paragraphs"]),
+    } for section in detailed["sections"]]
+    detailed["structure_changes"] = _paired_structure_changes(detailed["sections"])
+    detailed["section_diffs"] = section_diffs
+    detailed["summary"].update({
+        "added_sections": sum(1 for s in detailed["sections"] if s["change_type"] == "added"),
+        "modified_sections": sum(1 for s in detailed["sections"] if s["change_type"] in {"modified", "rewritten", "provenance_changed"}),
+        "removed_sections": sum(1 for s in detailed["sections"] if s["change_type"] == "removed"),
+    })
+    return detailed
+
+
+def diff_report_version_sentences(version_id: int, task_id: str = "") -> dict[str, Any] | None:
+    """Sentence/paragraph diff backed by the unified section pairing model."""
+    return compare_report_versions(version_id, task_id=task_id)
+
 __all__ = [
     "VersionSnapshot",
     "ensure_report_version",
@@ -1624,6 +1804,7 @@ __all__ = [
     "build_incremental_impact",
     "diff_report_version_to_current",
     "diff_report_version_sentences",
+    "compare_report_versions",
     "restore_report_version",
     "restore_report_version_scope",
     "get_report_delta",

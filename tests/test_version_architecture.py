@@ -3,8 +3,11 @@ import unittest
 from app.infrastructure.orm import Base
 from app.report_versions import (
     _align_paragraphs,
+    _build_sentence_diff,
     _inline_text_diff,
     _object_delta,
+    _pair_sections,
+    _paired_structure_changes,
     _review_scopes_overlap,
     _sequence_diff,
     _version_label,
@@ -86,6 +89,75 @@ class VersionArchitectureTests(unittest.TestCase):
         self.assertTrue(_review_scopes_overlap(paragraph, same_sentence))
         self.assertFalse(_review_scopes_overlap(paragraph, other_sentence))
 
+    def test_section_title_change_is_paired_as_rename(self):
+        old = {
+            "Old chapter": {1: [{"id": 1, "text": "The same evidence based discussion.", "lineage_id": "a"}]},
+        }
+        new = {
+            "New chapter": {1: [{"id": 2, "text": "The same evidence based discussion.", "lineage_id": "a"}]},
+        }
+
+        pairs = _pair_sections(old, new)
+
+        self.assertEqual(len(pairs), 1)
+        self.assertEqual(pairs[0]["old_title"], "Old chapter")
+        self.assertEqual(pairs[0]["new_title"], "New chapter")
+        self.assertEqual(pairs[0]["change_type"], "renamed")
+
+    def test_paired_structure_changes_keep_rename_as_one_change(self):
+        changes = _paired_structure_changes([
+            {
+                "old_title": "\u65e7\u7ae0\u8282",
+                "new_title": "\u65b0\u7ae0\u8282",
+                "change_type": "renamed",
+                "old_index": 0,
+                "new_index": 0,
+            },
+        ])
+
+        self.assertEqual(len(changes), 1)
+        self.assertEqual(changes[0]["type"], "renamed_section")
+        self.assertEqual(changes[0]["from"], "\u65e7\u7ae0\u8282")
+        self.assertEqual(changes[0]["to"], "\u65b0\u7ae0\u8282")
+
+    def test_same_sentence_with_new_lineage_is_provenance_change(self):
+        diff = _sequence_diff(
+            [{"id": 1, "text": "Stable text.", "lineage_id": "old", "source_refs": {"fact_ids": [1]}}],
+            [{"id": 2, "text": "Stable text.", "lineage_id": "new", "source_refs": {"fact_ids": [2]}}],
+        )
+
+        self.assertEqual(diff[0]["change_type"], "provenance_changed")
+
+    def test_unified_diff_keeps_renamed_section_and_paragraph_visible(self):
+        base = {
+            "report_id": 9,
+            "title": "Report",
+            "sentence_snapshot": [
+                {"id": 1, "section": "Old chapter", "paragraph": 1, "position": 1,
+                 "content": "The same evidence based discussion.", "lineage_id": "a"},
+            ],
+            "metadata": {"snapshot_hash": "old"},
+        }
+        target = {
+            "report_id": 9,
+            "title": "Report",
+            "sentence_snapshot": [
+                {"id": 2, "section": "New chapter", "paragraph": 1, "position": 1,
+                 "content": "The same evidence based discussion.", "lineage_id": "a"},
+            ],
+            "metadata": {"snapshot_hash": "new"},
+        }
+
+        result = _build_sentence_diff(
+            base, target, base_version_id=1, target_version_id=2,
+            comparison_mode="version", can_apply=False,
+        )
+
+        self.assertEqual(result["summary"]["sections_changed"], 1)
+        self.assertEqual(result["sections"][0]["change_type"], "renamed")
+        self.assertEqual(result["sections"][0]["old_title"], "Old chapter")
+        self.assertEqual(result["sections"][0]["new_title"], "New chapter")
+        self.assertEqual(len(result["sections"][0]["paragraphs"]), 1)
 
 if __name__ == "__main__":
     unittest.main()

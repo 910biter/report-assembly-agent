@@ -74,7 +74,7 @@ class Settings(BaseSettings):
     planner_output_tokens: int = 3072
     analysis_output_tokens: int = 3072
     analysis_facts_per_batch: int = 45  # 资源边界；语义分组仍由运行时维度与事实关系决定
-    narrative_output_tokens: int = 3072
+    narrative_output_tokens: int = 4096
     narrative_qa_output_tokens: int = 2048
     qa_output_tokens: int = 2048
     conflict_output_tokens: int = 2048
@@ -117,7 +117,7 @@ class Settings(BaseSettings):
     graph_workspace_id: str = "default"
     graph_build_before_analysis: bool = False
     graph_max_hops: int = 2
-    graph_output_tokens: int = 4096
+    graph_output_tokens: int = 6144
     graph_facts_per_batch: int = 12
     graph_batch_concurrency: int = 2
     neo4j_uri: str = ""  # e.g. bolt://127.0.0.1:7687

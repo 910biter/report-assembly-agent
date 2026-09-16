@@ -12,6 +12,8 @@ type Decision = {
 type Scope = {
   level: "section" | "paragraph" | "sentence";
   section: string;
+  base_section?: string;
+  current_section?: string;
   [key: string]: any;
 };
 
@@ -41,13 +43,15 @@ const changedSections = computed(() =>
     (item: any) => item.change_type !== "unchanged",
   ),
 );
-const visibleSections = computed(() =>
-  activeSection.value === "all"
+const visibleSections = computed(() => {
+  const sections = activeSection.value === "all"
     ? changedSections.value
     : changedSections.value.filter(
-        (item: any) => item.section === activeSection.value,
-      ),
-);
+        (item: any) =>
+          (item.current_section || item.new_title || item.section) === activeSection.value,
+      );
+  return sections;
+});
 const versionMeta = computed(() =>
   props.versions.find((item) => Number(item.id) === activeVersion.value),
 );
@@ -200,12 +204,19 @@ async function loadDecisions() {
 }
 
 function sectionScope(section: any): Scope {
-  return { level: "section", section: section.section };
+  return {
+    level: "section",
+    section: section.base_section || section.section,
+    base_section: section.base_section || section.section,
+    current_section: section.current_section || section.new_title || section.section,
+  };
 }
 function paragraphScope(section: any, paragraph: any): Scope {
   return {
     level: "paragraph",
-    section: section.section,
+    section: section.base_section || section.section,
+    base_section: section.base_section || section.section,
+    current_section: section.current_section || section.new_title || section.section,
     paragraph: paragraph.old_paragraph ?? paragraph.paragraph,
     old_paragraph: paragraph.old_paragraph,
     new_paragraph: paragraph.new_paragraph,
@@ -214,7 +225,9 @@ function paragraphScope(section: any, paragraph: any): Scope {
 function sentenceScope(section: any, paragraph: any, sentence: any): Scope {
   return {
     level: "sentence",
-    section: section.section,
+    section: section.base_section || section.section,
+    base_section: section.base_section || section.section,
+    current_section: section.current_section || section.new_title || section.section,
     paragraph: paragraph.new_paragraph ?? paragraph.old_paragraph,
     old_paragraph: paragraph.old_paragraph,
     new_paragraph: paragraph.new_paragraph,
@@ -270,29 +283,53 @@ function decisionLabel(key: string) {
       : "默认保留当前版本";
 }
 function paragraphKey(section: any, paragraph: any) {
-  return `${section.section}:${paragraph.change_key}`;
+  return (section.change_key || section.section) + ":" + paragraph.change_key;
 }
 function toggleFine(section: any, paragraph: any) {
   const key = paragraphKey(section, paragraph);
   fineParagraph.value = fineParagraph.value === key ? "" : key;
 }
 function changedLabel(type: string, unit = "") {
-  return type === "added"
-    ? `新增${unit}`
-    : type === "removed"
-      ? `删除${unit}`
-      : `修改${unit}`;
+  const labels: Record<string, string> = {
+    added: "新增",
+    removed: "删除",
+    renamed: "改名",
+    rewritten: "重写",
+    reordered: "重排",
+    provenance_changed: "溯源变化",
+    modified: "修改",
+  };
+  return (labels[type] || "变化") + unit;
+}
+
+function matchConfidenceLabel(section: any) {
+  if (section.match_confidence === "low") return "\u6309\u4f4d\u7f6e\u914d\u5bf9\uff0c\u8bf7\u6838\u5bf9";
+  if (section.match_confidence === "medium") return "\u6309\u5185\u5bb9\u914d\u5bf9";
+  return "";
 }
 
 function reviewParagraphs(section: any) {
   const paragraphs = section.paragraphs || [];
   const changed = new Set<number>();
   paragraphs.forEach((paragraph: any, index: number) => {
+    const structural = filter.value === "renamed" || filter.value === "reordered";
+    const sectionRewrite =
+      filter.value === "rewritten" && section.change_type === "rewritten";
     if (
       paragraph.change_type !== "unchanged" &&
-      (filter.value === "all" || paragraph.change_type === filter.value)
-    )
+      (filter.value === "all" ||
+        paragraph.change_type === filter.value ||
+        sectionRewrite)
+    ) {
       changed.add(index);
+    } else if (structural && section.change_type === filter.value) {
+      changed.add(index);
+    } else if (
+      filter.value === "all" &&
+      (section.change_type === "renamed" || section.change_type === "reordered")
+    ) {
+      changed.add(index);
+    }
   });
   const visible = new Set<number>();
   changed.forEach((index) => {
@@ -418,12 +455,19 @@ function previewSection(section: any) {
           全部变化 <span>{{ changedSections.length }}</span></button
         ><button
           v-for="section in changedSections"
-          :key="section.section"
+          :key="section.change_key || section.section"
           class="chapter-option"
-          :class="{ active: activeSection === section.section }"
-          @click="activeSection = section.section"
+          :class="{
+            active:
+              activeSection ===
+              (section.current_section || section.new_title || section.section),
+          }"
+          @click="
+            activeSection =
+              section.current_section || section.new_title || section.section
+          "
         >
-          {{ section.section
+          {{ section.new_title || section.current_section || section.section
           }}<span>{{
             (section.paragraphs || []).filter(
               (paragraph: any) => paragraph.change_type !== "unchanged",
@@ -491,6 +535,9 @@ function previewSection(section: any) {
                 v-for="item in [
                   ['all', '全部'],
                   ['modified', '修改'],
+                  ['rewritten', '重写'],
+                  ['renamed', '改名'],
+                  ['provenance_changed', '溯源'],
                   ['added', '新增'],
                   ['removed', '删除'],
                 ]"
@@ -505,7 +552,7 @@ function previewSection(section: any) {
           </div>
           <section
             v-for="section in visibleSections"
-            :key="section.section"
+            :key="section.change_key || section.section"
             class="review-section"
           >
             <header>
@@ -513,7 +560,13 @@ function previewSection(section: any) {
                 <span :class="['change-kind', section.change_type]">{{
                   changedLabel(section.change_type, "章节")
                 }}</span>
-                <h2>{{ section.section }}</h2>
+                <h2>{{ section.new_title || section.current_section || section.section }}</h2>
+                <small v-if="section.title_changed" class="title-transition">
+                  {{ section.old_title }} -> {{ section.new_title }}
+                </small>
+                <small v-if="matchConfidenceLabel(section)" class="pair-confidence">
+                  {{ matchConfidenceLabel(section) }}
+                </small>
               </div>
               <div class="scope-actions">
                 <small>{{ decisionLabel(section.change_key) }}</small
@@ -721,9 +774,9 @@ function previewSection(section: any) {
           </header>
           <section
             v-for="section in diff.sections || []"
-            :key="section.section"
+            :key="section.change_key || section.section"
           >
-            <h2>{{ section.section }}</h2>
+            <h2>{{ section.new_title || section.current_section || section.section }}</h2>
             <p
               v-for="(paragraph, index) in previewSection(section)"
               :key="index"
@@ -784,8 +837,18 @@ function previewSection(section: any) {
           默认保留当前稿；只有选择“采用历史版本”的范围会被恢复。应用前自动保存候选稿快照。
         </p>
       </div>
-      <button class="apply-button" :disabled="!diff || applying" @click="apply">
-        {{ applying ? "正在生成版本…" : "完成审阅并生成版本" }}
+      <button
+        class="apply-button"
+        :disabled="!diff || applying || diff.can_apply === false"
+        @click="apply"
+      >
+        {{
+          diff?.can_apply === false
+            ? "历史版本对比（只读）"
+            : applying
+              ? "正在生成版本…"
+              : "完成审阅并生成版本"
+        }}
       </button>
     </aside>
   </section>
@@ -1046,6 +1109,25 @@ button {
 }
 .change-kind.removed {
   color: var(--destructive);
+}
+.change-kind.renamed,
+.change-kind.reordered,
+.change-kind.provenance_changed {
+  color: var(--color-primary);
+}
+.title-transition {
+  display: block;
+  margin-top: 4px;
+  color: var(--color-muted);
+  font-size: 11px;
+  font-weight: 400;
+}
+.pair-confidence {
+  display: inline-block;
+  margin-top: 5px;
+  color: var(--warning);
+  font-size: 11px;
+  font-weight: 500;
 }
 .scope-actions,
 .sentence-actions {
