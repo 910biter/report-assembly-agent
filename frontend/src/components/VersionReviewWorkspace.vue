@@ -37,6 +37,79 @@ const applying = ref(false);
 const historicalVersion = ref<any>(null);
 const historicalLoading = ref(false);
 const historicalError = ref("");
+const comparisonMode = ref<"current" | "before" | "after">("current");
+
+const orderedVersions = computed(() =>
+  [...props.versions].sort(
+    (a: any, b: any) => Number(b.version_no || 0) - Number(a.version_no || 0),
+  ),
+);
+const isAutomaticSnapshot = (version: any) => version?.status === "snapshot";
+const formalVersions = computed(() =>
+  orderedVersions.value.filter((version: any) => !isAutomaticSnapshot(version)),
+);
+const chronologicalFormalVersions = computed(() =>
+  [...formalVersions.value].sort(
+    (a: any, b: any) => Number(a.version_no || 0) - Number(b.version_no || 0),
+  ),
+);
+const snapshotGroups = computed(() => {
+  const groups = new Map<string, any[]>();
+  orderedVersions.value
+    .filter(isAutomaticSnapshot)
+    .forEach((version: any) => {
+      const hash = String(version.metadata?.snapshot_hash || version.snapshot_hash || "");
+      const key = hash || `version-${version.id}`;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key)!.push(version);
+    });
+  return [...groups.values()].map((items) => ({
+    representative: items[0],
+    items,
+    duplicateCount: items.length,
+  }));
+});
+const snapshotCount = computed(() =>
+  orderedVersions.value.filter(isAutomaticSnapshot).length,
+);
+const versionStatusLabel = (version: any) => {
+  const labels: Record<string, string> = {
+    draft: "草稿",
+    accepted: "已采用",
+    final: "已确认",
+    snapshot: "自动快照",
+  };
+  return labels[String(version?.status || "")] || "版本";
+};
+const selectedFormalIndex = computed(() =>
+  chronologicalFormalVersions.value.findIndex(
+    (version: any) => Number(version.id) === activeVersion.value,
+  ),
+);
+const previousVersion = computed(() => {
+  const index = selectedFormalIndex.value;
+  return index > 0 ? chronologicalFormalVersions.value[index - 1] : null;
+});
+const nextVersion = computed(() => {
+  const index = selectedFormalIndex.value;
+  return index >= 0 && index < chronologicalFormalVersions.value.length - 1
+    ? chronologicalFormalVersions.value[index + 1]
+    : null;
+});
+const comparisonLabel = computed(() => {
+  if (comparisonMode.value === "before") {
+    return previousVersion.value
+      ? `v${previousVersion.value.version_label || previousVersion.value.version_no} → 当前版本`
+      : "上一正式版本对比";
+  }
+  if (comparisonMode.value === "after") {
+    return nextVersion.value
+      ? `当前版本 → v${nextVersion.value.version_label || nextVersion.value.version_no}`
+      : "下一正式版本对比";
+  }
+  return "当前工作稿差异";
+});
+const comparisonReadOnly = computed(() => comparisonMode.value !== "current");
 
 const changedSections = computed(() =>
   (diff.value?.sections || []).filter(
@@ -138,13 +211,17 @@ const historicalSections = computed(() => {
 watch(
   () => props.versions,
   (versions) => {
-    if (!activeVersion.value && versions.length)
-      activeVersion.value = Number(versions[0].id);
+    const available = versions.some((version: any) => Number(version.id) === activeVersion.value);
+    if (!activeVersion.value || !available) {
+      activeVersion.value = Number(
+        formalVersions.value[0]?.id || versions[0]?.id || 0,
+      ) || null;
+    }
   },
   { immediate: true },
 );
 
-watch(activeVersion, async (versionId) => {
+watch([activeVersion, comparisonMode], async ([versionId, mode]) => {
   diff.value = null;
   decisions.value = {};
   activeSection.value = "all";
@@ -155,10 +232,21 @@ watch(activeVersion, async (versionId) => {
   if (!versionId) return;
   loading.value = true;
   try {
-    diff.value = await api(
-      `/api/report-versions/${versionId}/diff-current?granularity=sentence`,
-    );
-    await loadDecisions();
+    if (mode === "before" && previousVersion.value) {
+      diff.value = await api(
+        `/api/report-versions/${previousVersion.value.id}/diff/${versionId}`,
+      );
+    } else if (mode === "after" && nextVersion.value) {
+      diff.value = await api(
+        `/api/report-versions/${versionId}/diff/${nextVersion.value.id}`,
+      );
+    } else {
+      comparisonMode.value = "current";
+      diff.value = await api(
+        `/api/report-versions/${versionId}/diff-current?granularity=sentence`,
+      );
+      await loadDecisions();
+    }
   } catch (reason: any) {
     error.value = reason.message || "版本差异加载失败";
   } finally {
@@ -166,6 +254,11 @@ watch(activeVersion, async (versionId) => {
   }
   if (workspaceMode.value === "history") await loadHistoricalVersion();
 });
+
+function openComparison(mode: "before" | "after" | "current") {
+  comparisonMode.value = mode;
+  workspaceMode.value = "review";
+}
 
 watch(workspaceMode, async (mode) => {
   if (mode === "history") await loadHistoricalVersion();
@@ -429,21 +522,82 @@ function previewSection(section: any) {
 
     <aside class="review-navigation">
       <section>
-        <h3>对比基线</h3>
+        <div class="navigation-heading">
+          <div>
+            <h3>版本查看与对比</h3>
+            <small>{{ formalVersions.length }} 个正式版本</small>
+          </div>
+        </div>
+        <label class="version-select-label" for="version-anchor">当前查看版本</label>
+        <select id="version-anchor" v-model.number="activeVersion" class="version-select">
+          <option
+            v-for="version in formalVersions"
+            :key="version.id"
+            :value="Number(version.id)"
+          >
+            v{{ version.version_label || version.version_no }} · {{ versionStatusLabel(version) }}
+          </option>
+        </select>
+        <div v-if="versionMeta" class="version-focus">
+          <div>
+            <b>v{{ versionMeta.version_label || versionMeta.version_no }}</b>
+            <span>{{ versionStatusLabel(versionMeta) }}</span>
+          </div>
+          <small>{{ versionMeta.change_summary || "版本快照" }}</small>
+          <time>{{ versionMeta.created_at }}</time>
+        </div>
+        <div class="version-neighbor-actions">
+          <button
+            :disabled="!previousVersion"
+            @click="openComparison('before')"
+          >
+            ← 与上一版
+          </button>
+          <button @click="workspaceMode = 'history'">查看正文</button>
+          <button
+            :disabled="!nextVersion"
+            @click="openComparison('after')"
+          >
+            与下一版 →
+          </button>
+        </div>
+        <div class="comparison-mode-note">
+          <span>{{ comparisonLabel }}<i v-if="comparisonReadOnly"> · 只读</i></span>
+          <button
+            v-if="comparisonMode !== 'current'"
+            @click="openComparison('current')"
+          >
+            当前工作稿
+          </button>
+        </div>
         <button class="snapshot-button" @click="emit('snapshot')">
-          生成当前快照</button
-        ><button
-          v-for="version in versions"
-          :key="version.id"
-          class="version-option"
-          :class="{ active: activeVersion === Number(version.id) }"
-          @click="activeVersion = Number(version.id)"
-        >
-          <span
-            ><b>v{{ version.version_label || version.version_no }}</b
-            ><small>{{ version.change_summary || "版本快照" }}</small></span
-          ><time>{{ version.created_at }}</time>
+          生成当前快照
         </button>
+        <details v-if="snapshotGroups.length" class="automatic-snapshots">
+          <summary>自动快照 <span>{{ snapshotCount }}</span></summary>
+          <div
+            v-for="group in snapshotGroups"
+            :key="group.representative.id"
+            class="snapshot-group"
+          >
+            <button
+              class="snapshot-group-button"
+              :class="{ active: activeVersion === Number(group.representative.id) }"
+              @click="activeVersion = Number(group.representative.id); workspaceMode = 'history'"
+            >
+              <span>
+                <b>v{{ group.representative.version_label || group.representative.version_no }}</b>
+                <small>{{ group.representative.change_summary || "自动生成的内部快照" }}</small>
+              </span>
+              <em v-if="group.duplicateCount > 1">{{ group.duplicateCount }} 份相同内容</em>
+            </button>
+            <div v-if="group.items.length > 1" class="snapshot-group-items">
+              <span v-for="item in group.items" :key="item.id">
+                v{{ item.version_label || item.version_no }} · {{ item.created_at }}
+              </span>
+            </div>
+          </div>
+        </details>
       </section>
       <section v-if="diff">
         <h3>变化章节</h3>
@@ -978,6 +1132,183 @@ button {
 .review-summary h3 {
   margin: 0 0 10px;
   font-size: 12px;
+}
+.navigation-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+.navigation-heading h3 {
+  margin: 0;
+}
+.navigation-heading small,
+.version-select-label {
+  color: var(--color-muted);
+  font-size: 10px;
+}
+.version-select-label {
+  display: block;
+  margin-bottom: 5px;
+}
+.version-select {
+  width: 100%;
+  min-height: 34px;
+  padding: 6px 9px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-raised);
+  color: var(--color-text);
+  font: inherit;
+  font-size: 12px;
+}
+.version-select:focus {
+  outline: 2px solid color-mix(in srgb, var(--primary) 38%, transparent);
+  outline-offset: 1px;
+}
+.version-focus {
+  display: grid;
+  gap: 4px;
+  margin-top: 9px;
+  padding: 10px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-raised);
+}
+.version-focus > div {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.version-focus b {
+  font-size: 14px;
+}
+.version-focus span {
+  color: var(--color-primary);
+  font-size: 10px;
+}
+.version-focus small,
+.version-focus time {
+  color: var(--color-muted);
+  font-size: 10px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.version-neighbor-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 4px;
+  margin-top: 8px;
+}
+.version-neighbor-actions button,
+.comparison-mode-note button {
+  min-width: 0;
+  padding: 6px 4px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-muted);
+  font-size: 10px;
+  white-space: nowrap;
+}
+.version-neighbor-actions button:hover,
+.comparison-mode-note button:hover {
+  color: var(--color-primary);
+  border-color: color-mix(in srgb, var(--primary) 40%, var(--border));
+  background: var(--color-primary-soft);
+}
+.version-neighbor-actions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.42;
+}
+.comparison-mode-note {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 5px;
+  min-height: 27px;
+  margin: 8px 0;
+  color: var(--color-muted);
+  font-size: 10px;
+}
+.comparison-mode-note button {
+  flex: 0 0 auto;
+  padding: 4px 6px;
+  color: var(--color-primary);
+}
+.automatic-snapshots {
+  margin-top: 10px;
+  border-top: 1px solid var(--color-border);
+}
+.automatic-snapshots summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 9px 0 7px;
+  color: var(--color-muted);
+  cursor: pointer;
+  font-size: 11px;
+}
+.automatic-snapshots summary span {
+  min-width: 18px;
+  padding: 2px 5px;
+  border: 1px solid var(--color-border);
+  border-radius: 999px;
+  color: var(--color-faint);
+  font-size: 9px;
+  text-align: center;
+}
+.snapshot-group + .snapshot-group {
+  margin-top: 4px;
+}
+.snapshot-group-button {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-muted);
+  text-align: left;
+}
+.snapshot-group-button:hover,
+.snapshot-group-button.active {
+  border-color: color-mix(in srgb, var(--primary) 38%, var(--border));
+  background: var(--color-primary-soft);
+}
+.snapshot-group-button span,
+.snapshot-group-button small {
+  display: block;
+}
+.snapshot-group-button b {
+  color: var(--color-text);
+  font-size: 11px;
+}
+.snapshot-group-button small {
+  max-width: 145px;
+  margin-top: 3px;
+  color: var(--color-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.snapshot-group-button em {
+  flex: 0 0 auto;
+  color: var(--color-faint);
+  font-size: 9px;
+  font-style: normal;
+}
+.snapshot-group-items {
+  display: grid;
+  gap: 2px;
+  padding: 5px 8px 2px;
+  color: var(--color-faint);
+  font-size: 9px;
 }
 .version-option,
 .chapter-option {

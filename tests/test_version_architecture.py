@@ -4,6 +4,7 @@ from app.infrastructure.orm import Base
 from app.report_versions import (
     _align_paragraphs,
     _build_sentence_diff,
+    _content_snapshot_hash,
     _inline_text_diff,
     _object_delta,
     _pair_sections,
@@ -16,6 +17,63 @@ from app.report_versions import (
 
 
 class VersionArchitectureTests(unittest.TestCase):
+    def test_snapshot_hash_ignores_storage_and_runtime_identity(self):
+        base = {
+            "title": "报告",
+            "sentence_snapshot": [{
+                "id": 1,
+                "lineage_id": "old-lineage",
+                "origin_call_id": "call-1",
+                "section": "第一章",
+                "paragraph": 1,
+                "position": 1,
+                "content": "  同一份正文。 ",
+                "source_level": "MATERIAL_FACT",
+                "source_refs": {"fact_ids": [10], "inference_ids": []},
+            }],
+            "fact_snapshot": [{
+                "id": 10,
+                "stable_key": "fact-a",
+                "content": "同一事实",
+                "dimension": "背景",
+                "origin_call_id": "call-1",
+            }],
+            "inference_snapshot": [],
+            "conflict_snapshot": [],
+            "report_plan_snapshot": {"id": 4, "title": "报告", "finalized_at": "now"},
+            "narrative_plan_snapshot": {},
+            "scale_plan_snapshot": {},
+        }
+        rebuilt = {
+            **base,
+            "sentence_snapshot": [{
+                **base["sentence_snapshot"][0],
+                "id": 99,
+                "lineage_id": "new-lineage",
+                "origin_call_id": "call-2",
+                "source_refs": {"fact_ids": [1010], "inference_ids": []},
+            }],
+            "fact_snapshot": [{
+                **base["fact_snapshot"][0],
+                "id": 1010,
+                "origin_call_id": "call-2",
+            }],
+            "report_plan_snapshot": {"id": 44, "title": "报告", "finalized_at": "later"},
+        }
+
+        self.assertEqual(_content_snapshot_hash(base), _content_snapshot_hash(rebuilt))
+
+    def test_snapshot_hash_changes_when_report_content_changes(self):
+        base = {
+            "title": "报告",
+            "sentence_snapshot": [{"section": "第一章", "paragraph": 1, "position": 1, "content": "原文"}],
+            "fact_snapshot": [], "inference_snapshot": [], "conflict_snapshot": [],
+            "report_plan_snapshot": {}, "narrative_plan_snapshot": {}, "scale_plan_snapshot": {},
+        }
+        changed = {**base, "sentence_snapshot": [{**base["sentence_snapshot"][0], "content": "修改后的正文"}]}
+
+        self.assertNotEqual(_content_snapshot_hash(base), _content_snapshot_hash(changed))
+
     def test_paragraph_insert_does_not_shift_existing_paragraphs(self):
         old = {
             1: [{"id": 1, "text": "第一段原文", "lineage_id": "a"}],

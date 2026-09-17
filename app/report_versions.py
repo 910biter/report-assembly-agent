@@ -74,14 +74,8 @@ def ensure_report_version(report_id: int, task_id: str = "", status: str = "snap
             .where(ORMReportVersion.c.report_id == report_id)
             .order_by(ORMReportVersion.c.version_no.desc())
         ).mappings().first()
-        latest_hash = ""
-        if latest is not None:
-            try:
-                latest_hash = json.loads(latest["metadata_json"] or "{}").get("snapshot_hash", "")
-            except (TypeError, ValueError):
-                latest_hash = ""
-        if (latest is not None and latest_hash == snapshot["metadata"]["snapshot_hash"]
-                and str(latest.get("status") or "") == status):
+        latest_hash = _stored_version_hash(latest) if latest is not None else ""
+        if latest is not None and latest_hash == snapshot["metadata"]["snapshot_hash"]:
             major, minor = _version_components(latest)
             return VersionSnapshot(int(latest["id"]), int(latest["version_no"]), _version_label(major, minor))
         if latest is None:
@@ -178,18 +172,18 @@ def build_report_snapshot(report_id: int, task_id: str = "", *, _session=None) -
         "inference_count": len(inferences),
         "conflict_count": len(conflicts),
     }
-    payload_for_hash = {
+    metadata["snapshot_hash"] = _content_snapshot_hash({
         "title": report["title"],
-        "materials": materials,
-        "facts": facts,
-        "inferences": inferences,
-        "conflicts": conflicts,
-        "sentences": sentences,
-        "plan": plan_snapshot,
-        "narrative_plan": narrative,
-        "scale_plan": _json_load(plan["budget"] if plan is not None else "{}", {}),
-    }
-    metadata["snapshot_hash"] = _stable_json_hash(payload_for_hash)
+        "material_fingerprints": materials,
+        "report_plan_snapshot": plan_snapshot,
+        "narrative_plan_snapshot": narrative,
+        "scale_plan_snapshot": _json_load(plan["budget"] if plan is not None else "{}", {}),
+        "fact_snapshot": facts,
+        "inference_snapshot": inferences,
+        "conflict_snapshot": conflicts,
+        "sentence_snapshot": sentences,
+    })
+    metadata["snapshot_hash_version"] = _SNAPSHOT_HASH_VERSION
     return {
         "task_id": task_id,
         "title": report["title"],
@@ -1617,6 +1611,168 @@ def _stable_json_hash(value: Any) -> str:
     from hashlib import sha256
 
     return sha256(_dump(value).encode("utf-8")).hexdigest()
+
+
+_SNAPSHOT_HASH_VERSION = 2
+_VOLATILE_HASH_KEYS = {
+    "id",
+    "material_id",
+    "unit_id",
+    "fact_id",
+    "inference_id",
+    "evidence_id",
+    "conflict_id",
+    "sentence_id",
+    "task_id",
+    "run_id",
+    "origin_call_id",
+    "lineage_id",
+    "parent_sentence_id",
+    "introduced_run_id",
+    "superseded_by_fact_id",
+    "superseded_by_inference_id",
+    "created_at",
+    "updated_at",
+    "finalized_at",
+}
+
+
+def _hash_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _canonical_hash_value(value: Any, key: str = "") -> Any:
+    """Remove storage/runtime identity from nested snapshot values."""
+    if isinstance(value, dict):
+        return {
+            str(name): _canonical_hash_value(child, str(name))
+            for name, child in sorted(value.items(), key=lambda item: str(item[0]))
+            if str(name) not in _VOLATILE_HASH_KEYS
+        }
+    if isinstance(value, list):
+        return [_canonical_hash_value(item, key) for item in value]
+    if isinstance(value, str):
+        return _hash_text(value)
+    return value
+
+
+def _artifact_key(item: dict[str, Any], prefix: str) -> str:
+    stable = _hash_text(item.get("stable_key"))
+    if stable:
+        return stable
+    content = _hash_text(item.get("content"))
+    dimension = _hash_text(item.get("dimension"))
+    if content or dimension:
+        return f"{dimension}:{content}"
+    return f"{prefix}:{item.get('id', '')}"
+
+
+def _content_hash_payload(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Build a content-only projection for snapshot de-duplication.
+
+    Version identity belongs to the report-version table. It must not be
+    derived from database row ids, model call ids, or sentence lineage ids;
+    those values may change when an unchanged draft is rebuilt.
+    """
+    facts = list(snapshot.get("fact_snapshot") or snapshot.get("facts") or [])
+    inferences = list(snapshot.get("inference_snapshot") or snapshot.get("inferences") or [])
+    fact_keys = {str(item.get("id")): _artifact_key(item, "fact") for item in facts}
+    inference_keys = {str(item.get("id")): _artifact_key(item, "inference") for item in inferences}
+
+    stable_facts = []
+    for item in facts:
+        evidence = []
+        for entry in item.get("evidence") or []:
+            evidence.append({
+                "source_file": _hash_text(entry.get("source_file")),
+                "page": entry.get("page"),
+                "paragraph": entry.get("paragraph"),
+                "quote": _hash_text(entry.get("quote")),
+            })
+        stable_facts.append({
+            "key": fact_keys.get(str(item.get("id")), _artifact_key(item, "fact")),
+            "content": _hash_text(item.get("content")),
+            "dimension": _hash_text(item.get("dimension")),
+            "need_id": item.get("need_id"),
+            "source_level": _hash_text(item.get("source_level")),
+            "evidence": sorted(evidence, key=lambda value: _dump(value)),
+            "lifecycle_status": _hash_text(item.get("lifecycle_status")),
+        })
+
+    stable_inferences = []
+    for item in inferences:
+        stable_inferences.append({
+            "key": inference_keys.get(str(item.get("id")), _artifact_key(item, "inference")),
+            "content": _hash_text(item.get("content")),
+            "source_level": _hash_text(item.get("source_level")),
+            "based_fact_keys": sorted(
+                fact_keys.get(str(fact_id), f"fact:{fact_id}")
+                for fact_id in (item.get("based_fact_ids") or [])
+            ),
+            "reasoning_chain": _hash_text(item.get("reasoning_chain")),
+            "dimension": _hash_text(item.get("dimension")),
+            "analysis_type": _hash_text(item.get("analysis_type")),
+            "confidence_level": _hash_text(item.get("confidence_level")),
+            "confidence_reason": _hash_text(item.get("confidence_reason")),
+            "uncertainty": _hash_text(item.get("uncertainty")),
+            "lifecycle_status": _hash_text(item.get("lifecycle_status")),
+        })
+
+    stable_sentences = []
+    for item in snapshot.get("sentence_snapshot") or snapshot.get("sentences") or []:
+        refs = item.get("source_refs") or {}
+        stable_sentences.append({
+            "section": _hash_text(item.get("section")),
+            "paragraph": item.get("paragraph"),
+            "position": item.get("position"),
+            "content": _hash_text(item.get("user_edit") or item.get("content")),
+            "source_level": _hash_text(item.get("source_level")),
+            "fact_keys": sorted(
+                fact_keys.get(str(fact_id), f"fact:{fact_id}")
+                for fact_id in (refs.get("fact_ids") or [])
+            ),
+            "inference_keys": sorted(
+                inference_keys.get(str(inference_id), f"inference:{inference_id}")
+                for inference_id in (refs.get("inference_ids") or [])
+            ),
+            "selected": item.get("selected", 1),
+        })
+
+    materials = [
+        _canonical_hash_value(item)
+        for item in (snapshot.get("material_fingerprints") or snapshot.get("materials") or [])
+    ]
+    return {
+        "title": _hash_text(snapshot.get("title")),
+        "materials": sorted(materials, key=lambda value: _dump(value)),
+        "facts": sorted(stable_facts, key=lambda value: value["key"]),
+        "inferences": sorted(stable_inferences, key=lambda value: value["key"]),
+        "conflicts": _canonical_hash_value(snapshot.get("conflict_snapshot") or snapshot.get("conflicts") or []),
+        "sentences": stable_sentences,
+        "plan": _canonical_hash_value(snapshot.get("report_plan_snapshot") or snapshot.get("plan") or {}),
+        "narrative_plan": _canonical_hash_value(snapshot.get("narrative_plan_snapshot") or snapshot.get("narrative_plan") or {}),
+        "scale_plan": _canonical_hash_value(snapshot.get("scale_plan_snapshot") or snapshot.get("scale_plan") or {}),
+    }
+
+
+def _content_snapshot_hash(snapshot: dict[str, Any]) -> str:
+    return _stable_json_hash(_content_hash_payload(snapshot))
+
+
+def _stored_version_hash(row) -> str:
+    """Recompute a stable hash for both new and legacy version rows."""
+    snapshot = {
+        "title": row.get("title", ""),
+        "material_fingerprints": _json_load(row.get("material_fingerprints"), []),
+        "report_plan_snapshot": _json_load(row.get("report_plan_snapshot"), {}),
+        "narrative_plan_snapshot": _json_load(row.get("narrative_plan_snapshot"), {}),
+        "scale_plan_snapshot": _json_load(row.get("scale_plan_snapshot"), {}),
+        "fact_snapshot": _json_load(row.get("fact_snapshot"), []),
+        "inference_snapshot": _json_load(row.get("inference_snapshot"), []),
+        "conflict_snapshot": _json_load(row.get("conflict_snapshot"), []),
+        "sentence_snapshot": _json_load(row.get("sentence_snapshot"), []),
+    }
+    return _content_snapshot_hash(snapshot)
 
 
 def _build_sentence_diff(base: dict[str, Any], target: dict[str, Any], *,
