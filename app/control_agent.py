@@ -257,7 +257,8 @@ def build_task_agent_context(task_id: str, focus: dict | None = None) -> TaskAge
     artifact_counts = {
         "materials": len(task.get("material_ids") or []),
         "facts": len(task.get("fact_ids") or []),
-        "inferences": len(task.get("inference_ids") or []) + len(task.get("external_ids") or []),
+        "inferences": len(task.get("inference_ids") or []),
+        "external_inferences": len(task.get("external_ids") or []),
         "conflicts": len(task.get("conflict_ids") or []),
         "quality_issues": len(task.get("qa_notes") or []),
     }
@@ -1203,7 +1204,8 @@ def _load_task_map(task_id: str, report_id: int | None) -> dict[str, Any]:
         "counts": {
             "materials": len(task.get("material_ids") or []),
             "facts": len(task.get("fact_ids") or []),
-            "inferences": len(task.get("inference_ids") or []) + len(task.get("external_ids") or []),
+            "inferences": len(task.get("inference_ids") or []),
+            "external_inferences": len(task.get("external_ids") or []),
             "conflicts": len(task.get("conflict_ids") or []),
             "quality_issues": len(task.get("qa_notes") or []),
         },
@@ -1211,7 +1213,7 @@ def _load_task_map(task_id: str, report_id: int | None) -> dict[str, Any]:
             "materials": len(materials) > 12,
             "fact_highlights": len(task.get("fact_ids") or []) > len(facts),
             "inference_highlights": (
-                len(task.get("inference_ids") or []) + len(task.get("external_ids") or []) > len(inferences)
+                len(task.get("inference_ids") or []) > len(inferences)
             ),
             "notice": "任务地图只用于确定下一步读取方向；需要完整材料、事实或推论时请继续调用对应浏览工具。",
         },
@@ -1333,7 +1335,7 @@ def _load_inference_catalog(task_id: str, query: str = "", dimension: str = "",
                             confidence: str = "", offset: int = 0, limit: int = 12) -> dict[str, Any]:
     task = short_term.load_task(task_id) or {}
     ids = [
-        int(value) for value in [*(task.get("inference_ids") or []), *(task.get("external_ids") or [])]
+        int(value) for value in (task.get("inference_ids") or [])
         if str(value).isdigit()
     ]
     if not ids:

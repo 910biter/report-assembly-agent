@@ -259,24 +259,21 @@ const running = computed(
 );
 const stageProgress = computed(() => {
   const stage = String(task.data.value?.stage || "created");
-  if (["evidence", "conflict", "analysis"].includes(stage)) {
-    return {
-      label: "证据提取",
-      done: task.data.value?.evidence_progress?.done || 0,
-      total: task.data.value?.evidence_progress?.total || "—",
-    };
-  }
-  if (["directory_review", "writing", "review", "done"].includes(stage)) {
-    return {
-      label: "章节写作",
-      done: task.data.value?.write_progress?.done || 0,
-      total: task.data.value?.write_progress?.total || "—",
-    };
-  }
+  const progressByStage: Record<string, { label: string; key: string }> = {
+    parsing: { label: "材料解析", key: "parse_progress" },
+    material_analysis: { label: "材料理解", key: "material_analysis_progress" },
+    evidence: { label: "事实与证据", key: "evidence_progress" },
+    writing: { label: "报告生成", key: "write_progress" },
+  };
+  const config = progressByStage[stage];
+  if (!config) return null;
+  const progress = task.data.value?.[config.key] || {};
+  const total = Number(progress.total);
+  if (!Number.isFinite(total) || total <= 0) return null;
   return {
-    label: "材料解析",
-    done: task.data.value?.parse_progress?.done || 0,
-    total: task.data.value?.parse_progress?.total || "—",
+    label: config.label,
+    done: progress.done ?? 0,
+    total,
   };
 });
 const pauseRequested = computed(
@@ -284,9 +281,10 @@ const pauseRequested = computed(
 );
 const facts = computed(() => analysis.data.value?.facts || []);
 const inferences = computed(() =>
-  (analysis.data.value?.inferences || []).filter(
-    (x: any) => x.source_level === "MATERIAL_INFERENCE",
-  ),
+  [
+    ...(analysis.data.value?.inferences || []),
+    ...(analysis.data.value?.external_inferences || []),
+  ],
 );
 const conflicts = computed(() => analysis.data.value?.conflicts || []);
 const artifactCounts = computed(() => task.data.value?.artifact_counts || {});
@@ -490,16 +488,9 @@ function versionsList() {
           <span>队列状态</span
           ><b>{{ task.data.value.queue_status?.status || "—" }}</b>
         </div>
-        <div>
+        <div v-if="stageProgress">
           <span>{{ stageProgress.label }}</span
           ><b>{{ stageProgress.done }} / {{ stageProgress.total }}</b>
-        </div>
-        <div>
-          <span>写作进度</span
-          ><b
-            >{{ task.data.value.write_progress?.done || 0 }} /
-            {{ task.data.value.write_progress?.total || "—" }}</b
-          >
         </div>
       </div>
     </section>
@@ -540,11 +531,10 @@ function versionsList() {
           <span>队列状态</span
           ><b>{{ task.data.value.queue_status?.status || "—" }}</b>
         </div>
-        <div>
-          <span>解析进度</span
+        <div v-if="stageProgress">
+          <span>{{ stageProgress.label }}</span
           ><b
-            >{{ task.data.value.parse_progress?.done || 0 }} /
-            {{ task.data.value.parse_progress?.total || "—" }}</b
+            >{{ stageProgress.done }} / {{ stageProgress.total }}</b
           >
         </div>
       </div>
@@ -836,8 +826,15 @@ function versionsList() {
             class="knowledge-item inference"
           >
             <div>
-              <span class="badge success">置信度 {{ confidence(item) }}</span
-              ><small
+              <span
+                v-if="item.source_level === 'EXTERNAL_INFORMATION'"
+                class="inference-source"
+                >外部补充</span
+              ><span v-else class="badge success"
+                >置信度 {{ confidence(item) }}</span
+              ><small v-if="item.source_level === 'EXTERNAL_INFORMATION'"
+                >非本任务材料依据</small
+              ><small v-else
                 >依据事实
                 {{ item.based_fact_ids?.join("、") || "待核验" }}</small
               >
@@ -1264,10 +1261,20 @@ function versionsList() {
 }
 .knowledge-item.inference > div {
   display: flex;
-  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
 }
 .knowledge-item.inference p {
   margin: 12px 0 0;
+}
+.inference-source {
+  color: var(--color-muted);
+  border: 1px solid var(--color-border);
+  background: var(--color-surface-soft);
+  border-radius: var(--radius-sm);
+  padding: 2px 7px;
+  font-size: 12px;
 }
 .knowledge-item.conflict {
   border-left: 2px solid var(--warning);

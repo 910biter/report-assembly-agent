@@ -663,6 +663,7 @@ def get_task(task_id: str):
         "directory_review_completed": bool(view.get("directory_review_completed")),
         "queue_status": view.get("queue_status") or {},
         "parse_progress": view.get("parse_progress") or {},
+        "material_analysis_progress": view.get("material_analysis_progress") or {},
         "evidence_progress": view.get("evidence_progress") or {},
         "write_progress": view.get("write_progress") or {},
         "graph_status": view.get("graph_status") or {},
@@ -862,6 +863,13 @@ def task_materials(task_id: str):
     return result
 
 
+def _split_inference_ids(task: dict) -> tuple[list[int], list[int]]:
+    """Keep material inferences and external notes distinct at the API boundary."""
+    material = [int(item) for item in task.get("inference_ids", []) if str(item).isdigit()]
+    external = [int(item) for item in task.get("external_ids", []) if str(item).isdigit()]
+    return list(dict.fromkeys(material)), list(dict.fromkeys(external))
+
+
 @router.get("/tasks/{task_id}/analysis")
 def task_analysis(task_id: str):
     """任务分析结果:事实(带来源)/推断/外部信息/冲突。"""
@@ -869,7 +877,8 @@ def task_analysis(task_id: str):
     if task is None:
         return JSONResponse({"error": "TASK_NOT_FOUND"}, status_code=404)
     fact_ids = [int(item) for item in task.get("fact_ids", [])]
-    inference_ids = [int(item) for item in task.get("inference_ids", []) + task.get("external_ids", [])]
+    inference_ids, external_ids = _split_inference_ids(task)
+    all_inference_ids = list(dict.fromkeys(inference_ids + external_ids))
     with session_scope() as s:
         fact_rows = s.execute(
             select(ORMFact).where(ORMFact.c.id.in_(fact_ids))
@@ -892,15 +901,16 @@ def task_analysis(task_id: str):
             "evidence": evidence_by_fact.get(fact_id, []),
         } for fact_id in fact_ids if (row := fact_by_id.get(fact_id)) is not None]
         inferences = []
+        external_inferences = []
         inference_rows = s.execute(
-            select(ORMInference).where(ORMInference.c.id.in_(inference_ids))
-        ).mappings().all() if inference_ids else []
+            select(ORMInference).where(ORMInference.c.id.in_(all_inference_ids))
+        ).mappings().all() if all_inference_ids else []
         inference_by_id = {int(row["id"]): row for row in inference_rows}
-        for inference_id in inference_ids:
+        for inference_id in all_inference_ids:
             row = inference_by_id.get(inference_id)
             if row is None:
                 continue
-            inferences.append({
+            item = {
                 "id": row["id"], "content": row["content"],
                 "source_level": row["source_level"],
                 "based_fact_ids": json.loads(row["based_fact_ids"]),
@@ -910,11 +920,14 @@ def task_analysis(task_id: str):
                 "confidence_level": row["confidence_level"],
                 "confidence_reason": row["confidence_reason"],
                 "uncertainty": row["uncertainty"],
-            })
+            }
+            (external_inferences if inference_id in external_ids else inferences).append(item)
         from app.evidence.extractor import load_conflict_records
         conflicts = load_conflict_records(task.get("conflict_ids", []))
     return {
-        "facts": facts, "inferences": inferences, "conflicts": conflicts,
+        "facts": facts, "inferences": inferences,
+        "external_inferences": external_inferences, "conflicts": conflicts,
+        "analysis_group_audit": (task.get("coverage_audit") or {}).get("analysis_groups") or task.get("analysis_group_audit") or {},
         "qa_notes": task.get("qa_notes") or [],
     }
 

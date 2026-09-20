@@ -73,6 +73,7 @@ class Settings(BaseSettings):
     material_analysis_output_tokens: int = 2048
     planner_output_tokens: int = 3072
     analysis_output_tokens: int = 3072
+    analysis_inference_token_budget: int = 384  # Analysis 单条推断的资源估算，不是领域规则
     analysis_facts_per_batch: int = 45  # 资源边界；语义分组仍由运行时维度与事实关系决定
     narrative_output_tokens: int = 4096
     narrative_qa_output_tokens: int = 2048

@@ -2081,14 +2081,16 @@ def _review_groups(task_id: str, task: dict) -> list[dict]:
         "material_role": len(task.get("material_insights") or []),
         "analysis_plan": 1 if analysis_plan_exists else 0,
         "fact": len(task.get("fact_ids") or []),
-        "inference": len(task.get("inference_ids") or []) + len(task.get("external_ids") or []),
+        "inference": len(task.get("inference_ids") or []),
+        "external_inference": len(task.get("external_ids") or []),
         "final_plan": 1 if final_plan_exists else 0,
         "narrative_plan": len(narrative_stages),
         "qa_issue": len(task.get("qa_notes") or []),
     }
     labels = {
         "task_brief": "任务目标", "material_role": "材料理解", "analysis_plan": "分析规划",
-        "fact": "事实", "inference": "分析判断", "final_plan": "最终目录",
+        "fact": "事实", "inference": "分析判断", "external_inference": "外部补充",
+        "final_plan": "最终目录",
         "narrative_plan": "叙事计划",
         "qa_issue": "质量问题",
     }
@@ -2146,8 +2148,9 @@ def _review_items(task_id: str, task: dict, artifact_type: str) -> list[dict]:
             "id": fid, "content": by_id[fid]["content"], "dimension": by_id[fid]["dimension"],
             "fact_type": by_id[fid]["fact_type"],
         }, version) for fid in ids if fid in by_id]
-    if artifact_type == "inference":
-        ids = [int(value) for value in [*(task.get("inference_ids") or []), *(task.get("external_ids") or [])]
+    if artifact_type in {"inference", "external_inference"}:
+        source_ids = task.get("external_ids") if artifact_type == "external_inference" else task.get("inference_ids")
+        ids = [int(value) for value in (source_ids or [])
                if str(value).isdigit()]
         with session_scope() as s:
             rows = s.execute(select(ORMInference).where(ORMInference.c.id.in_(ids))).mappings().all() if ids else []

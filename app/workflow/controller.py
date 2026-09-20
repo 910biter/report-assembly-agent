@@ -14,7 +14,7 @@ from copy import deepcopy
 import numpy as np
 from sqlalchemy import delete, func, insert, select, update
 
-from app.analysis.analyzer import AnalysisAgent
+from app.analysis.analyzer import AnalysisAgent, _semantic_group_coverage
 from app.evidence.extractor import EvidenceAgent, load_evidence_quotes
 from app.planning.planner import PlannerAgent
 from app.writing.writer import WriterAgent, _chapter_position
@@ -53,6 +53,7 @@ from app.task_artifacts import save_task_artifact
 from app.task_runs import update_task_run
 from app.token_monitor import build_token_efficiency, build_workload_profile, token_context
 from app.context_budget import count_tokens, publish_context_audit, tokenizer_method, truncate_tokens
+from app.runtime_profiles import stage_input_budget_tokens
 from app.workflow.stage_state import stage_input_signature, signature_matches
 from app.workflow.stages import stage_rank
 
@@ -108,31 +109,83 @@ def _apply_section_title_changes_to_plan(plan: dict, changes: list[dict]) -> dic
     return result
 
 
-def _analysis_groups(facts: list[dict], max_group_size: int | None = None) -> dict[str, list[dict]]:
-    """Group facts for local analysis without domain-specific keywords."""
-    max_group_size = max(1, int(max_group_size or settings.analysis_facts_per_batch))
-    groups: dict[str, list[dict]] = {}
+def _analysis_fact_line(fact: dict) -> str:
+    """Estimate the same atomic record shape used by local analysis prompts."""
+    return f"{fact.get('id')}. [{fact.get('sources') or []}] {fact.get('content') or ''}"
+
+
+def _analysis_fact_cost(fact: dict) -> int:
+    return count_tokens(_analysis_fact_line(fact) + "\n")
+
+
+def _analysis_groups(
+    facts: list[dict],
+    max_group_size: int | None = None,
+    token_budget: int | None = None,
+) -> dict[str, list[dict]]:
+    """Pack local analysis facts by semantic ID groups and token budget.
+
+    Dimensions remain isolated, while need/type buckets are merged greedily. The
+    legacy ``max_group_size`` argument is retained for call compatibility but is
+    no longer used as a silent per-bucket split boundary. A bucket is split only
+    when that complete bucket cannot fit in one request.
+    """
+    del max_group_size
+    raw_budget = int(token_budget or stage_input_budget_tokens("analysis"))
+    # Leave room for the stable analysis instruction and prompt wrapper when the
+    # production stage budget is used. Explicit test budgets are exact.
+    budget = max(1, raw_budget if token_budget is not None else raw_budget - 512)
+    by_dimension: dict[str, list[dict]] = {}
     for fact in facts:
         dimension = str(fact.get("dimension") or "未分类")
-        groups.setdefault(dimension, []).append(fact)
-    refined: dict[str, list[dict]] = {}
-    for dimension, items in groups.items():
-        if len(items) <= max_group_size:
-            refined[dimension] = items
-            continue
-        buckets: dict[str, list[dict]] = {}
+        by_dimension.setdefault(dimension, []).append(fact)
+
+    packed: dict[str, list[dict]] = {}
+    for dimension, items in by_dimension.items():
+        buckets: dict[tuple[int, str], list[dict]] = {}
         for fact in items:
             need_id = int(fact.get("need_id") or 0)
             fact_type = str(fact.get("fact_type") or "unknown")
-            key = f"{dimension} / need:{need_id or 'open'} / type:{fact_type}"
-            buckets.setdefault(key, []).append(fact)
-        for key, bucket in buckets.items():
-            if len(bucket) <= max_group_size:
-                refined[key] = bucket
+            buckets.setdefault((need_id, fact_type), []).append(fact)
+
+        batch_index = 0
+        current: list[dict] = []
+        current_tokens = 0
+
+        def flush() -> None:
+            nonlocal batch_index, current, current_tokens
+            if not current:
+                return
+            batch_index += 1
+            key = dimension if batch_index == 1 else f"{dimension} / batch:{batch_index}"
+            packed[key] = current
+            current = []
+            current_tokens = 0
+
+        for bucket in buckets.values():
+            bucket_tokens = sum(_analysis_fact_cost(fact) for fact in bucket)
+            if bucket_tokens <= budget:
+                if current and current_tokens + bucket_tokens > budget:
+                    flush()
+                current.extend(bucket)
+                current_tokens += bucket_tokens
                 continue
-            for index in range(0, len(bucket), max_group_size):
-                refined[f"{key} / batch:{index // max_group_size + 1}"] = bucket[index:index + max_group_size]
-    return refined
+
+            # An oversized semantic bucket is the only case where individual
+            # facts may be split across requests.
+            flush()
+            for fact in bucket:
+                fact_tokens = _analysis_fact_cost(fact)
+                if current and current_tokens + fact_tokens > budget:
+                    flush()
+                if fact_tokens > budget and not current:
+                    current = [fact]
+                    flush()
+                    continue
+                current.append(fact)
+                current_tokens += fact_tokens
+        flush()
+    return packed
 
 
 def _graph_artifact_status(graph_status: dict) -> str:
@@ -1477,13 +1530,18 @@ class WorkflowController:
                 pass
             if ledger_block:
                 context_block = f"{ledger_block}\n{context_block}"
-            local_inferences.extend(analysis_agent.analyze_local(dimension, group_facts, context_block))
+            local_inferences.extend(analysis_agent.analyze_local(
+                dimension, group_facts, context_block,
+            ))
         # Reduce:跨维度综合(局部推断 → 全局推断 + 覆盖状态元数据)
         global_inferences, external, global_meta = analysis_agent.analyze_global(
             local_inferences, facts,
             "、".join(str(c.get("description") or c.get("note") or "") for c in (conflicts or [])),
         )
         inferences = local_inferences + global_inferences
+        self._update(analysis_group_audit=_semantic_group_coverage(
+            analysis_facts, local_inferences + global_inferences,
+        ))
         generated_ids = [int(i.id) for i in inferences if i.id is not None]
         generated_external_ids = [int(i.id) for i in external if i.id is not None]
         if self.task.get("incremental_update"):
@@ -1622,6 +1680,7 @@ class WorkflowController:
                               for dim, d in dim_facts.items()},
                 "requirement": req_status,
                 "analysis": self.task.get("analysis_global_meta") or {},
+                "analysis_groups": self.task.get("analysis_group_audit") or {},
             }
             self._update(coverage_audit=audit)
         except Exception:

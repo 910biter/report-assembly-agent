@@ -6,13 +6,15 @@ import json
 
 from app.agents.base import BaseAgent
 from app.cache import stable_hash
+from app.config import settings
+
 from app.context_budget import ContextSection, build_prompt_from_sections
 from app.db import session_scope
 from app.infrastructure.orm import ORMInference, Base
 from sqlalchemy import select
 from app.models import Inference
 from app.token_monitor import current_context, update_call_metrics, update_call_products
-from app.runtime_profiles import stage_input_budget_tokens
+from app.runtime_profiles import stage_input_budget_tokens, stage_profile
 
 _SYSTEM = """你是情报分析员。基于事实清单、来源冲突与历史知识做综合分析,禁止无依据结论。
 严格输出 JSON,不要任何解释:
@@ -70,16 +72,93 @@ def _int_ids(values) -> list[int]:
     return result
 
 
-def _target_local_inference_count(fact_count: int) -> int:
+def _target_local_inference_count(fact_count: int, group_count: int = 0) -> int:
     if fact_count <= 0:
         return 0
     if fact_count < 8:
-        return 1
-    if fact_count < 25:
-        return 2
-    if fact_count < 60:
-        return 3
-    return 4
+        base = 1
+    elif fact_count < 25:
+        base = 2
+    elif fact_count < 60:
+        base = 3
+    else:
+        base = 4
+    if group_count <= 0:
+        return base
+    # This is an output-capacity estimate, not a domain rule. A semantic
+    # batch may need more than the historical four-result suggestion, but the
+    # target remains bounded by the configured Analysis output budget.
+    output_capacity = max(4, stage_profile("analysis").output_tokens // max(1, int(settings.analysis_inference_token_budget)))
+    return max(base, min(int(group_count), int(fact_count), output_capacity))
+
+
+def _semantic_fact_groups(facts: list[dict]) -> dict[tuple[str, int, str], list[dict]]:
+    """Group facts using runtime planning keys, without domain assumptions."""
+    groups: dict[tuple[str, int, str], list[dict]] = {}
+    for fact in facts:
+        key = (
+            str(fact.get("dimension") or "未分类"),
+            int(fact.get("need_id") or 0),
+            str(fact.get("fact_type") or "unknown"),
+        )
+        groups.setdefault(key, []).append(fact)
+    return groups
+
+
+def _semantic_group_overview(facts: list[dict]) -> tuple[str, int]:
+    """Build a compact, generic map of groups already present in the prompt."""
+    groups = _semantic_fact_groups(facts)
+    lines = ["本批次事实组概览（用于覆盖检查，不要求一组生成一条推断）："]
+    for index, ((dimension, need_id, fact_type), items) in enumerate(groups.items(), start=1):
+        sample_ids = ",".join(str(item.get("id")) for item in items[:6])
+        if len(items) > 6:
+            sample_ids = f"{sample_ids},..."
+        lines.append(
+            f"- 组{index}: dimension={dimension}, need_id={need_id or 'open'}, "
+            f"fact_type={fact_type}, 事实数={len(items)}, 事实ID={sample_ids}"
+        )
+    return "\n".join(lines), len(groups)
+
+
+def _semantic_group_coverage(facts: list[dict], inferences: list) -> dict:
+    """Audit semantic-group coverage from deterministic fact bindings."""
+    groups = _semantic_fact_groups(facts)
+    referenced: set[int] = set()
+    for inference in inferences:
+        values = inference.get("based_fact_ids") if isinstance(inference, dict) else getattr(inference, "based_fact_ids", [])
+        for value in values or []:
+            try:
+                referenced.add(int(value))
+            except (TypeError, ValueError):
+                continue
+    covered_groups = 0
+    covered_facts = set()
+    uncovered_groups = []
+    for (dimension, need_id, fact_type), items in groups.items():
+        fact_ids = sorted(int(item["id"]) for item in items if item.get("id") is not None)
+        group_covered = set(fact_ids) & referenced
+        covered_facts.update(group_covered)
+        if group_covered:
+            covered_groups += 1
+        else:
+            uncovered_groups.append({
+                "dimension": dimension,
+                "need_id": need_id or None,
+                "fact_type": fact_type,
+                "fact_count": len(fact_ids),
+                "fact_ids": fact_ids,
+            })
+    total_groups = len(groups)
+    total_facts = sum(len(items) for items in groups.values())
+    return {
+        "total_groups": total_groups,
+        "covered_groups": covered_groups,
+        "coverage_ratio": round(covered_groups / total_groups, 4) if total_groups else 1.0,
+        "total_facts": total_facts,
+        "covered_facts": len(covered_facts),
+        "fact_coverage_ratio": round(len(covered_facts) / total_facts, 4) if total_facts else 1.0,
+        "uncovered_groups": uncovered_groups,
+    }
 
 
 def _confidence_from_facts(based_fact_ids: list[int]) -> tuple[str, str]:
@@ -105,12 +184,17 @@ class AnalysisAgent(BaseAgent):
         if not context_block:
             fact_lines = [f"{f['id']}. [{f['sources']}] {f['content']}" for f in facts]
             context_block = "事实清单(编号 + 来源):\n" + "\n".join(fact_lines)
-        target_count = _target_local_inference_count(len(facts))
+        group_overview, group_count = _semantic_group_overview(facts)
+        target_count = _target_local_inference_count(len(facts), group_count)
         instruction = (
             f"分析维度:{dimension}\n"
             f"事实数量:{len(facts)}\n"
-            f"建议推论数量:{target_count} 条左右;事实很少时可少于该数量,但不得为凑数重复。\n\n"
+            f"建议推论数量:{target_count} 条左右;这是覆盖提示而非硬上限,事实很少时可少于该数量,不得为凑数重复。\n\n"
+            f"{group_overview}\n"
+            f"事实组数量:{group_count}。\n"
             "请先按主题/问题/实体/机制/时间线在心中组织事实,再生成该维度的结构化推论层。"
+            "优先覆盖主要事实组；相近事实组可以合并为一条推论，不要机械地一组生成一条。"
+            "如果某个事实组无法形成可靠判断，可以不生成推论，但不得假装已经覆盖。"
             "每条推论必须表达一个清晰判断并挂真实 based_fact_ids；不要输出置信度相关字段。"
             "输出 JSON。"
         )
