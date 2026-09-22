@@ -263,6 +263,14 @@ def _migrate_integrity() -> None:
             "ON kg_assertion_facts(fact_id, assertion_id)"
         ))
         conn.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_kg_fact_coverage_workspace_fact "
+            "ON kg_fact_coverage(workspace_id, fact_id)"
+        ))
+        conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS idx_kg_fact_coverage_status "
+            "ON kg_fact_coverage(workspace_id, status, fact_id)"
+        ))
+        conn.execute(text(
             "CREATE INDEX IF NOT EXISTS idx_graph_outbox_status "
             "ON graph_outbox(status, id)"
         ))

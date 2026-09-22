@@ -116,7 +116,6 @@ class Settings(BaseSettings):
     # PostgreSQL stores the auditable canonical graph. Neo4j is an optional,
     # rebuildable query projection and must never become a second fact source.
     graph_workspace_id: str = "default"
-    graph_build_before_analysis: bool = False
     graph_max_hops: int = 2
     graph_output_tokens: int = 6144
     graph_facts_per_batch: int = 12

@@ -943,7 +943,16 @@ def task_graph(task_id: str):
     if task is None:
         return JSONResponse({"error": "TASK_NOT_FOUND"}, status_code=404)
     from app.graph import graph_service
-    result = graph_service.task_graph(task_id)
+    from app.workflow.controller import WorkflowController
+    controller = WorkflowController(task_id)
+    active_fact_ids = {
+        int(fact.get("id")) for fact in controller._facts() if fact.get("id") is not None
+    }
+    result = graph_service.task_graph(
+        task_id,
+        source_task_ids=controller._graph_scope_ids(),
+        active_fact_ids=active_fact_ids,
+    )
     result["build_status"] = task.get("graph_status") or {"status": "unknown"}
     jobs = task.get("background_jobs") or {}
     background_job = jobs.get("graph_rebuild") or jobs.get("graph_build") or {}

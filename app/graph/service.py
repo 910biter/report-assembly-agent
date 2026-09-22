@@ -28,6 +28,7 @@ from app.infrastructure.orm import (
     ORMKGChangeSet,
     ORMKGEntity,
     ORMKGEntityAlias,
+    ORMKGFactCoverage,
     ORMKGTaskMembership,
 )
 
@@ -82,6 +83,7 @@ class GraphBuildResult:
     failed_batches: int = 0
     split_count: int = 0
     failed_fact_ids: list[int] = field(default_factory=list)
+    processed_fact_count: int = 0
 
     def as_dict(self) -> dict:
         return {
@@ -96,6 +98,7 @@ class GraphBuildResult:
             "failed_batches": self.failed_batches,
             "adaptive_split_count": self.split_count,
             "failed_fact_ids": self.failed_fact_ids,
+            "processed_fact_count": self.processed_fact_count,
         }
 
 
@@ -213,11 +216,19 @@ class Neo4jProjector:
             return []
 
 
-def _projection_records(task_id: str) -> dict:
+def _scope_ids(task_id: str, source_task_ids: list[str] | None = None) -> list[str]:
+    values = [str(task_id or "")]
+    values.extend(str(value or "") for value in (source_task_ids or []))
+    return list(dict.fromkeys(value for value in values if value))
+
+
+def _projection_records(task_id: str, source_task_ids: list[str] | None = None,
+                        active_fact_ids: set[int] | None = None) -> dict:
+    task_ids = _scope_ids(task_id, source_task_ids)
     with session_scope() as s:
         memberships = s.execute(
             select(ORMKGTaskMembership.c.entity_id, ORMKGTaskMembership.c.assertion_id)
-            .where(ORMKGTaskMembership.c.task_id == task_id, ORMKGTaskMembership.c.status == "active")
+            .where(ORMKGTaskMembership.c.task_id.in_(task_ids), ORMKGTaskMembership.c.status == "active")
         ).mappings().all()
         assertion_ids = {int(row["assertion_id"]) for row in memberships if row["assertion_id"] is not None}
         entity_ids = {int(row["entity_id"]) for row in memberships if row["entity_id"] is not None}
@@ -232,6 +243,23 @@ def _projection_records(task_id: str) -> dict:
     fact_map: dict[int, list[int]] = {}
     for row in facts:
         fact_map.setdefault(int(row["assertion_id"]), []).append(int(row["fact_id"]))
+    if active_fact_ids is not None:
+        active_assertion_ids = {
+            assertion_id for assertion_id, fact_ids in fact_map.items()
+            if set(fact_ids) & set(active_fact_ids)
+        }
+        assertions = [row for row in assertions if int(row["id"]) in active_assertion_ids]
+        entity_ids = {
+            int(row["entity_id"]) for row in memberships
+            if row["entity_id"] is not None
+            and (row["assertion_id"] is None or int(row["assertion_id"]) in active_assertion_ids)
+        }
+        for item in assertions:
+            entity_ids.add(int(item["subject_entity_id"]))
+            if item["object_entity_id"] is not None:
+                entity_ids.add(int(item["object_entity_id"]))
+        entities = [row for row in entities if int(row["id"]) in entity_ids]
+        by_id = {int(row["id"]): row for row in entities}
     return {
         "entities": [{
             "key": row["entity_key"], "name": row["canonical_name"], "entity_type": row["entity_type"],
@@ -246,7 +274,7 @@ def _projection_records(task_id: str) -> dict:
             "target_key": by_id.get(int(row["object_entity_id"]))["entity_key"] if row["object_entity_id"] is not None and by_id.get(int(row["object_entity_id"])) else "value-" + _stable_key(row["workspace_id"], row["object_value"]),
             "target_name": by_id.get(int(row["object_entity_id"]))["canonical_name"] if row["object_entity_id"] is not None and by_id.get(int(row["object_entity_id"])) else row["object_value"],
             "predicate": row["predicate"], "status": row["status"], "confidence": row["confidence"],
-            "fact_ids": fact_map.get(int(row["id"]), []), "task_ids": [task_id], "workspace_id": row["workspace_id"],
+            "fact_ids": fact_map.get(int(row["id"]), []), "task_ids": task_ids, "workspace_id": row["workspace_id"],
             "valid_from": row["valid_from"], "valid_to": row["valid_to"], "event_name": row["event_name"],
         } for row in assertions],
     }
@@ -290,6 +318,121 @@ class GraphService:
             },
         }
 
+    def covered_fact_ids(self, fact_ids: list[int] | set[int], workspace_id: str = "") -> set[int]:
+        """Return facts already processed by Graph extraction in this workspace.
+
+        The coverage ledger is authoritative for both relations and explicit
+        no-relation outcomes. Existing assertion links are included as a
+        migration bridge for graph rows created before the ledger existed.
+        """
+        ids = {int(value) for value in fact_ids if str(value).isdigit()}
+        if not ids:
+            return set()
+        workspace_id = workspace_id or settings.graph_workspace_id
+        with session_scope() as s:
+            covered = {
+                int(row["fact_id"])
+                for row in s.execute(
+                    select(ORMKGFactCoverage.c.fact_id).where(
+                        ORMKGFactCoverage.c.workspace_id == workspace_id,
+                        ORMKGFactCoverage.c.fact_id.in_(ids),
+                        ORMKGFactCoverage.c.status == "processed",
+                    )
+                ).mappings().all()
+            }
+            legacy = s.execute(
+                select(ORMKGAssertionFact.c.fact_id)
+                .join(ORMKGAssertion, ORMKGAssertion.c.id == ORMKGAssertionFact.c.assertion_id)
+                .where(
+                    ORMKGAssertion.c.workspace_id == workspace_id,
+                    ORMKGAssertion.c.status.in_(["validated", "confirmed"]),
+                    ORMKGAssertionFact.c.fact_id.in_(ids),
+                )
+            ).mappings().all()
+        covered.update(int(row["fact_id"]) for row in legacy)
+        return covered
+
+    def link_existing_fact_graph(self, task_id: str, fact_ids: set[int] | list[int],
+                                 workspace_id: str = "") -> int:
+        """Attach existing validated assertions without re-running extraction."""
+        ids = {int(value) for value in fact_ids if str(value).isdigit()}
+        if not ids:
+            return 0
+        workspace_id = workspace_id or settings.graph_workspace_id
+        with session_scope() as s:
+            rows = s.execute(
+                select(ORMKGAssertionFact.c.assertion_id)
+                .join(ORMKGAssertion, ORMKGAssertion.c.id == ORMKGAssertionFact.c.assertion_id)
+                .where(
+                    ORMKGAssertion.c.workspace_id == workspace_id,
+                    ORMKGAssertion.c.status.in_(["validated", "confirmed"]),
+                    ORMKGAssertionFact.c.fact_id.in_(ids),
+                )
+                .distinct()
+            ).mappings().all()
+            assertion_ids = [int(row["assertion_id"]) for row in rows]
+            for assertion_id in assertion_ids:
+                self._membership(s, task_id, assertion_id=assertion_id, role="inherited")
+            if assertion_ids:
+                self._enqueue_projection(s, task_id, workspace_id)
+        return len(assertion_ids)
+
+    def _record_fact_coverage(
+        self,
+        workspace_id: str,
+        task_id: str,
+        processed_fact_ids: set[int],
+        failed_fact_ids: set[int],
+        assertion_count_by_fact: dict[int, int],
+        failures: list[dict],
+    ) -> None:
+        rows_by_fact: dict[int, dict] = {}
+        failure_text = {
+            int(fact_id): str(item.get("error") or "")[:300]
+            for item in failures
+            for fact_id in item.get("fact_ids") or []
+            if str(fact_id).isdigit()
+        }
+        for fact_id in processed_fact_ids:
+            rows_by_fact[int(fact_id)] = {
+                "workspace_id": workspace_id,
+                "fact_id": int(fact_id),
+                "status": "processed",
+                "source_task_id": task_id,
+                "assertion_count": int(assertion_count_by_fact.get(int(fact_id), 0)),
+                "last_error": "",
+            }
+        for fact_id in failed_fact_ids:
+            rows_by_fact[int(fact_id)] = {
+                "workspace_id": workspace_id,
+                "fact_id": int(fact_id),
+                "status": "failed",
+                "source_task_id": task_id,
+                "assertion_count": 0,
+                "last_error": failure_text.get(int(fact_id), "graph extraction failed"),
+            }
+        if not rows_by_fact:
+            return
+        from sqlalchemy import case, text
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+        with session_scope() as s:
+            stmt = pg_insert(ORMKGFactCoverage).values(list(rows_by_fact.values()))
+            excluded = stmt.excluded
+            s.execute(stmt.on_conflict_do_update(
+                index_elements=["workspace_id", "fact_id"],
+                set_={
+                    "status": case(
+                        (ORMKGFactCoverage.c.status == "processed", "processed"),
+                        else_=excluded.status,
+                    ),
+                    "source_task_id": excluded.source_task_id,
+                    "assertion_count": excluded.assertion_count,
+                    "last_error": excluded.last_error,
+                    "updated_at": text("CURRENT_TIMESTAMP"),
+                },
+            ))
+
     def build_task_graph(self, task_id: str, facts: list[dict], workspace_id: str = "",
                          active_fact_ids: set[int] | None = None) -> GraphBuildResult:
         if not facts:
@@ -322,6 +465,7 @@ class GraphService:
             split_count = sum(outcome.split_count for outcome in outcomes)
             entity_count = assertion_count = changes = 0
             persisted_batches = 0
+            assertion_count_by_fact: dict[int, int] = {}
             valid_fact_ids = {int(item["id"]) for item in facts if item.get("id") is not None}
             for record in payload_records:
                 payload = record["payload"]
@@ -337,6 +481,9 @@ class GraphService:
                             s, task_id, workspace_id,
                             payload.get("assertions") or [], entities, valid_fact_ids,
                         )
+                        for assertion in payload.get("assertions") or []:
+                            for fact_id in _int_ids(assertion.get("fact_ids"), set(batch_fact_ids)):
+                                assertion_count_by_fact[fact_id] = assertion_count_by_fact.get(fact_id, 0) + 1
                     persisted_batches += 1
                 except Exception as exc:
                     failures.append({
@@ -350,14 +497,29 @@ class GraphService:
                         active_fact_ids if active_fact_ids is not None else valid_fact_ids,
                     )
                     changes = self._enqueue_projection(s, task_id, workspace_id)
+            failed_facts = sorted({
+                int(fact_id) for item in failures
+                for fact_id in item.get("fact_ids") or []
+            })
+            failed_fact_set = set(failed_facts)
+            processed_fact_ids = {
+                int(fact_id)
+                for record in payload_records
+                for fact_id in record.get("fact_ids") or []
+                if int(fact_id) in valid_fact_ids
+            } - failed_fact_set
+            self._record_fact_coverage(
+                workspace_id,
+                task_id,
+                processed_fact_ids,
+                failed_fact_set,
+                assertion_count_by_fact,
+                failures,
+            )
             projected = self.project_pending(limit=1) if persisted_batches else 0
             status = "ready" if not failures else "partial_ready" if persisted_batches else "degraded"
             error = ""
             if failures:
-                failed_facts = sorted({
-                    int(fact_id) for item in failures
-                    for fact_id in item.get("fact_ids") or []
-                })
                 error = f"{len(failures)} terminal batch(es) failed; {len(failed_facts)} fact(s) not processed"
             else:
                 failed_facts = []
@@ -368,6 +530,7 @@ class GraphService:
                 failed_batches=len(failures),
                 split_count=split_count,
                 failed_fact_ids=failed_facts,
+                processed_fact_count=len(processed_fact_ids),
             )
         except Exception as exc:
             return GraphBuildResult("degraded", error=str(exc)[:300])
@@ -459,21 +622,43 @@ class GraphService:
             self._membership(s, task_id, assertion_id=assertion_id)
         return count
 
-    def _membership(self, s, task_id: str, entity_id: int | None = None, assertion_id: int | None = None) -> None:
+    def _membership(self, s, task_id: str, entity_id: int | None = None,
+                    assertion_id: int | None = None, role: str = "observed") -> None:
+        def ensure_membership(column, value: int, extra: dict) -> None:
+            rows = s.execute(select(
+                ORMKGTaskMembership.c.id, ORMKGTaskMembership.c.role, ORMKGTaskMembership.c.status,
+            ).where(
+                ORMKGTaskMembership.c.task_id == task_id,
+                column == value,
+            )).mappings().all()
+            observed = next((row for row in rows if row["role"] == "observed"), None)
+            same_role = next((row for row in rows if row["role"] == role), None)
+            if role == "observed":
+                if observed:
+                    s.execute(update(ORMKGTaskMembership).where(
+                        ORMKGTaskMembership.c.id == observed["id"],
+                    ).values(status="active"))
+                elif same_role:
+                    s.execute(update(ORMKGTaskMembership).where(
+                        ORMKGTaskMembership.c.id == same_role["id"],
+                    ).values(role="observed", status="active"))
+                else:
+                    s.execute(ORMKGTaskMembership.insert().values(
+                        task_id=task_id, **extra, role="observed", status="active",
+                    ))
+            elif same_role:
+                s.execute(update(ORMKGTaskMembership).where(
+                    ORMKGTaskMembership.c.id == same_role["id"],
+                ).values(status="active"))
+            elif not observed:
+                s.execute(ORMKGTaskMembership.insert().values(
+                    task_id=task_id, **extra, role=role, status="active",
+                ))
+
         if entity_id is not None:
-            exists = s.execute(select(ORMKGTaskMembership.c.id).where(
-                ORMKGTaskMembership.c.task_id == task_id, ORMKGTaskMembership.c.entity_id == entity_id,
-                ORMKGTaskMembership.c.role == "observed",
-            )).mappings().first()
-            if not exists:
-                s.execute(ORMKGTaskMembership.insert().values(task_id=task_id, entity_id=entity_id, role="observed"))
+            ensure_membership(ORMKGTaskMembership.c.entity_id, entity_id, {"entity_id": entity_id})
         if assertion_id is not None:
-            exists = s.execute(select(ORMKGTaskMembership.c.id).where(
-                ORMKGTaskMembership.c.task_id == task_id, ORMKGTaskMembership.c.assertion_id == assertion_id,
-                ORMKGTaskMembership.c.role == "observed",
-            )).mappings().first()
-            if not exists:
-                s.execute(ORMKGTaskMembership.insert().values(task_id=task_id, assertion_id=assertion_id, role="observed"))
+            ensure_membership(ORMKGTaskMembership.c.assertion_id, assertion_id, {"assertion_id": assertion_id})
 
     def _reconcile_task_assertions(self, s, task_id: str, workspace_id: str,
                                    active_fact_ids: set[int]) -> None:
@@ -549,7 +734,8 @@ class GraphService:
     def promote_task_graph(self, task_id: str, report_version_id: int | None = None) -> int:
         with session_scope() as s:
             assertion_ids = [int(row["assertion_id"]) for row in s.execute(select(ORMKGTaskMembership.c.assertion_id).where(
-                ORMKGTaskMembership.c.task_id == task_id, ORMKGTaskMembership.c.assertion_id.is_not(None), ORMKGTaskMembership.c.status == "active",
+                ORMKGTaskMembership.c.task_id == task_id, ORMKGTaskMembership.c.assertion_id.is_not(None),
+                ORMKGTaskMembership.c.role == "observed", ORMKGTaskMembership.c.status == "active",
             )).mappings().all()]
             if not assertion_ids:
                 return 0
@@ -563,11 +749,12 @@ class GraphService:
             self._enqueue_projection(s, task_id, workspace)
         return len(assertion_ids)
 
-    def context_for_analysis(self, task_id: str, facts: list[dict], limit: int = 12) -> str:
+    def context_for_analysis(self, task_id: str, facts: list[dict], limit: int = 12,
+                             source_task_ids: list[str] | None = None) -> str:
         fact_ids = [int(item["id"]) for item in facts if item.get("id") is not None]
-        rows = self.projector.neighborhood_for_fact_ids(task_id, fact_ids, limit=limit)
+        rows = [] if source_task_ids else self.projector.neighborhood_for_fact_ids(task_id, fact_ids, limit=limit)
         if not rows:
-            rows = self._postgres_neighborhood(task_id, fact_ids, limit)
+            rows = self._postgres_neighborhood(_scope_ids(task_id, source_task_ids), fact_ids, limit)
         if not rows:
             return ""
         lines = []
@@ -576,7 +763,7 @@ class GraphService:
             lines.append(f"- {row.get('subject','')} —{row.get('predicate','相关')}→ {row.get('object','')}（依据 Fact:{fact_refs}；{row.get('confidence','medium')}）")
         return "关系图谱（仅作交叉印证；必须以 Fact 与 Evidence 为准）：\n" + "\n".join(lines)
 
-    def _postgres_neighborhood(self, task_id: str, fact_ids: list[int], limit: int) -> list[dict]:
+    def _postgres_neighborhood(self, task_ids: list[str], fact_ids: list[int], limit: int) -> list[dict]:
         if not fact_ids:
             return []
         with session_scope() as s:
@@ -585,7 +772,7 @@ class GraphService:
                 .join(ORMKGAssertionFact, ORMKGAssertionFact.c.assertion_id == ORMKGAssertion.c.id)
                 .join(ORMKGTaskMembership, ORMKGTaskMembership.c.assertion_id == ORMKGAssertion.c.id)
                 .join(ORMKGEntity, ORMKGEntity.c.id == ORMKGAssertion.c.subject_entity_id)
-                .where(ORMKGTaskMembership.c.task_id == task_id, ORMKGAssertionFact.c.fact_id.in_(fact_ids), ORMKGAssertion.c.status.in_(["validated", "confirmed"]))
+                .where(ORMKGTaskMembership.c.task_id.in_(task_ids), ORMKGAssertionFact.c.fact_id.in_(fact_ids), ORMKGAssertion.c.status.in_(["validated", "confirmed"]))
                 .limit(limit)
             ).mappings().all()
             object_ids = {int(row["object_entity_id"]) for row in rows if row["object_entity_id"] is not None}
@@ -601,8 +788,9 @@ class GraphService:
             item["fact_ids"].append(int(row["fact_id"]))
         return list(grouped.values())
 
-    def task_graph(self, task_id: str) -> dict:
-        records = _projection_records(task_id)
+    def task_graph(self, task_id: str, source_task_ids: list[str] | None = None,
+                   active_fact_ids: set[int] | None = None) -> dict:
+        records = _projection_records(task_id, source_task_ids, active_fact_ids)
         nodes = _visualization_nodes(records)
         capability = self.capability_status()
         return {
@@ -615,10 +803,11 @@ class GraphService:
             "stats": {"entity_count": len(nodes), "assertion_count": len(records["assertions"])},
         }
 
-    def has_task_graph(self, task_id: str) -> bool:
+    def has_task_graph(self, task_id: str, source_task_ids: list[str] | None = None) -> bool:
+        task_ids = _scope_ids(task_id, source_task_ids)
         with session_scope() as s:
             row = s.execute(select(ORMKGTaskMembership.c.id).where(
-                ORMKGTaskMembership.c.task_id == task_id,
+                ORMKGTaskMembership.c.task_id.in_(task_ids),
                 ORMKGTaskMembership.c.assertion_id.is_not(None),
                 ORMKGTaskMembership.c.status == "active",
             ).limit(1)).mappings().first()

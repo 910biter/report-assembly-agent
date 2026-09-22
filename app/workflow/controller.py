@@ -7,7 +7,6 @@ artifacts and dependency signatures provide durable audit and safe resume.
 """
 import json
 import re
-import threading
 import time
 from copy import deepcopy
 
@@ -38,7 +37,6 @@ from app.infrastructure.orm import (
     ORMTaskArtifact,
     ORMUnit,
 )
-from app.llm_queue import PRIORITY_BACKGROUND, llm_priority
 from app.memory import short_term
 from app.models import Stage, Unit
 from app.parsing import PARSER_VERSION, parse_file_with_profile
@@ -211,6 +209,55 @@ class WorkflowController:
         self.task.setdefault("task_id", task_id)
         self.task.setdefault("id", task_id)
 
+    def _graph_scope_ids(self) -> list[str]:
+        """Return the current task and its incremental graph ancestors."""
+        scope: list[str] = []
+        seen: set[str] = set()
+        current_id = self.task_id
+        current_task = self.task
+        while current_id and current_id not in seen:
+            scope.append(current_id)
+            seen.add(current_id)
+            base_id = str(current_task.get("incremental_base_task_id") or "")
+            if not base_id or base_id in seen:
+                break
+            current_id = base_id
+            current_task = short_term.load_task(current_id) or {}
+        return scope
+
+    def _legacy_graph_fact_ids(self) -> set[int]:
+        """Read trusted pre-ledger graph coverage for one migration bridge."""
+        covered: set[int] = set()
+        for task_id in self._graph_scope_ids():
+            task = self.task if task_id == self.task_id else (short_term.load_task(task_id) or {})
+            status = str((task.get("graph_status") or {}).get("status") or "")
+            if status not in {"ready", "partial_ready", "reused"}:
+                continue
+            covered.update(
+                int(value) for value in task.get("graph_fact_ids") or []
+                if str(value).isdigit()
+            )
+        return covered
+
+    def _trusted_inherited_graph_fact_ids(self) -> set[int]:
+        """Trust inherited Facts only when the base task completed graphing."""
+        if not self.task.get("incremental_update"):
+            return set()
+        inherited = self.task.get("incremental_inherited_fact_ids")
+        if inherited is None:
+            return set()
+        base_id = str(self.task.get("incremental_base_task_id") or "")
+        if not base_id:
+            return set()
+        base_task = short_term.load_task(base_id) or {}
+        base_status = str((base_task.get("graph_status") or {}).get("status") or "")
+        if base_status not in {"ready", "reused"}:
+            return set()
+        return {
+            int(value) for value in inherited
+            if str(value).isdigit()
+        }
+
     # ---------- 对外入口 ----------
 
     def _control_boundary(self) -> None:
@@ -380,20 +427,20 @@ class WorkflowController:
             # The confirmed directory is downstream of graph construction.
             # Keep its existing graph status intact instead of overwriting it.
             pass
-        elif settings.graph_build_before_analysis:
-            with self._token_context("graph_build"):
-                self._build_task_graph(facts)
         else:
             from app.graph import graph_service
 
-            if (graph_service.has_task_graph(self.task_id)
-                  and self._graph_covers_facts(facts)):
-                stats = graph_service.task_graph(self.task_id).get("stats") or {}
+            if self._graph_covers_facts(facts):
+                stats = graph_service.task_graph(
+                    self.task_id,
+                    source_task_ids=self._graph_scope_ids(),
+                    active_fact_ids={int(fact.get("id") or 0) for fact in facts if fact.get("id") is not None},
+                ).get("stats") or {}
                 self._update(graph_status={"status": "reused", **stats})
             else:
                 self._update(graph_status={
                     "status": "pending",
-                    "reason": "post_review_background",
+                    "reason": "user_triggered",
                     "pending_fact_count": len({int(f["id"]) for f in facts if f.get("id") is not None}
                                               - set(self.task.get("graph_fact_ids") or [])),
                 })
@@ -673,7 +720,6 @@ class WorkflowController:
             metadata={"report_id": self.task.get("report_id"), "ttfr_seconds": ttfr},
             finished=True,
         )
-        self._start_background_graph_build(facts)
         return "review"
 
     def _complete_document_analysis(
@@ -1401,31 +1447,46 @@ class WorkflowController:
         """Create an evidence-grounded task graph and publish an outbox event."""
         try:
             from app.graph import graph_service
-
-            graph_facts = facts
-            if self.task.get("incremental_update"):
-                # Incremental runs only construct graph deltas for newly
-                # extracted facts. Inherited facts already have their task
-                # memberships and must not incur another extraction pass.
-                new_ids = {int(value) for value in self.task.get("incremental_new_fact_ids") or [] if str(value).isdigit()}
-                graph_facts = [fact for fact in facts if int(fact.get("id") or 0) in new_ids]
-                if not graph_facts:
-                    if graph_service.has_task_graph(self.task_id):
-                        status = {"status": "reused", **(graph_service.task_graph(self.task_id).get("stats") or {})}
-                        self._update(graph_status=status)
-                        return status
-                    graph_facts = facts  # one-time backfill for pre-graph tasks
+            workspace_id = str(self.task.get("workspace_id") or "")
+            active_ids = {int(fact.get("id") or 0) for fact in facts if fact.get("id") is not None}
+            covered_before = graph_service.covered_fact_ids(active_ids, workspace_id=workspace_id)
+            covered_before.update(active_ids & self._legacy_graph_fact_ids())
+            covered_before.update(active_ids & self._trusted_inherited_graph_fact_ids())
+            delta_ids = active_ids - covered_before
+            graph_facts = [fact for fact in facts if int(fact.get("id") or 0) in delta_ids]
+            scope_ids = self._graph_scope_ids()
+            inherited_assertion_count = graph_service.link_existing_fact_graph(
+                self.task_id, covered_before, workspace_id=workspace_id,
+            )
+            if not graph_facts:
+                stats = graph_service.task_graph(
+                    self.task_id,
+                    source_task_ids=scope_ids,
+                    active_fact_ids=active_ids,
+                ).get("stats") or {}
+                status = {
+                    "status": "reused" if covered_before else "skipped",
+                    "reused_fact_count": len(covered_before),
+                    "delta_fact_count": 0,
+                    "inherited_assertion_count": inherited_assertion_count,
+                    **stats,
+                }
+                self._update(graph_status=status, graph_fact_ids=sorted(covered_before))
+                return status
             result = graph_service.build_task_graph(
                 self.task_id,
                 graph_facts,
-                workspace_id=str(self.task.get("workspace_id") or ""),
-                active_fact_ids={int(fact.get("id") or 0) for fact in facts if fact.get("id") is not None},
+                workspace_id=workspace_id,
+                active_fact_ids=active_ids,
             )
             status = result.as_dict()
-            active_ids = {int(fact.get("id") or 0) for fact in facts if fact.get("id") is not None}
-            failed_ids = {int(value) for value in status.get("failed_fact_ids") or []}
-            covered_ids = sorted(active_ids - failed_ids) if status.get("status") in {"ready", "partial_ready"} else []
-            self._update(graph_status=status, graph_fact_ids=covered_ids)
+            covered_after = graph_service.covered_fact_ids(active_ids, workspace_id=workspace_id)
+            status.update({
+                "reused_fact_count": len(covered_before),
+                "delta_fact_count": len(graph_facts),
+                "inherited_assertion_count": inherited_assertion_count,
+            })
+            self._update(graph_status=status, graph_fact_ids=sorted(covered_after))
             return status
         except Exception as exc:
             status = {"status": "degraded", "error": str(exc)[:300]}
@@ -1522,8 +1583,14 @@ class WorkflowController:
             try:
                 from app.graph import graph_service
                 group_ids = {int(fact.get("id") or 0) for fact in group_facts if fact.get("id") is not None}
-                if group_ids and group_ids <= set(self.task.get("graph_fact_ids") or []):
-                    graph_block = graph_service.context_for_analysis(self.task_id, group_facts)
+                covered_group_ids = graph_service.covered_fact_ids(
+                    group_ids,
+                    workspace_id=str(self.task.get("workspace_id") or ""),
+                )
+                if group_ids and group_ids <= covered_group_ids:
+                    graph_block = graph_service.context_for_analysis(
+                        self.task_id, group_facts, source_task_ids=self._graph_scope_ids(),
+                    )
                     if graph_block:
                         context_block = f"{graph_block}\n\n{context_block}"
             except Exception:
@@ -2280,86 +2347,16 @@ class WorkflowController:
                     .values(position=_chapter_position(order[section], counters[section]))
                 )
 
-    def _publish_task_graph(self, facts: list[dict]) -> dict:
-        """Build and project task assertions without publishing them as reviewed.
-
-        Build the evidence-grounded graph after TTFR when it was intentionally
-        kept off the critical path, then project its validated assertions.
-        """
-        from app.graph import graph_service
-
-        if (not settings.graph_build_before_analysis
-                and (not graph_service.has_task_graph(self.task_id)
-                     or not self._graph_covers_facts(facts))):
-            with self._token_context("graph_build"):
-                graph_status = self._build_task_graph(facts)
-        else:
-            graph_status = dict(self.task.get("graph_status") or {})
-            if graph_service.has_task_graph(self.task_id) and graph_status.get("status") not in {"ready", "partial_ready"}:
-                stats = graph_service.task_graph(self.task_id).get("stats") or {}
-                graph_status = {"status": "reused", **stats}
-                self._update(graph_status=graph_status)
-
-        # Review has not yet been accepted by a human. Keep assertions
-        # validated and projectable for this task, but do not publish them into
-        # the workspace's confirmed long-term graph until finalize().
-        has_graph = graph_service.has_task_graph(self.task_id)
-        projected = graph_service.project_pending() if has_graph else 0
-        self._record_artifact(
-            "graph", {"graph_status": graph_status},
-            status=_graph_artifact_status(graph_status),
-        )
-        self._update(graph_stats={
-            "validated_task_graph": has_graph,
-            "graph_status": graph_status.get("status", "unknown"),
-            "projected_events": projected,
-        })
-        return graph_status
-
     def _graph_covers_facts(self, facts: list[dict]) -> bool:
         active_ids = {int(fact.get("id") or 0) for fact in facts if fact.get("id") is not None}
-        covered_ids = {int(value) for value in self.task.get("graph_fact_ids") or []}
+        from app.graph import graph_service
+        covered_ids = graph_service.covered_fact_ids(
+            active_ids,
+            workspace_id=str(self.task.get("workspace_id") or ""),
+        )
+        covered_ids.update(active_ids & self._legacy_graph_fact_ids())
+        covered_ids.update(active_ids & self._trusted_inherited_graph_fact_ids())
         return bool(active_ids) and active_ids <= covered_ids
-
-    def _start_background_graph_build(self, facts: list[dict]) -> None:
-        """Build the non-critical task graph without delaying first review."""
-        import time as _time
-
-        jobs = dict(self.task.get("background_jobs") or {})
-        jobs["graph_build"] = {"status": "queued", "queued_at": round(_time.time(), 1)}
-        self._update(background_jobs=jobs)
-
-        def _run() -> None:
-            started = _time.time()
-            try:
-                jobs = dict(self.task.get("background_jobs") or {})
-                jobs["graph_build"] = {"status": "running", "started_at": round(started, 1)}
-                self._update(background_jobs=jobs)
-                with llm_priority(PRIORITY_BACKGROUND), self._token_context("graph_build"):
-                    graph_status = self._publish_task_graph(facts)
-                graph_state = str(graph_status.get("status") or "unknown")
-                jobs = dict(self.task.get("background_jobs") or {})
-                jobs["graph_build"] = {
-                    "status": (
-                        "done" if graph_state in {"ready", "reused", "skipped"}
-                        else "partial" if graph_state == "partial_ready"
-                        else "failed"
-                    ),
-                    "duration_seconds": round(_time.time() - started, 1),
-                    "graph_status": graph_state,
-                    "error": graph_status.get("error", ""),
-                }
-                self._update(background_jobs=jobs)
-            except Exception as exc:
-                jobs = dict(self.task.get("background_jobs") or {})
-                jobs["graph_build"] = {
-                    "status": "failed",
-                    "duration_seconds": round(_time.time() - started, 1),
-                    "error": str(exc),
-                }
-                self._update(background_jobs=jobs)
-
-        threading.Thread(target=_run, daemon=True).start()
 
     def finalize(self) -> None:
         """审核完成后发布确认断言并生成最终报告版本。"""

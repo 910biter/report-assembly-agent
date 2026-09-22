@@ -604,6 +604,21 @@ CREATE TABLE IF NOT EXISTS kg_assertion_facts (
     PRIMARY KEY (assertion_id, fact_id)
 );
 
+-- Canonical per-fact graph extraction coverage. A fact with no extracted
+-- relation is still recorded as processed so incremental runs do not retry it.
+CREATE TABLE IF NOT EXISTS kg_fact_coverage (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace_id TEXT NOT NULL DEFAULT 'default',
+    fact_id INTEGER NOT NULL REFERENCES facts(id),
+    status TEXT NOT NULL DEFAULT 'pending',
+    source_task_id TEXT NOT NULL DEFAULT '',
+    assertion_count INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+    updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+    UNIQUE(workspace_id, fact_id)
+);
+
 CREATE TABLE IF NOT EXISTS kg_task_membership (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id TEXT NOT NULL,
@@ -904,6 +919,7 @@ ORMKGEntity = Base.metadata.tables["kg_entities"]
 ORMKGEntityAlias = Base.metadata.tables["kg_entity_aliases"]
 ORMKGAssertion = Base.metadata.tables["kg_assertions"]
 ORMKGAssertionFact = Base.metadata.tables["kg_assertion_facts"]
+ORMKGFactCoverage = Base.metadata.tables["kg_fact_coverage"]
 ORMKGTaskMembership = Base.metadata.tables["kg_task_membership"]
 ORMKGChangeSet = Base.metadata.tables["kg_changesets"]
 ORMGraphOutbox = Base.metadata.tables["graph_outbox"]
