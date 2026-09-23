@@ -7,7 +7,7 @@ import type { TaskSummary } from "@/api/types";
 import StatusBadge from "@/components/StatusBadge.vue";
 import MaterialComparisonWorkspace from "@/components/MaterialComparisonWorkspace.vue";
 import UiPageHeader from "@/components/ui/UiPageHeader.vue";
-import { stageGroups } from "@/domain/workflowStages";
+import { stageGroups, stageMeta } from "@/domain/workflowStages";
 import { useUiStore } from "@/stores/ui";
 const GraphNetwork = defineAsyncComponent(
   () => import("@/components/GraphNetwork.vue"),
@@ -28,9 +28,10 @@ function refreshAfterAssistantUpdate(event: Event) {
 }
 onMounted(() => window.addEventListener("ira:task-artifact-updated", refreshAfterAssistantUpdate));
 onBeforeUnmount(() => window.removeEventListener("ira:task-artifact-updated", refreshAfterAssistantUpdate));
-const active = ref(String(route.query.tab || "overview"));
+const requestedTab = String(route.query.tab || "overview");
+const active = ref(requestedTab === "runtime" ? "materials" : requestedTab);
+const workspacePane = ref(requestedTab === "runtime" ? "process" : "materials");
 const analysisType = ref("facts");
-const detailsOpen = ref(false);
 const selectedGraphEdge = ref<any>(null);
 const graphBuildError = ref("");
 const task = useQuery({
@@ -226,25 +227,25 @@ const taskTabs = computed(() =>
   isComparison.value
     ? [
         ["comparison", "对比结果"],
-        ["materials", "新增材料"],
-        ["runtime", "运行详情"],
+        ["materials", "材料与过程"],
       ]
     : [
         ["overview", "概览"],
-        ["materials", "材料"],
+        ["materials", "材料与过程"],
         ["analysis", "分析"],
         ["report", "报告"],
         ["versions", "版本"],
       ],
 );
-const stageIndex = computed(() =>
-  Math.max(
-    0,
-    stages.value.findIndex((x) =>
-      x.keys.includes(task.data.value?.stage || ""),
-    ),
-  ),
-);
+const stageIndex = computed(() => {
+  const stage = String(task.data.value?.stage || "created");
+  const index = stages.value.findIndex((item) => item.keys.includes(stage));
+  return index >= 0 ? index : ["failed", "paused"].includes(stage) ? -1 : 0;
+});
+const processCurrentLabel = computed(() => {
+  if (stageIndex.value >= 0) return stages.value[stageIndex.value]?.name || "处理中";
+  return stageMeta[String(task.data.value?.stage || "")]?.label || "处理中";
+});
 const running = computed(
   () =>
     ![
@@ -306,6 +307,18 @@ function confirmPlan() {
 }
 function confirmDirectoryPlan() {
   confirmDirectory.mutate();
+}
+function processStageStatus(index: number) {
+  if (index < stageIndex.value) return "已完成";
+  if (index > stageIndex.value) return "等待中";
+  const stage = String(task.data.value?.stage || "created");
+  if (stage === "failed") return "运行异常";
+  if (stage === "paused") return "已暂停";
+  if (stage === "review") return isComparison.value ? "待审阅" : "待审核";
+  if (stage === "done") return "已完成";
+  if (stage === "requirement_review") return "等待确认需求";
+  if (stage === "directory_review") return "等待确认目录";
+  return running.value ? "正在进行" : stage === "created" ? "待运行" : "等待开始";
 }
 function addCheckpointChapter() {
   checkpointStructure.value.push("");
@@ -453,7 +466,7 @@ function versionsList() {
       </template>
     </UiPageHeader>
     <section class="surface progress-block">
-      <div class="progress-rail" :class="{ compact: isComparison }">
+      <div v-if="stageIndex >= 0" class="progress-rail" :class="{ compact: isComparison }">
         <div
           v-for="(item, index) in stages"
           :key="item.name"
@@ -477,20 +490,11 @@ function versionsList() {
           </div>
         </div>
       </div>
-      <button class="details-toggle" @click="detailsOpen = !detailsOpen">
-        {{ detailsOpen ? "收起运行详情" : "查看运行详情" }}
-      </button>
-      <div v-if="detailsOpen" class="run-details">
+      <div v-else class="progress-interruption">
+        <span class="progress-interruption-mark" aria-hidden="true"></span>
         <div>
-          <span>内部阶段</span><b>{{ task.data.value.stage }}</b>
-        </div>
-        <div>
-          <span>队列状态</span
-          ><b>{{ task.data.value.queue_status?.status || "—" }}</b>
-        </div>
-        <div v-if="stageProgress">
-          <span>{{ stageProgress.label }}</span
-          ><b>{{ stageProgress.done }} / {{ stageProgress.total }}</b>
+          <b>{{ processCurrentLabel }}</b>
+          <small>{{ task.data.value.stage === "paused" ? "任务已暂停；暂停前的具体环节未记录" : "任务异常；失败环节未记录" }}</small>
         </div>
       </div>
     </section>
@@ -511,34 +515,6 @@ function versionsList() {
       :report-id="Number(task.data.value.comparison_report_id)"
       :comparison-id="Number(task.data.value.comparison_id)"
     />
-    <section
-      v-else-if="active === 'runtime' && isComparison"
-      class="surface section-block"
-    >
-      <div class="section-head">
-        <div>
-          <h2>运行详情</h2>
-          <p class="muted">
-            对比任务只执行新增材料解析、事实提取和变化核验，不生成或改写报告。
-          </p>
-        </div>
-      </div>
-      <div class="status-summary">
-        <div>
-          <span>内部阶段</span><b>{{ task.data.value.stage }}</b>
-        </div>
-        <div>
-          <span>队列状态</span
-          ><b>{{ task.data.value.queue_status?.status || "—" }}</b>
-        </div>
-        <div v-if="stageProgress">
-          <span>{{ stageProgress.label }}</span
-          ><b
-            >{{ stageProgress.done }} / {{ stageProgress.total }}</b
-          >
-        </div>
-      </div>
-    </section>
     <section v-else-if="active === 'overview'" class="workspace-grid">
       <div class="main-column">
         <div v-if="task.data.value.stage === 'failed'" class="notice warning">
@@ -630,7 +606,7 @@ function versionsList() {
           </div>
           <div class="status-summary">
             <div>
-              <span>当前阶段</span><b>{{ stages[stageIndex]?.name }}</b>
+              <span>当前阶段</span><b>{{ processCurrentLabel }}</b>
             </div>
             <div>
               <span>已经产生</span
@@ -645,11 +621,15 @@ function versionsList() {
                     ? "导出或增量更新"
                     : task.data.value.stage === "requirement_review"
                       ? "确认需求并开始规划"
-                      : task.data.value.stage === "directory_review"
-                        ? "确认目录并开始写作"
-                        : running
-                          ? "等待当前阶段完成"
-                          : "开始运行"
+                  : task.data.value.stage === "directory_review"
+                      ? "确认目录并开始写作"
+                      : task.data.value.stage === "paused"
+                        ? "继续运行"
+                        : task.data.value.stage === "failed"
+                          ? "查看异常信息"
+                      : running
+                        ? "等待当前阶段完成"
+                        : "开始运行"
               }}</b>
             </div>
           </div>
@@ -724,7 +704,7 @@ function versionsList() {
               }}</span>
             </div>
             <strong>打开</strong></RouterLink
-          ><button class="artifact-link" @click="active = 'materials'">
+          ><button class="artifact-link" @click="active = 'materials'; workspacePane = 'materials'">
             <div>
               <b>材料解析</b
               ><span
@@ -746,50 +726,110 @@ function versionsList() {
         </div>
       </aside>
     </section>
-    <section v-else-if="active === 'materials'" class="surface section-block">
-      <div class="section-head">
-        <div>
-          <h2>任务材料</h2>
-          <p class="muted">本任务实际使用的材料及解析状态</p>
-        </div>
-      </div>
-      <div class="data-list">
-        <div
-          v-for="item in materials.data.value || []"
-          :key="item.filename"
-          class="data-row material-row"
-        >
+    <section v-else-if="active === 'materials'" class="workspace-browser">
+      <nav class="tabs workspace-subtabs" aria-label="材料与运行过程">
+        <button
+          class="tab"
+          :class="{ active: workspacePane === 'materials' }"
+          @click="workspacePane = 'materials'"
+        >材料</button>
+        <button
+          class="tab"
+          :class="{ active: workspacePane === 'process' }"
+          @click="workspacePane = 'process'"
+        >运行过程</button>
+      </nav>
+      <section v-if="workspacePane === 'materials'" class="surface section-block">
+        <div class="section-head">
           <div>
-            <b>{{ item.filename }}</b
-            ><span
-              >{{ item.file_type }} · {{ item.units_count }} 个内容单元<span
-                v-if="item.pages?.length"
+            <h2>{{ isComparison ? "新增材料" : "任务材料" }}</h2>
+            <p class="muted">本任务实际使用的材料及解析状态</p>
+          </div>
+        </div>
+        <div class="data-list">
+          <div
+            v-for="item in materials.data.value || []"
+            :key="item.filename"
+            class="data-row material-row"
+          >
+            <div>
+              <b>{{ item.filename }}</b
+              ><span
+                >{{ item.file_type }} · {{ item.units_count }} 个内容单元<span
+                  v-if="item.pages?.length"
+                >
+                  · {{ item.pages.length }} 页</span
+                ></span
               >
-                · {{ item.pages.length }} 页</span
-              ></span
+            </div>
+            <span
+              class="badge"
+              :class="
+                item.parse_status === 'error'
+                  ? 'danger'
+                  : item.parse_status === 'ok'
+                    ? 'success'
+                    : 'warning'
+              "
+              >{{
+                item.parse_status === "ok"
+                  ? "已解析"
+                  : item.parse_status === "partial"
+                    ? "正文可用"
+                    : item.parse_status === "error"
+                      ? "解析失败"
+                      : "处理中"
+              }}</span
             >
           </div>
-          <span
-            class="badge"
-            :class="
-              item.parse_status === 'error'
-                ? 'danger'
-                : item.parse_status === 'ok'
-                  ? 'success'
-                  : 'warning'
-            "
-            >{{
-              item.parse_status === "ok"
-                ? "已解析"
-                : item.parse_status === "partial"
-                  ? "正文可用"
-                  : item.parse_status === "error"
-                    ? "解析失败"
-                    : "处理中"
-            }}</span
-          >
         </div>
-      </div>
+      </section>
+      <section v-else class="surface section-block process-panel">
+        <div class="section-head">
+          <div>
+            <h2>运行过程</h2>
+            <p class="muted">
+              {{ isComparison
+                ? "仅处理新增材料并核验变化，不生成或改写基线报告。"
+                : "查看各环节的完成状态和当前处理进度。" }}
+            </p>
+          </div>
+        </div>
+        <div class="process-current">
+          <div>
+            <span>当前环节</span>
+          <strong>{{ processCurrentLabel }}</strong>
+          </div>
+          <div v-if="stageProgress">
+            <span>{{ stageProgress.label }}</span>
+            <strong>{{ stageProgress.done }} / {{ stageProgress.total }}</strong>
+          </div>
+          <div v-else>
+            <span>状态</span>
+            <strong>{{ processStageStatus(stageIndex) }}</strong>
+          </div>
+        </div>
+        <ol v-if="stageIndex >= 0" class="process-steps">
+          <li
+            v-for="(item, index) in stages"
+            :key="item.name"
+            :class="{
+              complete: index < stageIndex,
+              current: index === stageIndex,
+            }"
+            :aria-current="index === stageIndex ? 'step' : undefined"
+          >
+            <span class="process-step-index">{{ index < stageIndex ? "✓" : index + 1 }}</span>
+            <div>
+              <strong>{{ item.name }}</strong>
+              <small>{{ processStageStatus(index) }}</small>
+            </div>
+          </li>
+        </ol>
+        <p v-if="task.data.value.stage === 'failed'" class="notice warning process-error">
+          {{ task.data.value.error || task.data.value.failure_reason || "当前环节未完成，请查看任务状态。" }}
+        </p>
+      </section>
     </section>
     <section v-else-if="active === 'analysis'" class="analysis-layout">
       <aside class="analysis-nav surface">
@@ -1025,6 +1065,32 @@ function versionsList() {
   border-color: var(--border);
   background: var(--card);
 }
+.progress-interruption {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 36px;
+}
+.progress-interruption-mark {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--warning);
+}
+.progress-interruption b,
+.progress-interruption small {
+  display: block;
+}
+.progress-interruption b {
+  font-size: 13px;
+  font-weight: 600;
+}
+.progress-interruption small {
+  margin-top: 3px;
+  color: var(--muted-foreground);
+  font-size: 12px;
+}
 .progress-rail {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
@@ -1098,31 +1164,6 @@ function versionsList() {
   color: var(--color-faint);
   font-size: 11px;
 }
-.details-toggle {
-  margin: 18px 0 0;
-  border: 0;
-  background: transparent;
-  color: var(--color-primary);
-  padding: 0;
-  font-size: 13px;
-  font-weight: 650;
-}
-.run-details {
-  display: grid;
-  grid-template-columns: repeat(4, 1fr);
-  gap: 16px;
-  margin-top: 16px;
-  padding-top: 16px;
-  border-top: 1px solid var(--color-border);
-}
-.run-details span,
-.run-details b {
-  display: block;
-}
-.run-details span {
-  color: var(--color-muted);
-  font-size: 12px;
-}
 .workspace-tabs {
   position: sticky;
   z-index: 5;
@@ -1130,6 +1171,116 @@ function versionsList() {
   padding: 7px 4px 9px;
   background: color-mix(in srgb, var(--background) 92%, transparent);
   backdrop-filter: blur(8px);
+}
+.workspace-browser {
+  display: grid;
+  min-width: 0;
+  gap: 12px;
+}
+.workspace-subtabs {
+  position: static;
+  z-index: auto;
+  display: flex;
+  width: fit-content;
+  max-width: 100%;
+  padding: 0 4px;
+  background: transparent;
+  backdrop-filter: none;
+}
+.process-panel .section-head {
+  margin-bottom: 4px;
+}
+.process-current {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 14px 0 16px;
+  border-bottom: 1px solid var(--border);
+}
+.process-current > div {
+  min-width: 0;
+}
+.process-current span,
+.process-current strong {
+  display: block;
+}
+.process-current span {
+  color: var(--muted-foreground);
+  font-size: 12px;
+}
+.process-current strong {
+  margin-top: 5px;
+  font-size: 14px;
+  font-weight: 600;
+}
+.process-steps {
+  display: grid;
+  gap: 0;
+  margin: 0;
+  padding: 18px 0 0;
+  list-style: none;
+}
+.process-steps li {
+  position: relative;
+  display: grid;
+  grid-template-columns: 30px minmax(0, 1fr);
+  gap: 12px;
+  min-width: 0;
+  padding: 0 0 18px;
+}
+.process-steps li:not(:last-child)::before {
+  position: absolute;
+  top: 30px;
+  bottom: 0;
+  left: 14px;
+  width: 1px;
+  background: var(--border);
+  content: "";
+}
+.process-step-index {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  width: 30px;
+  height: 30px;
+  place-items: center;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--surface-raised);
+  color: var(--muted-foreground);
+  font-size: 12px;
+}
+.process-steps li.current .process-step-index {
+  border-color: color-mix(in srgb, var(--primary) 62%, var(--border));
+  background: var(--primary-soft);
+  color: var(--foreground);
+}
+.process-steps li.complete .process-step-index {
+  color: var(--foreground);
+}
+.process-steps li > div {
+  min-width: 0;
+  padding-top: 2px;
+}
+.process-steps strong,
+.process-steps small {
+  display: block;
+}
+.process-steps strong {
+  font-size: 13px;
+  font-weight: 550;
+}
+.process-steps small {
+  margin-top: 3px;
+  color: var(--muted-foreground);
+  font-size: 12px;
+}
+.process-steps li.current small {
+  color: var(--accent);
+}
+.process-error {
+  margin-top: 4px;
 }
 .workspace-grid {
   display: grid;
@@ -1609,7 +1760,6 @@ function versionsList() {
   .progress-step::after {
     display: none;
   }
-  .run-details,
   .status-summary {
     grid-template-columns: repeat(2, 1fr);
   }
@@ -1626,9 +1776,13 @@ function versionsList() {
   }
 }
 @media (max-width: 600px) {
-  .run-details,
   .status-summary {
     grid-template-columns: 1fr;
+  }
+  .process-current {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 12px;
   }
   .version-row {
     grid-template-columns: 1fr auto;

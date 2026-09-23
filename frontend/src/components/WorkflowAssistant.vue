@@ -38,9 +38,10 @@ const savedPanelSize = (() => {
   }
 })();
 const panelSize = ref({
-  width: Number(savedPanelSize.width) || 680,
+  width: Number(savedPanelSize.width) || 520,
   height: Number(savedPanelSize.height) || 700,
 });
+ui.setAssistantDockWidth(panelSize.value.width);
 const panelPosition = ref({
   right: Number(savedPanelSize.right) || 0,
   bottom: Number(savedPanelSize.bottom) || 60,
@@ -52,13 +53,22 @@ const resizeLabels: Record<PanelEdge, string> = {
   bottom: "下侧",
 };
 const panelStyle = computed(() => {
+  if (isDocked.value) {
+    return {
+      width: `${dockWidth.value}px`,
+      height: "auto",
+      right: "0px",
+      bottom: "0px",
+      top: "var(--header-height)",
+    };
+  }
   const viewportInset = 8;
   const shellInset = 24;
   const preferredRight = Math.max(0, panelPosition.value.right);
   const preferredBottom = Math.max(0, panelPosition.value.bottom);
   const availableWidth = Math.max(
     1,
-    window.innerWidth - shellInset - preferredRight - viewportInset,
+    viewportWidth.value - shellInset - preferredRight - viewportInset,
   );
   const availableHeight = Math.max(
     1,
@@ -73,16 +83,42 @@ const panelStyle = computed(() => {
   return {
     width: `${width}px`,
     height: `${height}px`,
-    right: `${Math.min(preferredRight, Math.max(0, window.innerWidth - shellInset - width - viewportInset))}px`,
+    right: `${Math.min(preferredRight, Math.max(0, viewportWidth.value - shellInset - width - viewportInset))}px`,
     bottom: `${Math.min(preferredBottom, Math.max(0, window.innerHeight - shellInset - height - viewportInset))}px`,
   };
 });
 let timer: number | undefined;
 let stopResize: (() => void) | undefined;
+const viewportWidth = ref(window.innerWidth);
+const dockableRoute = computed(
+  () => route.path.startsWith("/tasks/") || route.path.startsWith("/reports/"),
+);
+const isDocked = computed(
+  () => open.value && dockableRoute.value && viewportWidth.value >= 1280,
+);
+const dockWidth = computed(() => clampDockWidth(panelSize.value.width));
+const resizeEdges = computed(() =>
+  isDocked.value ? ["left"] : ["left", "right", "top", "bottom"],
+);
+
+function clampDockWidth(width: number) {
+  const sidebarWidth = ui.navCollapsed ? 56 : 220;
+  const availableWidth = viewportWidth.value - sidebarWidth - 640;
+  const maximum = Math.max(
+    360,
+    Math.min(680, Math.floor(viewportWidth.value * 0.42), availableWidth),
+  );
+  return Math.max(360, Math.min(width, maximum));
+}
+
+function syncViewportWidth() {
+  viewportWidth.value = window.innerWidth;
+}
 
 type PanelEdge = "left" | "right" | "top" | "bottom";
 
 function persistPanelFrame() {
+  ui.setAssistantDockWidth(panelSize.value.width);
   localStorage.setItem(
     "ira-assistant-panel-frame-v3",
     JSON.stringify({ ...panelSize.value, ...panelPosition.value }),
@@ -90,7 +126,7 @@ function persistPanelFrame() {
 }
 
 function startPanelMove(event: PointerEvent) {
-  if (window.innerWidth <= 600) return;
+  if (viewportWidth.value <= 600 || isDocked.value) return;
   if ((event.target as HTMLElement).closest("button")) return;
   event.preventDefault();
   const panel = (event.currentTarget as HTMLElement).closest(
@@ -134,13 +170,31 @@ function startPanelMove(event: PointerEvent) {
 }
 
 function startPanelResize(event: PointerEvent, edge: PanelEdge) {
-  if (window.innerWidth <= 600) return;
+  if (viewportWidth.value <= 600) return;
   event.preventDefault();
   const panel = (event.currentTarget as HTMLElement).closest(
     ".assistant-panel",
   );
   if (!panel) return;
   const origin = panel.getBoundingClientRect();
+  if (isDocked.value) {
+    const move = (next: PointerEvent) => {
+      const width = clampDockWidth(viewportWidth.value - next.clientX);
+      panelSize.value = { ...panelSize.value, width };
+      ui.setAssistantDockWidth(width);
+    };
+    const stop = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", stop);
+      persistPanelFrame();
+      stopResize = undefined;
+    };
+    stopResize?.();
+    stopResize = stop;
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", stop, { once: true });
+    return;
+  }
   const margin = 8;
   const minimumWidth = 380;
   const minimumHeight = 480;
@@ -410,22 +464,29 @@ watch(
   () => applyFocus(ui.assistant.focus),
 );
 onMounted(() => {
+  window.addEventListener("resize", syncViewportWidth);
   loadContext();
   timer = window.setInterval(() => {
     if (open.value && taskId.value) loadContext();
   }, 5000);
 });
 onBeforeUnmount(() => {
+  window.removeEventListener("resize", syncViewportWidth);
   if (timer) window.clearInterval(timer);
   stopResize?.();
 });
 </script>
 
 <template>
-  <div v-if="visible" class="workflow-assistant" :class="{ open }">
-    <section v-if="open" class="assistant-panel" :style="panelStyle">
+  <div v-if="visible" class="workflow-assistant" :class="{ open, docked: isDocked }">
+    <section
+      v-if="open"
+      class="assistant-panel"
+      :class="{ 'assistant-panel--docked': isDocked }"
+      :style="panelStyle"
+    >
       <button
-        v-for="edge in ['left', 'right', 'top', 'bottom']"
+        v-for="edge in resizeEdges"
         :key="edge"
         class="panel-resize-handle"
         :class="`panel-resize-handle--${edge}`"
@@ -983,6 +1044,43 @@ onBeforeUnmount(() => {
 }
 .panel-resize-handle--bottom {
   bottom: -4px;
+}
+@media (min-width: 1280px) {
+  .assistant-panel--docked {
+    position: fixed;
+    z-index: 21;
+    border: 0;
+    border-left: 1px solid var(--border);
+    border-radius: 0;
+    box-shadow: none;
+  }
+  .assistant-panel--docked > header {
+    cursor: default;
+  }
+  .workflow-assistant.docked .assistant-orb {
+    display: none;
+  }
+  .assistant-panel--docked .panel-resize-handle--left {
+    top: 0;
+    bottom: 0;
+    left: 0;
+    width: 8px;
+  }
+  .assistant-panel--docked .panel-resize-handle--left::after {
+    position: absolute;
+    top: 50%;
+    left: 3px;
+    width: 2px;
+    height: 36px;
+    border-radius: 2px;
+    background: var(--border-strong);
+    content: "";
+    transform: translateY(-50%);
+  }
+  .assistant-panel--docked .panel-resize-handle--left:hover::after,
+  .assistant-panel--docked .panel-resize-handle--left:focus-visible::after {
+    background: var(--primary);
+  }
 }
 @media (max-width: 600px) {
   .workflow-assistant {

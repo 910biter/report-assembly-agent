@@ -21,6 +21,7 @@ export const useUiStore = defineStore("ui", {
       tab: "progress" as "progress" | "artifacts" | "discuss",
       focus: null as Record<string, any> | null,
       revision: 0,
+      dockWidth: 520,
     },
   }),
   actions: {
@@ -63,5 +64,6 @@ export const useUiStore = defineStore("ui", {
     },
     closeAssistant() { this.assistant.open = false; },
     setAssistantTab(tab: "progress" | "artifacts" | "discuss") { this.assistant.tab = tab; },
+    setAssistantDockWidth(width: number) { this.assistant.dockWidth = width; },
   },
 });

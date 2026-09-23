@@ -4,21 +4,31 @@ import { useRoute, RouterLink } from "vue-router";
 import { useUiStore } from "@/stores/ui";
 import AppIcon from "./AppIcon.vue";
 import WorkflowAssistant from "./WorkflowAssistant.vue";
+import { navigationGroups } from "@/navigation";
 
 const route = useRoute();
 const ui = useUiStore();
 const editor = computed(() => Boolean(route.meta.editor));
-const nav = [
-  { to: "/", label: "工作台", icon: "home" },
-  { to: "/tasks", label: "任务", icon: "tasks" },
-  { to: "/materials", label: "材料库", icon: "files" },
-  { to: "/documents", label: "文档解析", icon: "documents" },
-  { to: "/style", label: "模板中心", icon: "template" },
-  { to: "/settings", label: "系统设置", icon: "settings" },
-];
+const dockAssistantRoute = computed(
+  () => route.path.startsWith("/tasks/") || editor.value,
+);
+const shellStyle = computed(
+  () =>
+    ({
+      "--assistant-dock-width": `min(${ui.assistant.dockWidth}px, 42vw, calc(100vw - ${ui.navCollapsed ? 56 : 220}px - 640px))`,
+    }) as Record<string, string>,
+);
 </script>
 <template>
-  <div class="app-shell" :class="{ 'is-editor': editor, 'is-nav-collapsed': ui.navCollapsed }">
+  <div
+    class="app-shell"
+    :class="{
+      'is-editor': editor,
+      'is-nav-collapsed': ui.navCollapsed,
+      'assistant-docked': ui.assistant.open && dockAssistantRoute,
+    }"
+    :style="shellStyle"
+  >
     <aside class="sidebar" :class="{ open: ui.navOpen }">
       <div class="brand">
         <span class="brand-mark"><AppIcon name="document" :size="17" /></span>
@@ -33,20 +43,31 @@ const nav = [
           <AppIcon :name="ui.navCollapsed ? 'sidebar-open' : 'sidebar-close'" :size="16" />
         </button>
       </div>
-      <nav>
-        <RouterLink
-          v-for="item in nav"
-          :key="item.to"
-          :to="item.to"
-          :class="{
-            active:
-              route.path === item.to ||
-              (item.to === '/tasks' && route.path.startsWith('/tasks/')),
-          }"
-          @click="ui.closeNav()"
+      <nav class="primary-nav" aria-label="主导航">
+        <div
+          v-for="group in navigationGroups"
+          :key="group.label"
+          class="nav-group"
+          role="group"
+          :aria-label="group.label"
         >
-          <AppIcon :name="item.icon" /> <span>{{ item.label }}</span>
-        </RouterLink>
+          <span class="nav-group-label" aria-hidden="true">{{ group.label }}</span>
+          <RouterLink
+            v-for="item in group.items"
+            :key="item.to"
+            :to="item.to"
+            class="nav-link"
+            :title="ui.navCollapsed ? item.label : undefined"
+            :class="{
+              active:
+                route.path === item.to ||
+                (item.to === '/tasks' && route.path.startsWith('/tasks/')),
+            }"
+            @click="ui.closeNav()"
+          >
+            <AppIcon :name="item.icon" /> <span>{{ item.label }}</span>
+          </RouterLink>
+        </div>
       </nav>
       <div class="nav-foot">
         <span class="health-dot"></span><span>服务运行正常</span>
@@ -143,12 +164,28 @@ const nav = [
   font-size: 15px;
   letter-spacing: -0.01em;
 }
-nav {
+nav.primary-nav {
   display: grid;
-  gap: 3px;
+  gap: 12px;
   padding: 16px 10px;
 }
-nav a {
+.nav-group {
+  display: grid;
+  gap: 3px;
+}
+.nav-group + .nav-group {
+  padding-top: 9px;
+  border-top: 1px solid var(--border);
+}
+.nav-group-label {
+  padding: 0 10px 4px;
+  color: var(--subtle-foreground);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  line-height: 1.5;
+}
+.nav-link {
   position: relative;
   display: flex;
   align-items: center;
@@ -162,17 +199,17 @@ nav a {
     background var(--motion-fast),
     color var(--motion-fast);
 }
-nav a:hover {
+.nav-link:hover {
   color: var(--nav-foreground);
   background: var(--nav-raised);
 }
-nav a.active {
+.nav-link.active {
   color: var(--nav-foreground);
   background: var(--primary-soft);
   font-weight: 500;
   box-shadow: none;
 }
-nav a.active::before {
+.nav-link.active::before {
   content: "";
   position: absolute;
   left: -10px;
@@ -207,6 +244,14 @@ nav a.active::before {
   margin-left: var(--nav-width);
   transition: margin-left var(--motion-normal);
 }
+@media (min-width: 1280px) {
+  .app-shell.assistant-docked .shell-main {
+    margin-right: var(--assistant-dock-width);
+    transition:
+      margin-left var(--motion-normal),
+      margin-right var(--motion-normal);
+  }
+}
 .is-nav-collapsed .sidebar {
   width: 56px;
 }
@@ -219,7 +264,8 @@ nav a.active::before {
 }
 .is-nav-collapsed .brand strong,
 .is-nav-collapsed .nav-foot span:last-child,
-.is-nav-collapsed nav a span {
+.is-nav-collapsed nav a span,
+.is-nav-collapsed .nav-group-label {
   display: none;
 }
 .is-nav-collapsed .sidebar-toggle {
@@ -240,8 +286,12 @@ nav a.active::before {
   height: 30px;
   flex: 0 0 30px;
 }
-.is-nav-collapsed nav {
+.is-nav-collapsed nav.primary-nav {
+  gap: 8px;
   padding-inline: 8px;
+}
+.is-nav-collapsed .nav-group + .nav-group {
+  padding-top: 7px;
 }
 .is-nav-collapsed nav a {
   justify-content: center;
@@ -344,7 +394,8 @@ nav a.active::before {
   }
   .is-nav-collapsed .brand strong,
   .is-nav-collapsed .nav-foot span:last-child,
-  .is-nav-collapsed nav a span {
+  .is-nav-collapsed nav a span,
+  .is-nav-collapsed .nav-group-label {
     display: inline;
   }
   .is-nav-collapsed nav a {
