@@ -202,8 +202,22 @@ const graphAssertionCount = computed(() =>
       0,
   ),
 );
-const graphBuildMessage = computed(() => {
-  const status = graph.data.value?.build_status || {};
+  const graphBuildMessage = computed(() => {
+    const status = graph.data.value?.build_status || {};
+    const job = graph.data.value?.background_job || {};
+    if (job.status === "queued" && job.waiting_for_main) {
+      return "主报告任务完成后将自动开始构建关系网络。";
+    }
+    if (job.status === "queued") {
+      return "关系网络已排队，等待可用的模型执行资源。";
+    }
+    if (job.status === "running") {
+      const progress = job.progress || {};
+      if (progress.total_batches) {
+        return `正在抽取关系：${progress.completed_batches || 0}/${progress.total_batches} 批，已覆盖 ${progress.completed_facts || 0}/${progress.total_facts || 0} 条事实。`;
+      }
+      return "关系网络正在构建，完成后会自动刷新。";
+    }
   if (status.status === "partial_ready") {
     const failedFacts = Number(status.failed_fact_ids?.length || 0);
     return failedFacts
@@ -898,8 +912,8 @@ function versionsList() {
               }}</span
             ><small>关系只保存有事实依据的实体联系。</small
             ><span v-if="graphBuildError" class="graph-build-error">{{ graphBuildError }}</span
-            ><button class="btn graph-build-button" :disabled="rebuildGraph.isPending.value || graphBuildActive" @click="rebuildGraph.mutate()">{{ graphBuildActive ? "正在构建" : "构建知识图谱" }}</button
-            ><span v-if="graphBuildActive" class="badge warning">正在构建</span
+              ><button class="btn graph-build-button" :disabled="rebuildGraph.isPending.value || graphBuildActive" @click="rebuildGraph.mutate()">{{ graphBuildActive ? (graph.data.value?.background_job?.status === "queued" ? "已排队" : "正在构建") : "构建知识图谱" }}</button
+              ><span v-if="graphBuildActive" class="badge warning">{{ graph.data.value?.background_job?.status === "queued" ? "已排队" : "正在构建" }}</span
             ><span
               v-else-if="graphBuildStatus === 'partial_ready'"
               class="badge warning"

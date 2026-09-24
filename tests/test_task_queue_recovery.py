@@ -1,10 +1,27 @@
 import unittest
+import queue
 from unittest.mock import patch
 
 from app.workflow import queue as task_queue
 
 
 class TaskQueueRecoveryTests(unittest.TestCase):
+    def test_enqueue_does_not_reserve_in_memory_when_persistence_fails(self):
+        with patch.object(task_queue.short_term, "load_task", return_value={"stage": "created"}), patch.object(
+            task_queue.short_term, "update_task", side_effect=RuntimeError("database unavailable")
+        ) as update_task, patch.object(task_queue, "_ensure_worker"), patch.object(
+            task_queue, "_QUEUE", queue.PriorityQueue()
+        ), patch.object(task_queue, "_QUEUED_TASK_IDS", set()), patch.object(
+            task_queue, "_CANCELLED_TASK_IDS", set()
+        ), patch.object(task_queue, "_STATS", dict(task_queue._STATS)):
+            with self.assertRaisesRegex(RuntimeError, "database unavailable"):
+                task_queue.enqueue_task("task-1")
+
+            self.assertEqual(task_queue._QUEUED_TASK_IDS, set())
+            self.assertEqual(task_queue._QUEUE.qsize(), 0)
+            self.assertEqual(task_queue._STATS["submitted"], 0)
+            update_task.assert_called_once()
+
     def test_restart_pauses_orphaned_running_task(self):
         tasks = [("task-1", {
             "stage": "evidence",

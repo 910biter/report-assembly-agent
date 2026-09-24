@@ -211,8 +211,9 @@ def list_report_versions(report_id: int) -> list[dict[str, Any]]:
     return [_version_summary(row) for row in rows]
 
 
-def get_report_version(version_id: int) -> dict[str, Any] | None:
-    with session_scope() as s:
+def get_report_version(version_id: int, *, _session=None) -> dict[str, Any] | None:
+    manager = session_scope() if _session is None else nullcontext(_session)
+    with manager as s:
         row = s.execute(
             select(ORMReportVersion).where(ORMReportVersion.c.id == version_id)
         ).mappings().first()
@@ -281,7 +282,12 @@ def create_incremental_delta(report_id: int, added_material_ids: list[int],
             )
         )
         delta_id = int(cur.inserted_primary_key[0])
-    return get_report_delta(delta_id) or {"id": delta_id} if _session is None else {"id": delta_id}
+    if _session is None:
+        return get_report_delta(delta_id) or {"id": delta_id}
+    row = s.execute(
+        select(ORMReportVersionDelta).where(ORMReportVersionDelta.c.id == delta_id)
+    ).mappings().first()
+    return _delta_detail(row) if row is not None else {"id": delta_id}
 
 
 def attach_delta_version(delta_id: int, version_id: int, status: str = "applied") -> None:

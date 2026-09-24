@@ -101,16 +101,18 @@ def enqueue_task(task_id: str, priority: int = TASK_PRIORITY_NORMAL) -> dict:
             return {"status": "already_running"}
         if task_id in _QUEUED_TASK_IDS:
             return {"status": "already_queued", "queue_position": _queue_position(task_id)}
-        _CANCELLED_TASK_IDS.discard(task_id)
-        _QUEUED_TASK_IDS.add(task_id)
-        _STATS["submitted"] += 1
         position = _QUEUE.qsize() + 1
         short_term.update_task(task_id, error="", queue_status={
             "status": "queued",
             "position": position,
             "queued_at": round(time.time(), 1),
         })
+        # Persist first: a database error must not leave an in-memory ghost
+        # reservation that reports this task as queued but never runs it.
+        _CANCELLED_TASK_IDS.discard(task_id)
         _QUEUE.put(_QueuedTask(priority=priority, sequence=next(_SEQUENCE), task_id=task_id))
+        _QUEUED_TASK_IDS.add(task_id)
+        _STATS["submitted"] += 1
     return {"status": "queued", "queue_position": position}
 
 
@@ -221,16 +223,19 @@ def _worker_loop() -> None:
         heartbeat.start()
         outcome = None
         try:
-            from app import task_control
-            task_control.begin_task(item.task_id)
-            starting_task = short_term.load_task(item.task_id) or {}
-            if str(starting_task.get("run_mode") or "") == "interaction_revision":
-                try:
-                    from app.interaction import mark_recompute_running
-                    mark_recompute_running(str(starting_task.get("run_id") or ""))
-                except Exception:
-                    pass
-            outcome = WorkflowController(item.task_id).run_to_review()
+            from app.workflow.execution import execution_slot
+            with execution_slot(wait=True) as slot:
+                with slot.task(item.task_id):
+                    from app import task_control
+                    task_control.begin_task(item.task_id)
+                    starting_task = short_term.load_task(item.task_id) or {}
+                    if str(starting_task.get("run_mode") or "") == "interaction_revision":
+                        try:
+                            from app.interaction import mark_recompute_running
+                            mark_recompute_running(str(starting_task.get("run_id") or ""))
+                        except Exception:
+                            pass
+                    outcome = WorkflowController(item.task_id).run_to_review()
             if outcome in {"awaiting_requirements", "awaiting_directory"}:
                 with _LOCK:
                     _STATS["waiting_for_user"] += 1

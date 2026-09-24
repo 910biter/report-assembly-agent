@@ -30,6 +30,17 @@ def create_app() -> FastAPI:
     reconcile_interrupted_tasks()
     reconcile_interrupted_interactions()
     application = FastAPI(title="报告整编 Agent")
+
+    @application.on_event("startup")
+    def start_graph_job_worker() -> None:
+        from app.graph_jobs import start_worker
+        start_worker()
+
+    @application.on_event("shutdown")
+    def stop_graph_job_worker() -> None:
+        from app.graph_jobs import stop_worker
+        stop_worker()
+
     application.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
     application.include_router(api_router)
     application.include_router(web_router)

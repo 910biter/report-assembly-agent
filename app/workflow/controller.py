@@ -773,7 +773,7 @@ class WorkflowController:
         )
         return "review"
 
-    def _update(self, **fields) -> None:
+    def _update(self, *, _map_patches: dict[str, dict] | None = None, **fields) -> None:
         """更新短期记忆并同步内存快照,保证后续阶段读到最新产物。"""
         version_fields = {
             "stage", "parse_progress", "material_analysis_progress", "evidence_progress",
@@ -788,20 +788,31 @@ class WorkflowController:
             "final_plan_frozen", "replan_required", "intervention_force_final_plan",
             "incremental_plan", "incremental_delta", "incremental_structure_review_required",
         }
-        if set(fields) & version_fields:
-            current_versions = dict(self.task.get("versions") or {})
-            current_versions["task"] = int(current_versions.get("task", 0)) + 1
-            if set(fields) & {"material_ids", "material_insights", "parse_progress"}:
-                current_versions["materials"] = int(current_versions.get("materials", 0)) + 1
-            if set(fields) & {"fact_ids", "inference_ids", "external_ids", "conflict_ids", "qa_notes"}:
-                current_versions["analysis"] = int(current_versions.get("analysis", 0)) + 1
-            if set(fields) & {"plan_id", "plan_title", "final_plan_frozen"}:
-                current_versions["plan"] = int(current_versions.get("plan", 0)) + 1
-            if set(fields) & {"report_id", "report_stats", "write_progress"}:
-                current_versions["report"] = int(current_versions.get("report", 0)) + 1
-            fields["versions"] = current_versions
-        short_term.update_task(self.task_id, **fields)
-        self.task.update(fields)
+        map_patches = _map_patches or {}
+        version_changed = bool((set(fields) | set(map_patches)) & version_fields)
+
+        def apply(current: dict) -> dict:
+            current.update(fields)
+            for key, patch in map_patches.items():
+                value = current.get(key)
+                mapping = dict(value) if isinstance(value, dict) else {}
+                mapping.update(patch)
+                current[key] = mapping
+            if version_changed:
+                current_versions = dict(current.get("versions") or {})
+                current_versions["task"] = int(current_versions.get("task", 0)) + 1
+                if set(fields) & {"material_ids", "material_insights", "parse_progress"}:
+                    current_versions["materials"] = int(current_versions.get("materials", 0)) + 1
+                if set(fields) & {"fact_ids", "inference_ids", "external_ids", "conflict_ids", "qa_notes"}:
+                    current_versions["analysis"] = int(current_versions.get("analysis", 0)) + 1
+                if set(fields) & {"plan_id", "plan_title", "final_plan_frozen"}:
+                    current_versions["plan"] = int(current_versions.get("plan", 0)) + 1
+                if set(fields) & {"report_id", "report_stats", "write_progress"}:
+                    current_versions["report"] = int(current_versions.get("report", 0)) + 1
+                current["versions"] = current_versions
+            return current
+
+        self.task = short_term.mutate_task(self.task_id, apply, create=True)
 
     # ---------- 阶段执行 ----------
 
@@ -1443,7 +1454,7 @@ class WorkflowController:
                 "error": str(exc)[:300],
             })
 
-    def _build_task_graph(self, facts: list[dict]) -> dict:
+    def _build_task_graph(self, facts: list[dict], progress_callback=None) -> dict:
         """Create an evidence-grounded task graph and publish an outbox event."""
         try:
             from app.graph import graph_service
@@ -1478,6 +1489,7 @@ class WorkflowController:
                 graph_facts,
                 workspace_id=workspace_id,
                 active_fact_ids=active_ids,
+                progress_callback=progress_callback,
             )
             status = result.as_dict()
             covered_after = graph_service.covered_fact_ids(active_ids, workspace_id=workspace_id)

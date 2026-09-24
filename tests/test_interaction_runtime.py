@@ -83,7 +83,7 @@ class InteractionRuntimeTests(unittest.TestCase):
         self.assertEqual(result["final_plan_json"]["chapter_plans"][0]["title"], "新章")
         self.assertEqual(result["final_plan_json"]["plan_version"], 3)
 
-    def test_revision_preparation_failure_restores_task_and_cleans_records(self):
+    def test_revision_preparation_failure_leaves_payload_transition_uncommitted(self):
         task = {
             "report_id": 7, "run_revision": 1, "stage": "review",
             "run_mode": "initial", "run_history": [], "queue_status": {},
@@ -97,9 +97,16 @@ class InteractionRuntimeTests(unittest.TestCase):
         session = unittest.mock.MagicMock()
         context = unittest.mock.MagicMock()
         context.__enter__.return_value = session
+        committed_payloads = []
+
+        def transition_in_transaction(task_id, callback, *, _session):
+            payload = callback(dict(task), _session)
+            committed_payloads.append(payload)
+            return payload
+
         with (
             patch("app.interaction.short_term.load_task", return_value=task),
-            patch("app.interaction.short_term.save_task") as save_task,
+            patch("app.interaction.short_term.transition_task", side_effect=transition_in_transaction) as transition,
             patch("app.report_versions.ensure_report_version", return_value=SimpleNamespace(version_id=9)),
             patch("app.report_versions.get_report_version", return_value={
                 "id": 9, "report_plan_snapshot": {}, "fact_snapshot": [],
@@ -108,12 +115,13 @@ class InteractionRuntimeTests(unittest.TestCase):
             patch("app.task_runs.create_task_run", return_value="run-a"),
             patch("app.report_versions.create_incremental_delta", side_effect=ValueError("DELTA_FAIL")),
             patch("app.interaction.session_scope", return_value=context),
+            patch("app.workflow.queue.task_queue_status", return_value={}),
         ):
             with self.assertRaisesRegex(ValueError, "DELTA_FAIL"):
                 _prepare_revision_run("task-a", [proposal])
 
-        save_task.assert_called_once_with("task-a", task)
-        self.assertGreaterEqual(session.execute.call_count, 2)
+        transition.assert_called_once()
+        self.assertEqual(committed_payloads, [])
 
     def test_retry_selects_latest_accepted_failed_proposal(self):
         selected = _latest_failed_proposal([

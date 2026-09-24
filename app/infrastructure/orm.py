@@ -521,6 +521,21 @@ CREATE TABLE IF NOT EXISTS short_memory (
     payload TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS graph_jobs (
+    task_id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL UNIQUE,
+    source_run_id TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'queued',
+    requested_at REAL NOT NULL DEFAULT 0,
+    started_at REAL NOT NULL DEFAULT 0,
+    finished_at REAL NOT NULL DEFAULT 0,
+    heartbeat_at REAL NOT NULL DEFAULT 0,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    progress_json TEXT NOT NULL DEFAULT '{}',
+    result_json TEXT NOT NULL DEFAULT '{}',
+    error TEXT NOT NULL DEFAULT ''
+);
+
 CREATE TABLE IF NOT EXISTS long_memory (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL,
@@ -912,6 +927,7 @@ ORMRelation = Base.metadata.tables["fact_relations"]
 ORMTaskArtifact = Base.metadata.tables["task_artifacts"]
 ORMTaskRun = Base.metadata.tables["task_runs"]
 ORMShortMemory = Base.metadata.tables["short_memory"]
+ORMGraphJob = Base.metadata.tables["graph_jobs"]
 ORMLLMCall = Base.metadata.tables["llm_call_logs"]
 ORMInsight = Base.metadata.tables["material_insights"]
 ORMMaterialScan = Base.metadata.tables["material_scan"]

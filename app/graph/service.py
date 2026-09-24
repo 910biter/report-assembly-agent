@@ -11,7 +11,7 @@ import re
 import time
 import unicodedata
 import contextvars
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -434,7 +434,8 @@ class GraphService:
             ))
 
     def build_task_graph(self, task_id: str, facts: list[dict], workspace_id: str = "",
-                         active_fact_ids: set[int] | None = None) -> GraphBuildResult:
+                         active_fact_ids: set[int] | None = None,
+                         progress_callback=None) -> GraphBuildResult:
         if not facts:
             return GraphBuildResult(status="skipped")
         workspace_id = workspace_id or settings.graph_workspace_id
@@ -442,24 +443,47 @@ class GraphService:
         try:
             batches = _fact_batches(facts)
             concurrency = max(1, int(settings.graph_batch_concurrency or 1))
+            completed_batches = completed_facts = 0
+
+            def report_progress(phase: str, **extra) -> None:
+                if progress_callback:
+                    progress_callback({
+                        "phase": phase,
+                        "completed_batches": completed_batches,
+                        "total_batches": len(batches),
+                        "completed_facts": completed_facts,
+                        "total_facts": len(facts),
+                        **extra,
+                    })
+
+            report_progress("extracting")
 
             def extract_one(batch: list[dict]) -> GraphExtractionOutcome:
                 return _extract_adaptive(batch, GraphExtractionAgent().extract)
 
             if concurrency == 1 or len(batches) <= 1:
-                outcomes = [extract_one(batch) for batch in batches]
+                outcomes = []
+                for batch in batches:
+                    outcomes.append(extract_one(batch))
+                    completed_batches += 1
+                    completed_facts += len(batch)
+                    report_progress("extracting")
             else:
                 outcomes = [None] * len(batches)
                 with ThreadPoolExecutor(
                     max_workers=min(concurrency, len(batches)),
                     thread_name_prefix="graph-batch",
                 ) as pool:
-                    futures = []
+                    futures = {}
                     for index, batch in enumerate(batches):
                         context = contextvars.copy_context()
-                        futures.append((index, pool.submit(context.run, extract_one, batch)))
-                    for index, future in futures:
+                        futures[pool.submit(context.run, extract_one, batch)] = (index, batch)
+                    for future in as_completed(futures):
+                        index, batch = futures[future]
                         outcomes[index] = future.result()
+                        completed_batches += 1
+                        completed_facts += len(batch)
+                        report_progress("extracting")
             payload_records = [record for outcome in outcomes for record in outcome.payloads]
             failures = [failure for outcome in outcomes for failure in outcome.failures]
             split_count = sum(outcome.split_count for outcome in outcomes)
@@ -467,6 +491,8 @@ class GraphService:
             persisted_batches = 0
             assertion_count_by_fact: dict[int, int] = {}
             valid_fact_ids = {int(item["id"]) for item in facts if item.get("id") is not None}
+            persisted_records = 0
+            report_progress("persisting", completed_records=0, total_records=len(payload_records))
             for record in payload_records:
                 payload = record["payload"]
                 batch_fact_ids = list(record.get("fact_ids") or [])
@@ -490,6 +516,11 @@ class GraphService:
                         "fact_ids": batch_fact_ids,
                         "error": f"PERSISTENCE_ERROR:{str(exc)[:180]}",
                     })
+                persisted_records += 1
+                report_progress(
+                    "persisting", completed_records=persisted_records,
+                    total_records=len(payload_records),
+                )
             if persisted_batches:
                 with session_scope() as s:
                     self._reconcile_task_assertions(

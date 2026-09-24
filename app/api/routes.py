@@ -31,6 +31,7 @@ from app.infrastructure.orm import (
     ORMShortMemory,
     ORMTaskArtifact,
     ORMUnit,
+    ORMGraphJob,
 )
 from app.llm_queue import llm_queue_stats
 from app.llm_scheduler import invoke, model_lane_stats
@@ -73,6 +74,7 @@ from app.report_versions import (
     list_report_versions,
 )
 from app.task_runs import create_task_run
+from app.task_activation import activate_incremental_task
 from app.template_engine import compile_template
 from app.template_engine.compiler import COMPILER_VERSION
 from app.token_monitor import build_token_efficiency, build_workload_profile, list_llm_calls
@@ -123,8 +125,8 @@ def create_task(
     material_ids = list(dict.fromkeys(material_ids))
     if not material_ids:
         return JSONResponse({"error": "NO_MATERIALS"}, status_code=400)
-    run_id = create_task_run(task_id, revision=1, run_mode="initial")
-    short_term.save_task(task_id, {
+    run_id = None
+    task_payload = {
         "theme": theme,
         "user_requirements": requirements,
         "variant_id": variant_id,
@@ -144,7 +146,11 @@ def create_task(
         "requirement_review_completed": workflow_mode == "automatic" or requirement_review == "auto",
         "directory_review_pending": False,
         "directory_review_completed": directory_review == "auto" or workflow_mode == "automatic",
-    })
+    }
+    with session_scope() as tx:
+        run_id = create_task_run(task_id, revision=1, run_mode="initial", _session=tx)
+        task_payload["run_id"] = run_id
+        short_term.create_task(task_id, task_payload, _session=tx)
     attach_draft_thread(interaction_draft_id, task_id)
     queue = enqueue_task(task_id) if workflow_mode == "collaborative" else {}
     return {"task_id": task_id, "material_count": len(material_ids), "queue": queue}
@@ -166,8 +172,7 @@ def create_document_analysis(
         names = [str(row["filename"]) for row in s.execute(
             select(ORMMaterial.c.filename).where(ORMMaterial.c.id.in_(material_ids))
         ).mappings().all()]
-    run_id = create_task_run(task_id, revision=1, run_mode="document_analysis")
-    short_term.save_task(task_id, {
+    task_payload = {
         "theme": f"文档解析：{'、'.join(names[:2])}{'等' if len(names) > 2 else ''}",
         "user_requirements": "解析所选材料，形成可追溯的摘要、提纲与关键信息，供后续理解和复用。",
         "material_ids": material_ids,
@@ -179,7 +184,11 @@ def create_document_analysis(
         "workflow_mode": "automatic",
         "requirement_review_completed": True,
         "directory_review_completed": True,
-    })
+    }
+    with session_scope() as tx:
+        run_id = create_task_run(task_id, revision=1, run_mode="document_analysis", _session=tx)
+        task_payload["run_id"] = run_id
+        short_term.create_task(task_id, task_payload, _session=tx)
     return {"task_id": task_id, "material_count": len(material_ids), "queue": enqueue_task(task_id)}
 
 
@@ -238,78 +247,14 @@ def create_incremental_task(
     task_id = _find_task_by_report(report_id)
     if task_id is None:
         return JSONResponse({"error": "REPORT_NOT_FOUND"}, status_code=404)
-    base_task = short_term.load_task(task_id) or {}
-    queues = task_queue_status()
-    queue_state = str((base_task.get("queue_status") or {}).get("status") or "")
-    terminal_stage = str(base_task.get("stage") or "") in {"review", "done", "failed", "paused"}
-    live_in_queue = (
-        queues.get("running_task_id") == task_id
-        or task_id in set(queues.get("queued_task_ids") or [])
-    )
-    # 阶段终态优先于遗留的 queue_status。历史版本曾在 review 后留下
-    # queue_status=running，不能因此阻止增量轮次创建；只有实际仍在队列
-    # 中的任务才视为忙。
-    if live_in_queue or (queue_state in {"queued", "running"} and not terminal_stage):
-        return JSONResponse({"error": "TASK_BUSY", "task_id": task_id}, status_code=409)
-    if terminal_stage and queue_state in {"queued", "running"}:
-        base_task = short_term.update_task(
-            task_id,
-            queue_status={
-                "status": "completed" if str(base_task.get("stage")) in {"review", "done"} else str(base_task.get("stage")),
-                "finished_at": (base_task.get("queue_status") or {}).get("finished_at") or round(time.time(), 1),
-            },
-        )
     with session_scope() as s:
         report = s.execute(select(ORMReport).where(ORMReport.c.id == report_id)).mappings().first()
         if report is None:
             return JSONResponse({"error": "REPORT_NOT_FOUND"}, status_code=404)
-    for h in reversed(base_task.get("run_history") or []):
-        if h.get("mode") == "incremental" and h.get("stage") == "created":
-            return JSONResponse({"error": "PREVIOUS_INCREMENT_PENDING",
-                                 "message": "上一增量轮次尚未运行"}, status_code=409)
-    # Always snapshot the current working tree. This preserves edits made after
-    # the last version before an incremental run starts.
-    version = ensure_report_version(
-        report_id, task_id=task_id, status="snapshot",
-        change_summary="增量更新前自动生成基线快照", kind="minor",
-    )
-    base_version = get_report_version(version.version_id)
     try:
         submitted_material_ids = _collect_material_ids(task_id, existing_material_ids, files)
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=409)
-    # 允许"无新增材料"的增量更新(补写模式):仅通过 update_reason 触发全章节重写。
-    # 此时 material_ids = 旧材料全集, delta 不含新材料,
-    # 影响范围由 _prepare_incremental_write_scope 判定(无章节映射 → no_mapped_section_rewrite_all → 全章节重写)。
-    old_material_ids = [
-        int(item.get("material_id"))
-        for item in (base_version or {}).get("material_fingerprints", [])
-        if str(item.get("material_id", "")).isdigit()
-    ]
-    old_fact_ids = [
-        int(item.get("id"))
-        for item in (base_version or {}).get("fact_snapshot", [])
-        if str(item.get("id", "")).isdigit()
-    ]
-    old_inference_ids = [
-        int(item.get("id"))
-        for item in (base_version or {}).get("inference_snapshot", [])
-        if str(item.get("id", "")).isdigit()
-        and str(item.get("source_level") or "") != "EXTERNAL_INFORMATION"
-    ]
-    old_external_ids = [
-        int(item.get("id"))
-        for item in (base_version or {}).get("inference_snapshot", [])
-        if str(item.get("id", "")).isdigit()
-        and str(item.get("source_level") or "") == "EXTERNAL_INFORMATION"
-    ]
-    old_conflict_ids = [
-        int(item.get("id"))
-        for item in (base_version or {}).get("conflict_snapshot", [])
-        if str(item.get("id", "")).isdigit()
-    ]
-    if not submitted_material_ids and not update_reason.strip():
-        return JSONResponse({"error": "UPDATE_REASON_REQUIRED"}, status_code=400)
     comparison_handoff = None
     if source_comparison_id is not None:
         try:
@@ -318,106 +263,24 @@ def create_incremental_task(
             return JSONResponse({"error": str(exc)}, status_code=400)
         if int(comparison_handoff["report_id"]) != int(report_id):
             return JSONResponse({"error": "COMPARISON_REPORT_MISMATCH"}, status_code=409)
-    previous_revision = max(1, int(base_task.get("run_revision") or 1))
-    revision = previous_revision + 1
-    run_id = create_task_run(
-        task_id, revision=revision, run_mode="incremental",
-        base_version_id=int((base_version or {}).get("id") or 0) or None,
-        update_reason=update_reason,
-    )
-    delta = create_incremental_delta(
-        report_id, submitted_material_ids, update_reason=update_reason, run_id=run_id,
-    )
-    added_material_ids = [
-        int(item.get("material_id"))
-        for item in delta.get("added_materials", [])
-        if str(item.get("material_id", "")).isdigit()
-    ]
-    material_ids = list(dict.fromkeys(old_material_ids + added_material_ids))
-    plan_snapshot = (base_version or {}).get("report_plan_snapshot") or {}
-    run_history = list(base_task.get("run_history") or [])
-    run_history.append({
-        "revision": previous_revision,
-        "mode": str(base_task.get("run_mode") or "initial"),
-        "stage": str(base_task.get("stage") or ""),
-        "report_version_id": (base_version or {}).get("id"),
-        "material_count": len(old_material_ids),
-        "fact_count": len(old_fact_ids),
-        "inference_count": len(old_inference_ids) + len(old_external_ids),
-        "finished_at": (base_task.get("queue_status") or {}).get("finished_at"),
-    })
-    next_payload = dict(base_task)
-    next_payload.update({
-        "theme": base_task.get("theme") or plan_snapshot.get("title") or report["title"],
-        "user_requirements": base_task.get("user_requirements", ""),
-        "variant_id": base_task.get("variant_id") or report["style_profile_id"],
-        "material_ids": material_ids,
-        "stage": "created",
-        "report_id": report_id,
-        "plan_id": report["plan_id"],
-        "plan_title": plan_snapshot.get("title") or report["title"],
-        "fact_ids": old_fact_ids,
-        "inference_ids": old_inference_ids,
-        "external_ids": old_external_ids,
-        "conflict_ids": old_conflict_ids,
-        "run_revision": revision,
-        "run_id": run_id,
-        "run_mode": "incremental",
-        "run_history": run_history[-50:],
-        "revision_started_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
-        "incremental_update": True,
-        "incremental_base_task_id": task_id,
-        "incremental_base_version_id": (base_version or {}).get("id"),
-        "incremental_delta_id": delta.get("id"),
-        "incremental_added_material_ids": added_material_ids,
-        "incremental_update_reason": update_reason,
-        "incremental_inherited_fact_ids": old_fact_ids,
-        "incremental_inherited_inference_ids": old_inference_ids,
-        "incremental_inherited_external_ids": old_external_ids,
-        "incremental_inherited_conflict_ids": old_conflict_ids,
-        "incremental_new_fact_ids": [],
-        "incremental_generated_inference_ids": [],
-        "incremental_generated_external_ids": [],
-        "incremental_plan": {},
-        "incremental_delta": {},
-        "incremental_structure_review_required": False,
-        "incremental_source_comparison_id": source_comparison_id,
-        "incremental_selected_change_ids": (comparison_handoff or {}).get("accepted_item_ids", []),
-        "analysis_done": False,
-        # 增量默认沿用已冻结目录;受影响范围由 Delta 决定,避免重写旧 Plan。
-        "final_plan_frozen": bool(plan_snapshot.get("structure")),
-        "parse_progress": {},
-        "material_analysis_progress": {},
-        "evidence_progress": {},
-        "write_progress": {},
-        "parse_errors": [],
-        "embed_errors": [],
-        "qa_notes": [],
-        "stage_timings": {},
-        "stage_durations": {},
-        "llm_stats": {},
-        "token_efficiency": {},
-        "workload_profile": {},
-        "resource_samples": [],
-        "background_jobs": {},
-        "artifact_status": {},
-        "queue_status": {"status": "created"},
-        "control_request": "",
-        "error": "",
-        "critical_path_done": False,
-    })
-    short_term.save_task(task_id, next_payload)
-    return {
-        "task_id": task_id,
-        "report_id": report_id,
-        "revision": revision,
-        "base_version_id": (base_version or {}).get("id"),
-        "delta_id": delta.get("id"),
-        "material_count": len(material_ids),
-        "added_material_count": len(added_material_ids),
-        "status": "created",
-        "source_comparison_id": source_comparison_id,
-    }
+    try:
+        return activate_incremental_task(
+            task_id, dict(report), submitted_material_ids,
+            update_reason=update_reason,
+            source_comparison_id=source_comparison_id,
+            comparison_handoff=comparison_handoff,
+        )
+    except ValueError as exc:
+        error = str(exc)
+        if error == "UPDATE_REASON_REQUIRED":
+            return JSONResponse({"error": error}, status_code=400)
+        if error == "PREVIOUS_INCREMENT_PENDING":
+            return JSONResponse({"error": error, "message": "上一增量轮次尚未运行"}, status_code=409)
+        if error == "TASK_BUSY":
+            return JSONResponse({"error": error, "task_id": task_id}, status_code=409)
+        if error in {"REPORT_NOT_FOUND", "REPORT_VERSION_REQUIRED"}:
+            return JSONResponse({"error": "REPORT_NOT_FOUND"}, status_code=404)
+        raise
 
 
 @router.post("/reports/{report_id}/material-comparisons")
@@ -450,14 +313,7 @@ def create_material_comparison(
         return JSONResponse({"error": str(exc)}, status_code=409)
     if not material_ids:
         return JSONResponse({"error": "NO_NEW_MATERIALS"}, status_code=400)
-    run_id = create_task_run(
-        comparison_task_id, revision=1, run_mode="material_comparison",
-        base_version_id=int(version["id"]), update_reason=focus,
-    )
-    comparison = create_comparison_run(
-        comparison_task_id, report_id, int(version["id"]), material_ids, focus=focus,
-    )
-    short_term.save_task(comparison_task_id, {
+    task_payload = {
         "theme": f"新增材料对比：{version.get('title') or base_task.get('theme') or '报告'}",
         "user_requirements": (
             "只分析新增材料相对于基线报告带来的新增、补强、细化、更新、冲突、削弱与无关信息；"
@@ -468,14 +324,24 @@ def create_material_comparison(
         "stage": "created",
         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
         "run_revision": 1,
-        "run_id": run_id,
         "run_mode": "material_comparison",
-        "comparison_id": comparison["id"],
         "comparison_report_id": report_id,
         "comparison_base_version_id": int(version["id"]),
         "comparison_base_task_id": root_task_id,
         "queue_status": {"status": "created"},
-    })
+    }
+    with session_scope() as tx:
+        run_id = create_task_run(
+            comparison_task_id, revision=1, run_mode="material_comparison",
+            base_version_id=int(version["id"]), update_reason=focus, _session=tx,
+        )
+        comparison = create_comparison_run(
+            comparison_task_id, report_id, int(version["id"]), material_ids,
+            focus=focus, _session=tx,
+        )
+        task_payload["run_id"] = run_id
+        task_payload["comparison_id"] = comparison["id"]
+        short_term.create_task(comparison_task_id, task_payload, _session=tx)
     queue = enqueue_task(comparison_task_id)
     return {
         "comparison_id": comparison["id"], "task_id": comparison_task_id,
@@ -781,9 +647,17 @@ def delete_task(task_id: str):
         or task_id in set(queues.get("queued_task_ids") or [])
     ):
         return JSONResponse({"error": "TASK_BUSY"}, status_code=409)
-    short_term.delete_task(task_id)
-    with session_scope() as s:
-        s.execute(delete(ORMTaskArtifact).where(ORMTaskArtifact.c.task_id == task_id))
+    from app.workflow.execution import require_idle_task
+    try:
+        with session_scope() as s:
+            require_idle_task(s, task_id)
+            s.execute(delete(ORMGraphJob).where(ORMGraphJob.c.task_id == task_id))
+            short_term.delete_task(task_id, _session=s)
+            s.execute(delete(ORMTaskArtifact).where(ORMTaskArtifact.c.task_id == task_id))
+    except ValueError as exc:
+        if str(exc) == "TASK_BUSY":
+            return JSONResponse({"error": "TASK_BUSY"}, status_code=409)
+        raise
     return {"ok": True}
 
 
@@ -954,90 +828,29 @@ def task_graph(task_id: str):
         active_fact_ids=active_fact_ids,
     )
     result["build_status"] = task.get("graph_status") or {"status": "unknown"}
-    jobs = task.get("background_jobs") or {}
-    background_job = jobs.get("graph_rebuild") or jobs.get("graph_build") or {}
+    from app import graph_jobs
+    background_job = graph_jobs.get(task_id) or {}
     result["background_job"] = background_job
-    result["build_active"] = _graph_job_active(background_job)
+    result["build_active"] = background_job.get("status") in {"queued", "running"}
     return result
 
 
-def _graph_job_active(job: dict) -> bool:
-    if str((job or {}).get("status") or "") not in {"queued", "running"}:
-        return False
-    try:
-        timestamp = float((job or {}).get("started_at") or (job or {}).get("queued_at") or 0)
-    except (TypeError, ValueError):
-        return False
-    # A dead process must not leave graph recovery permanently locked.
-    return bool(timestamp and time.time() - timestamp < max(1800, settings.gateway_timeout_seconds * 2))
-
-
-def _run_graph_rebuild(task_id: str) -> None:
-    """Backfill only the task graph; Evidence, Analysis and report stay intact."""
-    from app.llm_queue import PRIORITY_BACKGROUND, llm_priority
-
-    controller = WorkflowController(task_id)
-    jobs = dict(controller.task.get("background_jobs") or {})
-    jobs["graph_rebuild"] = {"status": "running", "started_at": round(time.time(), 1)}
-    controller._update(graph_status={"status": "running"}, background_jobs=jobs)
-    started = time.time()
-    try:
-        facts = controller._facts()
-        with llm_priority(PRIORITY_BACKGROUND), controller._token_context("graph_build"):
-            graph_status = controller._build_task_graph(facts)
-        artifact_status = (
-            "done" if graph_status.get("status") in {"ready", "reused"}
-            else "partial" if graph_status.get("status") == "partial_ready"
-            else "skipped" if graph_status.get("status") == "skipped"
-            else "failed"
-        )
-        controller._record_artifact(
-            "graph", {"graph_status": graph_status}, status=artifact_status,
-        )
-        jobs = dict(controller.task.get("background_jobs") or {})
-        jobs["graph_rebuild"] = {
-            "status": (
-                "done" if graph_status.get("status") in {"ready", "reused"}
-                else "partial" if graph_status.get("status") == "partial_ready"
-                else "failed"
-            ),
-            "duration_seconds": round(time.time() - started, 1),
-            "error": graph_status.get("error", ""),
-        }
-        controller._update(background_jobs=jobs)
-    except Exception as exc:
-        jobs = dict(controller.task.get("background_jobs") or {})
-        jobs["graph_rebuild"] = {
-            "status": "failed",
-            "duration_seconds": round(time.time() - started, 1),
-            "error": str(exc)[:300],
-        }
-        controller._update(
-            graph_status={"status": "degraded", "error": str(exc)[:300]},
-            background_jobs=jobs,
-        )
-
-
 @router.post("/tasks/{task_id}/graph/rebuild", status_code=202)
-def rebuild_task_graph(task_id: str, background_tasks: BackgroundTasks):
+def rebuild_task_graph(task_id: str):
     """Queue graph-only recovery for completed or degraded tasks."""
     task = short_term.load_task(task_id)
     if task is None:
         return JSONResponse({"error": "TASK_NOT_FOUND"}, status_code=404)
-    from app.graph import graph_service
-    jobs = task.get("background_jobs") or {}
-    active_job = jobs.get("graph_rebuild") or jobs.get("graph_build") or {}
-    if _graph_job_active(active_job):
-        return {"status": "already_running", "task_id": task_id}
     from app.workflow.controller import WorkflowController
     facts = WorkflowController(task_id)._facts()
     if not facts:
         return JSONResponse({"error": "TASK_HAS_NO_FACTS"}, status_code=409)
-    jobs = dict(jobs)
-    jobs["graph_rebuild"] = {"status": "queued", "queued_at": round(time.time(), 1)}
-    short_term.update_task(task_id, graph_status={"status": "queued"}, background_jobs=jobs)
-    background_tasks.add_task(_run_graph_rebuild, task_id)
-    return {"status": "queued", "task_id": task_id, "fact_count": len(facts)}
+    from app import graph_jobs
+    try:
+        job = graph_jobs.submit(task_id)
+    except KeyError:
+        return JSONResponse({"error": "TASK_NOT_FOUND"}, status_code=404)
+    return {**job, "fact_count": len(facts)}
 
 
 @router.get("/tasks/{task_id}/graph/changesets")
@@ -1155,7 +968,7 @@ def create_material_assistant_session(material_id: int):
     if material is None:
         return JSONResponse({"error": "MATERIAL_NOT_FOUND"}, status_code=404)
     task_id = uuid.uuid4().hex[:12]
-    short_term.save_task(task_id, {
+    short_term.create_task(task_id, {
         "theme": f"材料理解：{material['filename']}",
         "user_requirements": "解释所选材料的内容、结构、关键信息、可证明范围与缺失信息；不得引用未选材料。",
         "material_ids": [material_id],

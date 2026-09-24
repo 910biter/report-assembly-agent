@@ -11,6 +11,7 @@ import re
 import time
 import uuid
 from collections import Counter
+from contextlib import nullcontext
 from typing import Any
 
 from sqlalchemy import delete, insert, select, update
@@ -72,9 +73,11 @@ _CLASSIFY_PROMPT = """你是新增材料变化核验员。请比较“新增事�
 
 
 def create_comparison_run(task_id: str, report_id: int, base_version_id: int,
-                          material_ids: list[int], focus: str = "") -> dict[str, Any]:
+                          material_ids: list[int], focus: str = "", *,
+                          _session=None) -> dict[str, Any]:
     key = uuid.uuid4().hex
-    with session_scope() as s:
+    manager = session_scope() if _session is None else nullcontext(_session)
+    with manager as s:
         result = s.execute(insert(ORMMaterialComparisonRun).values(
             comparison_key=key,
             task_id=task_id,
@@ -86,6 +89,8 @@ def create_comparison_run(task_id: str, report_id: int, base_version_id: int,
             summary_json="{}",
         ))
         comparison_id = int(result.inserted_primary_key[0])
+    if _session is not None:
+        return {"id": comparison_id, "comparison_key": key}
     return get_comparison(comparison_id) or {"id": comparison_id}
 
 

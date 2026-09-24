@@ -10,7 +10,7 @@ from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
-from sqlalchemy import delete, insert, select, update
+from sqlalchemy import and_, insert, or_, select, update
 
 from app.db import session_scope
 from app.memory import short_term
@@ -1248,22 +1248,19 @@ def _schedule_semantic_proposal(row: dict) -> bool:
     return True
 
 
-def _apply_approved_context_patch(row: dict) -> None:
-    """Persist user-owned task context; derived artifacts still require recompute."""
-    from app.memory import short_term
+def _apply_approved_context_patch(payload: dict, row: dict) -> None:
+    """Apply user-owned context to a locked task transition payload."""
     task_id = str(row.get("task_id") or "")
     artifact_type = str(row.get("artifact_type") or "")
+    if not task_id:
+        return
     after = _load(row.get("after_json"), {})
     if artifact_type == "task_brief":
-        values = {}
         if str(after.get("theme") or "").strip():
-            values["theme"] = str(after["theme"]).strip()
+            payload["theme"] = str(after["theme"]).strip()
         requirements = after.get("requirements")
         if str(requirements or "").strip():
-            values["user_requirements"] = str(requirements).strip()
-        if values:
-            short_term.update_task(task_id, **values)
-        return
+            payload["user_requirements"] = str(requirements).strip()
 
 
 def _pending_proposal_decision(thread: dict, message: str) -> tuple[dict, str] | None:
@@ -1622,13 +1619,12 @@ def dispatch_pending_revisions(task_id: str) -> dict[str, Any]:
         rows = _claim_revision_proposals(task_id)
     if not rows:
         return {"status": "empty"}
-    previous_task = deepcopy(task)
     try:
         prepared = _prepare_revision_run(task_id, [dict(row) for row in rows])
     except Exception as exc:
         proposal_ids = [int(row["id"]) for row in rows]
         _mark_revision_preparation_failed(
-            task_id, proposal_ids, error=str(exc), restore_task=previous_task,
+            task_id, proposal_ids, error=str(exc),
         )
         _notify(
             task_id=task_id, report_id=task.get("report_id"), notification_type="revision_failed",
@@ -1642,7 +1638,7 @@ def dispatch_pending_revisions(task_id: str) -> dict[str, Any]:
     except Exception as exc:
         _mark_revision_preparation_failed(
             task_id, [int(row["id"]) for row in rows], error=str(exc),
-            restore_task=previous_task, prepared=prepared,
+            prepared=prepared,
         )
         _notify(
             task_id=task_id, report_id=task.get("report_id"), notification_type="revision_failed",
@@ -1655,49 +1651,68 @@ def dispatch_pending_revisions(task_id: str) -> dict[str, Any]:
 
 
 def _claim_revision_proposals(task_id: str) -> list[dict]:
-    """Claim one task's accepted proposals before creating any Run records.
-
-    The short-lived ``preparing`` state makes the multi-store preparation
-    recoverable.  A second request in the same process cannot create a second
-    Run for the same proposal batch while the first request is preparing it.
-    """
+    """Read accepted proposals; the task activation transaction claims them."""
     with session_scope() as s:
         rows = s.execute(select(ORMChangeProposal).where(
             ORMChangeProposal.c.task_id == task_id,
             ORMChangeProposal.c.status == "accepted",
-            ORMChangeProposal.c.execution_status.in_(("waiting", "preparing")),
+            ORMChangeProposal.c.execution_status == "waiting",
         ).order_by(ORMChangeProposal.c.id).with_for_update()).mappings().all()
-        if not rows:
-            return []
-        waiting_ids = [int(row["id"]) for row in rows if row["execution_status"] == "waiting"]
-        if waiting_ids:
-            s.execute(update(ORMChangeProposal).where(
-                ORMChangeProposal.c.id.in_(waiting_ids),
-                ORMChangeProposal.c.execution_status == "waiting",
-            ).values(execution_status="preparing", execution_error=""))
-        return [dict(row) for row in s.execute(select(ORMChangeProposal).where(
-            ORMChangeProposal.c.id.in_([int(row["id"]) for row in rows])
-        ).order_by(ORMChangeProposal.c.id)).mappings().all()]
+    return [dict(row) for row in rows]
 
 
 def _mark_revision_preparation_failed(task_id: str, proposal_ids: list[int], *,
-                                      error: str, restore_task: dict | None = None,
-                                      prepared: dict | None = None) -> None:
-    """Leave a failed preparation retryable without an active/ghost Run."""
-    if restore_task is not None:
-        short_term.save_task(task_id, restore_task)
+                                      error: str, prepared: dict | None = None) -> None:
+    """Fail proposals/run without restoring a stale whole-task snapshot."""
     prepared = prepared or {}
     run_id = str(prepared.get("run_id") or "")
     delta_id = prepared.get("delta_id")
     with session_scope() as s:
-        if delta_id:
-            s.execute(delete(ORMReportVersionDelta).where(
-                ORMReportVersionDelta.c.id == int(delta_id)
-            ))
         if run_id:
-            s.execute(delete(ORMTaskRun).where(ORMTaskRun.c.run_id == run_id))
+            s.execute(update(ORMTaskRun).where(
+                ORMTaskRun.c.run_id == run_id
+            ).values(status="failed", finished_at=time.strftime("%Y-%m-%d %H:%M:%S")))
+            if delta_id:
+                s.execute(update(ORMReportVersionDelta).where(
+                    ORMReportVersionDelta.c.id == int(delta_id)
+                ).values(status="failed"))
+
+            def fail_active_run(payload: dict, _tx) -> dict:
+                if str(payload.get("run_id") or "") == run_id:
+                    payload["stage"] = "failed"
+                    payload["error"] = str(error)[:1000]
+                    payload["queue_status"] = {
+                        "status": "failed",
+                        "finished_at": round(time.time(), 1),
+                    }
+                return payload
+
+            try:
+                short_term.transition_task(task_id, fail_active_run, _session=s)
+            except KeyError:
+                pass
+            proposal_filter = and_(
+                ORMChangeProposal.c.id.in_([int(value) for value in proposal_ids]),
+                or_(
+                    ORMChangeProposal.c.execution_run_id == run_id,
+                    and_(
+                        ORMChangeProposal.c.execution_run_id.is_(None),
+                        ORMChangeProposal.c.execution_status == "waiting",
+                    ),
+                ),
+            )
+        else:
+            # A concurrent dispatcher may have committed the same proposals
+            # under another run while this stale preparation was waiting on
+            # the task row. Never fail proposals already claimed by that run.
+            proposal_filter = and_(
+                ORMChangeProposal.c.id.in_([int(value) for value in proposal_ids]),
+                ORMChangeProposal.c.execution_status == "waiting",
+            )
         s.execute(update(ORMChangeProposal).where(
-            ORMChangeProposal.c.id.in_([int(value) for value in proposal_ids])
+            proposal_filter,
+            ORMChangeProposal.c.status == "accepted",
+            ORMChangeProposal.c.execution_status.in_(("waiting", "queued")),
         ).values(execution_status="failed", execution_error=str(error)[:1000]))
 
 
@@ -1705,18 +1720,17 @@ def _prepare_revision_run(task_id: str, proposals: list[dict]) -> dict[str, Any]
     from app.memory import short_term
     from app.report_versions import create_incremental_delta, ensure_report_version, get_report_version
     from app.task_runs import create_task_run
+    from app.workflow.queue import task_queue_status
+    from app.workflow.execution import require_idle_task
 
     base_task = short_term.load_task(task_id) or {}
+    # Read the in-process queue before locking the task row. Enqueue persists
+    # queue state while holding its lock, so querying it inside the DB
+    # transition would reverse the lock order and could deadlock.
+    queues = task_queue_status()
     report_id = int(base_task.get("report_id") or 0)
     if not report_id:
         raise ValueError("REPORT_NOT_READY")
-    version = ensure_report_version(
-        report_id, task_id=task_id, status="snapshot",
-        change_summary="交互式修改前自动生成基线快照", kind="minor",
-    )
-    base_version = get_report_version(version.version_id)
-    if base_version is None:
-        raise ValueError("BASE_VERSION_NOT_FOUND")
     proposal_ids = [int(item["id"]) for item in proposals]
     instructions = [_proposal_instruction(item) for item in proposals]
     tool_calls = [
@@ -1795,10 +1809,6 @@ def _prepare_revision_run(task_id: str, proposals: list[dict]) -> dict[str, Any]
     analysis_constraint = next(iter(reversed(analysis_constraints)), {})
     evidence_recheck = next(iter(reversed(evidence_rechecks)), {})
     inference_recheck = next(iter(reversed(inference_rechecks)), {})
-    plan_snapshot = base_version.get("report_plan_snapshot") or {}
-    old_structure = [str(item) for item in plan_snapshot.get("structure") or [] if str(item).strip()]
-    structure_rewrite_sections = [title for title in required_structure if title not in set(old_structure)]
-    obsolete_sections = [title for title in old_structure if title not in set(required_structure)] if required_structure else []
     title_old_sections = [item["old_title"] for item in section_title_changes]
     title_new_sections = [item["new_title"] for item in section_title_changes]
     explicit_chapters = [
@@ -1814,50 +1824,81 @@ def _prepare_revision_run(task_id: str, proposals: list[dict]) -> dict[str, Any]
         AgentToolName.REWRITE_SENTENCE.value, AgentToolName.REWRITE_PARAGRAPH.value,
     }), {})
     update_reason = "根据用户已批准的交互提案生成新报告版本：\n" + "\n".join(instructions)
-    revision = max(1, int(base_task.get("run_revision") or 1)) + 1
-    previous_task = deepcopy(base_task)
-    run_id = ""
-    delta: dict[str, Any] = {}
-    try:
-        with session_scope() as tx:
-            run_id = create_task_run(
-                task_id, revision=revision, run_mode="interaction_revision",
-                base_version_id=int(base_version["id"]), update_reason=update_reason,
-                _session=tx,
-            )
-            delta = create_incremental_delta(
-                report_id, [], update_reason=update_reason, run_id=run_id, _session=tx,
-            )
-            tx.execute(update(ORMChangeProposal).where(
-                ORMChangeProposal.c.id.in_(proposal_ids),
-                ORMChangeProposal.c.execution_status == "preparing",
-            ).values(
-                execution_status="queued", execution_run_id=run_id,
-                base_version_id=int(base_version["id"]), execution_error="",
-            ))
+    expected_revision = max(1, int(base_task.get("run_revision") or 1))
+    force_evidence = any(item.force_evidence for item in policies)
+    force_analysis = any(item.force_analysis for item in policies)
+    force_final_plan = any(item.force_final_plan for item in policies)
+    rerun_initial_plan = any(item.rerun_initial_plan for item in policies)
+    prepared: dict[str, Any] = {}
+
+    def activate(current_task: dict, tx) -> dict:
+        if int(current_task.get("run_revision") or 1) != expected_revision:
+            raise ValueError("TASK_CHANGED_DURING_REVISION_PREPARATION")
+        if (
+            queues.get("running_task_id") == task_id
+            or task_id in set(queues.get("queued_task_ids") or [])
+            or str(current_task.get("stage") or "") not in {"review", "done", "failed", "paused"}
+        ):
+            raise ValueError("TASK_BUSY")
+
+        version = ensure_report_version(
+            report_id, task_id=task_id, status="snapshot",
+            change_summary="交互式修改前自动生成基线快照", kind="minor", _session=tx,
+        )
+        base_version = get_report_version(version.version_id, _session=tx)
+        if base_version is None:
+            raise ValueError("BASE_VERSION_NOT_FOUND")
+        plan_snapshot = base_version.get("report_plan_snapshot") or {}
+        old_structure = [
+            str(item) for item in plan_snapshot.get("structure") or [] if str(item).strip()
+        ]
+        structure_rewrite_sections = [
+            title for title in required_structure if title not in set(old_structure)
+        ]
+        obsolete_sections = [
+            title for title in old_structure if title not in set(required_structure)
+        ] if required_structure else []
         old_fact_ids = _snapshot_ids(base_version.get("fact_snapshot") or [])
         inference_rows = base_version.get("inference_snapshot") or []
-        old_inference_ids = [int(item["id"]) for item in inference_rows
-                             if item.get("id") is not None and item.get("source_level") != "EXTERNAL_INFORMATION"]
-        old_external_ids = [int(item["id"]) for item in inference_rows
-                            if item.get("id") is not None and item.get("source_level") == "EXTERNAL_INFORMATION"]
+        old_inference_ids = [
+            int(item["id"]) for item in inference_rows
+            if item.get("id") is not None and item.get("source_level") != "EXTERNAL_INFORMATION"
+        ]
+        old_external_ids = [
+            int(item["id"]) for item in inference_rows
+            if item.get("id") is not None and item.get("source_level") == "EXTERNAL_INFORMATION"
+        ]
         old_conflict_ids = _snapshot_ids(base_version.get("conflict_snapshot") or [])
-        force_evidence = any(item.force_evidence for item in policies)
-        force_analysis = any(item.force_analysis for item in policies)
-        force_final_plan = any(item.force_final_plan for item in policies)
-        rerun_initial_plan = any(item.rerun_initial_plan for item in policies)
-        run_history = list(base_task.get("run_history") or [])
+        revision = expected_revision + 1
+        run_history = list(current_task.get("run_history") or [])
         run_history.append({
-            "revision": int(base_task.get("run_revision") or 1),
-            "mode": str(base_task.get("run_mode") or "initial"),
-            "stage": str(base_task.get("stage") or ""),
+            "revision": expected_revision,
+            "mode": str(current_task.get("run_mode") or "initial"),
+            "stage": str(current_task.get("stage") or ""),
             "report_version_id": int(base_version["id"]),
-            "finished_at": (base_task.get("queue_status") or {}).get("finished_at"),
+            "finished_at": (current_task.get("queue_status") or {}).get("finished_at"),
         })
-        for proposal in proposals:
-            _apply_approved_context_patch(proposal)
-        current_task = short_term.load_task(task_id) or base_task
+
+        run_id = create_task_run(
+            task_id, revision=revision, run_mode="interaction_revision",
+            base_version_id=int(base_version["id"]), update_reason=update_reason,
+            _session=tx,
+        )
+        delta = create_incremental_delta(
+            report_id, [], update_reason=update_reason, run_id=run_id, _session=tx,
+        )
+        locked_proposals = tx.execute(select(ORMChangeProposal).where(
+            ORMChangeProposal.c.id.in_(proposal_ids),
+        ).order_by(ORMChangeProposal.c.id).with_for_update()).mappings().all()
+        if len(locked_proposals) != len(proposal_ids) or any(
+            row["status"] != "accepted" or row["execution_status"] != "waiting"
+            for row in locked_proposals
+        ):
+            raise ValueError("PROPOSALS_NO_LONGER_PENDING")
+
         next_payload = dict(current_task)
+        for proposal in proposals:
+            _apply_approved_context_patch(next_payload, proposal)
         next_payload.update({
             "stage": "created", "run_revision": revision, "run_id": run_id,
             "run_mode": "interaction_revision", "run_history": run_history[-50:],
@@ -1916,16 +1957,27 @@ def _prepare_revision_run(task_id: str, proposals: list[dict]) -> dict[str, Any]
             "queue_status": {"status": "created"}, "control_request": "", "error": "",
             "critical_path_done": False,
         })
-        short_term.save_task(task_id, next_payload)
-        return {"status": "queued", "run_id": run_id, "proposal_ids": proposal_ids,
-                "base_version_id": int(base_version["id"]), "delta_id": delta.get("id"),
-                "recompute_from": next_payload["intervention_recompute_from"]}
-    except Exception as exc:
-        _mark_revision_preparation_failed(
-            task_id, proposal_ids, error=str(exc), restore_task=previous_task,
-            prepared={"run_id": run_id, "delta_id": delta.get("id")},
-        )
-        raise
+        proposal_update = tx.execute(update(ORMChangeProposal).where(
+            ORMChangeProposal.c.id.in_(proposal_ids),
+            ORMChangeProposal.c.status == "accepted",
+            ORMChangeProposal.c.execution_status == "waiting",
+        ).values(
+            execution_status="queued", execution_run_id=run_id,
+            base_version_id=int(base_version["id"]), execution_error="",
+        ))
+        if proposal_update.rowcount != len(proposal_ids):
+            raise ValueError("PROPOSALS_NO_LONGER_PENDING")
+        prepared.update({
+            "status": "queued", "run_id": run_id, "proposal_ids": proposal_ids,
+            "base_version_id": int(base_version["id"]), "delta_id": delta.get("id"),
+            "recompute_from": next_payload["intervention_recompute_from"],
+        })
+        return next_payload
+
+    with session_scope() as tx:
+        require_idle_task(tx, task_id)
+        short_term.transition_task(task_id, activate, _session=tx)
+    return prepared
 
 
 def complete_recompute_for_run(run_id: str, candidate_version_id: int) -> None:
