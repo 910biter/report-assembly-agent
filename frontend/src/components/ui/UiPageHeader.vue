@@ -26,8 +26,8 @@ defineProps<{ title: string; description?: string; featured?: boolean }>();
   align-items: center;
   justify-content: space-between;
   gap: var(--space-6);
-  min-height: 64px;
-  padding: 4px 0 8px;
+  min-height: 60px;
+  padding: 2px 0 6px;
   border-bottom: 0;
 }
 .ui-page-header--featured {
@@ -37,14 +37,16 @@ defineProps<{ title: string; description?: string; featured?: boolean }>();
 .ui-page-header h1 {
   margin: 0;
   color: var(--foreground);
-  font-size: 25px;
+  font-size: 28px;
   font-weight: 600;
-  letter-spacing: -0.025em;
+  letter-spacing: -0.035em;
+  line-height: 1.2;
 }
 .ui-page-header p {
-  margin: 4px 0 0;
+  margin: 6px 0 0;
   color: var(--muted-foreground);
   font-size: 13px;
+  line-height: 1.5;
 }
 .ui-page-header__actions {
   display: flex;
@@ -58,7 +60,7 @@ defineProps<{ title: string; description?: string; featured?: boolean }>();
     padding: 4px 0 8px;
   }
   .ui-page-header h1 {
-    font-size: 23px;
+    font-size: 24px;
   }
   .ui-page-header p {
     display: none;

@@ -37,26 +37,19 @@ defineProps<{
 .ui-metric-strip {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
-  overflow: hidden;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-panel);
-  background: var(--card);
-  box-shadow: inset 0 1px 0 var(--surface-highlight);
+  border-block: 1px solid var(--border);
+  background: transparent;
 }
 .ui-metric-strip__item {
   display: flex;
   align-items: center;
   gap: var(--space-3);
-  min-height: 82px;
-  padding: 13px 18px;
+  min-height: 74px;
+  padding: 12px 20px;
   border-right: 1px solid var(--border);
-  transition: background var(--motion-fast);
 }
 .ui-metric-strip__item:last-child {
   border-right: 0;
-}
-.ui-metric-strip__item:hover {
-  background: var(--surface-hover);
 }
 .ui-metric-strip__icon {
   display: none;

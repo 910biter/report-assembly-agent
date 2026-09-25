@@ -22,17 +22,16 @@ withDefaults(
   border: 1px solid var(--border);
   border-radius: var(--radius-control);
   background: var(--card);
-  box-shadow: inset 0 1px 0 var(--surface-highlight);
 }
 .ui-panel--padded {
   padding: var(--space-6);
 }
 .ui-panel--raised {
   border-color: var(--border-strong);
-  box-shadow: inset 0 1px 0 var(--surface-highlight);
+  background: var(--surface-raised);
 }
 .ui-panel--inset {
-  background: var(--surface-raised);
+  background: color-mix(in srgb, var(--surface-raised) 72%, var(--background));
   border-color: var(--border);
 }
 </style>

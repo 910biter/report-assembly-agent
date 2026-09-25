@@ -323,7 +323,7 @@ onBeforeUnmount(() => window.clearTimeout(pollTimer));
           </select></label
         >
       </div>
-      ><UiButton
+      <UiButton
         :loading="learningBusy"
         @click="startLearning"
       >

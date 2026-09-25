@@ -382,13 +382,18 @@ function taskType(task: TaskSummary) {
 }
 .view-tabs {
   display: flex;
+  min-width: 0;
+  overflow-x: auto;
   gap: 4px;
   padding: 16px 18px 0;
   border-bottom: 1px solid var(--border);
   background: var(--muted);
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
 }
 .view-tabs button {
   display: flex;
+  flex: 0 0 auto;
   align-items: center;
   gap: 7px;
   padding: 8px 12px 12px;
@@ -422,14 +427,23 @@ function taskType(task: TaskSummary) {
   color: var(--primary);
 }
 .filter-bar {
-  display: grid;
-  grid-template-columns: minmax(180px, 2fr) repeat(3, minmax(112px, 1fr)) auto;
+  display: flex;
+  flex-wrap: wrap;
   min-width: 0;
   gap: 10px;
   padding: 14px 18px;
 }
 .search-box {
   position: relative;
+  flex: 2 1 240px;
+  min-width: 0;
+}
+.filter-bar > select {
+  flex: 1 1 132px;
+  min-width: 0;
+}
+.filter-bar > .reset {
+  flex: 0 0 auto;
 }
 .search-box :deep(svg) {
   position: absolute;
@@ -607,11 +621,8 @@ function taskType(task: TaskSummary) {
 @media (max-width: 1180px) {
 }
 @media (max-width: 900px) {
-  .filter-bar {
-    grid-template-columns: 1fr 1fr;
-  }
   .search-box {
-    grid-column: 1/-1;
+    flex-basis: 100%;
   }
   .table-head,
   .task-row {
@@ -628,11 +639,11 @@ function taskType(task: TaskSummary) {
   .tasks-page .page-header {
     min-height: 58px;
   }
-  .filter-bar {
-    grid-template-columns: 1fr;
+  .filter-bar > select {
+    flex-basis: calc(50% - 5px);
   }
   .search-box {
-    grid-column: auto;
+    flex-basis: 100%;
   }
   .view-tabs {
     overflow: auto;

@@ -29,13 +29,12 @@ withDefaults(defineProps<{
   width: 100%;
   max-width: 100%;
   min-width: 0;
-  min-height: 620px;
+  min-height: 520px;
   overflow: hidden;
   grid-template-columns: minmax(0, 1fr);
   border: 1px solid var(--border);
   border-radius: var(--radius-panel);
   background: var(--card);
-  box-shadow: inset 0 1px 0 var(--surface-highlight);
 }
 
 .ui-data-browser--detail-open {
@@ -71,7 +70,7 @@ withDefaults(defineProps<{
 
 @media (max-width: 640px) {
   .ui-data-browser {
-    min-height: 540px;
+    min-height: 460px;
     border-radius: var(--radius-sm);
   }
 

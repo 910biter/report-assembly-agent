@@ -271,6 +271,12 @@ const createTask = useMutation({
           name="directory_review"
           :value="workflowMode === 'collaborative' ? directoryReview : 'auto'"
         />
+        <section class="brief-section">
+          <div class="brief-section-heading">
+            <strong>任务目标</strong>
+            <span>协作规划模式下，主题和要求也可以在材料理解后补充。</span>
+          </div>
+          <div class="brief-fields">
         <label v-if="workflowMode === 'automatic'" class="field task-brief-field theme-field"
           ><span>报告主题</span
           ><input
@@ -317,6 +323,8 @@ const createTask = useMutation({
             ></textarea>
           </label>
         </details>
+          </div>
+        </section>
         <div
           v-if="workflowMode === 'collaborative'"
           class="collaboration-controls"
@@ -346,7 +354,7 @@ const createTask = useMutation({
     </UiPanel>
     <UiMetricStrip :items="metrics" />
     <div class="dashboard-grid">
-      <UiPanel class="section-block recent"
+      <section class="recent-workspace"
         ><UiSectionHeader title="最近任务"
           ><template #actions
             ><RouterLink class="btn tertiary" to="/tasks"
@@ -372,9 +380,9 @@ const createTask = useMutation({
           v-else
           title="尚无任务"
           description="创建第一个报告任务后，进度和审阅项会出现在这里。"
-      /></UiPanel>
+      /></section>
       <aside class="side-stack">
-        <section class="surface section-block">
+        <section class="side-section">
           <div class="section-head"><h2>待审核</h2></div>
           <RouterLink
             v-for="task in waiting.slice(0, 4)"
@@ -392,7 +400,7 @@ const createTask = useMutation({
             当前没有待审核报告
           </div>
         </section>
-        <section v-if="finished.length" class="surface section-block">
+        <section v-if="finished.length" class="side-section">
           <h2>最近完成</h2>
           <RouterLink
             v-for="task in finished.slice(0, 3)"
@@ -419,9 +427,6 @@ const createTask = useMutation({
 .create-panel {
   overflow: hidden;
   background: var(--card);
-  border-color: var(--border);
-  border-radius: var(--radius-feature);
-  box-shadow: inset 0 1px 0 var(--surface-highlight);
 }
 .create-form {
   display: grid;
@@ -430,24 +435,28 @@ const createTask = useMutation({
 }
 .setup-section {
   display: grid;
-  gap: 12px;
-  padding: 20px 24px;
+  grid-template-columns: minmax(176px, 0.34fr) minmax(0, 1fr);
+  align-items: start;
+  column-gap: 24px;
+  row-gap: 10px;
+  grid-column: 1 / -1;
+  padding: 18px 28px;
   border-top: 1px solid var(--border);
   background: transparent;
 }
+.setup-section > :not(.step-heading) {
+  grid-column: 2;
+}
+.setup-section:first-of-type {
+  border-top: 0;
+}
 .material-section {
-  grid-column: 1 / 8;
-  grid-row: span 2;
-  order: 3;
+  grid-column: 1 / -1;
 }
 .template-section,
-.flow-section,
-.collaboration-controls {
-  grid-column: 8 / -1;
-  border-left: 1px solid var(--border);
+.flow-section {
+  grid-column: 1 / -1;
 }
-.template-section { order: 3; }
-.flow-section { order: 4; }
 .step-heading {
   display: flex;
   align-items: flex-start;
@@ -566,7 +575,7 @@ const createTask = useMutation({
   width: calc(100% - 24px);
 }
 .template-select {
-  max-width: none;
+  max-width: 520px;
 }
 .selection-summary {
   display: inline-flex;
@@ -592,7 +601,7 @@ const createTask = useMutation({
   justify-content: space-between;
   gap: var(--space-4);
   grid-column: 1/-1;
-  padding: 22px 24px 18px;
+  padding: 20px 28px 18px;
   border-bottom: 1px solid var(--border);
 }
 .form-heading h2 {
@@ -615,19 +624,32 @@ const createTask = useMutation({
   font-size: 11px;
 }
 .task-brief-field {
-  order: 1;
   min-width: 0;
-  margin: 8px 0 20px;
+  margin: 0;
 }
-.theme-field {
-  grid-column: 1 / 7;
-  margin-left: 28px;
-  margin-right: 8px;
+.brief-section {
+  grid-column: 1 / -1;
+  padding: 18px 28px 22px;
+  border-top: 1px solid var(--border);
 }
-.requirements-field {
-  grid-column: 7 / -1;
-  margin-left: 8px;
-  margin-right: 28px;
+.brief-section-heading {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.brief-section-heading strong {
+  font-size: 13px;
+  font-weight: 600;
+}
+.brief-section-heading span {
+  color: var(--muted-foreground);
+  font-size: 12px;
+}
+.brief-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px;
 }
 .field-label {
   display: block;
@@ -726,12 +748,12 @@ const createTask = useMutation({
   width: 100%;
 }
 .collaboration-controls {
-  order: 5;
+  grid-column: 1 / -1;
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: var(--space-2);
-  padding: 12px 24px 20px;
+  padding: 12px 28px 18px;
   border-top: 1px solid var(--border);
 }
 .collaboration-controls label {
@@ -747,23 +769,40 @@ const createTask = useMutation({
 }
 .submit-row {
   grid-column: 1/-1;
-  order: 6;
   display: flex;
   align-items: center;
   justify-content: flex-end;
   gap: 12px;
   min-height: 68px;
-  padding: 14px 28px;
+  padding: 13px 28px;
   border-top: 1px solid var(--border);
-  background: var(--muted);
+  background: var(--surface-raised);
 }
 .dashboard-grid {
   display: grid;
-  grid-template-columns: minmax(0, 1.65fr) minmax(300px, 0.75fr);
-  gap: 24px;
+  grid-template-columns: minmax(0, 1.7fr) minmax(260px, 0.65fr);
+  gap: 32px;
 }
-.dashboard-grid > .surface {
-  box-shadow: inset 0 1px 0 var(--surface-highlight);
+.recent-workspace {
+  min-width: 0;
+}
+.recent-workspace :deep(.ui-section-header) {
+  margin-bottom: 14px;
+}
+.side-stack {
+  display: grid;
+  align-content: start;
+  gap: 0;
+  padding-left: 24px;
+  border-left: 1px solid var(--border);
+}
+.side-section {
+  min-width: 0;
+  padding: 0 0 18px;
+}
+.side-section + .side-section {
+  padding-top: 18px;
+  border-top: 1px solid var(--border);
 }
 .section-kicker {
   margin-bottom: 3px;
@@ -783,11 +822,6 @@ const createTask = useMutation({
   color: var(--subtle-foreground);
   margin-top: 2px;
   font-size: 12px;
-}
-.side-stack {
-  display: grid;
-  align-content: start;
-  gap: 24px;
 }
 .compact-link {
   display: flex;
@@ -835,15 +869,9 @@ const createTask = useMutation({
   .template-section,
   .flow-section,
   .collaboration-controls,
+  .brief-section,
   .submit-row {
     grid-column: 1;
-    grid-row: auto;
-    margin-inline: 0;
-  }
-  .template-section,
-  .flow-section,
-  .collaboration-controls {
-    border-left: 0;
   }
 }
 @media (max-width: 620px) {
@@ -860,11 +888,43 @@ const createTask = useMutation({
   }
   .form-heading,
   .setup-section,
+  .brief-section,
   .submit-row {
     padding-inline: 20px;
   }
-  .task-brief-field {
-    margin-inline: 20px;
+  .setup-section {
+    grid-template-columns: 1fr;
+    row-gap: 12px;
+  }
+  .setup-section > :not(.step-heading) {
+    grid-column: 1;
+  }
+  .brief-fields {
+    grid-template-columns: 1fr;
+    gap: 14px;
+  }
+  .brief-section-heading {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 3px;
+  }
+  .dashboard-grid {
+    gap: 20px;
+  }
+  .submit-row {
+    flex-wrap: wrap;
+    align-items: stretch;
+  }
+  .selection-summary {
+    flex-basis: 100%;
+  }
+  .submit-row :deep(.ui-button) {
+    width: 100%;
+  }
+  .side-stack {
+    padding: 18px 0 0;
+    border-top: 1px solid var(--border);
+    border-left: 0;
   }
   .collaboration-controls {
     align-items: flex-start;
