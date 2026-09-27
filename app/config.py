@@ -96,6 +96,7 @@ class Settings(BaseSettings):
     structured_output_tokens: int = 3072  # Planner/Analysis/QA 等结构化阶段默认输出预算
     final_planner_output_tokens: int = 8192  # 完整章节契约优先保留输出空间；24K 窗口仍保留输入与安全余量
     writer_output_tokens: int = 3072  # 单个 Narrative subsection 的正文输出预算
+    writer_output_tokens_per_word: float = 1.45  # 正文 token 估算比例；JSON/溯源结构余量单独计入
     writer_visible_word_token_ratio: float = 0.30  # JSON+引用绑定后的保守可见正文容量
     evidence_output_tokens: int = 5120  # Evidence 高密度批次需要比普通结构化阶段更大的输出空间
     evidence_first_pass_input_tokens: int = 160000  # 首轮 Evidence 总输入资源边界

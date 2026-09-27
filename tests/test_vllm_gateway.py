@@ -98,6 +98,14 @@ class VllmGatewayTests(unittest.TestCase):
         self.assertTrue(all(line in facts for line in selected_facts))
         self.assertTrue(all(line in inferences for line in selected_inferences))
 
+    def test_writer_packing_skips_oversized_line_and_keeps_later_fitting_evidence(self):
+        selected_facts, selected_inferences = _pack_writer_evidence(
+            ["1. A", "2. " + "x" * 30, "3. C"], [], available_tokens=4,
+        )
+
+        self.assertEqual(selected_facts, ["1. A", "3. C"])
+        self.assertEqual(selected_inferences, [])
+
     def test_context_overflow_reduces_only_generation_ceiling(self):
         response = _ContextOverflowResponse()
         with patch.object(settings, "model_context_window_tokens", 15360):

@@ -110,6 +110,11 @@ def _positive_unit_id(value) -> int | None:
     return parsed if parsed is not None and parsed > 0 else None
 
 
+def _unit_ids_in_text(text: str) -> list[int]:
+    """Extract source-unit IDs from the stable markers embedded in Evidence input."""
+    return sorted({int(value) for value in re.findall(r"\[U(\d+)\s*\|", str(text or ""))})
+
+
 def _split_quotes(quote: str) -> list[str]:
     parts = re.split(r"(?<=[。！？!?；;])", quote)
     return [p.strip() for p in parts if p.strip()]
@@ -233,6 +238,8 @@ def _normalize_needs(raw) -> list[dict]:
         cleaned.append(entry)
     if not cleaned:
         cleaned.append({"need": "核心事实发现", "dimension": "开放发现", "priority": "high"})
+    for index, entry in enumerate(cleaned, start=1):
+        entry["need_id"] = index
     return cleaned
 
 
@@ -444,6 +451,9 @@ class EvidenceAgent(BaseAgent):
         3. Iterative Retrieval:缺口 Needs 针对性补检(缺什么补什么,足够即停)。
         """
         needs = _normalize_needs(needs)
+        self.batch_failures = []
+        self.coverage_audit_status = {"status": "unknown", "error": "not_run"}
+        self.last_extraction_status = {"status": "running"}
         facts: list[Fact] = []
         total_phases = 3
 
@@ -520,6 +530,13 @@ class EvidenceAgent(BaseAgent):
                 break  # 无新证据:接受 information_gap,不再空转
             gaps = self._coverage_audit(facts, needs, task_id)
         report_phase(3)
+        self.last_extraction_status = {
+            "status": "partial" if self.batch_failures or gaps is None else "complete",
+            "failed_batches": list(self.batch_failures),
+            "coverage": dict(self.coverage_audit_status),
+            "uncovered_needs": list(gaps or []),
+            "needs": needs,
+        }
         return facts
 
     def _process_batches(
@@ -537,24 +554,28 @@ class EvidenceAgent(BaseAgent):
         batches = self._fit_material_batches(batches, needs)
         concurrency = max(1, int(settings.evidence_batch_concurrency or 1))
 
-        def run_one(batch_index: int, material_text: str, batch_meta: dict) -> list[Fact]:
+        def run_one(batch_index: int, material_text: str, batch_meta: dict):
             worker = EvidenceAgent()
-            return worker._process_batch(
+            worker.batch_failures = []
+            produced = worker._process_batch(
                 needs, material_text, batch_meta, units_by_material, filenames,
                 task_id, batch_index, len(batches), round_tag=round_tag,
             )
+            return produced, worker.batch_failures
 
         if concurrency == 1 or len(batches) == 1:
-            return [run_one(index, text, meta) for index, (text, meta) in enumerate(batches, start=1)]
-        results: list[list[Fact] | None] = [None] * len(batches)
-        with ThreadPoolExecutor(max_workers=min(concurrency, len(batches)), thread_name_prefix="evidence-batch") as pool:
-            futures = []
-            for index, (text, meta) in enumerate(batches, start=1):
-                context = contextvars.copy_context()
-                futures.append((index, pool.submit(context.run, run_one, index, text, meta)))
-            for index, future in futures:
-                results[index - 1] = future.result()
-        return [item or [] for item in results]
+            outcomes = [run_one(index, text, meta) for index, (text, meta) in enumerate(batches, start=1)]
+        else:
+            with ThreadPoolExecutor(max_workers=min(concurrency, len(batches)), thread_name_prefix="evidence-batch") as pool:
+                futures = []
+                for index, (text, meta) in enumerate(batches, start=1):
+                    context = contextvars.copy_context()
+                    futures.append(pool.submit(context.run, run_one, index, text, meta))
+                outcomes = [future.result() for future in futures]
+        self.batch_failures = list(getattr(self, "batch_failures", []))
+        for _facts, failures in outcomes:
+            self.batch_failures.extend(failures)
+        return [produced for produced, _failures in outcomes]
 
     def _fit_material_batches(
         self, batches: list[tuple[str, dict]], needs: list[dict],
@@ -609,6 +630,25 @@ class EvidenceAgent(BaseAgent):
             ContextSection("material_insight", insight_block.splitlines(), weight=2, required_items=0),
             ContextSection("material_units", material_text.split("\n\n"), weight=4, required_items=1),
         ], stage_input_budget_tokens("evidence"))
+        candidate_unit_ids = _unit_ids_in_text(material_text)
+        input_unit_ids = _unit_ids_in_text(prompt)
+        unit_to_material = {
+            int(unit.id): int(material_id)
+            for material_id, material_units in units_by_material.items()
+            for unit in material_units
+            if getattr(unit, "id", None) is not None
+        }
+        input_material_ids = sorted({
+            unit_to_material[unit_id] for unit_id in input_unit_ids if unit_id in unit_to_material
+        })
+        batch_input_audit = {
+            "input_unit_ids": input_unit_ids,
+            "candidate_unit_ids": candidate_unit_ids,
+            "omitted_unit_ids": sorted(set(candidate_unit_ids) - set(input_unit_ids)),
+            "input_material_ids": input_material_ids,
+            "input_material_count": len(input_material_ids),
+            "context_audit": _audit,
+        }
         prompt_parts = {
             "needs": sum(len(n.get("need", "")) for n in needs_list),
             "material_context": len(material_text or ""),
@@ -619,6 +659,8 @@ class EvidenceAgent(BaseAgent):
             self._split_truncated_batch = True
             payload = self.generate_json(prompt)
         except Exception as exc:
+            if str(exc) in {"TASK_PAUSED", "EXECUTION_LOCK_LOST"}:
+                raise
             call_id = self.last_call_id
             update_call_funnel(
                 call_id,
@@ -627,6 +669,7 @@ class EvidenceAgent(BaseAgent):
                 prompt_parts=prompt_parts,
                 prompt_chars=len(prompt),
                 material_context_chars=len(material_text),
+                **batch_input_audit,
                 model_claims=0,
                 valid_field_claims=0,
                 quote_bound_claims=0,
@@ -659,6 +702,11 @@ class EvidenceAgent(BaseAgent):
                             task_id, part_index, len(split_parts), round_tag=round_tag,
                         ))
                     return recovered
+            self.batch_failures = list(getattr(self, "batch_failures", []))
+            self.batch_failures.append({
+                "call_id": call_id, "round": round_tag, "batch": batch_index,
+                "unit_ids": candidate_unit_ids, "error": str(exc)[:300],
+            })
             return []
         finally:
             self._split_truncated_batch = False
@@ -691,9 +739,13 @@ class EvidenceAgent(BaseAgent):
                 need_idx = int(item.get("need_id", 0))
             except (TypeError, ValueError):
                 need_idx = 0
-            if not (0 <= need_idx < len(needs_list) + 1):
+            need_by_id = {
+                int(need.get("need_id") or index): need
+                for index, need in enumerate(needs_list, start=1)
+            }
+            if need_idx not in need_by_id:
                 need_idx = 0
-            dimension = needs_list[need_idx - 1].get("dimension", "开放发现") if need_idx > 0 else "开放发现"
+            dimension = need_by_id[need_idx].get("dimension", "开放发现") if need_idx else "开放发现"
             evidence_list = bind_sources(quote, units_by_material, filenames, unit_id=unit_id)
             claim = Claim(
                 material_id=evidence_list[0].material_id if evidence_list else 0,
@@ -741,10 +793,11 @@ class EvidenceAgent(BaseAgent):
             prompt_parts=prompt_parts,
             prompt_chars=len(prompt),
             material_context_chars=len(material_text),
+            **batch_input_audit,
             contributed_material_count=len(contributed_materials),
             contributed_unit_count=len(contributed_units),
             contributed_material_ids=sorted(contributed_materials),
-            contributed_unit_ids=sorted(contributed_units)[:50],
+            contributed_unit_ids=sorted(contributed_units),
             model_claims=model_claims,
             valid_field_claims=valid_field_claims,
             quote_bound_claims=quote_bound_claims,
@@ -788,43 +841,151 @@ class EvidenceAgent(BaseAgent):
         """Evidence Needs 清单(合并读取的多维提取引导)。"""
         lines = ["Evidence Needs(待证实信息需求):"]
         for index, need in enumerate(needs, start=1):
-            lines.append(f"{index}. [{need.get('priority', 'medium')}] {need.get('need', '')}")
+            lines.append(f"{int(need.get('need_id') or index)}. [{need.get('priority', 'medium')}] {need.get('need', '')}")
         return "\n".join(lines)
 
-    def _coverage_audit(self, facts: list[Fact], needs: list[dict], task_id: str) -> list[dict]:
+    def _coverage_audit(self, facts: list[Fact], needs: list[dict], task_id: str) -> list[dict] | None:
         """Coverage Audit:每个 Need 是否被事实真正支持(LLM 语义判断,无硬编码阈值)。
 
-        返回未被充分证实的 Needs(缺口),供 Iterative Retrieval 补检。
+        返回未被充分证实的 Needs; None 表示未核验,不能视为无缺口。
         """
         if not needs:
+            self.coverage_audit_status = {"status": "complete", "uncovered_need_ids": []}
             return []
+        need_by_id = {int(need.get("need_id") or index): need for index, need in enumerate(needs, start=1)}
         need_facts: dict[int, list[str]] = {}
-        for need_index, need in enumerate(needs, start=1):
+        for need_index, need in need_by_id.items():
             # 真实关系匹配:fact.need_id 由模型标注(非 dimension 猜测)
-            matched = [f.content for f in facts if int(getattr(f, "need_id", 0) or 0) == need_index]
+            matched = [
+                f"[F{getattr(f, 'id', index)}] {f.content}"
+                for index, f in enumerate(facts, start=1)
+                if int(getattr(f, "need_id", 0) or 0) == need_index
+            ]
             # 无标注的开放发现(need_id=0)不自动归属任何 need(避免误判支持)
             need_facts[need_index] = matched
-        need_lines = []
-        for index, need in enumerate(needs, start=1):
-            facts_text = "\n".join(f"  - {c}" for c in need_facts[index]) or "  (无)"
-            need_lines.append(f"{index}. {need.get('need', '')}\n已提取事实:\n{facts_text}")
-        prompt = (
+        from app.runtime_profiles import stage_input_budget_tokens, stage_profile
+
+        prefix = (
             "以下每个 Evidence Need 后列出了当前已提取的相关事实。"
-            "请判断每个 Need 是否已被充分证实(事实能直接回答该需求;若事实缺失、仅侧面提及或无法回答,视为未证实)。\n\n"
-            + "\n\n".join(need_lines) +
-            "\n\n严格输出 JSON:\n{\"uncovered\": [未充分证实的 need 编号数组]}\n"
-            "若全部充分,输出 {\"uncovered\": []}"
+            "逐项判断所列事实能否直接、具体地回答需求；仅侧面提及、过于概括或无法回答，视为未证实。"
+            "同一需求可能分在多个请求中核验；当前请求中的事实是该需求的一部分，判断这一组事实本身是否足以回答。\n\n"
         )
+        suffix = "\n\n严格输出 JSON:\n{\"uncovered\": [未充分证实的 need 编号数组]}\n若全部充分,输出 {\"uncovered\": []}"
+
+        def render_prompt(blocks: list[str]) -> str:
+            return prefix + "\n\n".join(blocks) + suffix
+
+        budget = max(0, int(stage_input_budget_tokens("qa") or 0))
+
+        def fits(blocks: list[str]) -> bool:
+            return count_tokens(_AUDIT_SYSTEM + "\n" + render_prompt(blocks)) <= budget
+
+        # Split only on complete fact records. A single indivisible record that
+        # cannot fit makes the audit unknown rather than silently truncating it.
+        need_chunks: list[tuple[int, str]] = []
+        for need_id, need in need_by_id.items():
+            rows = need_facts[need_id]
+            current_rows: list[str] = []
+            row_groups: list[list[str]] = []
+            if not rows:
+                row_groups.append([])
+            else:
+                for row in rows:
+                    candidate_rows = [*current_rows, row]
+                    block = (
+                        f"{need_id}. {need.get('need', '')}\n"
+                        "已提取事实（本组）:\n" + "\n".join(f"- {value}" for value in candidate_rows)
+                    )
+                    if fits([block]):
+                        current_rows = candidate_rows
+                        continue
+                    if current_rows:
+                        row_groups.append(current_rows)
+                        current_rows = []
+                    single_block = (
+                        f"{need_id}. {need.get('need', '')}\n已提取事实（本组）:\n- {row}"
+                    )
+                    if not fits([single_block]):
+                        self.coverage_audit_status = {
+                            "status": "unknown",
+                            "error": "COVERAGE_RECORD_EXCEEDS_INPUT_BUDGET",
+                            "unknown_need_ids": [need_id],
+                        }
+                        return None
+                    current_rows = [row]
+                if current_rows:
+                    row_groups.append(current_rows)
+            for rows_group in row_groups:
+                facts_text = "\n".join(f"- {value}" for value in rows_group) or "(无)"
+                need_chunks.append((need_id, f"{need_id}. {need.get('need', '')}\n已提取事实（本组）:\n{facts_text}"))
+
+        # Greedily combine distinct needs while the complete system+user prompt
+        # fits the stage budget. Repeated chunks for one need stay in separate calls.
+        batches: list[list[tuple[int, str]]] = []
+        current: list[tuple[int, str]] = []
+        current_ids: set[int] = set()
+        for need_id, block in need_chunks:
+            candidate = [*current, (need_id, block)]
+            if need_id in current_ids or not fits([item[1] for item in candidate]):
+                if current:
+                    batches.append(current)
+                    current, current_ids = [], set()
+                candidate = [(need_id, block)]
+            if not fits([item[1] for item in candidate]):
+                self.coverage_audit_status = {
+                    "status": "unknown",
+                    "error": "COVERAGE_RECORD_EXCEEDS_INPUT_BUDGET",
+                    "unknown_need_ids": [need_id],
+                }
+                return None
+            current = candidate
+            current_ids.add(need_id)
+        if current:
+            batches.append(current)
+
+        uncovered_by_need: dict[int, list[bool]] = {need_id: [] for need_id in need_by_id}
+        batch_count = 0
         try:
-            from app.runtime_profiles import stage_profile
-            payload = self.generate_json(
-                prompt, system=_AUDIT_SYSTEM,
-                max_tokens=stage_profile("qa").output_tokens,
+            for batch in batches:
+                prompt = render_prompt([block for _, block in batch])
+                payload = self.generate_json(
+                    prompt, system=_AUDIT_SYSTEM,
+                    max_tokens=stage_profile("qa").output_tokens,
+                )
+                uncovered = payload.get("uncovered") if isinstance(payload, dict) else None
+                batch_ids = {need_id for need_id, _ in batch}
+                if not isinstance(uncovered, list) or any(
+                    not str(value).isdigit() or int(value) not in batch_ids for value in uncovered
+                ):
+                    raise ValueError("INVALID_COVERAGE_RESULT")
+                uncovered_ids = {int(value) for value in uncovered}
+                for need_id in batch_ids:
+                    uncovered_by_need[need_id].append(need_id in uncovered_ids)
+                batch_count += 1
+            # A need is uncovered only when every complete fact group was audited
+            # as insufficient. Any independently sufficient group establishes coverage.
+            uncovered_ids = sorted(
+                need_id for need_id, results in uncovered_by_need.items()
+                if results and all(results)
             )
-            uncovered = payload.get("uncovered") or []
-            return [needs[int(i) - 1] for i in uncovered if str(i).isdigit() and 0 < int(i) <= len(needs)]
-        except Exception:
-            return []
+            split_ids = sorted(need_id for need_id, results in uncovered_by_need.items() if len(results) > 1)
+            self.coverage_audit_status = {
+                "status": "complete",
+                "uncovered_need_ids": uncovered_ids,
+                "audited_need_ids": sorted(need_by_id),
+                "split_need_ids": split_ids,
+                "batch_count": batch_count,
+            }
+            return [need_by_id[need_id] for need_id in uncovered_ids]
+        except Exception as exc:
+            if str(exc) in {"TASK_PAUSED", "EXECUTION_LOCK_LOST"}:
+                raise
+            self.coverage_audit_status = {
+                "status": "unknown", "error": str(exc)[:300],
+                "audited_batch_count": batch_count,
+                "unknown_need_ids": sorted(need_by_id),
+            }
+            return None
 
     def _record_material_scan(self, task_id: str, dimension: str, material_scan: dict) -> None:
         """材料扫描状态落独立表(可观测性,避免大 payload 反复写任务)。"""

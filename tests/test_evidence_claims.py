@@ -1,7 +1,7 @@
 from contextlib import contextmanager
 from unittest.mock import patch
 
-from app.evidence.extractor import _positive_unit_id, save_claim
+from app.evidence.extractor import _positive_unit_id, _unit_ids_in_text, save_claim
 from app.models.material import Claim
 
 
@@ -55,6 +55,11 @@ def test_missing_or_invalid_unit_id_is_normalized_before_comparison():
     assert _positive_unit_id("") is None
     assert _positive_unit_id(0) is None
     assert _positive_unit_id("42") == 42
+
+
+def test_unit_audit_parses_only_material_unit_markers():
+    text = "[U12 | sample.pdf]\n本文\n[U17 | sample.pdf | 第2页]\n更多本文"
+    assert _unit_ids_in_text(text) == [12, 17]
 
 
 def test_save_pending_claim_persists_null_fact_reference():

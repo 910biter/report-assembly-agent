@@ -63,7 +63,7 @@ _SYSTEM = """你是情报报告撰稿人。依据 Narrative Plan、ChapterPlan �
 4. 事实句引用 fact_ids,推断句引用 inference_ids,id 必须真实存在
 5. 正文不得出现来源标签、内部编号或证据标注;引用关系只写在 JSON 的 fact_ids/inference_ids 中
 6. 只撰写当前指定交付单元,不要扩写成整章或输出其他章节内容
-7. 承上启下、章节导语等过渡句可以没有引用,但应保持少量且不得编造事实
+7. 只有纯粹组织结构、且不包含事实前提或评价判断的过渡句可以没有引用；这类句子必须显式标记 source_level="TRANSITION"，并保持少量简短。事实性或评价性内容不得伪装成过渡句。
 8. 对材料未直接证明的成效、完成状态、数量变化或评价,不得写成既成事实；必须保留证据边界或明确标注待补充
 9. 段落、句式、详略、表格或分项表达由 ChapterPlan、模板风格、材料信息量和分层策略共同决定;不要机械套用固定格式
 10. 不要把无关 Fact 压缩拼接进同一句;一段一主题,一个句子通常只承担一个核心事实或一个直接相关的事实组
@@ -72,7 +72,11 @@ _SYSTEM = """你是情报报告撰稿人。依据 Narrative Plan、ChapterPlan �
 13. Narrative Plan 中 detail_level=expand 的话题应适度展开;brief/reference 只简要承接,不得平均铺陈
 14. paragraphs 是文档自然段,sentences 是段内溯源单位;同一自然段中的多句话应放入同一个 paragraphs[].sentences,不要把每句话都拆成一个 paragraph
 15. 当前交付单元的目标字数是近似目标,不是最低字数。证据充分时完成本单元核心论证并接近目标后收束；
-    若提示中另有明确最低要求则满足该下限。不得用重复表述、空泛套话或虚构事实凑字数；证据不足时可以欠填。"""
+    若提示中另有明确最低要求则满足该下限。不得用重复表述、空泛套话或虚构事实凑字数；证据不足时可以欠填。
+16. Narrative Plan 中 paragraph.target_words 是段落篇幅的分配参考,不是自然段硬下限;相邻计划段若一段只承担引出或过渡、无法独立形成论证,应合并成自然段。不得为保留计划段数制造单句段,也不得靠空泛扩写凑段落目标;交付单元篇幅要求仍按篇幅提示执行。
+17. 引用采用最小且逐句绑定:每个 fact_id/inference_id 都必须直接支持当前句中的具体主张,不得仅因其出现在本段、本小节或 Narrative Plan 中就引用。
+    不得把整段证据列表复制到每一句;一句含多个可独立核验的主张时应拆句并分别绑定。
+    事实陈述优先引用直接事实,分析判断引用对应推断;只有句子确实同时陈述两者时才同时引用。未绑定 ID 的句子只有在纯组织性过渡且显式标记 source_level="TRANSITION" 时才可保留。"""
 
 
 def _filter_facts_by_roles(
@@ -622,11 +626,9 @@ def _coerce_paragraphs(payload: dict) -> list[dict]:
             elif not isinstance(sentences, list):
                 text = str(item.get("text", "")).strip()
                 item["sentences"] = [{"text": text, "fact_ids": [], "inference_ids": []}] if text else []
-            paragraph_fact_ids = item.get("fact_ids") or []
-            paragraph_inference_ids = item.get("inference_ids") or []
             normalized_sentences = []
             for sentence in item.get("sentences") or []:
-                normalized = _normalize_sentence_item(sentence, paragraph_fact_ids, paragraph_inference_ids)
+                normalized = _normalize_sentence_item(sentence)
                 if normalized:
                     normalized_sentences.append(normalized)
             if normalized_sentences:
@@ -655,10 +657,10 @@ def _coerce_paragraphs(payload: dict) -> list[dict]:
     return []
 
 
-def _normalize_sentence_item(sentence, paragraph_fact_ids=None, paragraph_inference_ids=None) -> dict | None:
+def _normalize_sentence_item(sentence) -> dict | None:
     if isinstance(sentence, str):
         text = sentence.strip()
-        return {"text": text, "fact_ids": paragraph_fact_ids or [], "inference_ids": paragraph_inference_ids or []} if text else None
+        return {"text": text, "fact_ids": [], "inference_ids": []} if text else None
     if not isinstance(sentence, dict):
         return None
     text = str(sentence.get("text", "")).strip()
@@ -666,10 +668,9 @@ def _normalize_sentence_item(sentence, paragraph_fact_ids=None, paragraph_infere
         return None
     result = dict(sentence)
     result["text"] = text
-    if not result.get("fact_ids") and paragraph_fact_ids:
-        result["fact_ids"] = paragraph_fact_ids
-    if not result.get("inference_ids") and paragraph_inference_ids:
-        result["inference_ids"] = paragraph_inference_ids
+    # Paragraph-level references cannot identify which sentence they support.
+    result["fact_ids"] = result.get("fact_ids") or []
+    result["inference_ids"] = result.get("inference_ids") or []
     return result
 
 
@@ -1405,8 +1406,9 @@ class WriterAgent(BaseAgent):
                 + "允许引用的事实:\n" + "\n".join(selected_facts) + "\n\n"
                 + "允许引用的推断:\n" + "\n".join(selected_inferences) + "\n\n"
                 + f"{style_block}\n"
-                + "请先按段落执行计划安排开篇、展开、转折与收束，再输出连贯正文。自然段由论证关系决定，不要逐条复述事实；每句事实性内容必须绑定下列允许 ID。"
-                  "严格输出 JSON 对象：{\"paragraphs\":[{\"sentences\":[{\"text\":\"...\",\"fact_ids\":[1],\"inference_ids\":[]}]}]}。"
+                + "请先按段落执行计划安排开篇、展开、转折与收束，再输出连贯正文。自然段由论证关系决定，不要逐条复述事实；每句事实性或评价性内容必须绑定下列允许 ID。"
+                  "纯组织性过渡句若无引用，必须显式标记 source_level=\"TRANSITION\"，且不得含事实前提或评价判断。"
+                  "严格输出 JSON 对象：{\"paragraphs\":[{\"sentences\":[{\"text\":\"...\",\"fact_ids\":[1],\"inference_ids\":[]}]}]}；source_level 仅在纯过渡句时可选填 TRANSITION。"
             )
 
         empty_prompt = build_prompt([], [])
@@ -1480,6 +1482,7 @@ class WriterAgent(BaseAgent):
                 text = str(sentence.get("text") or "").strip()
                 raw_fact_ids = _int_ids(sentence.get("fact_ids"))
                 raw_inference_ids = _int_ids(sentence.get("inference_ids"))
+                sentence_level = str(sentence.get("source_level") or "").strip().upper()
                 rejected_fact_ids.update(set(raw_fact_ids) - allowed_fact_ids)
                 rejected_inference_ids.update(set(raw_inference_ids) - allowed_inference_ids)
                 fact_ids = [item for item in raw_fact_ids if item in allowed_fact_ids]
@@ -1488,7 +1491,7 @@ class WriterAgent(BaseAgent):
                 if not text or key in seen:
                     continue
                 if not fact_ids and not inference_ids:
-                    if transition_budget <= 0 or len(text) > 40:
+                    if sentence_level != "TRANSITION" or transition_budget <= 0 or len(text) > 40:
                         dropped_untraced_sentences += 1
                         continue
                     transition_budget -= 1
@@ -1496,7 +1499,9 @@ class WriterAgent(BaseAgent):
                 accepted_sentences += 1
                 result.append({
                     "text": text, "fact_ids": fact_ids, "inference_ids": inference_ids,
-                    "paragraph": paragraph_number, "source_level": "", "_origin_call_id": call_id,
+                    "paragraph": paragraph_number,
+                    "source_level": "TRANSITION" if not fact_ids and not inference_ids else "",
+                    "_origin_call_id": call_id,
                 })
         update_call_funnel(
             call_id, model_sentences=model_sentences, accepted_sentences=accepted_sentences,
@@ -1591,7 +1596,8 @@ class WriterAgent(BaseAgent):
                     f"用户要求：{instruction}",
                     f"原内容：{original}",
                     "只修改指定范围，保持与前后文衔接。具体事实优先，不得引入未提供的信息。"
-                    "每个事实性句子必须绑定实际支持它的 fact_ids/inference_ids；不得沿用不再支持新表达的旧引用。"
+                    "每个事实性句子必须绑定最小且直接支持它的 fact_ids/inference_ids；不得把整段证据列表复制到每句，"
+                    "不得沿用不再支持新表达的旧引用。"
                     f"严格输出 JSON：{{\"paragraphs\":[{{\"sentences\":[{{\"text\":\"...\",\"fact_ids\":[],\"inference_ids\":[]}}]}}]}}；{output_rule}。",
                 ], weight=6, required_items=4),
                 ContextSection("前后文", context_lines, weight=2),
@@ -2174,6 +2180,7 @@ class WriterAgent(BaseAgent):
               "自然段数量和每段篇幅由规划的语义关系、证据密度与阅读需要决定，不要套用固定段数;"
               "不要把 fact 清单改写成一串短句。输出必须是一个 JSON 对象,优先只包含 paragraphs 字段;"
               "paragraphs 每项代表一个自然段,包含 sentences 数组;sentences 每项包含 text/fact_ids/inference_ids。"
+              "无引用句仅可用于纯组织性过渡,必须额外标记 source_level=\"TRANSITION\"；实质性事实、判断以及反问句中的事实前提都必须绑定依据。"
               "同一自然段内多句话应放在同一个 paragraph 中,不要每句话单独建段。"
               "不要输出小标题或 source_level=\"SUBHEADING\";小标题由系统按 Narrative Plan 渲染。不要输出解释、备选文本、Markdown 代码块或额外字段。"
             )
@@ -2301,9 +2308,10 @@ class WriterAgent(BaseAgent):
                         part_fact_ids = [] if is_subheading else fact_ids
                         part_inf_ids = [] if is_subheading else inf_ids
                         if not part_fact_ids and not part_inf_ids and not is_subheading:
-                            # 无依据句:仅允许少量过渡句(连接词开头/短句),超出丢弃
+                            # Length alone cannot distinguish a transition from a short factual claim.
                             if (
-                                transition_budget <= 0
+                                sentence_level != "TRANSITION"
+                                or transition_budget <= 0
                                 or len(part_text) > 40  # 过渡句长度上限(工程约束,防无依据长句)
                             ):
                                 dropped_untraced_sentences += 1
@@ -2313,7 +2321,10 @@ class WriterAgent(BaseAgent):
                         result.append({
                             "text": part_text, "fact_ids": part_fact_ids, "inference_ids": part_inf_ids,
                             "paragraph": paragraph_number,
-                            "source_level": part.get("source_level", ""),
+                            "source_level": (
+                                "TRANSITION" if not part_fact_ids and not part_inf_ids
+                                else part.get("source_level", "")
+                            ),
                             "trace_granularity_warning": trace_warning and not is_subheading,
                             "_origin_call_id": call_id,
                         })
@@ -2407,8 +2418,25 @@ class WriterAgent(BaseAgent):
              if t.get("topic_id") == qa_item.get("topic_id")),
             {},
         )
-        tids = {int(fid) for fid in (topic.get("fact_ids") or []) if str(fid).isdigit()}
-        support_facts = [f for f in chapter_facts if f.get("id") in tids] or chapter_facts
+        tids = set(_int_ids(topic.get("fact_ids")))
+        topic_inference_ids = set(_int_ids(topic.get("inference_ids")))
+        support_facts = [f for f in chapter_facts if int(f.get("id") or 0) in tids] or chapter_facts
+        if topic_inference_ids:
+            support_inferences = [
+                item for item in chapter_inferences
+                if int(item.get("id") or 0) in topic_inference_ids
+            ]
+        elif tids:
+            support_inferences = [
+                item for item in chapter_inferences
+                if set(_int_ids(item.get("based_fact_ids"))) & tids
+            ]
+        else:
+            support_inferences = []
+        allowed_rewrite_fact_ids = {int(item.get("id") or 0) for item in support_facts} & valid_fact_ids
+        allowed_rewrite_inference_ids = {
+            int(item.get("id") or 0) for item in support_inferences
+        } & valid_inf_ids
         from app.runtime_profiles import stage_input_budget_tokens
 
         budget = stage_input_budget_tokens("writer")
@@ -2421,7 +2449,8 @@ class WriterAgent(BaseAgent):
                     f"章节:{chapter_title}(局部重写第 {target} 段,保持与前后段衔接)",
                     f"待改进方面:{missing}",
                     "请重写该段落:解决待改进方面,用支撑事实展开,不要罗列事实编号,"
-                    "不要重复段落外的内容。输出 JSON,优先只包含 paragraphs 字段"
+                    "不要重复段落外的内容。引用须最小且逐句绑定,每个 ID 都必须直接支持对应句子;"
+                    "不得将整段或整个主题的证据列表复制到每句。输出 JSON,优先只包含 paragraphs 字段"
                     "(一个自然段对象,内部 sentences 每项含 text/fact_ids/inference_ids)。",
                 ], weight=4, required_items=3),
                 ContextSection("Narrative Topic", ["Narrative Topic 计划:", topic_block], weight=4, required_items=2),
@@ -2429,6 +2458,10 @@ class WriterAgent(BaseAgent):
                 ContextSection("支撑事实", ["支撑事实:", *[
                     f"{fact['id']}. {fact.get('content', '')}" for fact in support_facts
                 ]], weight=5),
+                ContextSection("支撑推断", ["支撑推断:", *[
+                    f"{item['id']}. 依据事实={item.get('based_fact_ids') or []}；{item.get('content', '')}"
+                    for item in support_inferences
+                ]], weight=4),
             ],
             budget,
         )
@@ -2444,7 +2477,8 @@ class WriterAgent(BaseAgent):
                     continue
                 text = str(sentence.get("text", "")).strip()
                 fact_ids = [i for i in _int_ids(sentence.get("fact_ids")) if i in valid_fact_ids]
-                inf_ids = [i for i in _int_ids(sentence.get("inference_ids")) if i in valid_inf_ids]
+                inf_ids = [i for i in _int_ids(sentence.get("inference_ids")) if i in allowed_rewrite_inference_ids]
+                fact_ids = [i for i in fact_ids if i in allowed_rewrite_fact_ids]
                 if not fact_ids and not inf_ids:
                     continue  # 重写句也必须有依据
                 new_sentences.append({"text": text, "fact_ids": fact_ids, "inference_ids": inf_ids})

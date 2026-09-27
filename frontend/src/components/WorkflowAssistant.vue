@@ -576,10 +576,15 @@ onBeforeUnmount(() => {
                 </dd>
               </div>
               <div>
-                <dt>证据批次</dt>
+                <dt>证据阶段</dt>
                 <dd>
-                  {{ task?.evidence_progress?.done || 0 }} /
-                  {{ task?.evidence_progress?.total || "—" }}
+                  <template v-if="task?.evidence_progress?.status === 'stale'">
+                    历史进度不可用
+                  </template>
+                  <template v-else>
+                    {{ task?.evidence_progress?.done || 0 }} /
+                    {{ task?.evidence_progress?.total || "—" }}
+                  </template>
                 </dd>
               </div>
               <div>

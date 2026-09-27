@@ -80,6 +80,7 @@ from app.template_engine.compiler import COMPILER_VERSION
 from app.token_monitor import build_token_efficiency, build_workload_profile, list_llm_calls
 from app.workflow import WorkflowController
 from app.workflow.queue import enqueue_task, request_control, task_queue_status
+from app.workflow.progress import progress_for_display
 
 router = APIRouter(prefix="/api")
 
@@ -624,7 +625,7 @@ def _assistant_task_context(task_id: str, task: dict) -> dict:
         "queue_status": task.get("queue_status") or {},
         "parse_progress": task.get("parse_progress") or {},
         "material_analysis_progress": task.get("material_analysis_progress") or {},
-        "evidence_progress": task.get("evidence_progress") or {},
+        "evidence_progress": progress_for_display(task.get("evidence_progress")),
         "write_progress": task.get("write_progress") or {},
         "error": task.get("error") or task.get("failure_reason") or "",
         "updated_at": task.get("updated_at") or task.get("last_progress_at"),
@@ -2038,6 +2039,7 @@ def _report_task_index() -> dict[int, dict]:
 def _task_view(payload: dict) -> dict:
     """Return UI-safe task payload without mutating historical task records."""
     view = dict(payload or {})
+    view["evidence_progress"] = progress_for_display(view.get("evidence_progress"))
     stage = str(view.get("stage") or "")
     queue_status = dict(view.get("queue_status") or {})
     queue_state = str(queue_status.get("status") or "")

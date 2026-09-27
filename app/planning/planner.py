@@ -19,6 +19,8 @@ from app.document_shape import normalize_document_shape, normalize_composition_m
 from app.planning.scale import normalize_chapter_budgets, reconcile_scale_budget
 from app.planning.structure import normalize_contract
 from app.runtime_profiles import stage_input_budget_tokens
+from app.observability.core_chain import collect_assigned_ids, extract_tagged_ids
+from app.token_monitor import update_call_funnel
 
 _SYSTEM = """你是情报报告分析规划师。根据用户主题、材料摘要与机构风格,只制定分析问题与证据提取方向,不要冻结最终报告章节。
 严格输出 JSON,不要任何解释:
@@ -51,8 +53,9 @@ _SYSTEM = """你是情报报告分析规划师。根据用户主题、材料摘�
 2. 模板主要用于格式、标题层级、编号和版式;除非模板策略明确 HARD_STRUCTURE,不得把模板目录当成最终报告目录
 3. dimensions/required_facts 只是优先检索与重点发现方向,不是事实边界;Evidence 必须允许材料中出现的高价值新事实进入
 4. 初步分析假设不是最终叙事逻辑,后续 Final Planner 不需要继承,应以真实 Facts/Inferences 为准
-5. 规模预算依据:用户明确字数要求(如有)、报告类型档位
-   用户明确篇幅（如有）、材料信息量、章节数与重要性；未明确时不要套用预设字数档位。
+5. report_budget 是初步估算,不是最终写作约束。用户明确字数要求时原样保留；未明确时,
+   仅根据当前已知目标范围和材料理解给出暂定建议,不得套用固定报告类型/材料数量字数档位。
+   Evidence 与 Analysis 完成后,Final Planner 必须根据实际证据覆盖、信息丰富度和论证深度重新评估。
 6. 最终报告结构将在 Evidence + Analysis 后另行生成,届时由真实 Fact/Inference 和核心结论决定。
     7. handles_missing_information 必须根据本章目的判断是否需要主动说明材料缺口;不要根据标题关键词猜测。
     8. 【证据需求拆分——最重要的要求】evidence_needs 应覆盖完成用户目标所需的可查证问题:
@@ -139,8 +142,9 @@ _FINAL_SYSTEM = """你是情报报告结构总规划师。现在 Evidence 与 An
 6. 初步分析主线只是假设与关注方向;如果 Facts/Inferences 指向不同逻辑,必须调整,不得为继承早期规划而牺牲内容合理性
 7. 每个重要事实原则上只在最合适章节完整展开一次,其他章节只做必要承接
 8. 证据不足的主题不得硬设独立章节或小节凑结构,应合并为边界、风险或待补充说明。
-9. report_budget 是 Analysis 后冻结的全文唯一规模预算。它应综合用户目标、Facts、Inferences 与章节结构;
-   下游不得再次静默缩减。证据不足时允许 underfill,但必须给出 underfill_reason,禁止为写满而重复或虚构。
+9. report_budget 是 Analysis 后形成的全文规模预算。用户明确字数/范围时必须遵守；用户未明确时,
+   不得机械复制初步预算,应依据实际 Facts/Inferences 的覆盖广度、信息丰富度、证据支撑深度和最终章节任务重新估算。
+   min_words/max_words 必须与该估算相符；证据不足时允许 underfill,但必须给出 underfill_reason,禁止为写满而重复或虚构。
 10. 【文档形态】先判断本次应是正式报告、研究综述、分节文章、连续文章、推送还是新闻稿。文档形态由用户目标、受众、材料和已学习文风共同决定；模板的目录样例不是默认答案。
 11. 连续文章或新闻稿可使用内部语义单元组织证据，但 section_policy 应为 hidden，导出和阅读界面不得显示章节标题或自动编号。分节文章的标题通常为 plain，只有正式报告或明确要求编号时才用 numbered。
 12. composition_mode 决定 Writer 的调用边界，而非标题是否显示：正式报告/研究综述通常为 chaptered；连续文章、推送和新闻稿通常为 article_beats。article_beats 下 chapters 仍是内部证据弧线，必须保留事实归属，但不能要求 Writer 分章拼接成文。
@@ -368,12 +372,32 @@ class PlannerAgent(BaseAgent):
             ContextSection("instruction", [instruction], weight=5, required_items=1),
             ContextSection("planning_context", context_block.splitlines(), weight=3, required_items=1),
         ], stage_input_budget_tokens("final_planner"))
-        payload = self.generate_json(
-            prompt,
-            system=_FINAL_SYSTEM,
-            max_tokens=settings.final_planner_output_tokens,
-        )
+        input_fact_ids = extract_tagged_ids(prompt, "fact_id")
+        input_inference_ids = extract_tagged_ids(prompt, "inference_id")
+        try:
+            payload = self.generate_json(
+                prompt,
+                system=_FINAL_SYSTEM,
+                max_tokens=settings.final_planner_output_tokens,
+            )
+        except Exception as exc:
+            update_call_funnel(
+                self.last_call_id,
+                final_plan_input_fact_ids=input_fact_ids,
+                final_plan_input_inference_ids=input_inference_ids,
+                final_plan_generation_error=str(exc)[:300],
+            )
+            raise
+        call_id = self.last_call_id
         chapters = payload.get("chapters") if isinstance(payload.get("chapters"), list) else []
+        update_call_funnel(
+            call_id,
+            final_plan_input_fact_ids=input_fact_ids,
+            final_plan_input_inference_ids=input_inference_ids,
+            final_plan_candidate_fact_ids=collect_assigned_ids(chapters, "fact"),
+            final_plan_candidate_inference_ids=collect_assigned_ids(chapters, "inference"),
+            final_plan_candidate_chapter_count=len(chapters),
+        )
         if required_chapter_count and len(chapters) != int(required_chapter_count):
             raise ValueError(
                 f"FINAL_PLAN_CHAPTER_COUNT_MISMATCH: expected={int(required_chapter_count)}, "
@@ -417,6 +441,11 @@ class PlannerAgent(BaseAgent):
         normalized = normalize_contract({"chapter_plans": chapters})
         plan.chapter_plans = normalized["chapter_plans"]
         plan.structure = [c.get("title", "") for c in plan.chapter_plans]
+        update_call_funnel(
+            call_id,
+            final_plan_assigned_fact_ids=collect_assigned_ids(plan.chapter_plans, "fact"),
+            final_plan_assigned_inference_ids=collect_assigned_ids(plan.chapter_plans, "inference"),
+        )
         plan.final_plan_json = _plan_snapshot(plan, "final")
         return update_plan(plan)
 

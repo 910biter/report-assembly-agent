@@ -9,6 +9,21 @@ from app.planning.structure import normalize_topic, serializable_memory
 from app.rendering.headings import strip_heading_prefix
 from app.task_artifacts import save_task_artifact
 from app.context_budget import ContextSection, build_prompt_from_sections
+from app.observability.core_chain import collect_assigned_ids
+from app.token_monitor import update_call_funnel
+
+
+def _prompt_visible_ids(prompt: str, items: list[dict]) -> list[int]:
+    """Match complete evidence records retained in a budgeted narrative prompt."""
+    rendered = "\n" + str(prompt or "").strip() + "\n"
+    visible = set()
+    for item in items:
+        if item.get("id") is None:
+            continue
+        record = f"{int(item['id'])}. {item.get('content', '')}"
+        if "\n" + record + "\n" in rendered:
+            visible.add(int(item["id"]))
+    return sorted(visible)
 
 _SYSTEM = """你是报告章节叙事规划师。你的任务不是写正文,而是在 Writer 写作前组织事实。
 严格输出 JSON,不要任何解释:
@@ -70,7 +85,8 @@ _SYSTEM = """你是报告章节叙事规划师。你的任务不是写正文,而
     话题、主要事实/推断和目标篇幅,各小节 target_words 总和应接近章节目标。
 12. 每个小节可规划 paragraphs，paragraph 是成文时需要保持的语义边界，而不是固定段数模板。
     只在话题、论证层次或读者阅读负担确有变化时拆段；直接相关的事实可以同段表达。每个 paragraph
-    必须说明目的和所用证据，Writer 负责把它自然写成多句正文，不得逐条罗列。
+    必须说明目的和所用证据，Writer 负责把它自然写成多句正文，不得逐条罗列。相邻论证连续且前段仅承担引出或过渡时,
+    不要把它单独规划成自然段; paragraph.target_words 只是篇幅分配参考,不是每段必须独立达到的字数。
 13. evidence_status 判断“当前事实与推断能否支撑计划目的和目标篇幅”。证据有限时保留原目标预算，
     但明确缺口；不得通过重复、常识扩写或无依据概括把 limited/insufficient 伪装成 sufficient。"""
 
@@ -169,7 +185,10 @@ class NarrativeAgent(BaseAgent):
             500,
             int(settings.writer_output_tokens * settings.writer_visible_word_token_ratio),
         )
-        prompt = (
+        from app.runtime_profiles import stage_input_budget_tokens
+
+        chapter_contract = f"当前章节规划:{json.dumps(chapter_plan, ensure_ascii=False)}"
+        instructions = (
             f"全文标题:{report_plan.get('title','')}\n"
             f"全文核心判断:{report_plan.get('core_judgment','')}\n"
             f"全文叙事逻辑:{report_plan.get('narrative_logic','')}\n"
@@ -178,20 +197,62 @@ class NarrativeAgent(BaseAgent):
             f"单个小节一次生成的建议安全规模:不超过约 {safe_unit_words} 字。"
             "若章节较长且存在多个真实语义层次,应据此规划多个有独立目的的小节;"
             "不得为了切分长度制造无意义小节。\n"
-            f"当前章节规划:{json.dumps(chapter_plan, ensure_ascii=False)}\n"
-            f"前文记忆:{json.dumps(serializable_memory(report_memory or {}), ensure_ascii=False)}\n"
-            + (f"业务/证据边界:\n{business_block}\n" if business_block else "")
-            + "可用 Facts:\n"
-            + "\n".join(f"{f['id']}. {f.get('content','')}" for f in facts)
-            + "\n\n可用 Inferences:\n"
-            + "\n".join(f"{i['id']}. {i.get('content','')}" for i in inferences)
-            + "\n\n请输出本章 Narrative Plan JSON。"
+            "请输出本章 Narrative Plan JSON。"
         )
+        prompt, context_audit = build_prompt_from_sections(
+            "narrative",
+            [
+                ContextSection("章节契约", [chapter_contract], weight=5),
+                ContextSection("任务要求", [instructions], weight=5),
+                ContextSection("证据边界", [business_block], weight=4),
+                ContextSection("前文记忆", [
+                    f"前文记忆:{json.dumps(serializable_memory(report_memory or {}), ensure_ascii=False)}",
+                ], weight=1),
+                ContextSection("事实", ["可用 Facts:"] + [
+                    f"{f['id']}. {f.get('content', '')}" for f in facts
+                ], weight=5, required_items=2),
+                ContextSection("推断", ["可用 Inferences:"] + [
+                    f"{i['id']}. {i.get('content', '')}" for i in inferences
+                ], weight=3, required_items=2),
+            ], stage_input_budget_tokens("narrative"),
+        )
+        generation_error = ""
+        self.last_call_id = ""
         try:
+            if chapter_contract not in prompt or instructions not in prompt:
+                raise ValueError("NARRATIVE_CONTRACT_EXCEEDS_INPUT_BUDGET")
             payload = self.generate_json(prompt)
-        except Exception:
+            if not isinstance(payload, dict) or not (payload.get("topics") or payload.get("subsections")):
+                raise ValueError("EMPTY_NARRATIVE_PLAN")
+        except Exception as exc:
+            if str(exc) in {"TASK_PAUSED", "EXECUTION_LOCK_LOST"}:
+                raise
             payload = {}
-        plan = _sanitize_plan(payload, chapter_plan, fact_ids, inference_ids)
+            generation_error = str(exc)[:300]
+        call_id = self.last_call_id
+        input_fact_ids = _prompt_visible_ids(prompt, facts)
+        input_inference_ids = _prompt_visible_ids(prompt, inferences)
+        plan = _sanitize_plan(
+            payload, chapter_plan,
+            fact_ids if generation_error else set(input_fact_ids),
+            inference_ids if generation_error else set(input_inference_ids),
+        )
+        plan.update(
+            generation_status="fallback" if generation_error else "generated",
+            generation_error=generation_error,
+            context_audit=context_audit,
+        )
+        update_call_funnel(
+            call_id,
+            narrative_scope="chapter",
+            narrative_input_fact_ids=input_fact_ids,
+            narrative_omitted_fact_ids=sorted(fact_ids - set(input_fact_ids)),
+            narrative_input_inference_ids=input_inference_ids,
+            narrative_omitted_inference_ids=sorted(inference_ids - set(input_inference_ids)),
+            narrative_assigned_fact_ids=collect_assigned_ids(plan, "fact"),
+            narrative_assigned_inference_ids=collect_assigned_ids(plan, "inference"),
+            narrative_generation_error=generation_error,
+        )
         try:
             save_task_artifact(
                 task_id,
@@ -241,14 +302,44 @@ class NarrativeAgent(BaseAgent):
             ],
             stage_input_budget_tokens("narrative"),
         )
+        generation_error = ""
         try:
             payload = self.generate_json(
                 prompt, system=_DOCUMENT_SYSTEM,
                 max_tokens=stage_profile("narrative").output_tokens,
             )
-        except Exception:
+        except Exception as exc:
+            if str(exc) in {"TASK_PAUSED", "EXECUTION_LOCK_LOST"}:
+                raise
             payload = {}
-        plan = _sanitize_document_plan(payload, report_plan, fact_ids, inference_ids)
+            generation_error = str(exc)[:300]
+        call_id = self.last_call_id
+        input_fact_ids = _prompt_visible_ids(prompt, facts)
+        input_inference_ids = _prompt_visible_ids(prompt, inferences)
+        if not isinstance(payload, dict) or not payload.get("beats"):
+            payload = {}
+            generation_error = generation_error or "EMPTY_NARRATIVE_PLAN"
+        plan = _sanitize_document_plan(
+            payload, report_plan,
+            fact_ids if generation_error else set(input_fact_ids),
+            inference_ids if generation_error else set(input_inference_ids),
+        )
+        plan.update(
+            generation_status="fallback" if generation_error else "generated",
+            generation_error=generation_error,
+            context_audit=_audit,
+        )
+        update_call_funnel(
+            call_id,
+            narrative_scope="document",
+            narrative_input_fact_ids=input_fact_ids,
+            narrative_omitted_fact_ids=sorted(fact_ids - set(input_fact_ids)),
+            narrative_input_inference_ids=input_inference_ids,
+            narrative_omitted_inference_ids=sorted(inference_ids - set(input_inference_ids)),
+            narrative_assigned_fact_ids=collect_assigned_ids(plan, "fact"),
+            narrative_assigned_inference_ids=collect_assigned_ids(plan, "inference"),
+            narrative_generation_error=generation_error,
+        )
         if task_id:
             try:
                 save_task_artifact(

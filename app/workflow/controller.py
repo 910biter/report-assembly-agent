@@ -6,6 +6,7 @@ narrative writing -> quality review. Task payload drives the UI, while stage
 artifacts and dependency signatures provide durable audit and safe resume.
 """
 import json
+import logging
 import re
 import time
 from copy import deepcopy
@@ -49,11 +50,27 @@ from app.report_versions import (
 
 from app.task_artifacts import save_task_artifact
 from app.task_runs import update_task_run
-from app.token_monitor import build_token_efficiency, build_workload_profile, token_context
+from app.token_monitor import build_token_efficiency, build_workload_profile, list_llm_calls, token_context
 from app.context_budget import count_tokens, publish_context_audit, tokenizer_method, truncate_tokens
 from app.runtime_profiles import stage_input_budget_tokens
+from app.observability.core_chain import aggregate_generation_units, audit_id_flow, collect_assigned_ids
 from app.workflow.stage_state import stage_input_signature, signature_matches
 from app.workflow.stages import stage_rank
+
+logger = logging.getLogger(__name__)
+
+
+def _article_scale_completion(execution_actual_words: int, report_actual_words: int,
+                              target_words: int) -> tuple[int, float | None]:
+    actual = int(execution_actual_words or report_actual_words or 0)
+    target = int(target_words or 0)
+    return actual, round(actual / target, 4) if target else None
+
+
+def _evidence_checkpoint_complete(task: dict, expected_signature: str) -> bool:
+    """Progress counters are display data; only the completed input signature proves reuse is safe."""
+    return bool(task.get("fact_ids")) and signature_matches(task, "evidence", expected_signature)
+
 
 _MATERIAL_ANALYSIS_PROMPT = """你是材料分析师。理解一份情报材料,输出 JSON:
 {
@@ -273,6 +290,17 @@ class WorkflowController:
         return stage_rank(resume_from) > stage_rank(stage)
 
     def run_to_review(self) -> str:
+        try:
+            return self._run_to_review()
+        except Exception as exc:
+            if str(exc) != "TASK_PAUSED":
+                try:
+                    self._save_failed_core_chain_audit(exc)
+                except Exception:
+                    logger.exception("Could not persist failure audit for task %s", self.task_id)
+            raise
+
+    def _run_to_review(self) -> str:
         """跑完 解析→去重→规划→事实→冲突→分析→写作,停在评审阶段等待用户。
 
         各阶段耗时记录到 task.stage_timings(自阶段起点累计秒数),便于定位热点。
@@ -377,29 +405,21 @@ class WorkflowController:
                 evidence_progress={"status": "reused", "fact_count": len(facts)},
                 evidence_input_signature=evidence_signature,
             )
-        elif (self.task.get("fact_ids")
-              and str(self.task.get("evidence_active_signature") or "") == evidence_signature):
-            # 断点续跑(维度级):evidence_progress.done 记录已完成维度数
-            ep = self.task.get("evidence_progress") or {}
-            done = int(ep.get("done") or 0)
-            total = int(ep.get("total") or 0)
-            if done >= total and total > 0:
-                self._update(
-                    stage=str(Stage.EVIDENCE),
-                    evidence_progress={"done": done, "total": total, "status": "resumed"},
-                )
-                self._ensure_context_manager()
-                facts = self._facts()
-            else:
-                self._update(stage=str(Stage.EVIDENCE), resume={"stage": "evidence", "status": "partial"})
-                facts = self.extract_evidence()
+        elif _evidence_checkpoint_complete(self.task, evidence_signature):
+            # A matching completed signature is the checkpoint. Progress counters
+            # describe extractor phases and must never be interpreted as work counts.
+            self._update(stage=str(Stage.EVIDENCE), evidence_progress={"status": "reused"})
+            self._ensure_context_manager()
+            facts = self._facts()
         else:
             self._update(
-                evidence_active_signature=evidence_signature,
                 evidence_progress={"done": 0, "total": 0, "status": "starting"},
             )
             with self._token_context("evidence"):
                 facts = self.extract_evidence()
+            progress = dict(self.task.get("evidence_progress") or {})
+            progress.update(status="completed", fact_count=len(facts))
+            self._update(evidence_input_signature=evidence_signature, evidence_progress=progress)
         self._control_boundary()
         if self.task.get("incremental_update") and self.task.get("incremental_new_fact_ids"):
             lifecycle = reconcile_incremental_lifecycle(
@@ -721,6 +741,22 @@ class WorkflowController:
             finished=True,
         )
         return "review"
+
+    def _save_failed_core_chain_audit(self, error: Exception) -> None:
+        try:
+            plan = self._plan()
+        except Exception:
+            plan = {}
+        raw_report_id = self.task.get("report_id")
+        report_id = int(raw_report_id) if str(raw_report_id or "").isdigit() else None
+        self._save_core_chain_audit(
+            plan,
+            report_id,
+            [],
+            {},
+            status="failed",
+            error=str(error)[:400],
+        )
 
     def _complete_document_analysis(
         self,
@@ -1359,7 +1395,9 @@ class WorkflowController:
         )
 
     def extract_evidence(self) -> list[dict]:
-        self._update(stage=str(Stage.EVIDENCE))
+        self._update(stage=str(Stage.EVIDENCE), evidence_status={
+            "status": "running", "run_id": str(self.task.get("run_id") or ""),
+        })
         from app.context import ContextManager
 
         plan = self._plan()
@@ -1391,8 +1429,14 @@ class WorkflowController:
             cm=self.cm, insights=insights,
             required_facts=required_facts,
             task_id=self.task_id,
-            progress_callback=lambda done, total: self._update(evidence_progress={"done": done, "total": total}),
+            progress_callback=lambda done, total: self._update(evidence_progress={
+                "done": done, "total": total, "status": "running", "unit": "phase",
+            }),
         )
+        self._update(evidence_status={
+            **evidence_agent.last_extraction_status,
+            "run_id": str(self.task.get("run_id") or ""),
+        })
         # A batch can persist Facts before a later batch fails. Recover those
         # task-owned rows on resume instead of relying only on the final task
         # payload update, which is intentionally written after extraction.
@@ -1438,7 +1482,14 @@ class WorkflowController:
             # 关系判定(确定性冲突检测:同主题不同数值 → contradicts 落库)
             from app.intelligence.consolidate import resolve_relations
             resolve_relations(clusters, fact_rows, self.task_id)
-            ledger = build_ledger(self.task_id, needs, fact_rows)
+            extraction = self.task.get("evidence_status") or {}
+            coverage = dict(extraction.get("coverage") or {"status": "unknown"})
+            if extraction.get("status") != "complete":
+                coverage["status"] = "unknown"
+            ledger = build_ledger(
+                self.task_id, extraction.get("needs") or needs, fact_rows,
+                gaps=extraction.get("uncovered_needs"), coverage=coverage,
+            )
             persist_ledger(self.task_id, ledger)
             self._update(intelligence_ledger=ledger)
             self._update(intelligence_status={
@@ -1564,6 +1615,7 @@ class WorkflowController:
         ledger_block = ""
         if ledger:
             gaps = "、".join(str(g) for g in (ledger.get("information_gaps") or []))
+            unverified = "、".join(str(g) for g in (ledger.get("unverified_needs") or []))
             clusters = "; ".join(
                 f"{c.get('key', '')[:40]}({c.get('status', '')})"
                 for c in (ledger.get("fact_clusters") or [])
@@ -1573,7 +1625,8 @@ class WorkflowController:
             )
             ledger_block = truncate_tokens((
                 f"情报底稿(供分析参考):\n"
-                f"- 信息缺口:{gaps or '无'}\n"
+                f"- 已识别信息缺口:{gaps or '未记录'}\n"
+                f"- 覆盖尚未核验:{unverified or '无'}。未核验不等于材料缺失或事实不存在。\n"
                 f"- 事实聚簇:{clusters or '无'}\n"
                 f"- 事实关系:{relations or '无'}\n"
             ), max(512, settings.analysis_facts_per_batch * 24))
@@ -1618,9 +1671,16 @@ class WorkflowController:
             "、".join(str(c.get("description") or c.get("note") or "") for c in (conflicts or [])),
         )
         inferences = local_inferences + global_inferences
-        self._update(analysis_group_audit=_semantic_group_coverage(
+        combined_group_audit = _semantic_group_coverage(
             analysis_facts, local_inferences + global_inferences,
-        ))
+        )
+        self._update(analysis_group_audit={
+            **combined_group_audit,
+            "by_scope": {
+                "local": _semantic_group_coverage(analysis_facts, local_inferences),
+                "global": _semantic_group_coverage(analysis_facts, global_inferences),
+            },
+        })
         generated_ids = [int(i.id) for i in inferences if i.id is not None]
         generated_external_ids = [int(i.id) for i in external if i.id is not None]
         if self.task.get("incremental_update"):
@@ -2077,17 +2137,17 @@ class WorkflowController:
         with session_scope() as s:
             rows = s.execute(select(
                 ORMSentence.c.section, ORMSentence.c.content, ORMSentence.c.user_edit,
+                ORMSentence.c.source_level,
             ).where(
                 ORMSentence.c.report_id == report_id, ORMSentence.c.selected == 1,
             )).mappings().all()
-        from app.writing.scale_execution import measure_text_words
+        from app.writing.scale_execution import (
+            assess_report_scale,
+            measure_report_body_words_by_section,
+            report_minimum_words,
+        )
 
-        chapter_parts: dict[str, list[str]] = {}
-        for row in rows:
-            chapter_parts.setdefault(str(row["section"]), []).append(str(row["user_edit"] or row["content"] or ""))
-        actual_by_chapter = {
-            section: measure_text_words("".join(parts)) for section, parts in chapter_parts.items()
-        }
+        actual_by_chapter = measure_report_body_words_by_section(rows)
         execution_by_chapter: dict[str, dict] = {}
         with session_scope() as s:
             execution_rows = s.execute(
@@ -2112,19 +2172,36 @@ class WorkflowController:
         chapter_stats = []
         if composition_mode == "article_beats":
             execution = execution_by_chapter.get("正文") or {}
-            actual = int(actual_by_chapter.get("__article__", 0))
+            report_actual = int(actual_by_chapter.get("__article__", 0))
+            target = int((plan.get("budget") or {}).get("target_words") or 0)
+            article_actual, article_completion = _article_scale_completion(
+                execution.get("actual_words"), report_actual, target,
+            )
+            unit_stats = list(execution.get("generation_unit_stats") or [])
+            unit_aggregate = aggregate_generation_units(unit_stats)
+            has_unit_id_audit = any("planned_fact_ids" in item for item in unit_stats)
+            planned_fact_ids = set(unit_aggregate.get("planned_fact_ids") or [])
+            cited_fact_ids = set(unit_aggregate.get("cited_fact_ids") or [])
             chapter_stats.append({
-                "chapter": "正文", "target_words": int((plan.get("budget") or {}).get("target_words") or 0),
-                "actual_words": actual,
-                "completion_rate": round(actual / max(int((plan.get("budget") or {}).get("target_words") or 0), 1), 4),
+                "chapter": "正文", "target_words": target,
+                "actual_words": article_actual,
+                "completion_rate": article_completion,
                 "generation_units": int(execution.get("generation_units") or 1),
                 "generation_calls": int(execution.get("generation_calls") or 1),
-                "generation_unit_stats": list(execution.get("generation_unit_stats") or []),
-                "planned_fact_count": int(execution.get("planned_fact_count") or 0),
-                "used_fact_count": len(execution.get("fact_ids") or []),
-                "unused_planned_fact_count": 0,
+                "generation_unit_stats": unit_stats,
+                "planned_fact_count": (
+                    unit_aggregate["planned_fact_count"] if has_unit_id_audit
+                    else int(execution.get("planned_fact_count") or 0)
+                ),
+                "used_fact_count": (
+                    unit_aggregate["cited_fact_count"] if has_unit_id_audit
+                    else len(execution.get("fact_ids") or [])
+                ),
+                "unused_planned_fact_count": (
+                    len(planned_fact_ids - cited_fact_ids) if has_unit_id_audit else None
+                ),
                 "underfill_reason": str(execution.get("underfill_reason") or ""),
-                "generated_words": int(execution.get("actual_words") or actual),
+                "generated_words": article_actual,
                 "previous_words": 0,
             })
         for chapter in ([] if composition_mode == "article_beats" else plan.get("chapter_plans") or []):
@@ -2133,6 +2210,10 @@ class WorkflowController:
             actual = int(actual_by_chapter.get(chapter_name, 0))
             execution = execution_by_chapter.get(chapter_name) or {}
             unit_stats = list(execution.get("generation_unit_stats") or [])
+            unit_aggregate = aggregate_generation_units(unit_stats)
+            has_unit_id_audit = any("planned_fact_ids" in item for item in unit_stats)
+            planned_fact_ids = set(unit_aggregate.get("planned_fact_ids") or [])
+            cited_fact_ids = set(unit_aggregate.get("cited_fact_ids") or [])
             chapter_stats.append({
                 "chapter": chapter_name,
                 "target_words": target,
@@ -2141,10 +2222,18 @@ class WorkflowController:
                 "generation_units": int(execution.get("generation_units") or 0),
                 "generation_calls": int(execution.get("generation_calls") or 0),
                 "generation_unit_stats": unit_stats,
-                "planned_fact_count": sum(int(item.get("planned_fact_count") or 0) for item in unit_stats),
-                "used_fact_count": sum(int(item.get("used_fact_count") or 0) for item in unit_stats),
-                "unused_planned_fact_count": sum(
-                    len(item.get("unused_planned_fact_ids") or []) for item in unit_stats
+                "planned_fact_count": (
+                    unit_aggregate["planned_fact_count"] if has_unit_id_audit
+                    else sum(int(item.get("planned_fact_count") or 0) for item in unit_stats)
+                ),
+                "used_fact_count": (
+                    unit_aggregate["cited_fact_count"] if has_unit_id_audit
+                    else sum(int(item.get("used_fact_count") or 0) for item in unit_stats)
+                ),
+                "unused_planned_fact_count": (
+                    len(planned_fact_ids - cited_fact_ids)
+                    if has_unit_id_audit
+                    else sum(len(item.get("unused_planned_fact_ids") or []) for item in unit_stats)
                 ),
                 "underfill_reason": str(execution.get("underfill_reason") or ""),
                 "generated_words": int(execution.get("actual_words") or actual),
@@ -2152,28 +2241,75 @@ class WorkflowController:
             })
         budget = dict(plan.get("budget") or {})
         target_words = int(budget.get("target_words") or sum(item["target_words"] for item in chapter_stats))
-        minimum_words = int(
-            budget.get("min_words")
-            or round(target_words * settings.writer_min_budget_completion_ratio)
-        ) if target_words else 0
+        minimum_words = report_minimum_words(
+            target_words, budget, settings.writer_min_budget_completion_ratio,
+        )
         actual_words = sum(actual_by_chapter.values())
         completion_rate = round(actual_words / max(target_words, 1), 4) if target_words else 0
-        planned_fact_total = sum(item["planned_fact_count"] for item in chapter_stats)
-        unused_planned_fact_total = sum(item["unused_planned_fact_count"] for item in chapter_stats)
-        planned_fact_coverage = (
-            round((planned_fact_total - unused_planned_fact_total) / planned_fact_total, 4)
-            if planned_fact_total else None
+        scale_audit = assess_report_scale(
+            target_words,
+            actual_words,
+            budget.get("output_bounds"),
         )
+        all_generation_units = [
+            unit for chapter in chapter_stats for unit in chapter.get("generation_unit_stats", [])
+        ]
+        generation_aggregate = aggregate_generation_units(all_generation_units)
+        if any("planned_fact_ids" in unit for unit in all_generation_units):
+            planned_fact_coverage = generation_aggregate.get("planned_fact_coverage")
+        else:
+            planned_fact_total = sum(item["planned_fact_count"] for item in chapter_stats)
+            unused_planned_fact_total = sum(item["unused_planned_fact_count"] for item in chapter_stats)
+            planned_fact_coverage = (
+                round((planned_fact_total - unused_planned_fact_total) / planned_fact_total, 4)
+                if planned_fact_total else None
+            )
         if minimum_words and actual_words < minimum_words:
             issues.append({
                 "type": "SCALE_UNDERFILL", "severity": "high", "section": "", "quote": "",
                 "note": f"正文 {actual_words} 字，仅完成最终规模计划 {target_words} 字的 {completion_rate:.0%}",
                 "underfill_reason": budget.get("underfill_reason") or "Writer 未充分执行最终规模计划，需复核证据容量与章节展开",
             })
+        if scale_audit["over_budget"]:
+            bounds_source = str((budget.get("output_bounds") or {}).get("source") or "")
+            user_bound = bounds_source.startswith("user_")
+            issues.append({
+                "type": "SCALE_OVERFLOW",
+                "severity": "high" if user_bound else "medium",
+                "section": "",
+                "quote": "",
+                "note": (
+                    f"正文 {actual_words} 字，超过篇幅上限 {int((budget.get('output_bounds') or {}).get('max_words') or 0)} 字，"
+                    f"超出 {scale_audit['overrun_words']} 字；目标为 {target_words} 字。"
+                ),
+                "scale_source": bounds_source,
+                "overrun_words": scale_audit["overrun_words"],
+            })
+        try:
+            core_chain_summary = self._save_core_chain_audit(
+                plan, report_id, chapter_stats, generation_aggregate,
+            )
+        except Exception:
+            logger.exception("Could not persist run-scoped core-chain audit for task %s", self.task_id)
+            core_chain_summary = {"status": "unavailable", "run_id": str(self.task.get("run_id") or "")}
         self._update(qa_notes=issues, report_stats={
             "target_words": target_words, "minimum_words": minimum_words, "actual_words": actual_words,
             "completion_rate": completion_rate, "chapters": chapter_stats,
+            "output_bounds": scale_audit["output_bounds"],
+            "over_budget": scale_audit["over_budget"],
+            "overrun_words": scale_audit["overrun_words"],
             "planned_fact_coverage": planned_fact_coverage,
+            "generation_metrics": {
+                key: generation_aggregate.get(key)
+                for key in (
+                    "planned_fact_count", "supplied_fact_count", "cited_fact_count",
+                    "planned_fact_coverage", "supplied_fact_coverage",
+                    "planned_inference_count", "supplied_inference_count", "cited_inference_count",
+                    "planned_inference_coverage", "supplied_inference_coverage",
+                    "generation_units", "underfilled_units",
+                )
+            },
+            "core_chain_summary": core_chain_summary,
             "evidence_status": budget.get("evidence_status", ""),
             "underfill_reason": budget.get("underfill_reason", ""),
         }, qa_status={
@@ -2182,6 +2318,248 @@ class WorkflowController:
             "issue_count": len(issues),
             "located_issue_count": sum(1 for issue in issues if issue.get("sentence_ids")),
         })
+
+    def _save_core_chain_audit(self, plan: dict, report_id: int | None,
+                               chapter_stats: list[dict], generation_aggregate: dict,
+                               *, status: str = "done", error: str = "") -> dict:
+        """Persist exact run-scoped ID handoffs without storing source or draft text."""
+        run_id = str(self.task.get("run_id") or "").strip()
+        if not run_id:
+            logger.warning("Skipping unscoped core-chain audit for task %s: missing run_id", self.task_id)
+            return {"status": "unavailable", "reason": "missing_run_id", "run_id": ""}
+        calls = list_llm_calls(self.task_id, run_id)
+
+        def union(candidates, key):
+            return sorted({
+                int(value)
+                for item in candidates
+                for value in (item.get("funnel_json") or {}).get(key, []) or []
+                if str(value).isdigit()
+            })
+
+        evidence_calls = [item for item in calls if "input_unit_ids" in (item.get("funnel_json") or {})]
+        analysis_calls = [item for item in calls if (item.get("funnel_json") or {}).get("analysis_scope")]
+        final_plan_calls = [item for item in calls if "final_plan_input_fact_ids" in (item.get("funnel_json") or {})]
+        narrative_calls = [item for item in calls if (item.get("funnel_json") or {}).get("narrative_scope")]
+        writer_calls = [item for item in calls if (item.get("funnel_json") or {}).get("generation_mode")]
+        call_generation_units = [
+            unit
+            for item in writer_calls
+            for unit in ((item.get("funnel_json") or {}).get("generation_unit_stats") or [])
+            if isinstance(unit, dict)
+        ]
+        if status == "failed" and call_generation_units:
+            generation_aggregate = aggregate_generation_units(call_generation_units)
+        evidence_fact_ids = sorted({
+            int(value) for item in calls for value in item.get("produced_fact_ids", [])
+            if str(value).isdigit()
+        })
+        evidence_candidate_unit_ids = union(evidence_calls, "candidate_unit_ids")
+        evidence_input_unit_ids = union(evidence_calls, "input_unit_ids")
+        evidence_omitted_unit_ids = union(evidence_calls, "omitted_unit_ids")
+        evidence_input_material_ids = union(evidence_calls, "input_material_ids")
+        evidence_contributed_unit_ids = union(evidence_calls, "contributed_unit_ids")
+        evidence_contributed_material_ids = union(evidence_calls, "contributed_material_ids")
+        available_fact_ids = sorted({
+            int(item["id"]) for item in self._facts() if item.get("id") is not None
+        })
+        available_material_inference_ids = sorted({
+            int(item["id"]) for item in self._inferences()
+            if item.get("id") is not None and item.get("source_level") == "MATERIAL_INFERENCE"
+        })
+        analysis_input_fact_ids = union(analysis_calls, "input_fact_ids")
+        analysis_referenced_fact_ids = union(analysis_calls, "referenced_fact_ids")
+        final_plan_input_fact_ids = union(final_plan_calls, "final_plan_input_fact_ids")
+        final_plan_input_inference_ids = union(final_plan_calls, "final_plan_input_inference_ids")
+        final_plan_fact_ids = union(final_plan_calls, "final_plan_assigned_fact_ids")
+        final_plan_inference_ids = union(final_plan_calls, "final_plan_assigned_inference_ids")
+        narrative_input_fact_ids = union(narrative_calls, "narrative_input_fact_ids")
+        narrative_input_inference_ids = union(narrative_calls, "narrative_input_inference_ids")
+        narrative_fact_ids = union(narrative_calls, "narrative_assigned_fact_ids")
+        narrative_inference_ids = union(narrative_calls, "narrative_assigned_inference_ids")
+        writer_supplied_fact_ids = union(writer_calls, "supplied_fact_ids")
+        writer_supplied_inference_ids = union(writer_calls, "supplied_inference_ids")
+        writer_cited_fact_ids = union(writer_calls, "cited_fact_ids")
+        writer_cited_inference_ids = union(writer_calls, "cited_inference_ids")
+        material_inference_ids = union(analysis_calls, "material_inference_ids")
+        external_information_ids = union(analysis_calls, "external_information_ids")
+
+        writer_call_ids = [str(item.get("call_id") or "") for item in writer_calls if item.get("call_id")]
+        report_fact_ids: list[int] = []
+        report_inference_ids: list[int] = []
+        if report_id and writer_call_ids:
+            with session_scope() as s:
+                fact_rows = s.execute(
+                    select(ORMSentenceFact.c.fact_id)
+                    .select_from(ORMSentenceFact.join(
+                        ORMSentence, ORMSentenceFact.c.sentence_id == ORMSentence.c.id,
+                    ))
+                    .where(
+                        ORMSentence.c.report_id == int(report_id),
+                        ORMSentence.c.selected == 1,
+                        ORMSentence.c.origin_call_id.in_(writer_call_ids),
+                    )
+                ).all()
+                inference_rows = s.execute(
+                    select(ORMSentenceInference.c.inference_id)
+                    .select_from(ORMSentenceInference.join(
+                        ORMSentence, ORMSentenceInference.c.sentence_id == ORMSentence.c.id,
+                    ))
+                    .where(
+                        ORMSentence.c.report_id == int(report_id),
+                        ORMSentence.c.selected == 1,
+                        ORMSentence.c.origin_call_id.in_(writer_call_ids),
+                    )
+                ).all()
+            report_fact_ids = sorted({int(row[0]) for row in fact_rows})
+            report_inference_ids = sorted({int(row[0]) for row in inference_rows})
+
+        # Keep plan-derived fallbacks explicit for resumed runs whose older call
+        # rows predate ID-level audit fields; they are never mixed with prompt IDs.
+        if not final_plan_fact_ids:
+            final_plan_fact_ids = collect_assigned_ids(plan.get("chapter_plans") or [], "fact")
+        if not final_plan_inference_ids:
+            final_plan_inference_ids = collect_assigned_ids(plan.get("chapter_plans") or [], "inference")
+        if not narrative_fact_ids:
+            narrative_fact_ids = sorted({
+                int(value) for chapter in chapter_stats
+                for unit in chapter.get("generation_unit_stats", [])
+                for value in unit.get("planned_fact_ids", [])
+            })
+        if not narrative_inference_ids:
+            narrative_inference_ids = sorted({
+                int(value) for chapter in chapter_stats
+                for unit in chapter.get("generation_unit_stats", [])
+                for value in unit.get("planned_inference_ids", [])
+            })
+
+        fact_flow = audit_id_flow({
+            "available_fact_inventory": available_fact_ids,
+            "analysis_input": analysis_input_fact_ids,
+            "analysis_referenced": analysis_referenced_fact_ids,
+            "final_plan_input": final_plan_input_fact_ids,
+            "final_plan_assigned": final_plan_fact_ids,
+            "narrative_input": narrative_input_fact_ids,
+            "narrative_assigned": narrative_fact_ids,
+            "writer_supplied": writer_supplied_fact_ids,
+            "writer_cited": writer_cited_fact_ids,
+            "report_current_run": report_fact_ids,
+        })
+        inference_flow = audit_id_flow({
+            "available_material_inference_inventory": available_material_inference_ids,
+            "analysis_produced_this_run": material_inference_ids,
+            "final_plan_input": final_plan_input_inference_ids,
+            "final_plan_assigned": final_plan_inference_ids,
+            "narrative_input": narrative_input_inference_ids,
+            "narrative_assigned": narrative_inference_ids,
+            "writer_supplied": writer_supplied_inference_ids,
+            "writer_cited": writer_cited_inference_ids,
+            "report_current_run": report_inference_ids,
+        })
+        summary = {
+            "status": status,
+            "error": str(error or ""),
+            "run_id": run_id,
+            "report_id": int(report_id) if report_id is not None else None,
+            "counts": {
+                "available_facts": len(available_fact_ids),
+                "facts_produced_this_run": len(evidence_fact_ids),
+                "evidence_candidate_units": len(evidence_candidate_unit_ids),
+                "evidence_input_units": len(evidence_input_unit_ids),
+                "evidence_omitted_units": len(evidence_omitted_unit_ids),
+                "analysis_input_facts": len(analysis_input_fact_ids),
+                "analysis_referenced_facts": len(analysis_referenced_fact_ids),
+                "material_inferences_produced_this_run": len(material_inference_ids),
+                "external_information_items": len(external_information_ids),
+                "final_plan_input_facts": len(final_plan_input_fact_ids),
+                "final_plan_facts": len(final_plan_fact_ids),
+                "narrative_input_facts": len(narrative_input_fact_ids),
+                "narrative_plan_facts": len(narrative_fact_ids),
+                "writer_supplied_facts": len(writer_supplied_fact_ids),
+                "writer_cited_facts": len(writer_cited_fact_ids),
+                "report_cited_facts_this_run": len(report_fact_ids),
+                "final_plan_input_inferences": len(final_plan_input_inference_ids),
+                "final_plan_inferences": len(final_plan_inference_ids),
+                "narrative_input_inferences": len(narrative_input_inference_ids),
+                "narrative_plan_inferences": len(narrative_inference_ids),
+                "writer_supplied_inferences": len(writer_supplied_inference_ids),
+                "writer_cited_inferences": len(writer_cited_inference_ids),
+                "report_cited_inferences_this_run": len(report_inference_ids),
+            },
+        }
+        artifact = {
+            "schema_version": "core-chain-audit-1",
+            **summary,
+            "fact_id_flow": fact_flow,
+            "material_inference_id_flow": inference_flow,
+            "report_scale": {
+                "target_words": (
+                    sum(int(item.get("target_words") or 0) for item in chapter_stats)
+                    if chapter_stats else int(generation_aggregate.get("target_words") or 0)
+                ),
+                "actual_words": (
+                    sum(int(item.get("actual_words") or 0) for item in chapter_stats)
+                    if chapter_stats else int(generation_aggregate.get("actual_words") or 0)
+                ),
+                "output_bounds": dict((plan.get("budget") or {}).get("output_bounds") or {}),
+                "chapters": [{
+                    "title": str(item.get("chapter") or ""),
+                    "target_words": int(item.get("target_words") or 0),
+                    "actual_words": int(item.get("actual_words") or 0),
+                    "completion_rate": item.get("completion_rate"),
+                    "underfill_reason": str(item.get("underfill_reason") or ""),
+                } for item in chapter_stats],
+            },
+            "evidence": {
+                "extraction_status": self.task.get("evidence_status") or {},
+                "produced_fact_ids_this_run": evidence_fact_ids,
+                "candidate_unit_ids": evidence_candidate_unit_ids,
+                "input_unit_ids": evidence_input_unit_ids,
+                "omitted_unit_ids": evidence_omitted_unit_ids,
+                "input_material_ids": evidence_input_material_ids,
+                "contributed_unit_ids": evidence_contributed_unit_ids,
+                "contributed_material_ids": evidence_contributed_material_ids,
+            },
+            "external_information_ids": external_information_ids,
+            "generation": generation_aggregate,
+            "generation_unit_stats": (
+                [unit for chapter in chapter_stats for unit in chapter.get("generation_unit_stats", [])]
+                if chapter_stats else call_generation_units
+            ),
+            "analysis_group_coverage": self.task.get("analysis_group_audit") or {},
+            "calls": [{
+                "call_id": item.get("call_id"), "agent": item.get("agent"), "stage": item.get("stage"),
+                "success": bool(item.get("success")), "error": item.get("error") or "",
+                "input_tokens": int(item.get("input_tokens") or 0),
+                "output_tokens": int(item.get("output_tokens") or 0),
+                "latency_ms": int(item.get("latency_ms") or 0),
+                "audit": {
+                    key: value for key, value in (item.get("funnel_json") or {}).items()
+                    if key in {
+                        "analysis_scope", "narrative_scope", "generation_mode", "context_audit",
+                        "model_claims", "valid_field_claims", "quote_bound_claims",
+                        "duplicate_claims", "pending_claims", "promoted_facts",
+                        "candidate_inference_count", "accepted_inference_count",
+                        "rejected_empty_content_count", "rejected_without_visible_basis_count",
+                        "external_information_count", "model_sentences", "accepted_sentences",
+                        "dropped_untraced_sentences", "split_items",
+                    }
+                },
+            } for item in calls],
+        }
+        save_task_artifact(
+            self.task_id,
+            "core_chain_audit",
+            {
+                "report_id": int(report_id) if report_id is not None else None,
+                "run_id": run_id,
+                "schema_version": artifact["schema_version"],
+            },
+            artifact,
+            status=status,
+            run_id=run_id,
+        )
+        return summary
 
     def _auto_quality_fix(self, report_id: int, plan: dict) -> bool:
         """低风险质量问题自动修正。

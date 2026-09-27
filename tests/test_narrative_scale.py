@@ -1,4 +1,5 @@
 import unittest
+from contextlib import contextmanager
 from types import MethodType
 from unittest.mock import patch
 
@@ -14,6 +15,7 @@ from app.planning.scale import (
 from app.writing.writer import (
     WriterAgent,
     _article_evidence_ids,
+    _coerce_paragraphs,
     _evidence_execution_hint,
     _focused_unit_evidence,
     _subsection_generation_units,
@@ -31,6 +33,85 @@ from app.writing.scale_execution import (
 
 
 class NarrativeScaleTests(unittest.TestCase):
+    def test_paragraph_level_citations_are_not_broadcast_to_each_sentence(self):
+        paragraphs = _coerce_paragraphs({
+            "paragraphs": [{
+                "fact_ids": [1, 2],
+                "inference_ids": [10],
+                "sentences": [
+                    {"text": "第一句只描述事实一。", "fact_ids": [1]},
+                    {"text": "第二句表达一个判断。", "inference_ids": [10]},
+                    {"text": "第三句没有提供逐句依据。"},
+                ],
+            }],
+        })
+
+        sentences = paragraphs[0]["sentences"]
+        self.assertEqual([1], sentences[0]["fact_ids"])
+        self.assertEqual([], sentences[0]["inference_ids"])
+        self.assertEqual([], sentences[1]["fact_ids"])
+        self.assertEqual([10], sentences[1]["inference_ids"])
+        self.assertEqual([], sentences[2]["fact_ids"])
+        self.assertEqual([], sentences[2]["inference_ids"])
+
+    def test_writer_prompt_requires_minimal_sentence_specific_citations(self):
+        self.assertIn("最小且逐句绑定", WriterAgent.role)
+        self.assertIn("不得把整段证据列表复制到每一句", WriterAgent.role)
+        self.assertIn('source_level="TRANSITION"', WriterAgent.role)
+
+    def test_local_rewrite_cannot_cite_inference_omitted_from_its_context(self):
+        writer = WriterAgent.__new__(WriterAgent)
+        writer.last_call_id = "local-rewrite-test"
+        captured = {}
+
+        class Result:
+            def mappings(self):
+                return self
+
+            def all(self):
+                return [{"id": 12, "content": "旧段落。", "position": 10001}]
+
+        class Session:
+            def execute(self, _statement):
+                return Result()
+
+        session_calls = 0
+
+        @contextmanager
+        def fake_session_scope():
+            nonlocal session_calls
+            session_calls += 1
+            if session_calls > 1:
+                raise AssertionError("unavailable inference must not be persisted as a citation")
+            yield Session()
+
+        def fake_build_prompt(_stage, sections, _budget):
+            captured["prompt"] = "\n".join(str(item) for item in sections)
+            return "rewrite prompt", {}
+
+        writer.generate_json = lambda *_args, **_kwargs: {
+            "paragraphs": [{"sentences": [{
+                "text": "一个新的判断。", "fact_ids": [], "inference_ids": [99],
+            }]}],
+        }
+        with (
+            patch("app.writing.writer.session_scope", fake_session_scope),
+            patch("app.writing.writer.build_prompt_from_sections", fake_build_prompt),
+        ):
+            result = writer._rewrite_paragraph(
+                report_id=1,
+                chapter_title="Chapter",
+                chapter_index=1,
+                qa_item={"target_paragraph": 1, "topic_id": "T1", "missing_aspects": []},
+                narrative_plan={"topics": [{"topic_id": "T1", "fact_ids": [1], "inference_ids": []}]},
+                chapter_facts=[{"id": 1, "content": "当前主题事实"}],
+                chapter_inferences=[{"id": 99, "content": "不相关推论", "based_fact_ids": [2]}],
+                valid_fact_ids={1}, valid_inf_ids={99}, inf_levels={}, plan={}, report_memory={},
+            )
+
+        self.assertIsNone(result)
+        self.assertNotIn("不相关推论", captured["prompt"])
+
     def test_prompt_visibility_uses_complete_records_not_candidate_inventory(self):
         items = [
             {"id": 1, "content": "shown fact"},
@@ -428,6 +509,10 @@ class NarrativeScaleTests(unittest.TestCase):
     def test_writer_system_prompt_matches_subsection_generation_granularity(self):
         self.assertIn("当前交付单元", WriterAgent.role)
         self.assertNotIn("每次只撰写一个章节", WriterAgent.role)
+        self.assertIn("不得为保留计划段数制造单句段", WriterAgent.role)
+        self.assertIn("paragraph.target_words 是段落篇幅的分配参考", WriterAgent.role)
+        self.assertIn("相邻论证连续且前段仅承担引出或过渡时", NarrativeAgent.role)
+        self.assertIn("paragraph.target_words 只是篇幅分配参考", NarrativeAgent.role)
 
     def test_chapter_writer_receives_nested_report_chapter_and_unit_budgets(self):
         writer = WriterAgent.__new__(WriterAgent)
@@ -463,6 +548,48 @@ class NarrativeScaleTests(unittest.TestCase):
         self.assertIn("本章分配约 900 字", captured["prompt"])
         self.assertIn("当前交付单元目标约 500 字", captured["prompt"])
         self.assertIn("全文预算的内部拆分，不可相加", captured["prompt"])
+
+    def test_chapter_writer_drops_short_uncited_claim_but_keeps_marked_transition(self):
+        writer = WriterAgent.__new__(WriterAgent)
+        writer.last_call_id = "citation-gate-test"
+        writer.generate_json = lambda *_args, **_kwargs: {
+            "paragraphs": [{"sentences": [
+                {"text": "TrustZone 的设计几乎没有性能代价。", "fact_ids": [], "inference_ids": []},
+                {"text": "接下来讨论其适用边界。", "fact_ids": [], "inference_ids": [], "source_level": "TRANSITION"},
+            ]}],
+        }
+
+        with patch("app.writing.writer.publish_context_audit"), patch("app.writing.writer.update_call_funnel"):
+            result = writer._generate_chapter_pass(
+                "Chapter", 1, 1, ["Chapter"],
+                [{"id": 1, "content": "TrustZone 的性能影响较小。"}], [], "",
+                {"title": "Report", "budget": {"target_words": 100}}, {}, {1}, set(),
+                chapter_plan={"title": "Chapter", "target_words": 100},
+                generation_unit={"target_words": 100, "plan": {"fact_ids": [1]}},
+            )
+
+        self.assertEqual(["接下来讨论其适用边界。"], [item["text"] for item in result])
+        self.assertEqual("TRANSITION", result[0]["source_level"])
+
+    def test_article_writer_drops_short_uncited_substantive_sentence(self):
+        writer = WriterAgent.__new__(WriterAgent)
+        writer.last_call_id = "article-citation-gate-test"
+        writer.generate_json = lambda *_args, **_kwargs: {
+            "paragraphs": [{"sentences": [{
+                "text": "TrustZone 的设计几乎没有性能代价。", "fact_ids": [], "inference_ids": [],
+            }]}],
+        }
+
+        with patch("app.writing.writer.publish_context_audit"), patch("app.writing.writer.update_call_funnel"):
+            result = writer._generate_article_pass(
+                plan={"title": "Report", "budget": {"target_words": 100}},
+                article_plan={"target_words": 100},
+                facts=[{"id": 1, "content": "TrustZone 的性能影响较小。"}],
+                inferences=[], style_block="", allowed_fact_ids={1}, allowed_inference_ids=set(),
+                institution_rules=None, task_profile=None, policy_block="", minimum_ratio=0.8,
+            )
+
+        self.assertEqual([], result)
 
     def test_report_scale_audit_flags_overrun_and_keeps_in_range_output(self):
         bounds = {"min_words": 2700, "max_words": 3300, "source": "user_target_tolerance"}

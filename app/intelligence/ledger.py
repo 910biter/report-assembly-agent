@@ -17,27 +17,34 @@ from app.intelligence.consolidate import list_clusters, list_relations
 
 
 def build_ledger(task_id: str, needs: list[dict], facts: list[dict],
-                 gaps: list[dict] | None = None) -> dict:
+                 gaps: list[dict] | None = None, *, coverage: dict | None = None) -> dict:
     """构建情报底稿(快照视图,不落库——由调用方决定持久化)。
 
     facts: [{"id", "content", "dimension", "sources": [str]}]
     """
     clusters = list_clusters(task_id)
     relations = list_relations(task_id)
+    coverage = coverage or {"status": "unknown"}
+    uncovered_ids = {int(value) for value in coverage.get("uncovered_need_ids") or []}
 
     # Need 覆盖状态:按维度/need 内容匹配事实
     need_coverage: list[dict] = []
     for need_index, need in enumerate(needs, start=1):
+        need_index = int(need.get("need_id") or need_index)
         need_text = str(need.get("need", ""))
         matched = [f for f in facts if int(f.get("need_id") or 0) == need_index]
+        if coverage.get("status") != "complete":
+            status = "unknown"
+        elif need_index in uncovered_ids:
+            status = "partial" if matched else "missing"
+        else:
+            status = "supported" if matched else "unknown"
         need_coverage.append({
-            "need_id": need.get("need_id", ""),
+            "need_id": need_index,
             "need": need_text,
             "dimension": need.get("dimension", ""),
             "priority": need.get("priority", "medium"),
-            # 状态:need_id 精确匹配(事实↔Need 真实关系);partial 由 Coverage Auditor 语义判定,
-            # 此处只做确定性判断(避免 supported/partial 死代码)
-            "status": "supported" if matched else "missing",
+            "status": status,
             "supported_fact_ids": [f["id"] for f in matched],
             "supported_fact_count": len(matched),
         })
@@ -61,6 +68,8 @@ def build_ledger(task_id: str, needs: list[dict], facts: list[dict],
         "fact_clusters": [dict(c) for c in clusters],
         "fact_relations": [dict(r) for r in relations],
         "information_gaps": info_gaps,
+        "unverified_needs": [item["need"] for item in need_coverage if item["status"] == "unknown"],
+        "coverage_audit": coverage,
         "confidence": _confidence(need_coverage),
     }
 

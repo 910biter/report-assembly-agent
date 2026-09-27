@@ -36,6 +36,40 @@ def parse_user_scale(requirements: str) -> dict:
             "source_text": range_match.group(0),
         }
 
+    max_match = re.search(
+        rf"(?:不超过|最多|至多|不高于|上限(?:为)?|控制在)\s*({_NUMBER})\s*(万)?\s*字|"
+        rf"({_NUMBER})\s*(万)?\s*字(?:以内|以下)",
+        text,
+    )
+    if max_match:
+        number = max_match.group(1) or max_match.group(3)
+        unit = max_match.group(2) or max_match.group(4)
+        maximum = _word_value(number, unit)
+        return {
+            "kind": "maximum",
+            "min_words": 0,
+            "max_words": maximum,
+            "target_words": maximum,
+            "source_text": max_match.group(0),
+        }
+
+    min_match = re.search(
+        rf"(?:至少|不少于|不低于|下限(?:为)?)\s*({_NUMBER})\s*(万)?\s*字|"
+        rf"({_NUMBER})\s*(万)?\s*字(?:以上|起)",
+        text,
+    )
+    if min_match:
+        number = min_match.group(1) or min_match.group(3)
+        unit = min_match.group(2) or min_match.group(4)
+        minimum = _word_value(number, unit)
+        return {
+            "kind": "minimum",
+            "min_words": minimum,
+            "max_words": 0,
+            "target_words": minimum,
+            "source_text": min_match.group(0),
+        }
+
     exact_match = re.search(rf"(?:约|大约|左右|正文约|正文)?\s*({_NUMBER})\s*(万)?\s*字(?:左右)?", text)
     if exact_match:
         target = _word_value(exact_match.group(1), exact_match.group(2))
@@ -56,25 +90,77 @@ def reconcile_scale_budget(
 ) -> dict:
     """Keep one authoritative target while preserving evidence diagnostics."""
     preliminary = dict(preliminary or {})
-    result = {**preliminary, **dict(final or {})}
+    final = dict(final or {})
+    result = {**preliminary, **final}
     explicit = parse_user_scale(user_requirements)
     preliminary_target = _positive_int(preliminary.get("target_words"))
-    final_target = _positive_int(result.get("target_words"))
+    final_target = _positive_int(final.get("target_words"))
 
     if explicit:
         if explicit["kind"] == "range":
-            candidates = [preliminary_target, final_target]
+            candidates = [final_target, preliminary_target]
             target = next(
                 (value for value in candidates if explicit["min_words"] <= value <= explicit["max_words"]),
                 explicit["target_words"],
             )
+            output_bounds = {
+                "min_words": explicit["min_words"],
+                "max_words": explicit["max_words"],
+                "source": "user_range",
+            }
+        elif explicit["kind"] == "maximum":
+            target = explicit["target_words"]
+            output_bounds = {
+                "min_words": 0,
+                "max_words": explicit["max_words"],
+                "source": "user_maximum",
+            }
+        elif explicit["kind"] == "minimum":
+            target = explicit["target_words"]
+            output_bounds = {
+                "min_words": explicit["min_words"],
+                "max_words": 0,
+                "source": "user_minimum",
+            }
         else:
             target = explicit["target_words"]
+            output_bounds = _target_tolerance_bounds(target, "user_target_tolerance")
         result["user_scale"] = explicit
         result["target_source"] = "user_explicit"
+        result["output_bounds"] = output_bounds
+        if explicit["kind"] == "maximum":
+            result["min_words"] = 0
+        elif output_bounds["min_words"]:
+            result["min_words"] = output_bounds["min_words"]
+        if output_bounds["max_words"]:
+            result["user_max_words"] = output_bounds["max_words"]
     else:
-        target = preliminary_target or final_target
-        result["target_source"] = "preliminary_plan" if preliminary_target else "final_plan"
+        existing_source = str(preliminary.get("target_source") or "")
+        if final_target:
+            target = final_target
+            result["target_source"] = "final_plan"
+            result["preliminary_target_words"] = (
+                _positive_int(preliminary.get("preliminary_target_words")) or preliminary_target
+            )
+            result["output_bounds"] = _target_tolerance_bounds(target, "system_target_tolerance")
+        elif preliminary_target:
+            target = preliminary_target
+            result["target_source"] = (
+                existing_source if existing_source in {"final_plan", "preliminary_plan"}
+                else "preliminary_plan"
+            )
+            result["preliminary_target_words"] = (
+                _positive_int(preliminary.get("preliminary_target_words")) or preliminary_target
+            )
+            result["output_bounds"] = dict(preliminary.get("output_bounds") or {}) or _target_tolerance_bounds(
+                target, "system_target_tolerance",
+            )
+        else:
+            target = _positive_int(result.get("target_words"))
+            result["target_source"] = existing_source or ("final_plan" if final_target else "unknown")
+            result["output_bounds"] = dict(preliminary.get("output_bounds") or {})
+            if target and not result["output_bounds"]:
+                result["output_bounds"] = _target_tolerance_bounds(target, "system_target_tolerance")
 
     result["target_words"] = target
     result["requested_target_words"] = target
@@ -89,6 +175,17 @@ def reconcile_scale_budget(
         result["min_words"] = explicit["min_words"]
         result["user_max_words"] = explicit["max_words"]
     return result
+
+
+def _target_tolerance_bounds(target: int, source: str) -> dict:
+    target = _positive_int(target)
+    if not target:
+        return {"min_words": 0, "max_words": 0, "source": source}
+    return {
+        "min_words": round(target * 0.9),
+        "max_words": round(target * 1.1),
+        "source": source,
+    }
 
 
 def normalize_chapter_budgets(chapters: list[dict], target_words: int) -> list[dict]:

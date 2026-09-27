@@ -1,4 +1,5 @@
 """API 层:FastAPI 应用工厂。"""
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -29,17 +30,18 @@ def create_app() -> FastAPI:
     from app.interaction import reconcile_interrupted_interactions
     reconcile_interrupted_tasks()
     reconcile_interrupted_interactions()
-    application = FastAPI(title="报告整编 Agent")
 
-    @application.on_event("startup")
-    def start_graph_job_worker() -> None:
+    @asynccontextmanager
+    async def lifespan(_application: FastAPI):
         from app.graph_jobs import start_worker
         start_worker()
+        try:
+            yield
+        finally:
+            from app.graph_jobs import stop_worker
+            stop_worker()
 
-    @application.on_event("shutdown")
-    def stop_graph_job_worker() -> None:
-        from app.graph_jobs import stop_worker
-        stop_worker()
+    application = FastAPI(title="报告整编 Agent", lifespan=lifespan)
 
     application.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
     application.include_router(api_router)

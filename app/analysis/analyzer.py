@@ -3,6 +3,7 @@
 硬约束:推断必须挂依据事实;无依据的判断不输出。
 """
 import json
+import re
 
 from app.agents.base import BaseAgent
 from app.cache import stable_hash
@@ -13,7 +14,7 @@ from app.db import session_scope
 from app.infrastructure.orm import ORMInference, Base
 from sqlalchemy import select
 from app.models import Inference
-from app.token_monitor import current_context, update_call_metrics, update_call_products
+from app.token_monitor import current_context, update_call_funnel, update_call_metrics, update_call_products
 from app.runtime_profiles import stage_input_budget_tokens, stage_profile
 
 _SYSTEM = """你是情报分析员。基于事实清单、来源冲突与历史知识做综合分析,禁止无依据结论。
@@ -35,6 +36,7 @@ _SYSTEM = """你是情报分析员。基于事实清单、来源冲突与历史�
 5. external_notes 用于材料无法得出、但有助于理解的常识补充,必须与材料事实区分
 6. 不要判断或输出置信度与不确定性字段;系统将根据有效 based_fact_ids 确定性计算
 7. 不要输出长篇推理过程;short_rationale 只写必要依据链
+8. 不得扩大事实适用范围;保留依据中的主体、对象、版本、时间和条件限定,综合结论范围不得超出依据共同支持的范围
 """
 
 
@@ -59,6 +61,7 @@ _GLOBAL_SYSTEM = """你是情报报告综合研判师。基于各维度局部推
 5. 材料存在冲突时,unresolved_conflicts 必须列出,不得假装一致
 6. 全局判断应形成主线、关键风险和证据边界,不要简单重复局部推断
 7. 不要为单条推论输出置信度与不确定性字段;系统将按有效依据事实数量计算置信度
+8. 不得扩大局部推断或事实的适用范围;保留依据中的主体、对象、版本、时间和条件限定
 """
 
 
@@ -70,6 +73,57 @@ def _int_ids(values) -> list[int]:
         except (TypeError, ValueError):
             continue
     return result
+
+
+def _visible_fact_ids(prompt: str, candidates: list[dict] | None = None) -> set[int]:
+    """Read fact IDs from the concrete numbered fact lines in the final prompt."""
+    content_by_id = {
+        int(item["id"]): str(item.get("content") or "")
+        for item in candidates or [] if item.get("id") is not None
+    }
+    visible = set()
+    for line in str(prompt or "").splitlines():
+        match = re.match(r"^\s*(\d+)\.\s+\[", line)
+        if not match:
+            continue
+        fact_id = int(match.group(1))
+        if not content_by_id or (fact_id in content_by_id and content_by_id[fact_id] in line):
+            visible.add(fact_id)
+    return visible
+
+
+def _visible_local_inference_refs(prompt: str, inferences: list) -> tuple[set[int], set[int]]:
+    """Return IDs and Fact bases for complete local-inference records shown in prompt."""
+    lines = set(str(prompt or "").splitlines())
+    visible_ids: set[int] = set()
+    visible_fact_ids: set[int] = set()
+    for item in inferences:
+        get = item.get if isinstance(item, dict) else lambda key, default=None: getattr(item, key, default)
+        inference_id = get("id")
+        if inference_id is None:
+            continue
+        dimension = str(get("dimension") or "未分类")
+        content = str(get("content") or "")
+        analysis_type = str(get("analysis_type") or "SYNTHESIS")
+        based_fact_ids = get("based_fact_ids") or []
+        record = f"- [{dimension}] {content} (type={analysis_type}, based_fact_ids={based_fact_ids})"
+        if record in lines:
+            visible_ids.add(int(inference_id))
+            visible_fact_ids.update(_int_ids(based_fact_ids))
+    return visible_ids, visible_fact_ids
+
+
+def _visible_local_inference_ids(prompt: str, inferences: list) -> set[int]:
+    """Match complete local-inference records without adding prompt-only IDs."""
+    visible_ids, _ = _visible_local_inference_refs(prompt, inferences)
+    return visible_ids
+
+
+def _filter_fact_references(values, allowed_ids: set[int]) -> tuple[list[int], list[int]]:
+    """Return unique, allowed IDs and unique references outside the supplied context."""
+    accepted = sorted({value for value in _int_ids(values) if value in allowed_ids})
+    rejected = sorted({value for value in _int_ids(values) if value not in allowed_ids})
+    return accepted, rejected
 
 
 def _target_local_inference_count(fact_count: int, group_count: int = 0) -> int:
@@ -132,12 +186,10 @@ def _semantic_group_coverage(facts: list[dict], inferences: list) -> dict:
             except (TypeError, ValueError):
                 continue
     covered_groups = 0
-    covered_facts = set()
     uncovered_groups = []
     for (dimension, need_id, fact_type), items in groups.items():
         fact_ids = sorted(int(item["id"]) for item in items if item.get("id") is not None)
         group_covered = set(fact_ids) & referenced
-        covered_facts.update(group_covered)
         if group_covered:
             covered_groups += 1
         else:
@@ -149,14 +201,22 @@ def _semantic_group_coverage(facts: list[dict], inferences: list) -> dict:
                 "fact_ids": fact_ids,
             })
     total_groups = len(groups)
-    total_facts = sum(len(items) for items in groups.values())
+    all_fact_ids = sorted({
+        int(item["id"]) for items in groups.values() for item in items
+        if item.get("id") is not None
+    })
+    total_facts = len(all_fact_ids)
+    referenced_fact_ids = sorted(set(all_fact_ids) & referenced)
     return {
         "total_groups": total_groups,
         "covered_groups": covered_groups,
         "coverage_ratio": round(covered_groups / total_groups, 4) if total_groups else 1.0,
         "total_facts": total_facts,
-        "covered_facts": len(covered_facts),
-        "fact_coverage_ratio": round(len(covered_facts) / total_facts, 4) if total_facts else 1.0,
+        "covered_facts": len(referenced_fact_ids),
+        "fact_coverage_ratio": round(len(referenced_fact_ids) / total_facts, 4) if total_facts else 1.0,
+        "referenced_fact_ids": referenced_fact_ids,
+        "unreferenced_fact_ids": sorted(set(all_fact_ids) - set(referenced_fact_ids)),
+        "coverage_semantics": "A group is counted as touched when at least one member Fact is referenced; this is diagnostic, not a target.",
         "uncovered_groups": uncovered_groups,
     }
 
@@ -180,7 +240,7 @@ class AnalysisAgent(BaseAgent):
         """Map:单维局部分析(按维度分组的 facts),产出该维推断。"""
         if not facts:
             return []
-        valid_ids = {f["id"] for f in facts}
+        candidate_ids = {int(f["id"]) for f in facts if f.get("id") is not None}
         if not context_block:
             fact_lines = [f"{f['id']}. [{f['sources']}] {f['content']}" for f in facts]
             context_block = "事实清单(编号 + 来源):\n" + "\n".join(fact_lines)
@@ -202,9 +262,34 @@ class AnalysisAgent(BaseAgent):
             ContextSection("instruction", [instruction], weight=5, required_items=1),
             ContextSection("facts", context_block.splitlines(), weight=4, required_items=1),
         ], stage_input_budget_tokens("analysis"))
-        payload = self.generate_json(prompt)
+        visible_ids = _visible_fact_ids(prompt, facts)
+        try:
+            payload = self.generate_json(prompt)
+        except Exception as exc:
+            call_id = self.last_call_id
+            update_call_funnel(
+                call_id,
+                analysis_scope="local",
+                candidate_fact_ids=sorted(candidate_ids),
+                input_fact_ids=sorted(visible_ids),
+                omitted_candidate_fact_ids=sorted(candidate_ids - visible_ids),
+                analysis_generation_error=str(exc)[:300],
+            )
+            raise
         call_id = self.last_call_id
-        inferences, _external = self._parse_payload(payload, valid_ids, call_id, facts)
+        inferences, external, parse_audit = self._parse_payload(payload, visible_ids, call_id, facts)
+        referenced_ids = sorted({fact_id for item in inferences for fact_id in item.based_fact_ids})
+        update_call_funnel(
+            call_id,
+            analysis_scope="local",
+            candidate_fact_ids=sorted(candidate_ids),
+            input_fact_ids=sorted(visible_ids),
+            omitted_candidate_fact_ids=sorted(candidate_ids - visible_ids),
+            referenced_fact_ids=referenced_ids,
+            material_inference_ids=[int(i.id) for i in inferences if i.id],
+            external_information_ids=[int(i.id) for i in external if i.id],
+            **parse_audit,
+        )
         update_call_products(call_id, produced_inference_ids=[i.id for i in inferences if i.id])
         update_call_metrics(call_id, stored_chars=sum(len(i.content or "") + len(i.reasoning_chain or "") for i in inferences))
         return inferences
@@ -218,7 +303,7 @@ class AnalysisAgent(BaseAgent):
         """
         if not local_inferences:
             return [], [], {}
-        valid_ids = {f["id"] for f in facts}
+        task_fact_ids = {int(f["id"]) for f in facts if f.get("id") is not None}
         inference_lines = ["各维度局部推断:"]
         inference_lines.extend(
             f"- [{i.dimension or '未分类'}] {i.content} "
@@ -232,11 +317,38 @@ class AnalysisAgent(BaseAgent):
             ContextSection("local_inferences", inference_lines, weight=4, required_items=1),
             ContextSection("conflicts", [f"来源冲突:{conflicts}"] if conflicts else [], weight=4, required_items=1),
         ], stage_input_budget_tokens("analysis"))
-        payload = self.generate_json(prompt, system=_GLOBAL_SYSTEM)
+        visible_inference_ids, visible_fact_ids = _visible_local_inference_refs(prompt, local_inferences)
+        visible_ids = visible_fact_ids & task_fact_ids
+        try:
+            payload = self.generate_json(prompt, system=_GLOBAL_SYSTEM)
+        except Exception as exc:
+            call_id = self.last_call_id
+            update_call_funnel(
+                call_id,
+                analysis_scope="global",
+                input_inference_ids=sorted(visible_inference_ids),
+                input_fact_ids=sorted(visible_ids),
+                omitted_task_fact_count=len(task_fact_ids - visible_ids),
+                analysis_generation_error=str(exc)[:300],
+            )
+            raise
         call_id = self.last_call_id
-        inferences, external = self._parse_payload(payload, valid_ids, call_id, facts)
+        inferences, external, parse_audit = self._parse_payload(payload, visible_ids, call_id, facts)
+        referenced_ids = sorted({fact_id for item in inferences for fact_id in item.based_fact_ids})
+        update_call_funnel(
+            call_id,
+            analysis_scope="global",
+            input_inference_ids=sorted(visible_inference_ids),
+            input_fact_ids=sorted(visible_ids),
+            task_fact_ids=sorted(task_fact_ids),
+            omitted_task_fact_count=len(task_fact_ids - visible_ids),
+            referenced_fact_ids=referenced_ids,
+            material_inference_ids=[int(i.id) for i in inferences if i.id],
+            external_information_ids=[int(i.id) for i in external if i.id],
+            **parse_audit,
+        )
         meta = {
-            "critical_fact_ids": [int(i) for i in (payload.get("critical_fact_ids") or []) if str(i).isdigit() and int(i) in valid_ids],
+            "critical_fact_ids": [int(i) for i in (payload.get("critical_fact_ids") or []) if str(i).isdigit() and int(i) in visible_ids],
             "coverage_status": {
                 str(k): str(v).upper() for k, v in (payload.get("coverage_status") or {}).items()
                 if str(v).upper() in {"SUFFICIENT", "PARTIAL", "WEAK", "ABSENT", "CONFLICTING", "MATERIAL_INSUFFICIENT"}
@@ -249,10 +361,13 @@ class AnalysisAgent(BaseAgent):
         return inferences, external, meta
 
     def _parse_payload(self, payload: dict, valid_ids: set[int], call_id: str,
-                       facts: list[dict] | None = None) -> tuple[list[Inference], list[Inference]]:
+                       facts: list[dict] | None = None) -> tuple[list[Inference], list[Inference], dict]:
         """解析推断与外部知识并保存(局部/全局共用)。"""
         inferences: list[Inference] = []
+        candidate_count = rejected_empty_content = rejected_without_visible_basis = 0
+        invalid_fact_ids: set[int] = set()
         for item in payload.get("inferences", []):
+            candidate_count += 1
             # 兼容模型两种输出:对象 / 纯文本字符串(小模型提示跟随不稳)
             if isinstance(item, str):
                 content = item.strip()
@@ -260,11 +375,16 @@ class AnalysisAgent(BaseAgent):
                 reasoning = dimension = ""
             else:
                 content = str(item.get("content", "")).strip()
-                based = [i for i in _int_ids(item.get("based_fact_ids")) if i in valid_ids]
+                based, invalid = _filter_fact_references(item.get("based_fact_ids"), valid_ids)
+                invalid_fact_ids.update(invalid)
                 analysis_type = str(item.get("analysis_type") or "unknown").strip()[:64]
                 reasoning = str(item.get("short_rationale") or item.get("reasoning") or "")[:80]
                 dimension = str(item.get("dimension", ""))
-            if not content or not based:
+            if not content:
+                rejected_empty_content += 1
+                continue
+            if not based:
+                rejected_without_visible_basis += 1
                 continue  # 硬约束:推断必须挂依据事实
             confidence, confidence_reason = _confidence_from_facts(based)
             inference = Inference(
@@ -294,7 +414,15 @@ class AnalysisAgent(BaseAgent):
             )
             note.id = save_inference(note, origin_call_id=call_id)
             external.append(note)
-        return inferences, external
+        audit = {
+            "candidate_inference_count": candidate_count,
+            "accepted_inference_count": len(inferences),
+            "rejected_empty_content_count": rejected_empty_content,
+            "rejected_without_visible_basis_count": rejected_without_visible_basis,
+            "invalid_fact_reference_ids": sorted(invalid_fact_ids),
+            "external_information_count": len(external),
+        }
+        return inferences, external, audit
 
 
 def save_inference(inference: Inference, origin_call_id: str = "") -> int:

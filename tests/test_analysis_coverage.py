@@ -1,6 +1,8 @@
 import unittest
 
 from app.analysis.analyzer import (
+    _GLOBAL_SYSTEM,
+    _SYSTEM,
     _semantic_group_coverage,
     _semantic_group_overview,
     _target_local_inference_count,
@@ -19,6 +21,13 @@ def _fact(fact_id: int, need_id: int, fact_type: str = "STATEMENT") -> dict:
 
 
 class AnalysisCoverageTests(unittest.TestCase):
+    def test_local_and_global_inference_prompts_preserve_fact_scope(self):
+        for prompt in (_SYSTEM, _GLOBAL_SYSTEM):
+            with self.subTest(prompt=prompt[:24]):
+                self.assertIn("不得扩大", prompt)
+                self.assertIn("适用范围", prompt)
+                self.assertIn("主体、对象、版本、时间和条件", prompt)
+
     def test_target_count_grows_with_semantic_groups_within_output_capacity(self):
         self.assertEqual(_target_local_inference_count(100, group_count=1), 4)
         self.assertEqual(_target_local_inference_count(100, group_count=8), 8)
@@ -43,6 +52,9 @@ class AnalysisCoverageTests(unittest.TestCase):
         self.assertEqual(audit["total_groups"], 2)
         self.assertEqual(audit["covered_groups"], 1)
         self.assertEqual(audit["coverage_ratio"], 0.5)
+        self.assertEqual(audit["referenced_fact_ids"], [1, 2])
+        self.assertEqual(audit["unreferenced_fact_ids"], [3])
+        self.assertIn("diagnostic, not a target", audit["coverage_semantics"])
         self.assertEqual(audit["uncovered_groups"][0]["fact_ids"], [3])
 
 

@@ -382,15 +382,19 @@ class ContextManager:
                 try:
                     from app.retrieval import vector_store
                     if getattr(vector_store, "enabled", False) and query_vector:
-                        hits = vector_store.search_units(query_vector, top_k=_recall_budget())
+                        hits = vector_store.search_units(
+                            query_vector, top_k=_recall_budget(),
+                            filters={"material_id": int(material_id)},
+                        )
                         hit_ids = {int(h[0]) for h in hits}
                 except Exception:
                     hit_ids = set()
+                local_hit_ids = {unit.id for unit in units if unit.id in hit_ids}
                 for unit in units:
                     if unit.id is not None and unit.id in hit_ids:
                         candidates.setdefault(id(unit), unit)
-                if not hit_ids:
-                    # 回退:全库 Python 打分(离线/无 Qdrant 场景)
+                if not local_hit_ids:
+                    # Missing or stale vector entries must not exclude a material.
                     scored = sorted(
                         [(_unit_relevance(unit, query, keywords, query_vector, unit_vectors), unit)
                          for unit in units if (unit.content or "").strip()],
@@ -587,9 +591,19 @@ class ContextManager:
                           facts: list[dict], inferences: list[dict],
                           insights: list[dict], style_block: str,
                           policy_block: str = "") -> str:
+        from app.planning.scale import parse_user_scale
+
+        explicit_scale = parse_user_scale(user_requirements)
+        scale_guidance = (
+            "用户已明确篇幅约束；按该目标/范围规划，证据不足应说明边界，不得静默改写用户目标。"
+            if explicit_scale else
+            "下方初步字数预算仅为材料理解阶段的暂定估计；请基于本次实际 Facts/Inferences、覆盖广度、"
+            "信息丰富度、证据支撑深度和最终章节任务重新估算，不要机械继承初步数字或套固定档位。"
+        )
         header_lines = [
             f"用户主题:{theme}",
             f"用户要求:{user_requirements or '无'}",
+            f"篇幅决策:{scale_guidance}",
             "初步分析规划(仅为分析假设与检索重点,可被后续事实推翻,不是最终目录):",
             json_dumps({
                 "title": plan.get("title"),

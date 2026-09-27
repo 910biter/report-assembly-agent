@@ -179,6 +179,34 @@ class ControlAgentTests(unittest.TestCase):
         self.assertEqual(issues[0]["location_confidence"], "high")
         self.assertTrue(issues[0]["issue_id"].startswith("qa_"))
 
+    def test_quality_issue_resolves_unique_exact_quote_without_model_sentence_id(self):
+        rows = [
+            {"id": 31, "section": "第二章", "paragraph": 2, "content": "第一句没有问题。", "user_edit": None},
+            {"id": 32, "section": "第二章", "paragraph": 2, "content": "关键机制仍存在覆盖不足的问题。", "user_edit": None},
+        ]
+        issues = attach_quality_issue_locations(1, [{
+            "type": "LOGIC_GAP", "section": "第二章", "paragraph": 2,
+            "quote": "存在覆盖不足", "note": "需要补充依据",
+        }], rows=rows)
+
+        self.assertEqual(issues[0]["sentence_ids"], [32])
+        self.assertEqual(issues[0]["target_type"], "sentence")
+        self.assertEqual(issues[0]["location_source"], "quote_exact")
+        self.assertEqual(issues[0]["quote_start"], 5)
+
+    def test_quality_issue_keeps_scope_when_quote_matches_multiple_sentences(self):
+        rows = [
+            {"id": 31, "section": "第二章", "paragraph": 2, "content": "结论仍有待核验。", "user_edit": None},
+            {"id": 32, "section": "第二章", "paragraph": 3, "content": "结论仍有待核验。", "user_edit": None},
+        ]
+        issues = attach_quality_issue_locations(1, [{
+            "type": "LOGIC_GAP", "section": "第二章", "quote": "结论仍有待核验。", "note": "证据不足",
+        }], rows=rows)
+
+        self.assertEqual(issues[0]["sentence_ids"], [])
+        self.assertEqual(issues[0]["target_type"], "section")
+        self.assertEqual(issues[0]["location_source"], "scope_only")
+
     def test_quality_issue_prefers_stable_sentence_ids(self):
         rows = [{
             "id": 31, "section": "第二章", "paragraph": 2,
