@@ -1,20 +1,62 @@
 import unittest
 from types import MethodType
+from unittest.mock import patch
 
 from app.context import ContextManager
 from app.context_budget import count_tokens
-from app.planning.narrative import _sanitize_document_plan, _sanitize_plan
+from app.planning.narrative import NarrativeAgent, _prompt_visible_ids, _sanitize_document_plan, _sanitize_plan
 from app.planning.scale import (
     normalize_chapter_budgets,
     normalize_execution_plan,
     parse_user_scale,
     reconcile_scale_budget,
 )
-from app.writing.writer import WriterAgent, _article_evidence_ids, _focused_unit_evidence, _subsection_generation_units
-from app.writing.scale_execution import assess_chapter_output, measure_text_words
+from app.writing.writer import (
+    WriterAgent,
+    _article_evidence_ids,
+    _evidence_execution_hint,
+    _focused_unit_evidence,
+    _subsection_generation_units,
+)
+from app.writing.scale_execution import (
+    assess_chapter_output,
+    assess_report_scale,
+    measure_text_words,
+    writer_output_token_limit,
+    writer_output_retry_limit,
+    writer_scale_prompt_hint,
+    measure_report_body_words_by_section,
+    report_minimum_words,
+)
 
 
 class NarrativeScaleTests(unittest.TestCase):
+    def test_prompt_visibility_uses_complete_records_not_candidate_inventory(self):
+        items = [
+            {"id": 1, "content": "shown fact"},
+            {"id": 2, "content": "omitted fact"},
+        ]
+        self.assertEqual([1], _prompt_visible_ids("1. shown fact", items))
+
+    def test_document_narrative_cannot_assign_fact_omitted_from_final_prompt(self):
+        agent = NarrativeAgent()
+        agent.generate_json = lambda *_args, **_kwargs: {
+            "beats": [{"beat_id": "B1", "purpose": "主题", "fact_ids": [1, 2]}],
+        }
+        facts = [
+            {"id": 1, "content": "shown fact"},
+            {"id": 2, "content": "omitted fact"},
+        ]
+        with patch(
+            "app.planning.narrative.build_prompt_from_sections",
+            return_value=("1. shown fact", {}),
+        ), patch("app.planning.narrative.update_call_funnel"):
+            plan = agent.plan_document(
+                task_id="", report_plan={"budget": {"target_words": 300}},
+                facts=facts, inferences=[], run_id="run-1",
+            )
+        self.assertEqual([1], plan["beats"][0]["fact_ids"])
+
     def test_document_narrative_beats_keep_only_supplied_evidence(self):
         plan = _sanitize_document_plan(
             {"beats": [{"beat_id": "B1", "purpose": "开篇", "fact_ids": [1, 999], "inference_ids": [7, 888]}]},
@@ -157,6 +199,277 @@ class NarrativeScaleTests(unittest.TestCase):
         self.assertEqual("user_explicit", budget["target_source"])
         self.assertEqual(7000, budget["evidence_supported_max_words"])
         self.assertEqual("limited", budget["evidence_status"])
+        self.assertEqual(18000, budget["target_words"])
+        self.assertEqual(
+            {"min_words": 15000, "max_words": 20000, "source": "user_range"},
+            budget.get("output_bounds"),
+        )
+
+    def test_final_plan_reestimates_system_suggested_scale_from_evidence(self):
+        budget = reconcile_scale_budget(
+            "",
+            {"target_words": 9000},
+            {"target_words": 4200, "max_words": 5200, "evidence_status": "sufficient"},
+        )
+
+        self.assertEqual(4200, budget["target_words"])
+        self.assertEqual(9000, budget["preliminary_target_words"])
+        self.assertEqual("final_plan", budget["target_source"])
+        self.assertEqual(
+            {"min_words": 3780, "max_words": 4620, "source": "system_target_tolerance"},
+            budget.get("output_bounds"),
+        )
+
+    def test_approximate_user_target_is_not_replaced_and_gets_auditable_bounds(self):
+        budget = reconcile_scale_budget(
+            "请写约3000字",
+            {"target_words": 5000},
+            {"target_words": 7000, "max_words": 9000, "evidence_status": "sufficient"},
+        )
+
+        self.assertEqual(3000, budget["target_words"])
+        self.assertEqual("user_explicit", budget["target_source"])
+        self.assertEqual(
+            {"min_words": 2700, "max_words": 3300, "source": "user_target_tolerance"},
+            budget.get("output_bounds"),
+        )
+
+    def test_final_planner_target_wins_when_it_is_inside_user_range(self):
+        budget = reconcile_scale_budget(
+            "15000-20000字",
+            {"target_words": 18000},
+            {"target_words": 19500, "evidence_status": "sufficient"},
+        )
+
+        self.assertEqual(19500, budget["target_words"])
+        self.assertEqual(
+            {"min_words": 15000, "max_words": 20000, "source": "user_range"},
+            budget.get("output_bounds"),
+        )
+
+    def test_explicit_word_ceiling_and_floor_keep_their_one_sided_meaning(self):
+        ceiling = reconcile_scale_budget("正文不超过3000字", {}, {"target_words": 2600})
+        floor = reconcile_scale_budget("正文至少3000字", {}, {"target_words": 3800})
+
+        self.assertEqual(3000, ceiling["target_words"])
+        self.assertEqual({"min_words": 0, "max_words": 3000, "source": "user_maximum"}, ceiling["output_bounds"])
+        self.assertEqual(3000, floor["target_words"])
+        self.assertEqual({"min_words": 3000, "max_words": 0, "source": "user_minimum"}, floor["output_bounds"])
+
+    def test_final_budget_source_survives_writer_plan_normalization(self):
+        budget = reconcile_scale_budget(
+            "", {"target_words": 9000}, {"target_words": 4200},
+        )
+        normalized = normalize_execution_plan({
+            "user_requirements": "",
+            "budget": budget,
+            "chapter_plans": [{"title": "A", "target_words": 4200}],
+        })
+
+        self.assertEqual(4200, normalized["budget"]["target_words"])
+        self.assertEqual("final_plan", normalized["budget"]["target_source"])
+        self.assertEqual(9000, normalized["budget"]["preliminary_target_words"])
+
+    def test_writer_output_tokens_scale_with_unit_target_and_respect_stage_cap(self):
+        self.assertEqual(981, writer_output_token_limit(500, 3072, 1.45))
+        self.assertEqual(512, writer_output_token_limit(174, 3072, 1.45))
+        self.assertEqual(823, writer_output_token_limit(391, 3072, 1.45))
+        self.assertEqual(3072, writer_output_token_limit(0, 3072, 1.45))
+        self.assertEqual(3072, writer_output_token_limit(3000, 3072, 1.45))
+
+    def test_writer_truncation_retry_escalates_once_without_repeating_same_cap(self):
+        writer = WriterAgent.__new__(WriterAgent)
+        caps = []
+
+        def fake_generate_json(_prompt, max_tokens=None, **_kwargs):
+            caps.append(max_tokens)
+            if len(caps) == 1:
+                raise RuntimeError("MODEL_OUTPUT_TRUNCATED")
+            return {"paragraphs": []}
+
+        writer.generate_json = fake_generate_json
+        payload, used_cap = writer._generate_json_with_budget_retry("prompt", 512)
+
+        self.assertEqual({"paragraphs": []}, payload)
+        self.assertEqual([512, 1024], caps)
+        self.assertEqual(1024, used_cap)
+        self.assertEqual(3072, writer_output_retry_limit(1600, 3072))
+        self.assertEqual(3072, writer_output_retry_limit(3072, 3072))
+
+    def test_writer_does_not_retry_identical_truncated_request(self):
+        writer = WriterAgent.__new__(WriterAgent)
+        self.assertFalse(writer.should_retry(RuntimeError("MODEL_OUTPUT_TRUNCATED")))
+        self.assertTrue(writer.should_retry(RuntimeError("temporary transport error")))
+
+    def test_sufficient_evidence_guidance_enforces_declared_unit_minimum(self):
+        hint = _evidence_execution_hint({
+            "evidence_status": "sufficient", "target_words": 174,
+            "minimum_words": 139,
+        })
+
+        self.assertIn("最低完成要求约 139 字", hint)
+        self.assertIn("未达到最低完成要求前不得收束", hint)
+
+    def test_sufficient_evidence_without_declared_minimum_does_not_invent_one(self):
+        hint = _evidence_execution_hint({
+            "evidence_status": "sufficient", "target_words": 174,
+        })
+
+        self.assertIn("目标不是最低字数", hint)
+        self.assertNotIn("最低完成要求", hint)
+
+    def test_limited_evidence_can_underfill_declared_unit_minimum(self):
+        hint = _evidence_execution_hint({
+            "evidence_status": "limited", "target_words": 174,
+            "minimum_words": 139,
+        })
+
+        self.assertIn("允许低于最低完成要求 139 字", hint)
+        self.assertIn("不得重复事实", hint)
+
+    def test_writer_scale_hint_keeps_report_bounds_and_nested_allocations_distinct(self):
+        hint = writer_scale_prompt_hint(
+            {
+                "target_words": 3000,
+                "soft_max_words": 3200,
+                "output_bounds": {"min_words": 2700, "max_words": 3300},
+            },
+            chapter_target_words=900,
+            unit_target_words=500,
+            unit_minimum_words=450,
+            evidence_status="sufficient",
+        )
+
+        self.assertIn("全文目标约 3000 字", hint)
+        self.assertIn("全文允许范围 2700–3300 字", hint)
+        self.assertIn("全文软控制线 3200 字", hint)
+        self.assertIn("本章分配约 900 字", hint)
+        self.assertIn("当前交付单元目标约 500 字", hint)
+        self.assertIn("当前交付单元最低完成要求约 450 字", hint)
+        self.assertIn("最终规模评估判定证据充足", hint)
+        self.assertIn("未达到本单元最低完成要求前不得收束", hint)
+        self.assertIn("全文预算的内部拆分，不可相加", hint)
+        self.assertIn("全文不得超过上限", hint)
+
+    def test_writer_scale_hint_preserves_one_sided_user_minimum(self):
+        hint = writer_scale_prompt_hint(
+            {"target_words": 3000, "output_bounds": {"min_words": 3000}},
+            unit_target_words=600,
+        )
+
+        self.assertIn("全文最低要求 3000 字", hint)
+        self.assertNotIn("全文上限", hint)
+
+    def test_insufficient_evidence_can_underfill_without_weakening_sufficient_case(self):
+        hint = writer_scale_prompt_hint(
+            {"target_words": 3000, "output_bounds": {"min_words": 2700}},
+            unit_target_words=600,
+            evidence_status="insufficient",
+        )
+
+        self.assertIn("证据有限或不足", hint)
+        self.assertIn("允许低于", hint)
+        self.assertNotIn("未达到本单元最低完成要求前不得收束", hint)
+
+    def test_report_minimum_uses_explicit_output_bound_before_default_ratio(self):
+        self.assertEqual(
+            2700,
+            report_minimum_words(
+                3000,
+                {"output_bounds": {"min_words": 2700, "max_words": 3300}},
+                default_ratio=0.8,
+            ),
+        )
+        self.assertEqual(2400, report_minimum_words(3000, {}, default_ratio=0.8))
+
+    def test_report_scale_excludes_subheading_rows_from_body_count(self):
+        rows = [
+            {"section": "Chapter 1", "source_level": "SUBHEADING", "content": "小标题不计入正文"},
+            {"section": "Chapter 1", "source_level": "MATERIAL_FACT", "content": "正文事实"},
+            {"section": "Chapter 2", "source_level": "INFERENCE", "content": "第二章推论内容"},
+        ]
+        self.assertEqual(
+            {"Chapter 1": measure_text_words("正文事实"), "Chapter 2": measure_text_words("第二章推论内容")},
+            measure_report_body_words_by_section(rows),
+        )
+
+    def test_continuous_article_prompt_distinguishes_report_and_group_targets(self):
+        writer = WriterAgent.__new__(WriterAgent)
+        captured = {}
+        writer.last_call_id = "article-scale-test-call"
+
+        def fake_generate_json(prompt, max_tokens=None, **_kwargs):
+            captured["prompt"] = prompt
+            captured["max_tokens"] = max_tokens
+            return {"paragraphs": []}
+
+        writer.generate_json = fake_generate_json
+        with patch("app.writing.writer.publish_context_audit"), patch("app.writing.writer.update_call_funnel"):
+            result = writer._generate_article_pass(
+                plan={"title": "Report", "budget": {
+                    "target_words": 3000,
+                    "output_bounds": {"min_words": 2700, "max_words": 3300},
+                    "evidence_status": "sufficient",
+                }},
+                article_plan={"target_words": 650, "group_index": 1, "group_count": 2},
+                facts=[], inferences=[], style_block="", allowed_fact_ids=set(),
+                allowed_inference_ids=set(), institution_rules=None, task_profile=None,
+                policy_block="", minimum_ratio=0.8,
+            )
+
+        self.assertEqual([], result)
+        self.assertIn("全文目标约 3000 字", captured["prompt"])
+        self.assertIn("当前文章片段目标约 650 字", captured["prompt"])
+        self.assertIn("当前文章片段最低完成要求约 585 字", captured["prompt"])
+        self.assertIn("最终规模评估判定证据充足", captured["prompt"])
+        self.assertNotIn("证据不足时允许欠填", captured["prompt"])
+        self.assertNotIn("全文目标:约 650 字", captured["prompt"])
+
+    def test_writer_system_prompt_matches_subsection_generation_granularity(self):
+        self.assertIn("当前交付单元", WriterAgent.role)
+        self.assertNotIn("每次只撰写一个章节", WriterAgent.role)
+
+    def test_chapter_writer_receives_nested_report_chapter_and_unit_budgets(self):
+        writer = WriterAgent.__new__(WriterAgent)
+        captured = {}
+        writer.last_call_id = "scale-test-call"
+
+        def fake_generate_json(_prompt, max_tokens=None, **_kwargs):
+            captured["max_tokens"] = max_tokens
+            captured["prompt"] = _prompt
+            return {"paragraphs": [{"sentences": [{
+                "text": "材料明确记载了这一事实。", "fact_ids": [1], "inference_ids": [],
+            }]}]}
+
+        writer.generate_json = fake_generate_json
+        with patch("app.writing.writer.publish_context_audit"), patch("app.writing.writer.update_call_funnel"):
+            writer._generate_chapter_pass(
+                "Chapter", 1, 1, ["Chapter"],
+                [{"id": 1, "content": "材料明确记载了这一事实"}], [], "",
+                {"title": "Report", "budget": {
+                    "target_words": 3000, "soft_max_words": 3200,
+                    "output_bounds": {"min_words": 2700, "max_words": 3300},
+                }}, {}, {1}, set(),
+                chapter_plan={"title": "Chapter", "target_words": 900},
+                generation_unit={
+                    "index": 1, "count": 1, "title": "", "target_words": 500,
+                    "plan": {"fact_ids": [1]}, "evidence_status": "sufficient",
+                },
+            )
+
+        self.assertEqual(981, captured["max_tokens"])
+        self.assertIn("全文目标约 3000 字", captured["prompt"])
+        self.assertIn("全文允许范围 2700–3300 字", captured["prompt"])
+        self.assertIn("本章分配约 900 字", captured["prompt"])
+        self.assertIn("当前交付单元目标约 500 字", captured["prompt"])
+        self.assertIn("全文预算的内部拆分，不可相加", captured["prompt"])
+
+    def test_report_scale_audit_flags_overrun_and_keeps_in_range_output(self):
+        bounds = {"min_words": 2700, "max_words": 3300, "source": "user_target_tolerance"}
+        self.assertTrue(assess_report_scale(3000, 3400, bounds)["over_budget"])
+        self.assertEqual(100, assess_report_scale(3000, 3400, bounds)["overrun_words"])
+        self.assertFalse(assess_report_scale(3000, 3200, bounds)["over_budget"])
+        self.assertTrue(assess_report_scale(3000, 2591, bounds)["below_minimum"])
 
     def test_exact_user_target_is_parsed_with_wan_unit(self):
         scale = parse_user_scale("请形成一篇2万字左右的研究综述")
@@ -426,7 +739,7 @@ class NarrativeScaleTests(unittest.TestCase):
 
         self.assertEqual(1, len(units))
         self.assertEqual("", units[0]["title"])
-        self.assertIsNone(units[0]["plan"])
+        self.assertEqual([1], units[0]["plan"]["fact_ids"])
 
     def test_no_evidence_still_uses_only_one_call(self):
         writer = WriterAgent.__new__(WriterAgent)
