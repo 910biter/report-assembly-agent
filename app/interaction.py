@@ -442,6 +442,12 @@ def _generate_interaction_reply(thread_id: int, content: str, request_id: str = 
         if decision == "accepted":
             if str(thread.get("artifact_type") or "") == "task_draft":
                 reply = "已将这份需求写入新建任务草稿。你仍可继续调整，确认无误后再创建任务。"
+            elif result.get("status") == "applied" and not result.get("report_id") and result.get("artifact_type") == "task_brief":
+                reply = "已将需求提案填入任务要求。你仍可编辑；确认需求后，系统会从分析规划开始执行这一轮任务。"
+            elif result.get("status") == "applied" and not result.get("report_id") and result.get("artifact_type") in {
+                "final_plan", "section_title", "section_titles",
+            }:
+                reply = "已更新待确认目录。请检查当前目录，确认后系统会继续叙事规划和写作。"
             else:
                 state = "已执行" if result.get("status") == "applied" else "已进入后台处理"
                 reply = f"已确认该操作，{state}。成功后将形成新报告版本并保留历史基线；若执行失败，系统会自动回滚。"
@@ -659,11 +665,17 @@ def decide_proposal(proposal_id: int, decision: str) -> dict[str, Any]:
         # that state recoverable and idempotent instead of leaving it stuck
         # forever until a new proposal is created.
         if row["status"] == "accepted" and row.get("execution_status") == "waiting":
-            if _apply_supported_proposal(dict(row)):
+            applied = _apply_pre_report_checkpoint_proposal(dict(row))
+            if not applied:
+                applied = _apply_supported_proposal(dict(row))
+            if applied:
                 with session_scope() as s:
                     s.execute(update(ORMChangeProposal).where(
                         ORMChangeProposal.c.id == int(proposal_id)
-                    ).values(execution_status="completed"))
+                    ).values(
+                        status="applied", execution_status="completed",
+                        execution_error="",
+                    ))
             else:
                 dispatch_pending_revisions(str(row.get("task_id") or ""))
             with session_scope() as s:
@@ -674,7 +686,9 @@ def decide_proposal(proposal_id: int, decision: str) -> dict[str, Any]:
     applied = False
     scheduled = False
     if decision == "accepted":
-        applied = _apply_supported_proposal(dict(row))
+        applied = _apply_pre_report_checkpoint_proposal(dict(row))
+        if not applied:
+            applied = _apply_supported_proposal(dict(row))
         if not applied:
             scheduled = _schedule_semantic_proposal(dict(row))
     status = "applied" if applied else decision
@@ -698,6 +712,71 @@ def decide_proposal(proposal_id: int, decision: str) -> dict[str, Any]:
             ORMChangeProposal.c.id == int(proposal_id)
         )).mappings().first()
     return _proposal_detail(current)
+
+
+def _apply_pre_report_checkpoint_proposal(row: dict) -> bool:
+    """Consume accepted inputs at their open pre-write checkpoint.
+
+    These changes are inputs to the initial workflow, not post-report revisions.
+    Applying them here prevents the queue's post-run dispatcher from treating
+    the same approval as a second full report generation.
+    """
+    task_id = str(row.get("task_id") or "")
+    if not task_id or row.get("report_id"):
+        return False
+    task = short_term.load_task(task_id) or {}
+    if task.get("report_id"):
+        return False
+
+    artifact_type = str(row.get("artifact_type") or "")
+    after = _load(row.get("after_json"), {})
+    if artifact_type == "task_brief" and task.get("requirement_review_pending"):
+        theme = str(after.get("theme") or "").strip()
+        requirements = str(after.get("requirements") or "").strip()
+        if not theme or not requirements:
+            return False
+        short_term.update_task(
+            task_id, theme=theme, user_requirements=requirements,
+        )
+        return True
+
+    if not task.get("directory_review_pending"):
+        return False
+    if artifact_type == "final_plan":
+        structure = [str(title).strip() for title in after.get("required_structure") or []
+                     if str(title).strip()]
+        if not structure:
+            return False
+        plan_id = _resolve_task_plan_id(task_id, task)
+        if not plan_id:
+            return False
+        from app.workflow.controller import planner as workflow_planner
+
+        revised = workflow_planner.revise_final_plan_structure(
+            int(plan_id), structure,
+            instruction=str(after.get("instruction") or "按用户确认目录调整"),
+            refine=False,
+        )
+        short_term.update_task(
+            task_id, plan_id=int(plan_id), plan_title=revised.title,
+            final_plan_frozen=True,
+        )
+        return True
+
+    if artifact_type in {"section_title", "section_titles"}:
+        impact = _load(row.get("impact_json"), {})
+        tool_call = dict((impact.get("scope") or {}).get("tool_call") or {})
+        arguments = dict(tool_call.get("arguments") or {})
+        if artifact_type == "section_title":
+            changes = [(str(row.get("object_id") or ""), str(after.get("title") or ""))]
+        else:
+            changes = [
+                (str(item.get("old_title") or ""), str(item.get("new_title") or ""))
+                for item in (after.get("changes") or arguments.get("changes") or [])
+                if isinstance(item, dict)
+            ]
+        return _rename_sections_in_task(task_id, None, changes)
+    return False
 
 
 _RETRY_FAILED_PATTERN = re.compile(r"^(?:请)?(?:再试一遍|重试|重新执行|再执行一次)[！!。\s]*$")

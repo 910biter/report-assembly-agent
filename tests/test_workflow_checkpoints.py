@@ -7,20 +7,29 @@ from app.workflow.controller import Stage, WorkflowController
 
 class WorkflowCheckpointTests(unittest.TestCase):
     def test_confirm_requirements_persists_brief_then_enqueues(self):
-        with patch("app.workflow.checkpoints.short_term.load_task", return_value={
-            "requirement_review_pending": True,
-        }), patch("app.workflow.checkpoints.short_term.update_task") as update_task, patch(
-            "app.workflow.checkpoints.enqueue_task", return_value={"status": "queued"},
-        ) as enqueue:
+        payload = {"requirement_review_pending": True}
+
+        def transition(_task_id, callback, *, _session):
+            return callback(payload, _session)
+
+        session = unittest.mock.MagicMock()
+        context = unittest.mock.MagicMock()
+        context.__enter__.return_value = session
+        with (
+            patch("app.workflow.checkpoints.short_term.load_task", return_value=payload),
+            patch("app.workflow.checkpoints.short_term.transition_task", side_effect=transition) as transition_task,
+            patch("app.workflow.checkpoints.session_scope", return_value=context),
+            patch("app.workflow.checkpoints.enqueue_task", return_value={"status": "queued"}) as enqueue,
+        ):
             result = confirm_requirements("task-a", theme="专题报告", requirements="形成可信分析报告")
         self.assertEqual(result["status"], "confirmed")
         self.assertTrue(result["replan_required"])
-        update_task.assert_called_once_with(
-            "task-a", requirement_review_pending=False, requirement_review_completed=True,
-            theme="专题报告", user_requirements="形成可信分析报告",
-            requirement_review_feedback="", replan_required=True,
-            stage="planning", resume_from_stage="planning",
-        )
+        transition_task.assert_called_once()
+        self.assertEqual("专题报告", payload["theme"])
+        self.assertEqual("形成可信分析报告", payload["user_requirements"])
+        self.assertFalse(payload["requirement_review_pending"])
+        self.assertEqual("planning", payload["resume_from_stage"])
+        session.execute.assert_called_once()
         enqueue.assert_called_once_with("task-a")
 
     def test_confirm_directory_preserves_current_plan_and_enqueues(self):

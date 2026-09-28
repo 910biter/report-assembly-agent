@@ -1,8 +1,13 @@
 """Deterministic workflow checkpoint transitions shared by API and copilot."""
 from __future__ import annotations
 
+import time
 from typing import Any
 
+from sqlalchemy import update
+
+from app.db import session_scope
+from app.infrastructure.orm import ORMChangeProposal
 from app.memory import short_term
 from app.workflow.queue import enqueue_task
 
@@ -24,22 +29,40 @@ def confirm_requirements(task_id: str, *, theme: str, requirements: str,
         raise CheckpointError("THEME_REQUIRED")
     if not requirements:
         raise CheckpointError("REQUIREMENTS_REQUIRED")
-    short_term.update_task(
-        task_id,
-        requirement_review_pending=False,
-        requirement_review_completed=True,
-        theme=theme,
-        user_requirements=requirements,
-        requirement_review_feedback=str(feedback or "").strip(),
-        # The existing AnalysisPlan was created before the user confirmed the
-        # brief.  A plan id alone must not make the workflow reuse that stale
-        # contract on resume.
-        replan_required=True,
-        # Material parsing and understanding completed before this checkpoint.
-        # Resume from planning instead of re-entering the public task entry point.
-        stage="planning",
-        resume_from_stage="planning",
-    )
+    def transition(payload: dict, session) -> dict:
+        if not payload.get("requirement_review_pending", payload.get("planning_review_pending")):
+            raise CheckpointError("REQUIREMENT_REVIEW_NOT_PENDING")
+        payload.update(
+            requirement_review_pending=False,
+            requirement_review_completed=True,
+            theme=theme,
+            user_requirements=requirements,
+            requirement_review_feedback=str(feedback or "").strip(),
+            # The existing AnalysisPlan predates the confirmed brief.
+            replan_required=True,
+            # Material understanding is done; resume at planning.
+            stage="planning",
+            resume_from_stage="planning",
+        )
+        # Older accepted task-brief proposals may still be waiting from before
+        # checkpoint-aware proposal application. The confirmed form is the
+        # authoritative brief, so consume them in this same transaction.
+        session.execute(update(ORMChangeProposal).where(
+            ORMChangeProposal.c.task_id == task_id,
+            ORMChangeProposal.c.artifact_type == "task_brief",
+            ORMChangeProposal.c.status == "accepted",
+            ORMChangeProposal.c.execution_status == "waiting",
+        ).values(
+            status="applied", execution_status="completed",
+            execution_error="", decided_at=time.strftime("%Y-%m-%d %H:%M:%S"),
+        ))
+        return payload
+
+    try:
+        with session_scope() as session:
+            short_term.transition_task(task_id, transition, _session=session)
+    except KeyError as exc:
+        raise CheckpointError("TASK_NOT_FOUND") from exc
     return _enqueue_or_raise(task_id, replan_required=True)
 
 

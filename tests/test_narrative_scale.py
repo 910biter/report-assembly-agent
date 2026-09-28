@@ -622,6 +622,42 @@ class NarrativeScaleTests(unittest.TestCase):
                 sum(item["target_words"] for item in chapter["subsections"]),
             )
 
+    def test_single_subsection_budget_matches_its_chapter(self):
+        normalized = normalize_chapter_budgets([{
+            "title": "单小节章节", "target_words": 573,
+            "subsections": [{"title": "唯一小节", "target_words": 900}],
+        }], 3500)
+
+        self.assertEqual(3500, normalized[0]["target_words"])
+        self.assertEqual(3500, normalized[0]["subsections"][0]["target_words"])
+
+    def test_system_scale_uses_one_effective_minimum_and_preserves_evidence_estimate(self):
+        budget = reconcile_scale_budget(
+            "",
+            {"target_words": 3500, "min_words": 2800},
+            {"target_words": 3500, "evidence_status": "sufficient"},
+        )
+
+        self.assertEqual(2800, budget["min_words"])
+        self.assertEqual(3150, budget["effective_min_words"])
+        self.assertEqual(3150, report_minimum_words(3500, budget, default_ratio=0.8))
+        audit = assess_report_scale(
+            3500, 3030, budget["output_bounds"],
+            minimum_words=report_minimum_words(3500, budget, default_ratio=0.8),
+        )
+        self.assertTrue(audit["below_minimum"])
+        self.assertEqual(3150, audit["shortfall_words"] + 3030)
+
+    def test_scale_minimum_normalization_is_idempotent(self):
+        initial = reconcile_scale_budget(
+            "", {"target_words": 3500, "min_words": 2800},
+            {"target_words": 3500, "evidence_status": "sufficient"},
+        )
+        normalized = reconcile_scale_budget("", initial, {})
+
+        self.assertEqual(initial["min_words"], normalized["min_words"])
+        self.assertEqual(initial["effective_min_words"], normalized["effective_min_words"])
+
     def test_historical_plan_recovers_budget_without_overriding_user_range(self):
         plan = normalize_execution_plan({
             "user_requirements": "正文约 15000-20000 字",

@@ -95,7 +95,6 @@ def reconcile_scale_budget(
     explicit = parse_user_scale(user_requirements)
     preliminary_target = _positive_int(preliminary.get("target_words"))
     final_target = _positive_int(final.get("target_words"))
-
     if explicit:
         if explicit["kind"] == "range":
             candidates = [final_target, preliminary_target]
@@ -174,6 +173,13 @@ def reconcile_scale_budget(
     if explicit.get("kind") == "range":
         result["min_words"] = explicit["min_words"]
         result["user_max_words"] = explicit["max_words"]
+    # min_words is the planner's evidence estimate; output_bounds is the
+    # requested/system acceptance range. Persist their resolved runtime floor
+    # separately instead of overwriting either source.
+    result["effective_min_words"] = max(
+        _positive_int(result.get("min_words")),
+        _positive_int((result.get("output_bounds") or {}).get("min_words")),
+    )
     return result
 
 
@@ -202,6 +208,9 @@ def normalize_chapter_budgets(chapters: list[dict], target_words: int) -> list[d
             subsection_targets = _allocate(subsections, target)
             for subsection, subsection_target in zip(subsections, subsection_targets):
                 subsection["target_words"] = subsection_target
+            chapter["subsections"] = subsections
+        elif len(subsections) == 1:
+            subsections[0]["target_words"] = target
             chapter["subsections"] = subsections
         normalized.append(chapter)
     return normalized

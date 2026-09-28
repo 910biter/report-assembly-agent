@@ -29,15 +29,25 @@ def measure_report_body_words_by_section(rows: Iterable[Mapping[str, object]]) -
 def report_minimum_words(target_words: int, budget: dict | None, default_ratio: float) -> int:
     """Use a declared lower bound when present; otherwise retain the QA floor."""
     budget = dict(budget or {})
-    bounds = dict(budget.get("output_bounds") or {})
     target = max(0, int(target_words or 0))
-    declared_minimum = max(
-        0,
-        int(budget.get("min_words") or 0),
-        int(bounds.get("min_words") or 0),
-    )
+    declared_minimum = declared_report_minimum_words(budget)
     fallback_minimum = round(target * max(0.0, float(default_ratio or 0.0)))
     return max(declared_minimum, fallback_minimum)
+
+
+def declared_report_minimum_words(budget: dict | None) -> int:
+    """Resolve evidence and acceptance floors to the stored runtime contract."""
+    budget = dict(budget or {})
+    bounds = dict(budget.get("output_bounds") or {})
+    resolved = max(
+        0,
+        int(budget.get("effective_min_words") or 0),
+        int(bounds.get("min_words") or 0),
+    )
+    if "effective_min_words" in budget:
+        return resolved
+    # Read pre-contract historical plans without changing their semantics.
+    return max(resolved, int(budget.get("min_words") or 0))
 
 
 def writer_output_token_limit(
@@ -86,7 +96,7 @@ def writer_scale_prompt_hint(
     budget = dict(report_budget or {})
     target = max(0, int(budget.get("target_words") or 0))
     bounds = dict(budget.get("output_bounds") or {})
-    minimum = max(0, int(bounds.get("min_words") or 0), int(budget.get("min_words") or 0))
+    minimum = declared_report_minimum_words(budget)
     maximum = max(0, int(bounds.get("max_words") or 0))
     soft_maximum = max(0, int(budget.get("soft_max_words") or 0))
     unit_target = max(0, int(unit_target_words or 0))
@@ -139,12 +149,22 @@ def writer_scale_prompt_hint(
     return hint
 
 
-def assess_report_scale(target_words: int, actual_words: int, output_bounds: dict | None) -> dict:
+def assess_report_scale(
+    target_words: int,
+    actual_words: int,
+    output_bounds: dict | None,
+    *,
+    minimum_words: int | None = None,
+) -> dict:
     """Report measurable deviation from the user/system scale contract."""
     target = max(0, int(target_words or 0))
     actual = max(0, int(actual_words or 0))
     bounds = dict(output_bounds or {})
-    minimum = max(0, int(bounds.get("min_words") or 0))
+    minimum = max(
+        0,
+        int(bounds.get("min_words") or 0),
+        int(minimum_words) if minimum_words is not None else 0,
+    )
     maximum = max(0, int(bounds.get("max_words") or 0))
     overrun = max(0, actual - maximum) if maximum else 0
     return {

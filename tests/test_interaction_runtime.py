@@ -10,6 +10,8 @@ from app.interaction import (
     _friendly_revision_error,
     _merge_draft_change,
     _apply_supported_proposal,
+    _apply_pre_report_checkpoint_proposal,
+    decide_proposal,
     _prepare_revision_run,
     _synchronize_plan_title_payloads,
     _latest_failed_proposal,
@@ -25,6 +27,80 @@ from app.workflow.controller import _apply_section_title_changes_to_plan
 
 
 class InteractionRuntimeTests(unittest.TestCase):
+    def test_requirement_checkpoint_proposal_is_consumed_by_initial_run(self):
+        row = {
+            "id": 8, "task_id": "task-a", "report_id": None,
+            "artifact_type": "task_brief",
+            "after_json": '{"theme":"新主题","requirements":"完整要求"}',
+            "proposal_key": "proposal-a", "thread_id": 1, "artifact_version": "1",
+            "object_id": "", "operation": "update", "before_json": "{}",
+            "impact_json": "{}", "rationale": "更新需求", "risk_level": "low",
+            "created_at": "now", "decided_at": "now",
+        }
+        query_result = unittest.mock.MagicMock()
+        query_result.mappings.return_value.first.side_effect = [
+            {**row, "status": "proposed", "execution_status": "not_required"},
+            {**row, "status": "applied", "execution_status": "completed"},
+        ]
+        session = unittest.mock.MagicMock()
+        session.execute.return_value = query_result
+        context = unittest.mock.MagicMock()
+        context.__enter__.return_value = session
+
+        with (
+            patch("app.interaction.session_scope", return_value=context),
+            patch("app.interaction._apply_pre_report_checkpoint_proposal", return_value=True) as apply,
+            patch("app.interaction._apply_supported_proposal") as apply_report,
+            patch("app.interaction._schedule_semantic_proposal") as schedule,
+        ):
+            result = decide_proposal(8, "accepted")
+
+        apply.assert_called_once()
+        apply_report.assert_not_called()
+        schedule.assert_not_called()
+        self.assertEqual("applied", result["status"])
+        self.assertEqual("completed", result["execution_status"])
+
+    def test_pre_report_task_brief_fills_pending_requirements_checkpoint(self):
+        row = {
+            "task_id": "task-a", "report_id": None,
+            "artifact_type": "task_brief",
+            "after_json": '{"theme":"新主题","requirements":"完整要求"}',
+        }
+        with (
+            patch("app.interaction.short_term.load_task", return_value={
+                "requirement_review_pending": True, "report_id": None,
+            }),
+            patch("app.interaction.short_term.update_task") as update_task,
+        ):
+            self.assertTrue(_apply_pre_report_checkpoint_proposal(row))
+
+        update_task.assert_called_once_with(
+            "task-a", theme="新主题", user_requirements="完整要求",
+        )
+
+    def test_pre_report_directory_proposal_updates_authoritative_plan(self):
+        row = {
+            "task_id": "task-a", "report_id": None,
+            "artifact_type": "final_plan",
+            "after_json": '{"instruction":"合并章节","required_structure":["甲","乙"]}',
+        }
+        revised_plan = SimpleNamespace(title="新目录")
+        with (
+            patch("app.interaction.short_term.load_task", return_value={
+                "directory_review_pending": True, "report_id": None, "plan_id": 7,
+            }),
+            patch("app.workflow.controller.planner.revise_final_plan_structure",
+                  return_value=revised_plan) as revise,
+            patch("app.interaction.short_term.update_task") as update_task,
+        ):
+            self.assertTrue(_apply_pre_report_checkpoint_proposal(row))
+
+        revise.assert_called_once_with(7, ["甲", "乙"], instruction="合并章节", refine=False)
+        update_task.assert_called_once_with(
+            "task-a", plan_id=7, plan_title="新目录", final_plan_frozen=True,
+        )
+
     def test_section_title_proposals_are_deferred_to_revision_run(self):
         row = {
             "artifact_type": "section_title",

@@ -2250,6 +2250,7 @@ class WorkflowController:
             target_words,
             actual_words,
             budget.get("output_bounds"),
+            minimum_words=minimum_words,
         )
         all_generation_units = [
             unit for chapter in chapter_stats for unit in chapter.get("generation_unit_stats", [])
