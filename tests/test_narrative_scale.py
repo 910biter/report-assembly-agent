@@ -1,3 +1,4 @@
+import json
 import unittest
 from contextlib import contextmanager
 from types import MethodType
@@ -15,8 +16,8 @@ from app.planning.scale import (
 from app.writing.writer import (
     WriterAgent,
     _article_evidence_ids,
+    _article_narrative_evidence,
     _coerce_paragraphs,
-    _evidence_execution_hint,
     _focused_unit_evidence,
     _subsection_generation_units,
 )
@@ -167,6 +168,40 @@ class NarrativeScaleTests(unittest.TestCase):
         }])
         self.assertEqual({1, 2}, fact_ids)
         self.assertEqual({9, 10}, inference_ids)
+
+    def test_article_narrative_keeps_supporting_evidence_after_primary_anchors(self):
+        chapters = [{"primary_fact_ids": [2], "primary_inference_ids": [11]}]
+        facts = [{"id": 1, "content": "补充事实"}, {"id": 2, "content": "主事实"}]
+        inferences = [{"id": 10, "content": "补充判断"}, {"id": 11, "content": "主要判断"}]
+        selected_facts, selected_inferences = _article_narrative_evidence(chapters, facts, inferences)
+        self.assertEqual([2, 1], [item["id"] for item in selected_facts])
+        self.assertEqual([11, 10], [item["id"] for item in selected_inferences])
+
+    def test_article_writer_keeps_complete_current_paragraph_contract(self):
+        writer = WriterAgent.__new__(WriterAgent)
+        writer.last_call_id = "article-contract-test"
+        captured = {}
+
+        def fake_generate(prompt, **_kwargs):
+            captured["prompt"] = prompt
+            return {"paragraphs": []}
+
+        writer.generate_json = fake_generate
+        paragraphs = [{
+            "paragraph_id": f"P{index}", "purpose": "论证步骤" * 40 + str(index),
+            "fact_ids": [1], "inference_ids": [], "target_words": 100,
+        } for index in range(1, 9)]
+        with patch("app.writing.writer.publish_context_audit"), patch("app.writing.writer.update_call_funnel"):
+            writer._generate_article_pass(
+                plan={"title": "Report", "budget": {"target_words": 800}},
+                article_plan={"target_words": 800, "paragraphs": paragraphs, "beats": []},
+                facts=[{"id": 1, "content": "事实"}], inferences=[], style_block="",
+                allowed_fact_ids={1}, allowed_inference_ids=set(), institution_rules=None,
+                task_profile=None, policy_block="", minimum_ratio=0.8,
+            )
+        self.assertIn('"paragraph_id": "P8"', captured["prompt"])
+        self.assertNotIn("…", captured["prompt"])
+
     def test_final_planner_context_is_coverage_driven_and_not_first_40_inferences(self):
         manager = ContextManager({"id": "task"})
         manager.budget_tokens = MethodType(lambda self, stage="structured": 5000, manager)
@@ -382,32 +417,6 @@ class NarrativeScaleTests(unittest.TestCase):
         self.assertFalse(writer.should_retry(RuntimeError("MODEL_OUTPUT_TRUNCATED")))
         self.assertTrue(writer.should_retry(RuntimeError("temporary transport error")))
 
-    def test_sufficient_evidence_guidance_enforces_declared_unit_minimum(self):
-        hint = _evidence_execution_hint({
-            "evidence_status": "sufficient", "target_words": 174,
-            "minimum_words": 139,
-        })
-
-        self.assertIn("最低完成要求约 139 字", hint)
-        self.assertIn("未达到最低完成要求前不得收束", hint)
-
-    def test_sufficient_evidence_without_declared_minimum_does_not_invent_one(self):
-        hint = _evidence_execution_hint({
-            "evidence_status": "sufficient", "target_words": 174,
-        })
-
-        self.assertIn("目标不是最低字数", hint)
-        self.assertNotIn("最低完成要求", hint)
-
-    def test_limited_evidence_can_underfill_declared_unit_minimum(self):
-        hint = _evidence_execution_hint({
-            "evidence_status": "limited", "target_words": 174,
-            "minimum_words": 139,
-        })
-
-        self.assertIn("允许低于最低完成要求 139 字", hint)
-        self.assertIn("不得重复事实", hint)
-
     def test_writer_scale_hint_keeps_report_bounds_and_nested_allocations_distinct(self):
         hint = writer_scale_prompt_hint(
             {
@@ -494,7 +503,7 @@ class NarrativeScaleTests(unittest.TestCase):
                 }},
                 article_plan={"target_words": 650, "group_index": 1, "group_count": 2},
                 facts=[], inferences=[], style_block="", allowed_fact_ids=set(),
-                allowed_inference_ids=set(), institution_rules=None, task_profile=None,
+                allowed_inference_ids=set(), institution_rules={"confirmed": True, "must_include": ["独立业务规则"]}, task_profile=None,
                 policy_block="", minimum_ratio=0.8,
             )
 
@@ -505,6 +514,7 @@ class NarrativeScaleTests(unittest.TestCase):
         self.assertIn("最终规模评估判定证据充足", captured["prompt"])
         self.assertNotIn("证据不足时允许欠填", captured["prompt"])
         self.assertNotIn("全文目标:约 650 字", captured["prompt"])
+        self.assertEqual(1, captured["prompt"].count("独立业务规则"))
 
     def test_writer_system_prompt_matches_subsection_generation_granularity(self):
         self.assertIn("当前交付单元", WriterAgent.role)
@@ -548,6 +558,72 @@ class NarrativeScaleTests(unittest.TestCase):
         self.assertIn("本章分配约 900 字", captured["prompt"])
         self.assertIn("当前交付单元目标约 500 字", captured["prompt"])
         self.assertIn("全文预算的内部拆分，不可相加", captured["prompt"])
+
+    def test_chapter_writer_receives_one_complete_current_unit_contract(self):
+        writer = WriterAgent.__new__(WriterAgent)
+        writer.last_call_id = "chapter-contract-test"
+        captured = {}
+
+        def fake_generate(prompt, **_kwargs):
+            captured["prompt"] = prompt
+            return {"paragraphs": []}
+
+        writer.generate_json = fake_generate
+        unit_plan = {
+            "title": "Current unit", "fact_ids": [1], "target_words": 500,
+            "paragraphs": [{"purpose": f"独特段落目的{i}", "fact_ids": [1]}
+                           for i in range(1, 9)],
+        }
+        with patch("app.writing.writer.publish_context_audit"), patch("app.writing.writer.update_call_funnel"):
+            writer._generate_chapter_pass(
+                "Chapter", 1, 1, ["Chapter"],
+                [{"id": 1, "content": "可核验事实"}], [], "",
+                {"title": "Report", "core_judgment": "统一核心判断", "budget": {"target_words": 500}},
+                {"core_judgment": "统一核心判断"}, {1}, set(),
+                chapter_plan={"title": "Chapter", "target_words": 500,
+                              "required_facts": ["章级事实要求"]},
+                narrative_plan={"subsections": [unit_plan]},
+                generation_unit={"plan": unit_plan, "target_words": 500},
+                institution_rules={"confirmed": True, "must_include": ["必须覆盖的独立要求"]},
+            )
+
+        prompt = captured["prompt"]
+        self.assertEqual(1, prompt.count("独特段落目的8"))
+        self.assertEqual(1, prompt.count("统一核心判断"))
+        self.assertIn("章级事实要求", prompt)
+        self.assertNotIn("…", prompt)
+        self.assertNotIn("Discourse Plan(", prompt)
+        self.assertNotIn("当前小节计划(", prompt)
+        self.assertEqual(1, prompt.count("必须覆盖的独立要求"))
+        contract = json.loads(prompt.split("当前交付单元契约(章节边界与当前叙事计划,完整执行):\n", 1)[1].split("\n\n", 1)[0])
+        self.assertEqual(8, len(contract["narrative"]["current_unit"]["paragraphs"]))
+        self.assertEqual(["章级事实要求"], contract["chapter"]["required_facts"])
+
+    def test_chapter_writer_without_subsections_keeps_narrative_topics_once(self):
+        writer = WriterAgent.__new__(WriterAgent)
+        writer.last_call_id = "chapter-no-subsections-test"
+        captured = {}
+
+        def fake_generate(prompt, **_kwargs):
+            captured["prompt"] = prompt
+            return {"paragraphs": []}
+
+        writer.generate_json = fake_generate
+        with patch("app.writing.writer.publish_context_audit"), patch("app.writing.writer.update_call_funnel"):
+            writer._generate_chapter_pass(
+                "Chapter", 1, 1, ["Chapter"],
+                [{"id": 1, "content": "可核验事实"}], [], "",
+                {"title": "Report", "budget": {"target_words": 300}}, {}, {1}, set(),
+                chapter_plan={"title": "Chapter", "target_words": 300},
+                narrative_plan={"central_message": "章级主线", "topics": [{
+                    "purpose": "唯一论证目的", "fact_ids": [1],
+                }]},
+                generation_unit={"target_words": 300},
+            )
+        prompt = captured["prompt"]
+        self.assertEqual(1, prompt.count("唯一论证目的"))
+        contract = json.loads(prompt.split("当前交付单元契约(章节边界与当前叙事计划,完整执行):\n", 1)[1].split("\n\n", 1)[0])
+        self.assertEqual("章级主线", contract["narrative"]["central_message"])
 
     def test_chapter_writer_drops_short_uncited_claim_but_keeps_marked_transition(self):
         writer = WriterAgent.__new__(WriterAgent)
@@ -765,6 +841,51 @@ class NarrativeScaleTests(unittest.TestCase):
         )
         self.assertEqual([2], [item["id"] for item in facts])
         self.assertEqual([10], [item["id"] for item in inferences])
+
+    def test_paragraph_and_flow_supporting_evidence_reaches_writer(self):
+        payload = {"subsections": [{
+            "title": "隔离机制",
+            "fact_ids": [1],
+            "paragraphs": [{
+                "purpose": "比较隔离边界及其限制",
+                "fact_ids": [1, 2, 99],
+                "inference_ids": [10],
+            }],
+            "discourse_flow": [{"role": "limitation", "fact_ids": [3]}],
+        }]}
+        plan = _sanitize_plan(payload, {"title": "机制", "target_words": 500}, {1, 2, 3}, {10})
+        unit = plan["subsections"][0]
+
+        self.assertEqual([1, 2, 3], unit["fact_ids"])
+        self.assertEqual([10], unit["inference_ids"])
+        self.assertEqual([1, 2], unit["paragraphs"][0]["fact_ids"])
+        facts, inferences = _focused_unit_evidence(
+            [{"id": 1}, {"id": 2}, {"id": 3}, {"id": 4}], [{"id": 10}],
+            unit, {"primary_fact_ids": [1]},
+        )
+        self.assertEqual([1, 2, 3], [item["id"] for item in facts])
+        self.assertEqual([10], [item["id"] for item in inferences])
+
+    def test_paragraph_only_evidence_keeps_semantic_unit(self):
+        plan = _sanitize_plan({"subsections": [{
+            "title": "适用边界",
+            "paragraphs": [{"purpose": "限定结论", "fact_ids": [2]}],
+        }]}, {"title": "机制", "target_words": 400}, {1, 2}, set())
+
+        self.assertEqual(1, len(plan["subsections"]))
+        self.assertEqual([2], plan["subsections"][0]["fact_ids"])
+
+    def test_topic_summary_tracks_subsection_supporting_evidence(self):
+        plan = _sanitize_plan({
+            "topics": [{"topic_id": "old", "name": "隔离机制", "fact_ids": [1]}],
+            "subsections": [{
+                "title": "隔离机制", "fact_ids": [1],
+                "paragraphs": [{"purpose": "比较边界", "fact_ids": [1, 2]}],
+            }],
+        }, {"title": "机制", "target_words": 500}, {1, 2}, set())
+
+        self.assertEqual([1, 2], plan["topics"][0]["fact_ids"])
+        self.assertEqual(plan["subsections"][0]["topic_ids"], [plan["topics"][0]["topic_id"]])
 
     def test_incremental_output_is_measured_without_automatic_acceptance(self):
         assessment = assess_chapter_output(

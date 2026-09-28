@@ -265,6 +265,18 @@ class ProductExtensionTests(unittest.TestCase):
         self.assertIn("弱参考", variant.planner_prompt_block())
         variant.structure_policy = {"mode": "HARD_STRUCTURE"}
         self.assertIn("必须遵守", variant.planner_prompt_block())
+        self.assertNotIn("模板结构策略", variant.writer_prompt_block())
+
+    def test_writer_style_omits_rules_and_keeps_valid_bounded_profile(self):
+        from app.models.memory import json_dumps
+        import json
+
+        rendered = json_dumps({"short": "kept", "long": "x" * 500}, limit=40)
+        self.assertEqual({"short": "kept", "_omitted_fields": 1}, json.loads(rendered))
+        variant = StyleVariant(library_id=1, institution_rules={
+            "confirmed": True, "must_include": ["必须保留的完整规则" * 30],
+        })
+        self.assertNotIn("必须保留的完整规则", variant.writer_prompt_block())
 
     def test_style_learning_samples_sections_instead_of_whole_document_slice(self):
         members = [{

@@ -51,7 +51,6 @@ class StyleVariant:
     def writer_prompt_block(self, context: dict | None = None) -> str:
         """Editorial profile plus a few context-relevant, approved exemplars."""
         block = f"机构风格变体「{self.name or '未命名'}」约束:\n"
-        block += "- 结构边界: " + self.planner_prompt_block() + "\n"
         writing = self.writing_style or {}
         if writing:
             block += (
@@ -116,9 +115,6 @@ class StyleVariant:
         reasoning = self.reasoning_profile or {}
         if reasoning:
             block += f"- 分析逻辑(本机构如何分析): {json_dumps(reasoning, limit=600)}\n"
-        rules = self.institution_rules or {}
-        if rules.get("confirmed") is True:
-            block += f"- 机构规则(业务约束): {json_dumps(rules, limit=500)}\n"
         return block.strip()
 
     def select_exemplars(self, context: dict, limit: int = 3) -> list[dict]:
@@ -142,7 +138,27 @@ def json_dumps(value, limit: int | None = None) -> str:
     import json
 
     text = json.dumps(value, ensure_ascii=False)
-    return text[:limit] + ("…" if limit and len(text) > limit else "")
+    if not limit or len(text) <= limit:
+        return text
+    if isinstance(value, dict):
+        selected = {}
+        for key, item in value.items():
+            candidate = {**selected, key: item}
+            if len(json.dumps(candidate, ensure_ascii=False)) <= limit:
+                selected[key] = item
+        if len(selected) < len(value):
+            selected["_omitted_fields"] = len(value) - len(selected)
+        return json.dumps(selected, ensure_ascii=False)
+    if isinstance(value, list):
+        selected = []
+        for item in value:
+            candidate = [*selected, item]
+            if len(json.dumps(candidate, ensure_ascii=False)) <= limit:
+                selected.append(item)
+        if len(selected) < len(value):
+            selected.append({"_omitted_items": len(value) - len(selected)})
+        return json.dumps(selected, ensure_ascii=False)
+    return json.dumps(str(value)[:max(0, limit - 8)] + "…", ensure_ascii=False)
 
 
 @dataclass

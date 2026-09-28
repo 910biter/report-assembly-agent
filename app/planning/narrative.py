@@ -85,7 +85,9 @@ _SYSTEM = """你是报告章节叙事规划师。你的任务不是写正文,而
     话题、主要事实/推断和目标篇幅,各小节 target_words 总和应接近章节目标。
 12. 每个小节可规划 paragraphs，paragraph 是成文时需要保持的语义边界，而不是固定段数模板。
     只在话题、论证层次或读者阅读负担确有变化时拆段；直接相关的事实可以同段表达。每个 paragraph
-    必须说明目的和所用证据，Writer 负责把它自然写成多句正文，不得逐条罗列。相邻论证连续且前段仅承担引出或过渡时,
+    必须说明目的和所用证据。除支撑核心判断的事实外，按需选择能解释机制、形成对比或限定结论的补充事实，
+    并写清它们在本段的作用；小节 fact_ids 应包含各段和 discourse_flow 实际规划使用的事实。
+    Writer 负责把它自然写成多句正文，不得逐条罗列。相邻论证连续且前段仅承担引出或过渡时,
     不要把它单独规划成自然段; paragraph.target_words 只是篇幅分配参考,不是每段必须独立达到的字数。
 13. evidence_status 判断“当前事实与推断能否支撑计划目的和目标篇幅”。证据有限时保留原目标预算，
     但明确缺口；不得通过重复、常识扩写或无依据概括把 limited/insufficient 伪装成 sufficient。"""
@@ -150,8 +152,10 @@ _DOCUMENT_SYSTEM = """你是连续文章的叙事总编。Facts/Inferences 已�
 1. 只使用输入中真实存在的 fact_ids/inference_ids，不得编造编号。
 2. beat 是文章论证节拍，不是展示标题。paragraphs 是实际成文段落设计：由论证关系决定，
    不按固定段数；除非两个 beat 确实共同回答同一问题，否则不要把它们塞进同一长段。
-3. 保留 Final ReportPlan 的全部关键证据弧线，但重新组织为读者可连续阅读的开篇、展开、核心矛盾和收束。
+3. 保留 Final ReportPlan 的全部关键证据弧线。primary_fact_ids 是优先锚点，不是事实白名单；
+   可从输入中选择能补足机制、对比、边界的其他事实，并重新组织为连续论证。
 4. 不平均罗列事实；每个 beat 必须有明确论证目的和与前文的关系。
+   每个 paragraph 的 purpose 应说明具体要解释或比较什么，不要只写“介绍背景”“分析影响”等空泛任务。
 5. target_words 总和应接近全文目标。证据有限时不得用常识、重复或虚构补足。
 6. paragraphs 必须覆盖全部 beat；每段指定的 fact_ids/inference_ids 必须来自该段所含 beat。
 7. 模板的文风只影响组织与表达，不得覆盖事实边界。"""
@@ -193,7 +197,6 @@ class NarrativeAgent(BaseAgent):
             f"全文核心判断:{report_plan.get('core_judgment','')}\n"
             f"全文叙事逻辑:{report_plan.get('narrative_logic','')}\n"
             f"本轮更新目标:{report_plan.get('update_instruction','')}\n"
-            f"本章目标字数:{int(chapter_plan.get('target_words') or 0)}\n"
             f"单个小节一次生成的建议安全规模:不超过约 {safe_unit_words} 字。"
             "若章节较长且存在多个真实语义层次,应据此规划多个有独立目的的小节;"
             "不得为了切分长度制造无意义小节。\n"
@@ -490,7 +493,7 @@ def _sanitize_plan(payload: dict, chapter_plan: dict, fact_ids: set[int], infere
         }
         for item in subsections
     ]
-    if not topics and subsections:
+    if subsections:
         topics = _topics_from_subsections(subsections)
         for index, subsection in enumerate(subsections, start=1):
             subsection["topic_ids"] = [f"T{index}"]
@@ -562,6 +565,21 @@ def _int_ids(values) -> list[int]:
     return result
 
 
+def unit_evidence_ids(unit: dict) -> tuple[list[int], list[int]]:
+    """Collect evidence explicitly assigned to a semantic unit at every plan depth."""
+    facts = _int_ids(unit.get("fact_ids"))
+    inferences = _int_ids(unit.get("inference_ids"))
+    for paragraph in unit.get("paragraphs") or []:
+        if isinstance(paragraph, dict):
+            facts.extend(_int_ids(paragraph.get("fact_ids")))
+            inferences.extend(_int_ids(paragraph.get("inference_ids")))
+    for step in unit.get("discourse_flow") or []:
+        if isinstance(step, dict):
+            facts.extend(_int_ids(step.get("facts") or step.get("fact_ids")))
+            inferences.extend(_int_ids(step.get("inferences") or step.get("inference_ids")))
+    return list(dict.fromkeys(facts)), list(dict.fromkeys(inferences))
+
+
 def _evidence_status(value, *, has_evidence: bool) -> str:
     if not has_evidence:
         return "insufficient"
@@ -591,11 +609,19 @@ def _sanitize_subsections(raw, chapter_plan: dict, topics: list[dict],
                 fids = list(matched.get("fact_ids") or [])
                 iids = list(matched.get("inference_ids") or [])
                 topic_ids = topic_ids or [matched.get("topic_id", "")]
-        if not fids and not iids:
-            continue
         detail = str(item.get("detail_level") or "brief")
         if detail not in {"expand", "brief", "reference"}:
             detail = "brief"
+        flow = _sanitize_flow(item.get("discourse_flow"), fact_ids, inference_ids)
+        paragraphs = _sanitize_paragraph_plan(
+            item.get("paragraphs"), fids, iids, fact_ids, inference_ids,
+        )
+        fids, iids = unit_evidence_ids({
+            "fact_ids": fids, "inference_ids": iids,
+            "paragraphs": paragraphs, "discourse_flow": flow,
+        })
+        if not fids and not iids:
+            continue
         result.append({
             "title": title[:60],
             "purpose": str(item.get("purpose") or "")[:180],
@@ -617,10 +643,8 @@ def _sanitize_subsections(raw, chapter_plan: dict, topics: list[dict],
             ],
             "detail_level": detail,
             "completion_criteria": [str(c)[:120] for c in (item.get("completion_criteria") or []) if str(c).strip()],
-            "discourse_flow": _sanitize_flow(item.get("discourse_flow"), fact_ids, inference_ids),
-            "paragraphs": _sanitize_paragraph_plan(
-                item.get("paragraphs"), fids, iids, fact_ids, inference_ids,
-            ),
+            "discourse_flow": flow,
+            "paragraphs": paragraphs,
             "writing_hint": str(item.get("writing_hint") or "")[:180],
         })
     return result
