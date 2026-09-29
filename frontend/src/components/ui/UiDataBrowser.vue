@@ -30,7 +30,7 @@ withDefaults(defineProps<{
   max-width: 100%;
   min-width: 0;
   min-height: 520px;
-  overflow: hidden;
+  overflow: clip;
   grid-template-columns: minmax(0, 1fr);
   border: 1px solid var(--border);
   border-radius: var(--radius-panel);
@@ -49,7 +49,11 @@ withDefaults(defineProps<{
 
 .ui-data-browser__detail {
   min-width: 0;
-  overflow: auto;
+  position: sticky;
+  top: var(--header-height);
+  align-self: start;
+  max-height: calc(100dvh - var(--header-height));
+  overflow-y: auto;
   border-left: 1px solid var(--border);
   background: var(--surface-raised);
 }
@@ -62,6 +66,8 @@ withDefaults(defineProps<{
   .ui-data-browser__detail {
     position: fixed;
     inset: var(--header-height) 0 0 auto;
+    max-height: none;
+    overflow-y: auto;
     z-index: 40;
     width: min(var(--ui-detail-width), 100%);
     box-shadow: var(--shadow-float);

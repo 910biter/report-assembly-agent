@@ -7,6 +7,7 @@ import type { TaskSummary } from "@/api/types";
 import StatusBadge from "@/components/StatusBadge.vue";
 import MaterialComparisonWorkspace from "@/components/MaterialComparisonWorkspace.vue";
 import UiPageHeader from "@/components/ui/UiPageHeader.vue";
+import UiPagination from "@/components/ui/UiPagination.vue";
 import { stageGroups, stageMeta } from "@/domain/workflowStages";
 import { useUiStore } from "@/stores/ui";
 const GraphNetwork = defineAsyncComponent(
@@ -32,6 +33,9 @@ const requestedTab = String(route.query.tab || "overview");
 const active = ref(requestedTab === "runtime" ? "materials" : requestedTab);
 const workspacePane = ref(requestedTab === "runtime" ? "process" : "materials");
 const analysisType = ref("facts");
+const analysisPage = ref(1);
+const analysisPageSize = ref(20);
+watch([analysisType, analysisPageSize], () => { analysisPage.value = 1; });
 const selectedGraphEdge = ref<any>(null);
 const graphBuildError = ref("");
 const task = useQuery({
@@ -60,10 +64,14 @@ const materials = useQuery({
   staleTime: 30000,
 });
 const analysis = useQuery({
-  queryKey: ["task-analysis", taskId],
-  queryFn: () => api<any>(`/api/tasks/${taskId}/analysis`),
-  enabled: computed(() => active.value === "analysis"),
+  queryKey: ["task-analysis", taskId, analysisType, analysisPage, analysisPageSize],
+  queryFn: () => api<{ items: any[]; total: number }>(`/api/tasks/${taskId}/analysis/page?kind=${analysisType.value}&page=${analysisPage.value}&page_size=${analysisPageSize.value}`),
+  enabled: computed(() => active.value === "analysis" && ["facts", "inferences"].includes(analysisType.value)),
   staleTime: 30000,
+});
+watch(() => analysis.data.value?.total, (total) => {
+  if (total === undefined) return;
+  analysisPage.value = Math.min(analysisPage.value, Math.max(1, Math.ceil(total / analysisPageSize.value)));
 });
 const graph = useQuery({
   queryKey: ["task-graph", taskId],
@@ -294,23 +302,17 @@ const stageProgress = computed(() => {
 const pauseRequested = computed(
   () => task.data.value?.queue_status?.status === "pause_requested",
 );
-const facts = computed(() => analysis.data.value?.facts || []);
-const inferences = computed(() =>
-  [
-    ...(analysis.data.value?.inferences || []),
-    ...(analysis.data.value?.external_inferences || []),
-  ],
-);
-const conflicts = computed(() => analysis.data.value?.conflicts || []);
+const facts = computed(() => analysisType.value === "facts" ? analysis.data.value?.items || [] : []);
+const inferences = computed(() => analysisType.value === "inferences" ? analysis.data.value?.items || [] : []);
 const artifactCounts = computed(() => task.data.value?.artifact_counts || {});
 const factCount = computed(() =>
-  analysis.data.value
-    ? facts.value.length
+  analysisType.value === "facts" && analysis.data.value
+    ? analysis.data.value.total
     : Number(artifactCounts.value.facts || 0),
 );
 const inferenceCount = computed(() =>
-  analysis.data.value
-    ? inferences.value.length
+  analysisType.value === "inferences" && analysis.data.value
+    ? analysis.data.value.total
     : Number(artifactCounts.value.inferences || 0),
 );
 function run() {
@@ -849,8 +851,8 @@ function versionsList() {
       <aside class="analysis-nav surface">
         <button
           v-for="item in [
-            ['facts', `事实 ${facts.length}`],
-            ['inferences', `分析判断 ${inferences.length}`],
+            ['facts', `事实 ${factCount}`],
+            ['inferences', `分析判断 ${inferenceCount}`],
             ['graph', `关系网络 ${graphAssertionCount}`],
           ]"
           :key="item[0]"
@@ -861,6 +863,8 @@ function versionsList() {
         </button>
       </aside>
       <div class="surface analysis-content">
+        <p v-if="analysis.isPending.value && analysisType !== 'graph'" class="muted">正在读取分析结果…</p>
+        <p v-if="analysis.isError.value && analysisType !== 'graph'" class="notice warning">分析结果读取失败，请稍后重试。</p>
         <template v-if="analysisType === 'facts'"
           ><details v-for="fact in facts" :key="fact.id" class="knowledge-item">
             <summary>
@@ -898,7 +902,8 @@ function versionsList() {
               {{ item.reasoning_chain }}
             </blockquote>
           </article></template>
-        <template v-else-if="analysisType === 'graph'"
+        <UiPagination v-if="['facts', 'inferences'].includes(analysisType) && (analysis.data.value?.total || 0)" v-model:page="analysisPage" v-model:page-size="analysisPageSize" :total="analysis.data.value?.total || 0" />
+        <template v-if="analysisType === 'graph'"
           ><div class="graph-summary">
             <span
               class="badge"

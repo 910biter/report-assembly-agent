@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
+import { computed, ref, watch } from "vue";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/vue-query";
 import { RouterLink } from "vue-router";
 import { api } from "@/api/http";
@@ -9,6 +9,7 @@ import AppIcon from "@/components/AppIcon.vue";
 import UiDataBrowser from "@/components/ui/UiDataBrowser.vue";
 import UiButton from "@/components/ui/UiButton.vue";
 import UiPageHeader from "@/components/ui/UiPageHeader.vue";
+import UiPagination from "@/components/ui/UiPagination.vue";
 
 type TaskView =
   | "all"
@@ -26,6 +27,8 @@ const dateRange = ref("all");
 const variant = ref("");
 const sortBy = ref("updated_desc");
 const selectedId = ref<string | null>(null);
+const page = ref(1);
+const pageSize = ref(20);
 const tasks = useQuery({
   queryKey: ["tasks"],
   queryFn: () => api<TaskSummary[]>("/api/tasks"),
@@ -150,6 +153,15 @@ const filtered = computed(() => {
         return (b.material_count || 0) - (a.material_count || 0);
       return timestamp(b) - timestamp(a);
     });
+});
+const visibleTasks = computed(() => filtered.value.slice((page.value - 1) * pageSize.value, page.value * pageSize.value));
+watch([search, view, dateRange, variant, sortBy, pageSize], () => {
+  page.value = 1;
+  selectedId.value = null;
+});
+watch(page, () => { selectedId.value = null; });
+watch(() => filtered.value.length, (total) => {
+  page.value = Math.min(page.value, Math.max(1, Math.ceil(total / pageSize.value)));
 });
 const selected = computed(
   () =>
@@ -276,7 +288,7 @@ function taskType(task: TaskSummary) {
             ><span>模板</span><span>最近更新</span><span></span>
           </div>
           <div
-            v-for="task in filtered"
+            v-for="task in visibleTasks"
             :key="task.task_id"
             class="task-row"
             :class="{ selected: selectedId === task.task_id }"
@@ -313,6 +325,7 @@ function taskType(task: TaskSummary) {
             >
           </div>
         </div>
+        <UiPagination v-if="filtered.length" v-model:page="page" v-model:page-size="pageSize" :total="filtered.length" />
         <div v-else-if="!tasks.isLoading.value" class="empty">
           <div>
             <strong>没有匹配的任务</strong>调整筛选条件，或创建新的报告任务。

@@ -9,12 +9,13 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import APIRouter, BackgroundTasks, File, Form, UploadFile
+from fastapi import APIRouter, BackgroundTasks, File, Form, Query, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from sqlalchemy import delete, func, insert, select, update
 from sqlalchemy.exc import IntegrityError
 
 from app.config import settings
+from app.pagination import page_ids
 from app.db import session_scope
 from app.export import export_report
 from app.infrastructure.orm import (
@@ -743,6 +744,58 @@ def _split_inference_ids(task: dict) -> tuple[list[int], list[int]]:
     material = [int(item) for item in task.get("inference_ids", []) if str(item).isdigit()]
     external = [int(item) for item in task.get("external_ids", []) if str(item).isdigit()]
     return list(dict.fromkeys(material)), list(dict.fromkeys(external))
+
+
+@router.get("/tasks/{task_id}/analysis/page")
+def task_analysis_page(
+    task_id: str,
+    kind: str = Query(pattern="^(facts|inferences)$"),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+):
+    task = short_term.load_task(task_id)
+    if task is None:
+        return JSONResponse({"error": "TASK_NOT_FOUND"}, status_code=404)
+    if kind == "facts":
+        ids = list(dict.fromkeys(int(item) for item in task.get("fact_ids", [])))
+    else:
+        material_ids, external_ids = _split_inference_ids(task)
+        ids = list(dict.fromkeys(material_ids + external_ids))
+    visible_ids, total = page_ids(ids, page=page, page_size=page_size)
+    if not visible_ids:
+        return {"items": [], "total": total, "page": page, "page_size": page_size}
+    with session_scope() as s:
+        if kind == "facts":
+            rows = s.execute(select(ORMFact).where(ORMFact.c.id.in_(visible_ids))).mappings().all()
+            evidence_rows = s.execute(
+                select(
+                    ORMEvidence.c.fact_id, ORMEvidence.c.source_file,
+                    ORMEvidence.c.page, ORMEvidence.c.paragraph, ORMEvidence.c.quote,
+                ).where(ORMEvidence.c.fact_id.in_(visible_ids))
+            ).mappings().all()
+            evidence_by_fact: dict[int, list[dict]] = {}
+            for item in evidence_rows:
+                evidence_by_fact.setdefault(int(item["fact_id"]), []).append({
+                    "source_file": item["source_file"], "page": item["page"],
+                    "paragraph": item["paragraph"], "quote": item["quote"],
+                })
+            by_id = {int(row["id"]): row for row in rows}
+            items = [{
+                "id": row["id"], "content": row["content"], "dimension": row["dimension"],
+                "evidence": evidence_by_fact.get(fact_id, []),
+            } for fact_id in visible_ids if (row := by_id.get(fact_id)) is not None]
+        else:
+            rows = s.execute(select(ORMInference).where(ORMInference.c.id.in_(visible_ids))).mappings().all()
+            by_id = {int(row["id"]): row for row in rows}
+            items = [{
+                "id": row["id"], "content": row["content"], "source_level": row["source_level"],
+                "based_fact_ids": json.loads(row["based_fact_ids"]),
+                "reasoning_chain": row["reasoning_chain"], "dimension": row["dimension"],
+                "analysis_type": row["analysis_type"],
+                "confidence_level": row["confidence_level"],
+                "confidence_reason": row["confidence_reason"], "uncertainty": row["uncertainty"],
+            } for inference_id in visible_ids if (row := by_id.get(inference_id)) is not None]
+    return {"items": items, "total": total, "page": page, "page_size": page_size}
 
 
 @router.get("/tasks/{task_id}/analysis")

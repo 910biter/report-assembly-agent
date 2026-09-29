@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
+import { computed, ref, watch } from "vue";
 import { useQuery } from "@tanstack/vue-query";
 import { RouterLink, useRouter } from "vue-router";
 import { api } from "@/api/http";
@@ -8,6 +8,7 @@ import AppIcon from "@/components/AppIcon.vue";
 import UiDataBrowser from "@/components/ui/UiDataBrowser.vue";
 import UiPageHeader from "@/components/ui/UiPageHeader.vue";
 import UiButton from "@/components/ui/UiButton.vue";
+import UiPagination from "@/components/ui/UiPagination.vue";
 import { useUiStore } from "@/stores/ui";
 
 const search = ref("");
@@ -20,6 +21,8 @@ const router = useRouter();
 const ui = useUiStore();
 const openingAssistant = ref(false);
 const selected = ref<number | null>(null);
+const page = ref(1);
+const pageSize = ref(20);
 const detailTab = ref("overview");
 const list = useQuery({
   queryKey: ["materials"],
@@ -89,6 +92,15 @@ const filtered = computed(() => {
         b.id - a.id
       );
     });
+});
+const visibleMaterials = computed(() => filtered.value.slice((page.value - 1) * pageSize.value, page.value * pageSize.value));
+watch([search, type, status, usage, dateRange, sortBy, pageSize], () => {
+  page.value = 1;
+  selected.value = null;
+});
+watch(page, () => { selected.value = null; });
+watch(() => filtered.value.length, (total) => {
+  page.value = Math.min(page.value, Math.max(1, Math.ceil(total / pageSize.value)));
 });
 const hasFilters = computed(() =>
   Boolean(
@@ -228,7 +240,7 @@ async function discussMaterial() {
           ><span>内容单元</span><span>关联任务</span><span>解析时间</span>
         </div>
         <button
-          v-for="item in filtered"
+          v-for="item in visibleMaterials"
           :key="item.id"
           class="file-row"
           :class="{ selected: selected === item.id }"
@@ -250,6 +262,7 @@ async function discussMaterial() {
           ><span>{{ taskCount(item) }}</span
           ><time>{{ formatDate(item.parsed_at) }}</time>
         </button>
+        <UiPagination v-if="filtered.length" v-model:page="page" v-model:page-size="pageSize" :total="filtered.length" />
         <div v-if="!filtered.length && !list.isLoading.value" class="empty">
           <div>
             <strong>没有匹配的材料</strong
