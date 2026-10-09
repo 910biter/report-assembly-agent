@@ -51,7 +51,8 @@ def test_iterative_extraction_preserves_original_need_id(monkeypatch, isolated_e
     needs = [{"need_id": 2, "need": "Second question", "dimension": "Second"}]
     monkeypatch.setattr(agent, "generate_json", lambda *args, **kwargs: {"claims": [{
         "content": "Supported statement", "short_quote": "Original statement", "unit_id": 12,
-        "need_id": 2,
+        "need_id": 2, "assertion_mode": "prescriptive",
+        "assertion_mode_raw": "design requirement",
     }]})
     unit = Unit(material_id=7, id=12, kind="text", content="Original statement")
 
@@ -60,6 +61,8 @@ def test_iterative_extraction_preserves_original_need_id(monkeypatch, isolated_e
 
     assert facts[0].need_id == 2
     assert facts[0].dimension == "Second"
+    assert facts[0].assertion_mode == "prescriptive"
+    assert facts[0].assertion_mode_raw == "design requirement"
     assert "2. [" in agent._build_need_block(needs)
 
 
@@ -158,7 +161,7 @@ def test_narrative_missing_instructions_does_not_call_model_or_reuse_call_id(mon
     agent.last_call_id = "previous-chapter"
     chapter = {"title": "Chapter", "fact_ids": [1]}
     calls = []
-    monkeypatch.setattr(narrative, "build_prompt_from_sections", lambda *args: (
+    monkeypatch.setattr(narrative, "planning_prompt", lambda *args, **kwargs: (
         f"当前章节规划:{json.dumps(chapter, ensure_ascii=False)}", {},
     ))
     monkeypatch.setattr(agent, "generate_json", lambda *args: pytest.fail("incomplete contract"))

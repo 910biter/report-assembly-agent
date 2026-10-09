@@ -1,3 +1,5 @@
+import { authMode, clearSession } from "@/lib/auth";
+
 export class ApiError extends Error {
   constructor(message: string, public status: number, public payload: unknown) {
     super(message);
@@ -9,6 +11,10 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const contentType = response.headers.get("content-type") || "";
   const payload = contentType.includes("application/json") ? await response.json() : await response.text();
   if (!response.ok) {
+    if (response.status === 401 && authMode.value === "on" && !path.startsWith("/api/auth/")) {
+      clearSession();
+      window.location.assign("/login");
+    }
     const message = typeof payload === "object" && payload && "error" in payload
       ? String((payload as { error: unknown }).error)
       : `请求失败（${response.status}）`;
@@ -44,6 +50,10 @@ export function uploadForm<T>(
         ? String((payload as { error: unknown }).error)
         : `请求失败（${request.status}）`;
       reject(new ApiError(message, request.status, payload));
+      if (request.status === 401 && authMode.value === "on") {
+        clearSession();
+        window.location.assign("/login");
+      }
     };
     request.send(form);
   });

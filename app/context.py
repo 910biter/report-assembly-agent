@@ -2,6 +2,7 @@
 
 from app.runtime_profiles import stage_input_budget_tokens, stage_profile
 from app.context_budget import ContextSection, build_prompt_from_sections, count_tokens, truncate_tokens
+from app.planning.evidence_context import planning_prompt, evidence_ids
 from app.models import Unit
 from app.planning.structure import normalize_text_list
 from app.retrieval.query_compiler import QueryCompiler, RetrievalQuery
@@ -574,13 +575,15 @@ class ContextManager:
         return result
 
     def for_analysis(self, facts: list[dict], conflicts: list[dict]) -> str:
-        fact_lines = ["事实清单(编号 + 来源):"] + [
-            f"{fact['id']}. [{fact['sources']}] {fact['content']}" for fact in facts
-        ]
+        from app.analysis.evidence_semantics import analysis_fact_line, analysis_source_lines
+
+        fact_lines = ["事实清单(编号 + 来源陈述性质):"] + [analysis_fact_line(fact) for fact in facts]
+        source_lines = analysis_source_lines(facts)
         prompt, _audit = build_prompt_from_sections(
             "analysis",
             [
                 ContextSection("事实", fact_lines, weight=6),
+                ContextSection("原文所在章节及上下文", source_lines, weight=2),
                 ContextSection("来源冲突", ["来源冲突:", json_dumps(conflicts) if conflicts else "无"], weight=3),
             ],
             self.budget_tokens("analysis"),
@@ -652,36 +655,12 @@ class ContextManager:
             inferences, selected_fact_ids, critical_ids, queries, total_budget
         )
 
-        fact_lines = ["已抽取事实(关键事实 + 多问题/来源覆盖 + 语义去冗余):"]
-        fact_lines.extend(
-            f"- fact_id={fact.get('id')}; dimension={fact.get('dimension') or '未分类'}; "
-            f"sources={fact.get('source_files') or []}: {fact.get('content')}"
-            for fact in selected_facts
-        )
-        if len(selected_facts) < len(facts):
-            fact_lines.append(
-                f"[覆盖说明] Facts 共 {len(facts)} 条，本次展开 {len(selected_facts)} 条；"
-                "后续 Narrative Plan 与 Writer 仍会按章检索完整事实库。"
-            )
-        inference_lines = ["已形成分析判断(按关键事实关联、维度覆盖、置信度与去冗余选择):"]
-        inference_lines.extend(
-            f"- inference_id={inf.get('id')}; dimension={inf.get('dimension') or '未分类'}; "
-            f"confidence={inf.get('confidence_level') or 'unknown'}; "
-            f"based_fact_ids={inf.get('based_fact_ids')}: {inf.get('content')}"
-            for inf in selected_inferences
-        )
-        if len(selected_inferences) < len(inferences):
-            inference_lines.append(
-                f"[覆盖说明] Inferences 共 {len(inferences)} 条，本次展开 {len(selected_inferences)} 条；"
-                "未展开推论不会从任务中删除。"
-            )
-
-        prompt, _audit = build_prompt_from_sections(
+        based_ids = {fid for item in selected_inferences for fid in evidence_ids(item.get("based_fact_ids"))}
+        selected_facts.extend(item for item in facts if int(item.get("id") or 0) in based_ids - selected_fact_ids)
+        prompt, _audit = planning_prompt(
             "final_planner",
             [
                 ContextSection("任务与分析摘要", header_lines, weight=3, required_items=2),
-                ContextSection("事实", fact_lines, weight=6),
-                ContextSection("推论", inference_lines, weight=4),
                 ContextSection(
                     "模板风格",
                     ["模板/风格信息(格式优先,结构按策略处理):", *(style_block.splitlines() if style_block else ["无"])],
@@ -692,7 +671,7 @@ class ContextManager:
                     weight=2,
                 ),
             ],
-            total_budget,
+            selected_facts, selected_inferences, total_budget, required_facts=sorted(critical_ids), tagged=True,
         )
         return prompt
 
@@ -849,6 +828,8 @@ class ContextManager:
             inference for inference in inferences
             if any(bid in related_ids for bid in (inference.get("based_fact_ids") or []))
         ]
+        bases = {fid for item in related_inferences for fid in evidence_ids(item.get("based_fact_ids"))}
+        related_facts.extend(by_id[fid] for fid in sorted(bases - seen) if fid in by_id)
         return related_facts, related_inferences, style_block
 
     def _retrieve_facts(self, query: str, facts: list[dict], top_k: int,

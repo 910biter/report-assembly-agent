@@ -70,6 +70,12 @@ def clear_pause(task_id: str) -> None:
 
 
 def is_paused(task_id: str) -> bool:
+    from app.config import settings
+    if settings.multiuser_enabled:
+        from app.memory import short_term
+        task = short_term.load_task(task_id) or {}
+        if task.get("control_request") == "pause":
+            return True
     with _LOCK:
         event = _EVENTS.get(task_id)
         return bool(event and event.is_set())

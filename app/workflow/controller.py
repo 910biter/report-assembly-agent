@@ -15,6 +15,8 @@ import numpy as np
 from sqlalchemy import delete, func, insert, select, update
 
 from app.analysis.analyzer import AnalysisAgent, _semantic_group_coverage
+from app.assertion_semantics import normalize_assertion_semantics, normalize_semantic_profile
+from app.analysis.evidence_semantics import attach_source_contexts
 from app.evidence.extractor import EvidenceAgent, load_evidence_quotes
 from app.planning.planner import PlannerAgent
 from app.writing.writer import WriterAgent, _chapter_position
@@ -1125,7 +1127,7 @@ class WorkflowController:
             self.task.get("theme", ""),
             requirements,
             self.task.get("material_insights", []),
-            variant.planner_prompt_block() if variant else self._style_block(),
+            "" if variant else self._style_block(),
             business_block(profile),
             policy_prompt_block(policy),
         )
@@ -1175,7 +1177,7 @@ class WorkflowController:
             facts,
             inferences,
             self.task.get("material_insights", []),
-            variant.planner_prompt_block() if variant else self._style_block(),
+            "" if variant else self._style_block(),
             policy_prompt_block(policy),
         )
         final_plan = planner.finalize_report_plan(
@@ -1183,6 +1185,7 @@ class WorkflowController:
             required_structure=required_structure,
             required_chapter_count=int(self.task.get("intervention_required_chapter_count") or 0),
             document_shape_hint=((policy.get("template_policy") or {}).get("document_shape_hint") or {}),
+            facts=facts, inferences=inferences,
         )
         self._update(plan_title=final_plan.title, final_plan_frozen=True)
 
@@ -1509,7 +1512,8 @@ class WorkflowController:
         """Create an evidence-grounded task graph and publish an outbox event."""
         try:
             from app.graph import graph_service
-            workspace_id = str(self.task.get("workspace_id") or "")
+            from app.graph.service import workspace_for_task
+            workspace_id = workspace_for_task(self.task_id)
             active_ids = {int(fact.get("id") or 0) for fact in facts if fact.get("id") is not None}
             covered_before = graph_service.covered_fact_ids(active_ids, workspace_id=workspace_id)
             covered_before.update(active_ids & self._legacy_graph_fact_ids())
@@ -1648,9 +1652,10 @@ class WorkflowController:
             try:
                 from app.graph import graph_service
                 group_ids = {int(fact.get("id") or 0) for fact in group_facts if fact.get("id") is not None}
+                from app.graph.service import workspace_for_task
                 covered_group_ids = graph_service.covered_fact_ids(
                     group_ids,
-                    workspace_id=str(self.task.get("workspace_id") or ""),
+                    workspace_id=workspace_for_task(self.task_id),
                 )
                 if group_ids and group_ids <= covered_group_ids:
                     graph_block = graph_service.context_for_analysis(
@@ -1667,7 +1672,7 @@ class WorkflowController:
             ))
         # Reduce:跨维度综合(局部推断 → 全局推断 + 覆盖状态元数据)
         global_inferences, external, global_meta = analysis_agent.analyze_global(
-            local_inferences, facts,
+            local_inferences, analysis_facts,
             "、".join(str(c.get("description") or c.get("note") or "") for c in (conflicts or [])),
         )
         inferences = local_inferences + global_inferences
@@ -2131,6 +2136,8 @@ class WorkflowController:
             )
             expected_sections = [] if composition_mode == "article_beats" else plan.get("structure") or []
             issues = run_quality_check(report_id, expected_sections, forbidden, institution_rules, qa_policy)
+            if any(issue.get("type") == "QA_CHECK_INCOMPLETE" for issue in issues):
+                quality_error = "语义与引用核验未完成；本地规则检查结果仍保留。"
         except Exception as exc:
             issues = []
             quality_error = str(exc)[:300]
@@ -2741,9 +2748,10 @@ class WorkflowController:
     def _graph_covers_facts(self, facts: list[dict]) -> bool:
         active_ids = {int(fact.get("id") or 0) for fact in facts if fact.get("id") is not None}
         from app.graph import graph_service
+        from app.graph.service import workspace_for_task
         covered_ids = graph_service.covered_fact_ids(
             active_ids,
-            workspace_id=str(self.task.get("workspace_id") or ""),
+            workspace_id=workspace_for_task(self.task_id),
         )
         covered_ids.update(active_ids & self._legacy_graph_fact_ids())
         covered_ids.update(active_ids & self._trusted_inherited_graph_fact_ids())
@@ -3004,6 +3012,13 @@ class WorkflowController:
                 "content": row["content"],
                 "dimension": row.get("dimension") or "",
                 "fact_type": row.get("fact_type") or "",
+                "assertion_mode": normalize_assertion_semantics(
+                    row.get("assertion_mode"), row.get("assertion_mode_raw"),
+                )[0],
+                "assertion_mode_raw": normalize_assertion_semantics(
+                    row.get("assertion_mode"), row.get("assertion_mode_raw"),
+                )[1],
+                "semantic_profile": normalize_semantic_profile(row.get("semantic_profile_json")),
                 "need_id": row.get("need_id") or 0,
                 "sources": [ev["quote"] for ev in ev_rows if ev["quote"]],
                 "source_roles": source_roles,
@@ -3018,18 +3033,47 @@ class WorkflowController:
             return facts
         with session_scope() as s:
             rows = s.execute(
-                select(ORMFact.c.id, ORMFact.c.dimension, ORMFact.c.fact_type, ORMFact.c.need_id)
+                select(
+                    ORMFact.c.id, ORMFact.c.dimension, ORMFact.c.fact_type,
+                    ORMFact.c.assertion_mode, ORMFact.c.assertion_mode_raw, ORMFact.c.need_id,
+                    ORMFact.c.semantic_profile_json,
+                )
                 .where(ORMFact.c.id.in_(fact_ids))
             ).mappings().all()
+            evidence_rows = s.execute(
+                select(ORMEvidence).where(ORMEvidence.c.fact_id.in_(fact_ids))
+                .order_by(ORMEvidence.c.id)
+            ).mappings().all()
+            unit_ids = sorted({int(row["unit_id"]) for row in evidence_rows if row.get("unit_id") is not None})
+            material_ids = sorted({int(row["material_id"]) for row in evidence_rows if row.get("material_id") is not None})
+            source_units = []
+            if unit_ids:
+                source_units.extend(s.execute(
+                    select(ORMUnit).where(ORMUnit.c.id.in_(unit_ids))
+                ).mappings().all())
+            if material_ids:
+                source_units.extend(s.execute(
+                    select(ORMUnit).where(
+                        ORMUnit.c.material_id.in_(material_ids), ORMUnit.c.kind == "heading",
+                    ).order_by(ORMUnit.c.material_id, ORMUnit.c.id)
+                ).mappings().all())
         meta = {
             int(row["id"]): {
                 "dimension": row["dimension"] or "",
                 "fact_type": row["fact_type"] or "",
+                "assertion_mode": normalize_assertion_semantics(
+                    row.get("assertion_mode"), row.get("assertion_mode_raw"),
+                )[0],
+                "assertion_mode_raw": normalize_assertion_semantics(
+                    row.get("assertion_mode"), row.get("assertion_mode_raw"),
+                )[1],
+                "semantic_profile": normalize_semantic_profile(row.get("semantic_profile_json")),
                 "need_id": row["need_id"] or 0,
             }
             for row in rows
         }
-        return [dict(fact, **meta.get(int(fact.get("id") or 0), {})) for fact in facts]
+        enriched = [dict(fact, **meta.get(int(fact.get("id") or 0), {})) for fact in facts]
+        return attach_source_contexts(enriched, [dict(row) for row in evidence_rows], [dict(row) for row in source_units])
 
     def _inferences(self) -> list[dict]:
         inference_ids = [
@@ -3048,6 +3092,8 @@ class WorkflowController:
             "confidence_level": row.get("confidence_level") or "medium",
             "confidence_reason": row.get("confidence_reason") or "",
             "uncertainty": row.get("uncertainty") or "",
+            "semantic_profile": normalize_semantic_profile(row.get("semantic_profile_json")),
+            "source_semantics": json.loads(row.get("source_semantics_json") or "[]"),
         } for row in rows if str(row.get("lifecycle_status") or "active") == "active"]
 
     def _style_block(self) -> str:
@@ -3060,10 +3106,12 @@ class WorkflowController:
 
         variant_id = self.task.get("variant_id")
         if variant_id is not None:
-            variant = get_variant(int(variant_id))
+            from app.memory.style import owner_for_task
+            variant = get_variant(int(variant_id), owner_user_id=owner_for_task(self.task_id))
             if variant is not None:
                 return variant
-        return get_locked_variant()
+        from app.memory.style import owner_for_task
+        return get_locked_variant(owner_user_id=owner_for_task(self.task_id))
 
     def _load_units(self) -> tuple[dict[int, list[Unit]], dict[int, str]]:
         units_by_material: dict[int, list[Unit]] = {}

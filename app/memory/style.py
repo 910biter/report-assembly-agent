@@ -27,8 +27,14 @@ from app.memory.style_profile import (
 from app.template_engine import compile_template
 
 _SAMPLE_LENGTH = 150
-_STYLE_LEARNER_VERSION = "editorial-v5-document-shape"
+_STYLE_LEARNER_VERSION = "editorial-v6-role-isolation"
 _DEFAULT_PROFILE_NAME = "综合报告风格"
+_ASSET_ROLE_ORDER = ("editorial", "structure", "layout")
+_ASSET_ROLE_LABELS = {
+    "editorial": "文体参考",
+    "structure": "结构参考",
+    "layout": "Word 版式母版",
+}
 _REALIZATION_KEYS = (
     "fact_expression", "judgment_expression", "fact_judgment_transition",
     "information_compression", "attribution_style",
@@ -74,16 +80,52 @@ def _normalize_profile_label(value, fallback: str = _DEFAULT_PROFILE_NAME) -> st
     return label
 
 
-def _editorial_confidence(
-    writing: dict, writing_patterns: dict, member_count: int, exemplar_count: int,
-) -> str:
-    semantic_patterns = {key: value for key, value in writing_patterns.items() if key != "observed_metrics" and value}
-    if not writing or not semantic_patterns:
-        return "low"
-    return "high" if member_count >= 2 and exemplar_count >= 12 else "medium"
+def normalize_asset_roles(value) -> list[str]:
+    """Normalize one source's explicit capabilities into a stable role list.
+
+    The old scalar ``auto`` value is treated as editorial-only: it must never
+    silently grant structural authority or become a Word export template.
+    """
+    if isinstance(value, dict):
+        value = value.get("roles") or value.get("asset_roles")
+    if value is None or value == "":
+        values = ["editorial"]
+    elif isinstance(value, str):
+        values = ["editorial"] if value.strip().lower() == "auto" else [value]
+    elif isinstance(value, (list, tuple, set)):
+        values = list(value)
+    else:
+        raise ValueError("INVALID_ASSET_ROLES")
+    normalized = {str(item or "").strip().lower() for item in values if str(item or "").strip()}
+    if not normalized or normalized - set(_ASSET_ROLE_ORDER):
+        raise ValueError("INVALID_ASSET_ROLES")
+    return [role for role in _ASSET_ROLE_ORDER if role in normalized]
 
 
-def _validate_profile_payload(payload: dict) -> None:
+def validate_asset_role_assignments(filenames: list[str], raw_roles_json: str) -> list[list[str]]:
+    """Validate the one-to-one file/role contract for a learning submission."""
+    try:
+        submitted = json.loads(raw_roles_json)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("INVALID_ASSET_ROLES_JSON") from exc
+    if not isinstance(submitted, list) or len(submitted) != len(filenames):
+        raise ValueError("ASSET_ROLE_COUNT_MISMATCH")
+    roles_by_file = [normalize_asset_roles(roles) for roles in submitted]
+    layout_indices = [i for i, roles in enumerate(roles_by_file) if "layout" in roles]
+    if len(layout_indices) > 1:
+        raise ValueError("ONLY_ONE_LAYOUT_MASTER_ALLOWED")
+    if layout_indices and Path(str(filenames[layout_indices[0]] or "")).suffix.lower() != ".docx":
+        raise ValueError("LAYOUT_MASTER_MUST_BE_DOCX")
+    return roles_by_file
+
+
+def _member_roles(member: dict) -> list[str]:
+    return normalize_asset_roles(member.get("asset_roles", member.get("asset_role")))
+
+
+def _validate_profile_payload(payload: dict, *, require_editorial: bool = True) -> None:
+    if not require_editorial:
+        return
     if not isinstance(payload.get("writing_style"), dict) or not payload.get("writing_style"):
         raise ValueError("STYLE_PROFILE_WRITING_STYLE_EMPTY")
     patterns = payload.get("writing_patterns")
@@ -92,7 +134,13 @@ def _validate_profile_payload(payload: dict) -> None:
     if sum(bool(patterns.get(key)) for key in _REALIZATION_KEYS) < 3:
         raise ValueError("STYLE_PROFILE_CONTENT_REALIZATION_INCOMPLETE")
 
-_VARIANT_PROMPT = """以下为同一机构、同一类型({type})的 {count} 份报告(每份含章节结构与片段采样):
+_VARIANT_PROMPT = """以下是一次提交的模板学习来源，画像名称参考类型为 {type}，来源数为 {count}。
+
+严格遵守来源用途边界：
+- 文体参考：只用于语言、段落组织、文档形态的软信号、材料表达方式与表达范例；不得据此复制事实。
+- 结构参考：只用于观察标题层级与组织模式；不得把目录当作新报告的固定目录。
+- Word 版式母版：由程序从原始 DOCX 提取格式，不参与本次语言或结构推断。
+- 未提供某种用途的字段必须留空/使用 unknown；不得从其它用途来源推断。
 
 {reports}
 
@@ -157,13 +205,6 @@ _VARIANT_PROMPT = """以下为同一机构、同一类型({type})的 {count} 份
     "risk_expression": "风险表达方式(如:结合外部环境分析,存在…风险)",
     "suggestion_style": "建议形成方式(如:面向中长期,建议…)"
   }},
-  "institution_rules": {{
-    "must_include": ["必须出现的内容"],
-    "forbidden": ["禁止出现的内容"],
-    "word_count": "字数要求或区间",
-    "inference_ratio": "推断与事实的比例限制说明",
-    "data_requirements": "数据引用要求(如:关键数字必须注明来源)"
-  }},
   "sample_annotations": [
     {{"sample_id": "输入中的样例编号", "sample_type": "模型判断的开放表达功能标签或 unknown", "rhetorical_role": "模型判断的开放修辞角色或 unknown", "purpose": "该段承担的表达任务", "realization_mode": "模型判断的开放实现方式", "discourse_moves": ["模型识别的论述动作"], "tags": ["可检索语义标签"]}}
   ]
@@ -177,6 +218,7 @@ def analyze_library(
     reports: list[dict],
     force: bool = False,
     progress_callback=None,
+    owner_user_id: int | None = None,
 ) -> list[StyleVariant]:
     """从参考报告构建机构风格库(幂等:同一文件默认只产生一个稳定变体)。
 
@@ -187,11 +229,12 @@ def analyze_library(
     """
     if not reports:
         raise ValueError("NO_HISTORICAL_REPORTS")
+    _require_owner(owner_user_id)
     library_id = _ensure_library()
 
     # 幂等:同一文件(hash)已分析过 → 直接复用已有变体(LLM 分类不稳定不改变模板身份)
     if not force:
-        reused = _reuse_by_source_hash(reports)
+        reused = _reuse_by_source_hash(reports, owner_user_id=owner_user_id)
         if reused is not None:
             _emit_progress(progress_callback, "profiling", 1, 1, "复用已学习画像")
             return reused
@@ -199,27 +242,34 @@ def analyze_library(
     features = []
     for report_index, report in enumerate(reports, start=1):
         text = report.get("text", "")
+        roles = normalize_asset_roles(report.get("asset_roles", report.get("asset_role")))
         headings = _extract_headings(text, report.get("path"))
         samples = _sample_report(text)
-        try:
-            prompt, _audit = build_prompt_from_sections("style_probe", [
-                ContextSection("instruction", ["分析以下报告的体裁与风格特征。"], weight=5, required_items=1),
-                ContextSection("report_paragraphs", [item for item in text.splitlines() if item.strip()], weight=3, required_items=1),
-            ], stage_input_budget_tokens("style_probe"))
-            payload = _StyleProbeAgent().generate_json(
-                prompt, max_tokens=settings.style_probe_output_tokens,
-            )
-            topic_type = _normalize_profile_label(payload.get("topic_type"))
-        except Exception:
-            topic_type = _DEFAULT_PROFILE_NAME
+        topic_type = _DEFAULT_PROFILE_NAME
+        probe_audit = {}
+        probe_attempted = bool({"editorial", "structure"}.intersection(roles))
+        if probe_attempted:
+            try:
+                prompt, probe_audit = build_prompt_from_sections("style_probe", [
+                    ContextSection("instruction", ["分析以下来源的报告体裁，不推断版式或强制目录。"], weight=5, required_items=1),
+                    ContextSection("report_paragraphs", [item for item in text.splitlines() if item.strip()], weight=3, required_items=1),
+                ], stage_input_budget_tokens("style_probe"))
+                payload = _StyleProbeAgent().generate_json(
+                    prompt, max_tokens=settings.style_probe_output_tokens,
+                )
+                topic_type = _normalize_profile_label(payload.get("topic_type"))
+            except Exception:
+                pass
         features.append({
             "filename": report.get("filename", ""),
             "text": text,
             "path": report.get("path"),
-            "asset_role": report.get("asset_role") or "auto",
+            "asset_roles": roles,
             "headings": headings,
             "samples": samples,
             "topic_type": topic_type,
+            "topic_probe_attempted": probe_attempted,
+            "topic_probe_audit": probe_audit,
         })
         _emit_progress(
             progress_callback, "classifying", report_index, len(reports),
@@ -231,7 +281,7 @@ def analyze_library(
     # one coherent, selectable template image for this submission.
     topic_type = _combined_topic_type(features)
     _emit_progress(progress_callback, "profiling", 0, 1, topic_type)
-    variants = [_build_variant(library_id, topic_type, features)]
+    variants = [_build_variant(library_id, topic_type, features, owner_user_id=owner_user_id)]
     _emit_progress(progress_callback, "profiling", 1, 1, topic_type)
     _record_source_hash(reports, variants)
     return variants
@@ -266,27 +316,47 @@ def _source_hash(report: dict) -> str:
         if path and Path(path).exists():
             digest = hashlib.sha256(Path(path).read_bytes())
             digest.update(_STYLE_LEARNER_VERSION.encode())
-            digest.update(str(report.get("asset_role") or "auto").encode())
+            roles = normalize_asset_roles(report.get("asset_roles", report.get("asset_role")))
+            digest.update(",".join(roles).encode())
             return digest.hexdigest()[:16]
     except Exception:
         pass
-    fallback = f"{report.get('filename') or ''}:{report.get('asset_role') or 'auto'}:{_STYLE_LEARNER_VERSION}"
+    roles = normalize_asset_roles(report.get("asset_roles", report.get("asset_role")))
+    fallback = f"{report.get('filename') or ''}:{','.join(roles)}:{_STYLE_LEARNER_VERSION}"
     return hashlib.sha256(fallback.encode()).hexdigest()[:16]
 
 
-def _reuse_by_source_hash(reports: list[dict]) -> list[StyleVariant] | None:
+def _require_owner(owner_user_id: int | None) -> None:
+    if settings.multiuser_enabled and owner_user_id is None:
+        raise ValueError("TEMPLATE_OWNER_REQUIRED")
+
+
+def owner_for_task(task_id: str) -> int | None:
+    if not settings.multiuser_enabled:
+        return None
+    task_table = Base.metadata.tables["short_memory"]
+    with session_scope() as s:
+        owner = s.execute(select(task_table.c.owner_user_id).where(
+            task_table.c.task_id == task_id,
+        )).scalar_one_or_none()
+    _require_owner(owner)
+    return owner
+
+
+def _reuse_by_source_hash(reports: list[dict], owner_user_id: int | None = None) -> list[StyleVariant] | None:
     """同一源文件已分析过 → 复用已有变体(返回 None 表示需新分析)。"""
     if len(reports) != 1:
         return None
+    _require_owner(owner_user_id)
     digest = _source_hash(reports[0])
     with session_scope() as s:
-        row = s.execute(
-            select(ORMVariant.c.id).where(
+        query = select(ORMVariant.c.id).where(
                 ORMVariant.c.source_hash == digest,
                 ORMVariant.c.status != "deleted",  # 已被删除的旧变体不复用,重新学习应能重建
             )
-            .order_by(ORMVariant.c.id).limit(1)
-        ).mappings().first()
+        if owner_user_id is not None:
+            query = query.where(ORMVariant.c.owner_user_id == owner_user_id)
+        row = s.execute(query.order_by(ORMVariant.c.id).limit(1)).mappings().first()
     if row is None:
         return None
     variant = get_variant(row["id"])
@@ -364,51 +434,79 @@ def _sample_report(text: str) -> dict:
     }
 
 
-def _build_variant(library_id: int, topic_type: str, members: list[dict]) -> StyleVariant:
-    """提炼一个变体:LLM 结构/语言/术语 + 规则格式(dominant/alternatives)+ 分类型范例。"""
-    all_exemplars = build_report_exemplars(members)
+def _build_variant(library_id: int, topic_type: str, members: list[dict],
+                   owner_user_id: int | None = None) -> StyleVariant:
+    """Build one aggregate profile while keeping each source's declared role isolated."""
+    editorial_members = [item for item in members if "editorial" in _member_roles(item)]
+    structure_members = [item for item in members if "structure" in _member_roles(item)]
+    structure_evidence_members = [item for item in structure_members if item.get("headings")]
+    layout_members = _eligible_layout_members(members)
+    all_exemplars = build_report_exemplars(editorial_members)
     exemplar_bank = compact_exemplar_bank(all_exemplars, limit=200)
-    report_blocks = []
-    for member in members:
+
+    editorial_blocks = [
+        f"[{member['filename']}]\n开篇: {member['samples']['opening'][:150]}\n"
+        f"正文: {member['samples']['middle'][:150]}\n结尾: {member['samples']['ending'][:150]}"
+        for member in editorial_members
+    ]
+    structure_blocks = []
+    for member in structure_evidence_members:
         heading_lines = []
-        for _h in (member.get("headings") or []):
-            _lv = 1
-            _txt = str(_h)
-            if isinstance(_h, dict):
-                try:
-                    _lv = int(_h.get("level", 1))
-                except Exception:
-                    _lv = 1
-                _txt = _h.get("text") or ""
-            heading_lines.append("  " * max(0, _lv - 1) + "- " + _txt)
-        headings = "\n".join(heading_lines) or "(未识别标题)"
-        report_blocks.append(
-            f"[{member['filename']}]\n来源用途: {_asset_role_label(member.get('asset_role'))}\n章节结构: {headings}\n"
-            f"开篇: {member['samples']['opening'][:150]}\n"
-            f"正文: {member['samples']['middle'][:150]}\n"
-            f"结尾: {member['samples']['ending'][:150]}"
+        for heading in member.get("headings") or []:
+            level = int(heading.get("level", 1)) if isinstance(heading, dict) else 1
+            text = heading.get("text", "") if isinstance(heading, dict) else str(heading)
+            heading_lines.append("  " * max(0, level - 1) + "- " + str(text))
+        structure_blocks.append(
+            f"[{member['filename']}]\n" + ("\n".join(heading_lines) or "(未识别到标题层级)")
         )
-    sample_packet = "\n\n".join(
+
+    exemplar_items = compact_exemplar_bank(all_exemplars, limit=24)
+    sample_packet = [
         f"[{item.get('exemplar_id')}] 来源={item.get('source_report')} / 章节={item.get('section')} / "
         f"位置={item.get('structural_role')}\n{str(item.get('content') or '')[:700]}"
-        for item in compact_exemplar_bank(all_exemplars, limit=24)
-    ) or "(没有可用的自然段样例)"
-    instruction = (_VARIANT_PROMPT.replace("{type}", topic_type).replace("{reports}", "")
-                   + "\n\n" + _STYLE_SAMPLE_NOTE.replace("{style_samples}", ""))
-    prompt, _audit = build_prompt_from_sections("style_profile", [
-        ContextSection("instruction", [instruction], weight=5, required_items=1),
-        ContextSection("report_summaries", report_blocks, weight=3, required_items=1),
-        ContextSection("style_exemplars", sample_packet.split("\n\n"), weight=4, required_items=1),
-    ], stage_input_budget_tokens("style_profile"))
-    payload = _StyleProfileAgent().generate_json(
-        prompt, max_tokens=settings.style_profile_output_tokens,
-    )
-    _validate_profile_payload(payload)
+        for item in exemplar_items
+    ]
+    has_semantic_input = bool(editorial_members or structure_evidence_members)
+    audit = {
+        "stage": "style_profile",
+        "budget_tokens": int(stage_input_budget_tokens("style_profile")),
+        "actual_tokens": 0,
+        "truncated": False,
+        "sections": {},
+    }
+    payload: dict = {"name": topic_type}
+    if has_semantic_input:
+        instruction = (
+            _VARIANT_PROMPT.replace("{type}", topic_type)
+            .replace("{count}", str(len(members)))
+            .replace("{reports}", "")
+            + "\n\n"
+            + (_STYLE_SAMPLE_NOTE.replace("{style_samples}", "") if editorial_members else "")
+        )
+        sections = [
+            ContextSection("instruction", [instruction], weight=5, required_items=1),
+            ContextSection("editorial_reference_samples", editorial_blocks, weight=3, required_items=1),
+            ContextSection("structural_reference_headings", structure_blocks, weight=4, required_items=1),
+            ContextSection("approved_editorial_exemplars", sample_packet, weight=4, required_items=1),
+        ]
+        prompt, audit = build_prompt_from_sections(
+            "style_profile", sections, stage_input_budget_tokens("style_profile"),
+        )
+        payload = _StyleProfileAgent().generate_json(
+            prompt, max_tokens=settings.style_profile_output_tokens,
+        )
+        _validate_profile_payload(payload, require_editorial=bool(editorial_members))
+
     structure = payload.get("structure") if isinstance(payload.get("structure"), dict) else {}
-    # The learner describes a reusable editorial form. It is a hint for the
-    # Final Planner, never a frozen directory copied into a new task.
     from app.document_shape import normalize_document_shape
-    structure["document_shape"] = normalize_document_shape(structure.get("document_shape"))
+    if not has_semantic_input:
+        structure["document_shape"] = normalize_document_shape({
+            "kind": "unknown",
+            "raw_kind": "unknown",
+            "render_base": "selected_template" if layout_members else "blank_article",
+        })
+    else:
+        structure["document_shape"] = normalize_document_shape(structure.get("document_shape"))
     writing = payload.get("writing_style") if isinstance(payload.get("writing_style"), dict) else {}
     writing_patterns = payload.get("writing_patterns") if isinstance(payload.get("writing_patterns"), dict) else {}
     material_realization = payload.get("material_realization") if isinstance(payload.get("material_realization"), dict) else {}
@@ -417,7 +515,9 @@ def _build_variant(library_id: int, topic_type: str, members: list[dict]) -> Sty
     terminology = payload.get("terminology") if isinstance(payload.get("terminology"), dict) else {}
     chapter_styles = payload.get("chapter_styles") if isinstance(payload.get("chapter_styles"), list) else []
     reasoning = payload.get("reasoning_profile") if isinstance(payload.get("reasoning_profile"), dict) else {}
-    institution_rules = payload.get("institution_rules") if isinstance(payload.get("institution_rules"), dict) else {}
+    # A model may describe observed patterns, but it cannot confirm business
+    # rules from examples; only explicit user-confirmed rules are enforceable.
+    institution_rules = {}
     annotations = payload.get("sample_annotations") if isinstance(payload.get("sample_annotations"), list) else []
     exemplar_bank = annotate_exemplars(exemplar_bank, annotations)
     observed_metrics = aggregate_style_metrics(all_exemplars)
@@ -426,22 +526,28 @@ def _build_variant(library_id: int, topic_type: str, members: list[dict]) -> Sty
     samples = [
         {"sample_type": item.get("sample_type", "fact"), "content": item.get("content", "")}
         for item in exemplar_bank[:12]
-    ] or _collect_samples(members)
-    # A DOCX may be deliberately supplied as an editorial or structural
-    # reference. Only explicit layout assets (or automatic mode) may become
-    # a Word export base.
-    layout_members = _eligible_layout_members(members)
+    ] or _collect_samples(editorial_members)
+
+    # A structural or layout source cannot silently train language behavior.
+    if not editorial_members:
+        writing = {}
+        writing_patterns = {key: value for key, value in writing_patterns.items() if key == "observed_metrics"}
+        terminology = {}
+        chapter_styles = []
+        reasoning = {}
+        institution_rules = {}
+        exemplar_bank = []
+        samples = []
+    if not structure_evidence_members:
+        for key in ("sections", "summary_first", "conclusion_first", "heading_patterns"):
+            structure.pop(key, None)
+        structure["sections"] = []
+
     format_spec = _collect_format(layout_members)
     structure["source_assets"] = _source_asset_profiles(members)
-    structure["asset_roles"] = _aggregate_asset_roles(members, structure, format_spec)
-    # Editorial-only inputs may have OCR headings, but they do not grant a
-    # reusable directory. Keep their discourse value and remove false structure.
-    if not structure["asset_roles"].get("structural_reference"):
-        structure["sections"] = []
+    asset_roles = _aggregate_asset_roles(members, structure, format_spec)
+    structure["asset_roles"] = asset_roles
     shape = normalize_document_shape(structure.get("document_shape"))
-    # A non-DOCX reference can teach how to write, but it cannot faithfully be
-    # reused as a Word layout base. Preserve its editorial value and let the
-    # Renderer select a structured default or a clean article document.
     if not format_spec:
         shape["render_base"] = (
             "default_structured"
@@ -449,6 +555,60 @@ def _build_variant(library_id: int, topic_type: str, members: list[dict]) -> Sty
             else "blank_article"
         )
     structure["document_shape"] = shape
+    role_counts = {
+        role: sum(role in _member_roles(item) for item in members)
+        for role in _ASSET_ROLE_ORDER
+    }
+    probe_audits = [
+        item.get("topic_probe_audit") or {} for item in members
+        if item.get("topic_probe_attempted")
+    ]
+    structure["learning_evidence"] = {
+        "source_count": len(members),
+        "role_source_counts": role_counts,
+        "sources": [
+            {
+                "filename": str(item.get("filename") or ""),
+                "roles": _member_roles(item),
+                "heading_count": len(item.get("headings") or []) if "structure" in _member_roles(item) else 0,
+                "editorial_sample_count": sum(bool(value) for value in (item.get("samples") or {}).values())
+                if "editorial" in _member_roles(item) else 0,
+                "topic_probe": item.get("topic_probe_audit") or {},
+            }
+            for item in members
+        ],
+        "editorial": {
+            "source_count": len(editorial_members),
+            "candidate_paragraphs": len(all_exemplars),
+            "stored_examples": len(exemplar_bank),
+            "paragraph_metric_samples": int(observed_metrics.get("sample_count") or 0),
+        },
+        "structure": {
+            "source_count": len(structure_members),
+            "observed_headings": sum(len(item.get("headings") or []) for item in structure_members),
+        },
+        "topic_probe": {
+            "attempts": sum(bool(item.get("topic_probe_attempted")) for item in members),
+            "actual_tokens": sum(int(item.get("actual_tokens") or 0) for item in probe_audits),
+            "budget_tokens": sum(int(item.get("budget_tokens") or 0) for item in probe_audits),
+            "truncated_sources": sum(bool(item.get("truncated")) for item in probe_audits),
+        },
+        "layout": {
+            "source_count": len(layout_members),
+            "master_file": str(layout_members[0].get("filename") or "") if layout_members and format_spec else "",
+            "extracted": bool(format_spec),
+        },
+        "profile_prompt": {
+            "called": has_semantic_input,
+            "tokenizer_method": audit.get("tokenizer_method", "not_called"),
+            "budget_tokens": audit.get("budget_tokens", 0),
+            "actual_tokens": audit.get("actual_tokens", 0),
+            "truncated": bool(audit.get("truncated")),
+            "sections": audit.get("sections", {}),
+        },
+    }
+    from app.template_policy import resolve_structure_policy
+    structure_policy = resolve_structure_policy({}, asset_roles)
     variant = StyleVariant(
         library_id=library_id,
         name=_normalize_profile_label(payload.get("name"), fallback=topic_type),
@@ -463,38 +623,16 @@ def _build_variant(library_id: int, topic_type: str, members: list[dict]) -> Sty
         reasoning_profile=reasoning,
         institution_rules=institution_rules,
         exemplar_bank=exemplar_bank[:200],
-        structure_policy={
-            "mode": "FORMAT_ONLY",
-            "source": "safe_default",
-            "confirmed": False,
-            "principle": "模板默认只约束呈现和成文风格，当前报告结构由任务事实与分析决定。",
-        },
-        profile_confidence={
-            "document_format": "high" if format_spec else "unavailable",
-            "content_structure": "medium" if structure else "low",
-            "editorial_style": _editorial_confidence(
-                writing, writing_patterns, len(members), len(exemplar_bank),
-            ),
-        },
+        structure_policy=structure_policy,
+        profile_confidence={},
         source_reports=[m["filename"] for m in members],
         status="draft",
     )
-    return save_variant(variant)
-
-
-def _asset_role_label(value) -> str:
-    return {
-        "editorial": "文体参考",
-        "structure": "结构参考",
-        "layout": "Word 版式母版",
-    }.get(str(value or "").strip().lower(), "自动识别")
+    return save_variant(variant, owner_user_id=owner_user_id)
 
 
 def _eligible_layout_members(members: list[dict]) -> list[dict]:
-    return [
-        item for item in members
-        if str(item.get("asset_role") or "auto").lower() in {"auto", "layout"}
-    ]
+    return [item for item in members if "layout" in _member_roles(item)]
 
 
 def _source_asset_profiles(members: list[dict]) -> list[dict]:
@@ -504,40 +642,57 @@ def _source_asset_profiles(members: list[dict]) -> list[dict]:
         path = str(item.get("path") or "")
         suffix = Path(path).suffix.lower().lstrip(".")
         headings = item.get("headings") or []
+        roles = _member_roles(item)
         result.append({
             "filename": str(item.get("filename") or ""),
             "file_type": suffix or "unknown",
-            "requested_role": str(item.get("asset_role") or "auto"),
-            "can_learn_editorial": bool(item.get("text")),
-            "can_reference_structure": bool(headings),
-            "can_be_layout_master": suffix == "docx",
+            "roles": roles,
+            "can_learn_editorial": "editorial" in roles and bool(item.get("text")),
+            "can_reference_structure": "structure" in roles and bool(headings),
+            "can_be_layout_master": "layout" in roles and suffix == "docx",
         })
     return result
 
 
 def _aggregate_asset_roles(members: list[dict], structure: dict, format_spec: dict) -> dict:
     assets = _source_asset_profiles(members)
-    requested = {str(item.get("requested_role") or "auto") for item in assets}
-    has_headings = any(
-        bool(item.get("can_reference_structure"))
-        and str(item.get("requested_role") or "auto") == "structure"
-        for item in assets
+    requested = {role for item in assets for role in item.get("roles", [])}
+    structure_count = sum("structure" in item.get("roles", []) for item in assets)
+    layout_count = sum("layout" in item.get("roles", []) for item in assets)
+    editorial_count = sum("editorial" in item.get("roles", []) for item in assets)
+    heading_count = sum(
+        len(member.get("headings") or [])
+        for member in members if "structure" in _member_roles(member)
     )
+    dominant = format_spec.get("dominant") if isinstance(format_spec, dict) else {}
+    dominant = dominant if isinstance(dominant, dict) else {}
+    has_layout = bool(dominant.get("template_schema") or dominant.get("source_template_path"))
     return {
+        "role_assignment_known": True,
         "editorial_reference": any(bool(item.get("can_learn_editorial")) for item in assets),
-        "structural_reference": has_headings or "structure" in requested,
-        "layout_master": bool(format_spec) and ("layout" in requested or "auto" in requested),
-        "layout_master_available": bool(format_spec),
-        "note": _asset_role_note(assets, bool(format_spec)),
+        "structural_reference": structure_count > 0,
+        "structural_reference_available": heading_count > 0,
+        "layout_master": has_layout,
+        "layout_master_available": has_layout,
+        "role_source_counts": {
+            "editorial": editorial_count,
+            "structure": structure_count,
+            "layout": layout_count,
+        },
+        "observed_heading_count": heading_count,
+        "note": _asset_role_note(requested, has_layout, heading_count),
     }
 
 
-def _asset_role_note(assets: list[dict], has_layout_master: bool) -> str:
+def _asset_role_note(roles: set[str], has_layout_master: bool, heading_count: int) -> str:
     if has_layout_master:
-        return "该画像包含可复用的原始 DOCX 版式母版。"
-    if any(item.get("requested_role") == "layout" for item in assets):
-        return "未找到可用的 DOCX 版式母版；该批文件仍会学习文体和结构，Word 导出将使用默认版式。"
-    return "非 Word 文件或仅参考用途的 Word 文件不会作为导出母版；Word 导出将按任务选择默认版式。"
+        return "已使用明确选定的 DOCX 母版；版式字段来自原始文档解析。"
+    notes = []
+    if "layout" not in roles:
+        notes.append("未指定版式母版，Word 导出使用任务默认版式")
+    if "structure" in roles and not heading_count:
+        notes.append("已指定结构参考，但未识别到标题层级")
+    return "；".join(notes) or "文体、结构和版式按所选来源用途分别处理。"
 
 
 def _collect_samples(members: list[dict]) -> list[dict]:
@@ -563,104 +718,35 @@ def _collect_samples(members: list[dict]) -> list[dict]:
 
 
 def _collect_format(members: list[dict]) -> dict:
-    """Keep complete DOCX variants; never build a field-level hybrid template."""
-    specs: list[dict] = []
-    for member in members:
-        if member.get("path") and str(member["path"]).lower().endswith(".docx"):
-            source_path = _persist_template_source(member["path"])
-            spec = extract_docx_format(source_path)
-            if spec:
-                specs.append(spec)
-    if not specs:
+    """Extract the one explicitly chosen DOCX master without silent ranking."""
+    if not members:
         return {}
-    # A renderer must use one coherent OOXML template.  Mixing the title from
-    # one file with body/numbering from another creates a document that never
-    # existed and cannot be reliably validated.
-    dominant = max(specs, key=_value_completeness)
-    _unused, conflicts = _merge_format_specs(specs)
-    field_confidence = _field_confidence(specs, dominant)
-    alternatives = []
-    seen = {_freeze_spec(dominant)}
-    for spec in specs:
-        frozen = _freeze_spec(spec)
-        if frozen not in seen:
-            seen.add(frozen)
-            alternatives.append(spec)
+    if len(members) != 1:
+        raise ValueError("ONLY_ONE_LAYOUT_MASTER_ALLOWED")
+    member = members[0]
+    source = str(member.get("path") or "")
+    if Path(source).suffix.lower() != ".docx":
+        raise ValueError("LAYOUT_MASTER_MUST_BE_DOCX")
+    source_path = _persist_template_source(source)
+    dominant = extract_docx_format(source_path)
+    if not dominant:
+        raise ValueError("LAYOUT_MASTER_EXTRACTION_FAILED")
+    conflicts = {}
     return {
         "dominant": dominant,
-        "alternatives": alternatives[:3],
+        "alternatives": [],
         "conflicts": conflicts,
-        "field_confidence": field_confidence,
-        "template_profile": _template_profile(dominant, conflicts, field_confidence),
+        "template_profile": _template_profile(dominant, conflicts),
         "selection_strategy": {
-            "mode": "whole_template_variant",
-            "principle": "始终选择一份完整原始 DOCX 作为渲染母版，不跨模板拼接格式字段。",
-            "tie_breakers": [
-                "优先用户明确选择或锁定的模板",
-                "未指定时优先结构化字段更完整的模板",
-                "其余模板作为完整 alternatives 保留",
-            ],
-            "conflict_policy": [
-                "格式冲突不自动投票合并，必须选择完整模板变体。",
-                "结构策略与文档版式分开确认，FORMAT_ONLY 不继承示例目录。",
-            ],
+            "mode": "explicit_single_master",
+            "source": str(member.get("filename") or Path(source).name),
+            "principle": "只使用用户明确指定的这一份原始 DOCX；不跨文档合并或自动择优。",
         },
-        "sample_count": len(specs),
+        "sample_count": 1,
     }
 
 
-def _strip_merge_noise(value):
-    """投票前剥离非格式动态元数据(compiled_at / source.*),避免多数投票因每次编译时间戳
-    不同而从不相等、投票退化成不稳定 tie-break。只影响判别,不影响保留的完整值。"""
-    if isinstance(value, dict):
-        v = dict(value)
-        v.pop("compiled_at", None)
-        v.pop("source", None)
-        return v
-    return value
-
-
-def _merge_format_specs(specs: list[dict]) -> tuple[dict, dict]:
-    dominant: dict = {}
-    conflicts: dict = {}
-    keys = sorted({key for spec in specs for key in spec.keys()})
-    for key in keys:
-        values = [spec.get(key) for spec in specs if spec.get(key) not in (None, "", [], {})]
-        if not values:
-            continue
-        counts: dict[str, int] = {}
-        best_value = values[0]
-        best_score = (0, 0)
-        for value in values:
-            frozen = _freeze_value(_strip_merge_noise(value))
-            counts[frozen] = counts.get(frozen, 0) + 1
-            score = (counts[frozen], _value_completeness(value))
-            if score > best_score:
-                best_value = value
-                best_score = score
-        dominant[key] = best_value
-        unique_values = []
-        for value in values:
-            if all(_freeze_value(_strip_merge_noise(value)) != _freeze_value(_strip_merge_noise(other))
-                   for other in unique_values):
-                unique_values.append(value)
-        if len(unique_values) > 1:
-            conflicts[key] = unique_values[:4]
-    return dominant, conflicts
-
-
-def _field_confidence(specs: list[dict], dominant: dict) -> dict:
-    confidence = {}
-    for key, value in dominant.items():
-        if value in (None, "", [], {}):
-            continue
-        same = sum(1 for spec in specs if _freeze_value(spec.get(key)) == _freeze_value(value))
-        present = sum(1 for spec in specs if spec.get(key) not in (None, "", [], {}))
-        confidence[key] = round(same / max(present, 1), 2)
-    return confidence
-
-
-def _template_profile(dominant: dict, conflicts: dict, confidence: dict) -> dict:
+def _template_profile(dominant: dict, conflicts: dict) -> dict:
     schema = dominant.get("template_schema") if isinstance(dominant.get("template_schema"), dict) else {}
     roles = schema.get("style", {}).get("roles", {}) if schema else {}
     learned_fields = sorted(k for k, v in dominant.items() if v not in (None, "", [], {}))
@@ -673,34 +759,14 @@ def _template_profile(dominant: dict, conflicts: dict, confidence: dict) -> dict
         "render_contract": schema.get("structure", {}).get("render_contract"),
     }
     missing = [field for field, value in required.items() if value in (None, "", [], {})]
-    low_confidence = [field for field, score in confidence.items() if score < 0.67]
     return {
         "learned_fields": learned_fields,
         "missing_critical_fields": missing,
         "conflict_fields": sorted(conflicts.keys()),
-        "low_confidence_fields": low_confidence,
         "completeness": round((len(required) - len(missing)) / max(1, len(required)), 2),
         "render_ready": not missing,
-        "recommendation": "可用于正式导出" if not missing and not low_confidence else "建议人工复核冲突或缺失的模板字段",
+        "recommendation": "可用于正式导出" if not missing else "建议人工复核缺失的模板字段",
     }
-
-
-def _value_completeness(value) -> int:
-    if isinstance(value, dict):
-        return sum(1 for item in value.values() if item not in (None, "", [], {}))
-    if isinstance(value, (list, tuple)):
-        return len(value)
-    return 1
-
-
-def _freeze_value(value) -> str:
-    import json
-
-    return json.dumps(value, ensure_ascii=False, sort_keys=True)
-
-
-def _freeze_spec(spec: dict) -> str:
-    return _freeze_value(spec)
 
 
 def _persist_template_source(path) -> Path:
@@ -732,10 +798,12 @@ def _write_template_schema_file(schema: dict) -> None:
         pass
 
 
-def save_variant(variant: StyleVariant) -> StyleVariant:
+def save_variant(variant: StyleVariant, *, owner_user_id: int | None = None) -> StyleVariant:
+    _require_owner(owner_user_id)
     with session_scope() as s:
         result = s.execute(
             ORMVariant.insert().values(
+                owner_user_id=owner_user_id,
                 library_id=variant.library_id, name=variant.name,
                 description=variant.description,
                 structure_json=json.dumps(variant.structure, ensure_ascii=False),
@@ -760,27 +828,32 @@ def save_variant(variant: StyleVariant) -> StyleVariant:
     return variant
 
 
-def get_variant(variant_id: int) -> StyleVariant | None:
+def get_variant(variant_id: int, *, owner_user_id: int | None = None) -> StyleVariant | None:
     with session_scope() as s:
-        row = s.execute(select(ORMVariant).where(ORMVariant.c.id == variant_id)).mappings().first()
+        query = select(ORMVariant).where(ORMVariant.c.id == variant_id)
+        if owner_user_id is not None:
+            query = query.where(ORMVariant.c.owner_user_id == owner_user_id)
+        row = s.execute(query).mappings().first()
     return _row_to_variant(dict(row)) if row else None
 
 
-def list_variants() -> list[StyleVariant]:
+def list_variants(owner_user_id: int | None = None) -> list[StyleVariant]:
+    _require_owner(owner_user_id)
     with session_scope() as s:
-        rows = s.execute(
-            select(ORMVariant).where(ORMVariant.c.status != "deleted")
-            .order_by(ORMVariant.c.id.desc())
-        ).mappings().all()
+        query = select(ORMVariant).where(ORMVariant.c.status != "deleted")
+        if owner_user_id is not None:
+            query = query.where(ORMVariant.c.owner_user_id == owner_user_id)
+        rows = s.execute(query.order_by(ORMVariant.c.id.desc())).mappings().all()
     return [_row_to_variant(dict(row)) for row in rows]
 
 
-def get_locked_variant() -> StyleVariant | None:
+def get_locked_variant(owner_user_id: int | None = None) -> StyleVariant | None:
+    _require_owner(owner_user_id)
     with session_scope() as s:
-        row = s.execute(
-            select(ORMVariant).where(ORMVariant.c.status == "locked")
-            .order_by(ORMVariant.c.id.desc()).limit(1)
-        ).mappings().first()
+        query = select(ORMVariant).where(ORMVariant.c.status == "locked")
+        if owner_user_id is not None:
+            query = query.where(ORMVariant.c.owner_user_id == owner_user_id)
+        row = s.execute(query.order_by(ORMVariant.c.id.desc()).limit(1)).mappings().first()
     return _row_to_variant(dict(row)) if row else None
 
 
@@ -788,16 +861,19 @@ def set_variant_status(variant_id: int, status: str) -> None:
     with session_scope() as s:
         if status == "locked":
             row = s.execute(
-                select(ORMVariant.c.library_id).where(ORMVariant.c.id == variant_id)
-            ).first()
-            if row is not None:
-                s.execute(
-                    ORMVariant.update()
-                    .where(ORMVariant.c.library_id == row[0],
-                           ORMVariant.c.status == "locked",
-                           ORMVariant.c.id != variant_id)
-                    .values(status="confirmed")
+                select(ORMVariant.c.library_id, ORMVariant.c.owner_user_id).where(
+                    ORMVariant.c.id == variant_id,
                 )
+            ).mappings().first()
+            if row is not None:
+                query = ORMVariant.update().where(
+                    ORMVariant.c.library_id == row["library_id"],
+                    ORMVariant.c.status == "locked",
+                    ORMVariant.c.id != variant_id,
+                )
+                if row["owner_user_id"] is not None:
+                    query = query.where(ORMVariant.c.owner_user_id == row["owner_user_id"])
+                s.execute(query.values(status="confirmed"))
         s.execute(ORMVariant.update().where(ORMVariant.c.id == variant_id).values(status=status))
 
 

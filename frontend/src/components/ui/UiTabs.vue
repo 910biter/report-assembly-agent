@@ -34,14 +34,15 @@ const emit = defineEmits<{ "update:modelValue": [value: string] }>();
 <style scoped>
 .ui-tabs {
   display: flex;
-  gap: 0;
+  gap: 4px;
   min-width: 0;
   overflow: auto;
-  padding: 0;
-  border: 0;
-  border-bottom: 1px solid var(--border);
-  border-radius: 0;
-  background: transparent;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  background: var(--muted);
+  width: fit-content;
+  max-width: 100%;
   scrollbar-width: none;
 }
 
@@ -57,11 +58,11 @@ const emit = defineEmits<{ "update:modelValue": [value: string] }>();
   min-height: 36px;
   padding: 0 12px;
   border: 0;
-  border-bottom: 2px solid transparent;
-  border-radius: 0;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
   background: transparent;
   color: var(--muted-foreground);
-  font: 600 12px/1 var(--font-ui);
+  font: 500 13px/1 var(--font-ui);
   transition:
     background var(--motion-fast),
     color var(--motion-fast),
@@ -75,8 +76,8 @@ const emit = defineEmits<{ "update:modelValue": [value: string] }>();
 
 .ui-tabs__item--active {
   color: var(--foreground);
-  background: transparent;
-  border-bottom-color: var(--primary);
+  background: var(--card);
+  border-color: var(--border-strong);
 }
 
 .ui-tabs button:disabled {
@@ -90,8 +91,8 @@ const emit = defineEmits<{ "update:modelValue": [value: string] }>();
   height: 17px;
   place-items: center;
   border-radius: 99px;
-  background: var(--primary-soft);
-  color: var(--primary);
+  background: var(--surface-hover);
+  color: var(--muted-foreground);
   font-size: 10px;
 }
 </style>

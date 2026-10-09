@@ -57,7 +57,8 @@ def export_report(report_id: int) -> Path:
     composition_mode = normalize_composition_mode(
         final_plan.get("composition_mode"), shape=document_shape,
     )
-    variant = _select_export_variant(report["style_profile_id"], document_shape)
+    variant = _select_export_variant(report["style_profile_id"], document_shape,
+                                     owner_user_id=report.get("owner_user_id"))
     format_spec = _dominant_format(variant)
     schema = format_spec.get("template_schema") if isinstance(format_spec.get("template_schema"), dict) else {}
 
@@ -140,12 +141,13 @@ def _dominant_format(variant) -> dict:
     return result
 
 
-def _select_export_variant(style_profile_id: int | None, document_shape: dict):
+def _select_export_variant(style_profile_id: int | None, document_shape: dict,
+                           owner_user_id: int | None = None):
     """Keep editorial style separate from the OOXML base chosen for output."""
-    selected = get_variant(style_profile_id) if style_profile_id else None
+    selected = get_variant(style_profile_id, owner_user_id=owner_user_id) if style_profile_id else None
     if document_shape.get("render_base") != "default_structured":
         return selected
-    fallback = get_locked_variant()
+    fallback = get_locked_variant(owner_user_id=owner_user_id)
     # A style-only reference must not be reused as a fake formal template.
     # With no compatible structured base, the semantic renderer starts a clean
     # document and applies its deterministic fallback styles.

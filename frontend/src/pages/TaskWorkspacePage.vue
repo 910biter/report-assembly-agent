@@ -8,6 +8,7 @@ import StatusBadge from "@/components/StatusBadge.vue";
 import MaterialComparisonWorkspace from "@/components/MaterialComparisonWorkspace.vue";
 import UiPageHeader from "@/components/ui/UiPageHeader.vue";
 import UiPagination from "@/components/ui/UiPagination.vue";
+import { usePersistentPageSize } from "@/lib/pagination";
 import { stageGroups, stageMeta } from "@/domain/workflowStages";
 import { useUiStore } from "@/stores/ui";
 const GraphNetwork = defineAsyncComponent(
@@ -34,7 +35,7 @@ const active = ref(requestedTab === "runtime" ? "materials" : requestedTab);
 const workspacePane = ref(requestedTab === "runtime" ? "process" : "materials");
 const analysisType = ref("facts");
 const analysisPage = ref(1);
-const analysisPageSize = ref(20);
+const analysisPageSize = usePersistentPageSize("analysis");
 watch([analysisType, analysisPageSize], () => { analysisPage.value = 1; });
 const selectedGraphEdge = ref<any>(null);
 const graphBuildError = ref("");
@@ -265,11 +266,16 @@ const stageIndex = computed(() => {
   return index >= 0 ? index : ["failed", "paused"].includes(stage) ? -1 : 0;
 });
 const processCurrentLabel = computed(() => {
+  if (task.data.value?.queue_status?.status === "queued") {
+    const ahead = task.data.value?.queue_status?.ahead;
+    return ahead == null ? "待运行" : `待运行 · 前方 ${ahead} 个任务`;
+  }
   if (stageIndex.value >= 0) return stages.value[stageIndex.value]?.name || "处理中";
   return stageMeta[String(task.data.value?.stage || "")]?.label || "处理中";
 });
 const running = computed(
   () =>
+    task.data.value?.queue_status?.status === "queued" ||
     ![
       "created",
       "requirement_review",
@@ -390,6 +396,23 @@ function confidence(x: any) {
       String(x.confidence_level || "").toLowerCase()
     ] || "需人工复核"
   );
+}
+function semanticFacets(profile: any, legacyMode = "", legacyDetail = "") {
+  const facets = Array.isArray(profile?.facets)
+    ? profile.facets.filter((item: any) => item?.axis && item?.label)
+    : [];
+  const attribution = profile?.additional?.attribution;
+  if (typeof attribution === "string" && attribution.trim()) {
+    facets.push({ axis: "来源归属", label: attribution.trim(), detail: "" });
+  }
+  if (!facets.length && (legacyDetail || (legacyMode && legacyMode !== "unknown"))) {
+    facets.push({ axis: "陈述性质", label: legacyDetail || legacyMode, detail: "" });
+  }
+  return facets;
+}
+function hasInferenceSemantics(item: any) {
+  return semanticFacets(item?.semantic_profile).length > 0 ||
+    (Array.isArray(item?.source_semantics) && item.source_semantics.length > 0);
 }
 function versionsList() {
   const data = versions.data.value;
@@ -876,6 +899,18 @@ function versionsList() {
                 ev.quote
               }}
             </blockquote>
+            <div
+              v-if="semanticFacets(fact.semantic_profile, fact.assertion_mode, fact.assertion_mode_raw).length"
+              class="semantic-profile"
+            >
+              <small>陈述语义</small>
+              <span
+                v-for="facet in semanticFacets(fact.semantic_profile, fact.assertion_mode, fact.assertion_mode_raw)"
+                :key="`${facet.axis}:${facet.label}`"
+                class="semantic-facet"
+                :title="facet.detail || `${facet.axis}：${facet.label}`"
+              >{{ facet.axis }} · {{ facet.label }}</span>
+            </div>
           </details></template>
         <template v-else-if="analysisType === 'inferences'"
           ><article
@@ -901,6 +936,34 @@ function versionsList() {
             <blockquote v-if="item.reasoning_chain">
               {{ item.reasoning_chain }}
             </blockquote>
+            <details v-if="hasInferenceSemantics(item)" class="semantic-details">
+              <summary>语义边界与来源</summary>
+              <div
+                v-if="semanticFacets(item.semantic_profile).length"
+                class="semantic-profile"
+              >
+                <small>推论语义</small>
+                <span
+                  v-for="facet in semanticFacets(item.semantic_profile)"
+                  :key="`inference:${facet.axis}:${facet.label}`"
+                  class="semantic-facet"
+                  :title="facet.detail || `${facet.axis}：${facet.label}`"
+                >{{ facet.axis }} · {{ facet.label }}</span>
+              </div>
+              <div
+                v-for="source in item.source_semantics || []"
+                :key="`source:${source.fact_id}`"
+                class="semantic-profile semantic-source"
+              >
+                <small>来源事实 {{ source.fact_id }}</small>
+                <span
+                  v-for="facet in semanticFacets(source.profile, source.legacy_assertion_mode, source.legacy_assertion_detail)"
+                  :key="`${source.fact_id}:${facet.axis}:${facet.label}`"
+                  class="semantic-facet"
+                  :title="facet.detail || `${facet.axis}：${facet.label}`"
+                >{{ facet.axis }} · {{ facet.label }}</span>
+              </div>
+            </details>
           </article></template>
         <UiPagination v-if="['facts', 'inferences'].includes(analysisType) && (analysis.data.value?.total || 0)" v-model:page="analysisPage" v-model:page-size="analysisPageSize" :total="analysis.data.value?.total || 0" />
         <template v-if="analysisType === 'graph'"
@@ -1424,6 +1487,41 @@ function versionsList() {
   border-left: 2px solid var(--border-strong);
   background: var(--color-surface-soft);
   color: var(--color-muted);
+}
+.semantic-profile {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+}
+.semantic-profile > small {
+  color: var(--color-muted);
+  margin-right: 2px;
+}
+.semantic-facet {
+  max-width: 100%;
+  padding: 3px 7px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface-soft);
+  color: var(--foreground);
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.semantic-details {
+  margin-top: 12px;
+  padding-top: 9px;
+  border-top: 1px solid var(--color-border);
+}
+.semantic-details > summary {
+  color: var(--color-muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+.semantic-source {
+  padding-top: 6px;
 }
 .knowledge-item.inference {
   border-left: 2px solid var(--success);

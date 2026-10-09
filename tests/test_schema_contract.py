@@ -1,5 +1,9 @@
 import unittest
+from unittest.mock import patch
 
+from sqlalchemy import create_engine, text
+
+from app import db
 from app.db import _report_ownership_statements, _schema_constraint_plan
 from app.infrastructure.orm import Base, _MIGRATED_COLUMNS
 
@@ -11,6 +15,38 @@ class SchemaContractTests(unittest.TestCase):
             if "NOT NULL" in _ddl.upper():
                 self.assertFalse(column.nullable, f"{table_name}.{column_name}")
                 self.assertIsNotNone(column.server_default, f"{table_name}.{column_name}")
+
+    def test_fact_and_claim_assertion_semantics_are_additive_fields(self):
+        for table_name in ("facts", "claims"):
+            for column_name in ("assertion_mode", "assertion_mode_raw"):
+                column = Base.metadata.tables[table_name].c[column_name]
+                self.assertFalse(column.nullable)
+                self.assertEqual(str(column.server_default.arg), "unknown")
+        migration = {(table, column): ddl for table, column, ddl in _MIGRATED_COLUMNS
+                     if column in {"assertion_mode", "assertion_mode_raw"}}
+        self.assertEqual(set(migration), {
+            ("facts", "assertion_mode"), ("claims", "assertion_mode"),
+            ("facts", "assertion_mode_raw"), ("claims", "assertion_mode_raw"),
+        })
+        self.assertTrue(all("DEFAULT 'unknown'" in ddl for ddl in migration.values()))
+
+    def test_open_semantic_profile_storage_exists_on_source_and_derived_records(self):
+        expected = {
+            "facts": ("semantic_profile_json",),
+            "claims": ("semantic_profile_json",),
+            "inferences": ("semantic_profile_json", "source_semantics_json"),
+        }
+        for table_name, columns in expected.items():
+            for column_name in columns:
+                column = Base.metadata.tables[table_name].c[column_name]
+                self.assertFalse(column.nullable, f"{table_name}.{column_name}")
+                self.assertIsNotNone(column.server_default, f"{table_name}.{column_name}")
+        migrated = {(table, column) for table, column, _ddl in _MIGRATED_COLUMNS}
+        self.assertTrue({
+            (table, column)
+            for table, columns in expected.items()
+            for column in columns
+        } <= migrated)
 
     def test_reports_have_a_direct_task_owner(self):
         owner = Base.metadata.tables["reports"].c["task_id"]
@@ -41,6 +77,30 @@ class SchemaContractTests(unittest.TestCase):
             },
         })
         self.assertEqual(statements, [])
+
+    def test_legacy_open_assertion_labels_are_preserved_during_protocol_migration(self):
+        engine = create_engine("sqlite:///:memory:")
+        with engine.begin() as conn:
+            conn.execute(text(
+                "CREATE TABLE facts (id INTEGER PRIMARY KEY, assertion_mode TEXT NOT NULL)"
+            ))
+            conn.execute(text(
+                "CREATE TABLE claims (id INTEGER PRIMARY KEY, assertion_mode TEXT NOT NULL)"
+            ))
+            conn.execute(text("INSERT INTO facts VALUES (1, '设计目标')"))
+            conn.execute(text("INSERT INTO claims VALUES (1, '实施建议')"))
+        with patch.object(db, "_get_engine", lambda: engine):
+            db._migrate_columns()
+
+        with engine.connect() as conn:
+            fact = conn.execute(text(
+                "SELECT assertion_mode, assertion_mode_raw FROM facts WHERE id=1"
+            )).one()
+            claim = conn.execute(text(
+                "SELECT assertion_mode, assertion_mode_raw FROM claims WHERE id=1"
+            )).one()
+        assert tuple(fact) == ("unknown", "设计目标")
+        assert tuple(claim) == ("unknown", "实施建议")
 
     def test_unexpected_existing_default_is_removed(self):
         statements = _schema_constraint_plan({

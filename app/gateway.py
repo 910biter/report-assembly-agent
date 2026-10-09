@@ -29,10 +29,12 @@ _LAST_GENERATION_STATS = contextvars.ContextVar("last_generation_stats", default
 
 class ModelGateway(Protocol):
     def generate(self, prompt: str, system: str | None = None,
-                 max_tokens: int | None = None) -> str: ...
+                 max_tokens: int | None = None,
+                 temperature: float | None = None) -> str: ...
     def generate_json(self, prompt: str, system: str | None = None,
                       think: bool | None = None,
-                      max_tokens: int | None = None) -> dict: ...
+                      max_tokens: int | None = None,
+                      temperature: float | None = None) -> dict: ...
     def embed(self, texts: list[str], query: bool = False, **kwargs) -> list[list[float]]: ...
     def health(self) -> dict: ...
 
@@ -46,14 +48,20 @@ class OpenAICompatibleGateway:
         ).rstrip("/")
 
     def generate(self, prompt: str, system: str | None = None,
-                 max_tokens: int | None = None) -> str:
-        return self._chat(prompt, system=system, json_mode=False, max_tokens=max_tokens)
+                 max_tokens: int | None = None,
+                 temperature: float | None = None) -> str:
+        return self._chat(
+            prompt, system=system, json_mode=False,
+            max_tokens=max_tokens, temperature=temperature,
+        )
 
     def generate_json(self, prompt: str, system: str | None = None,
                       think: bool | None = None,
-                      max_tokens: int | None = None) -> dict:
+                      max_tokens: int | None = None,
+                      temperature: float | None = None) -> dict:
         content = self._chat(
             prompt, system, json_mode=False, think=think, max_tokens=max_tokens,
+            temperature=temperature,
         )
         fenced = re.search(r"```(?:json)?\s*(.*?)\s*```", content, re.DOTALL)
         if fenced:
@@ -88,7 +96,8 @@ class OpenAICompatibleGateway:
         return local_embedding_runtime.embed(texts, query=query)
 
     def _chat(self, prompt: str, system: str | None = None, json_mode: bool = False,
-              think: bool | None = None, max_tokens: int | None = None) -> str:
+              think: bool | None = None, max_tokens: int | None = None,
+              temperature: float | None = None) -> str:
         messages = []
         if system:
             messages.append({"role": "system", "content": system})
@@ -99,6 +108,8 @@ class OpenAICompatibleGateway:
             "stream": False,
             "max_tokens": int(max_tokens or settings.generation_reserve_tokens),
         }
+        if temperature is not None:
+            payload["temperature"] = float(temperature)
         # Lower values are more urgent in vLLM's priority scheduler.
         from app.llm_queue import current_llm_priority
         payload["priority"] = current_llm_priority()

@@ -1,5 +1,5 @@
 """材料与来源绑定模型。"""
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -51,6 +51,9 @@ class Claim:
     quote: str = ""
     source: str = ""
     fact_type: str = "unknown"  # Open semantic label; legacy rows may contain canonical values
+    assertion_mode: str = "unknown"  # Cross-domain protocol state
+    assertion_mode_raw: str = "unknown"  # Open source-claim semantics, not a closed business taxonomy
+    semantic_profile: dict = field(default_factory=dict)
     dimension: str = ""
     need_id: int = 0  # EvidenceNeed 归属(0=开放发现)
     status: str = "pending"  # pending / promoted / rejected

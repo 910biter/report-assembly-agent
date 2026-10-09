@@ -28,6 +28,7 @@ from app.infrastructure.orm import (
     ORMSentence,
     ORMTaskRun,
     ORMTaskArtifact,
+    ORMShortMemory,
 )
 from app.llm_scheduler import invoke
 from app.llm_queue import PRIORITY_INTERACTIVE, llm_priority
@@ -93,7 +94,8 @@ def _tool_confirmation_reply(tool_call) -> str:
 
 def create_thread(*, task_id: str = "", report_id: int | None = None,
                   artifact_type: str, artifact_version: str = "", object_id: str = "",
-                  scope: dict | None = None) -> dict[str, Any]:
+                  scope: dict | None = None,
+                  owner_user_id: int | None = None) -> dict[str, Any]:
     if artifact_type not in INTERACTION_THREAD_TYPES:
         raise ValueError("INVALID_ARTIFACT_TYPE")
     if not task_id and report_id is not None:
@@ -104,6 +106,16 @@ def create_thread(*, task_id: str = "", report_id: int | None = None,
         task_id = str(report[0] or "") if report else ""
         if not task_id:
             raise ValueError("REPORT_TASK_NOT_FOUND")
+    if task_id:
+        with session_scope() as s:
+            task_owner = s.execute(select(ORMShortMemory.c.owner_user_id).where(
+                ORMShortMemory.c.task_id == task_id,
+            )).scalar_one_or_none()
+        if owner_user_id is not None and task_owner != owner_user_id:
+            raise ValueError("TASK_NOT_FOUND")
+        owner_user_id = task_owner
+    elif settings.multiuser_enabled and owner_user_id is None:
+        raise ValueError("OWNER_REQUIRED")
     scope = dict(scope or {})
     with session_scope() as s:
         query = select(ORMInteractionThread).where(
@@ -113,6 +125,8 @@ def create_thread(*, task_id: str = "", report_id: int | None = None,
             ORMInteractionThread.c.object_id == str(object_id or ""),
             ORMInteractionThread.c.status == "open",
         )
+        if owner_user_id is not None:
+            query = query.where(ORMInteractionThread.c.owner_user_id == owner_user_id)
         if report_id is None:
             query = query.where(ORMInteractionThread.c.report_id.is_(None))
         else:
@@ -132,6 +146,7 @@ def create_thread(*, task_id: str = "", report_id: int | None = None,
     with session_scope() as s:
         result = s.execute(insert(ORMInteractionThread).values(
             thread_key=thread_key,
+            owner_user_id=owner_user_id,
             task_id=task_id,
             report_id=report_id,
             artifact_type=artifact_type,
@@ -184,8 +199,10 @@ def get_thread(thread_id: int, *, include_decision_memory: bool = True) -> dict[
 
 
 def list_threads(*, task_id: str = "", report_id: int | None = None,
-                 draft_id: str = "") -> list[dict[str, Any]]:
+                 draft_id: str = "", owner_user_id: int | None = None) -> list[dict[str, Any]]:
     query = select(ORMInteractionThread)
+    if owner_user_id is not None:
+        query = query.where(ORMInteractionThread.c.owner_user_id == owner_user_id)
     if report_id is not None:
         query = query.where(ORMInteractionThread.c.report_id == int(report_id))
     elif task_id:
@@ -234,11 +251,19 @@ def attach_draft_thread(draft_id: str, task_id: str) -> int:
     if not draft_id or not task_id:
         return 0
     with session_scope() as s:
-        rows = s.execute(select(ORMInteractionThread.c.id).where(
+        owner_user_id = s.execute(select(ORMShortMemory.c.owner_user_id).where(
+            ORMShortMemory.c.task_id == task_id,
+        )).scalar_one_or_none()
+        if settings.multiuser_enabled and owner_user_id is None:
+            raise ValueError("TASK_NOT_FOUND")
+        query = select(ORMInteractionThread.c.id).where(
             ORMInteractionThread.c.task_id == "",
             ORMInteractionThread.c.artifact_type == "task_draft",
             ORMInteractionThread.c.object_id == draft_id,
-        )).all()
+        )
+        if owner_user_id is not None:
+            query = query.where(ORMInteractionThread.c.owner_user_id == owner_user_id)
+        rows = s.execute(query).all()
         thread_ids = [int(row[0]) for row in rows]
         if not thread_ids:
             return 0
@@ -594,7 +619,7 @@ def _run_draft_agent_interaction(
             with llm_priority(PRIORITY_INTERACTIVE):
                 result = invoke(
                     "review_copilot", run_task_draft_agent,
-                    current, content, history,
+                    current, content, history, thread.get("owner_user_id"),
                 )
             context_audit.update({
                 "requests": int(result.usage.get("requests") or 0),
@@ -1530,6 +1555,7 @@ def _update_message_metadata(message_id: int, metadata: dict) -> None:
 def _thread_detail(row) -> dict:
     return {
         "id": int(row["id"]), "thread_key": row["thread_key"], "task_id": row["task_id"],
+        "owner_user_id": row["owner_user_id"],
         "report_id": row["report_id"], "artifact_type": row["artifact_type"],
         "artifact_version": row["artifact_version"], "object_id": row["object_id"],
         "scope": _load(row["scope_json"], {}), "status": row["status"],

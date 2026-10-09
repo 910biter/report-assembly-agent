@@ -9,6 +9,7 @@ import UiDataBrowser from "@/components/ui/UiDataBrowser.vue";
 import UiPageHeader from "@/components/ui/UiPageHeader.vue";
 import UiButton from "@/components/ui/UiButton.vue";
 import UiPagination from "@/components/ui/UiPagination.vue";
+import { usePersistentPageSize } from "@/lib/pagination";
 import { useUiStore } from "@/stores/ui";
 
 const search = ref("");
@@ -22,7 +23,7 @@ const ui = useUiStore();
 const openingAssistant = ref(false);
 const selected = ref<number | null>(null);
 const page = ref(1);
-const pageSize = ref(20);
+const pageSize = usePersistentPageSize("materials");
 const detailTab = ref("overview");
 const list = useQuery({
   queryKey: ["materials"],

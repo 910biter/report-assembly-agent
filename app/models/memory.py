@@ -27,36 +27,44 @@ class StyleVariant:
     structure_policy: dict = field(default_factory=dict)  # FORMAT_ONLY / SOFT_STRUCTURE / HARD_STRUCTURE
     exemplar_bank: list[dict] = field(default_factory=list)  # 已审核的材料→成文配对范例
     learning_cases: list[dict] = field(default_factory=list)  # 画像来源及质量等级
-    profile_confidence: dict = field(default_factory=dict)  # 分层置信度，不用单一总分掩盖缺失
+    profile_confidence: dict = field(default_factory=dict)  # legacy storage field; new learning evidence lives in structure
     profile_version: int = 1
     source_reports: list[str] = field(default_factory=list)
     status: str = "draft"  # draft / confirmed / locked
     id: int | None = None
 
     def planner_prompt_block(self) -> str:
-        """Planner only sees the declared structure policy, never DOCX layout."""
-        policy = self.structure_policy or {"mode": "SOFT_STRUCTURE", "source": "inferred"}
-        mode = str(policy.get("mode") or "SOFT_STRUCTURE").upper()
+        """Expose the canonical structure policy; never infer hard structure."""
+        from app.template_policy import resolve_structure_policy, structure_guidance
+
+        structure = self.structure if isinstance(self.structure, dict) else {}
+        roles = structure.get("asset_roles") or {}
+        policy = resolve_structure_policy(self.structure_policy, roles)
+        mode = policy["mode"]
         if mode == "FORMAT_ONLY":
-            return "模板结构策略：FORMAT_ONLY。模板只控制排版，不得继承其示例目录。"
-        sections = (self.structure or {}).get("sections") or []
+            return f"模板结构策略：{mode}。{structure_guidance(mode)}"
+        sections = structure.get("sections") or []
         reference = "、".join(str(item.get("title") or "") for item in sections if isinstance(item, dict))
         if mode == "HARD_STRUCTURE":
-            return f"模板结构策略：HARD_STRUCTURE。必须遵守已确认目录：{reference or '以模板Schema为准'}。"
+            return f"模板结构策略：{mode}。{structure_guidance(mode)}目录：{reference or '以已确认目录为准'}。"
         return (
-            "模板结构策略：SOFT_STRUCTURE。历史目录仅为弱参考，最终结构必须由当前事实、推论和用户目标决定。"
+            f"模板结构策略：{mode}。{structure_guidance(mode)}"
             + (f"参考章节类型：{reference}" if reference else "")
         )
 
     def writer_prompt_block(self, context: dict | None = None) -> str:
         """Editorial profile plus a few context-relevant, approved exemplars."""
-        block = f"机构风格变体「{self.name or '未命名'}」约束:\n"
+        block = (
+            f"机构风格变体「{self.name or '未命名'}」表达参考:\n"
+            "只借鉴组织、句式、节奏和材料表达方式。样本的主题、立场、分析对象和结论不是本任务要求；"
+            "不能据此补充业务事实、动机或因果。用户要求和当前材料的证据边界优先；不适用的表达可不采用。\n"
+        )
         writing = self.writing_style or {}
         if writing:
             block += (
                 f"- 语言正式程度: {writing.get('tone', '未指定')}\n"
                 f"- 句式习惯: {writing.get('sentence_pattern', '未指定')}\n"
-                f"- 分析风格: {writing.get('analysis_style', '未指定')}\n"
+                f"- 样本的分析表达(非本任务论证要求): {writing.get('analysis_style', '未指定')}\n"
             )
         patterns = self.writing_patterns or {}
         if patterns:
@@ -75,12 +83,15 @@ class StyleVariant:
                 observed = {**observed, **aggregate_style_metrics(self.exemplar_bank)}
             if observed:
                 block += (
-                    "- 历史成品统计(仅作为节奏参考,不得机械凑数): "
-                    f"段落长度={json_dumps(observed.get('paragraph_chars', {}), limit=180)}; "
-                    f"每段句数={json_dumps(observed.get('sentences_per_paragraph', {}), limit=180)}; "
+                    "- 历史句长统计(节奏参考，不作硬性要求): "
                     f"句长={json_dumps(observed.get('sentence_chars', {}), limit=180)}\n"
                 )
-                editorial = observed.get("editorial_contract") or {}
+                editorial = dict(observed.get("editorial_contract") or {})
+                # Parsed text fragments are not confirmed natural paragraphs.
+                # Keep learned data, but do not turn fragment length into prose
+                # paragraph instructions at runtime.
+                if observed.get("measurement_basis") != "natural_paragraphs":
+                    editorial.pop("paragraph_rhythm", None)
                 if editorial:
                     block += (
                         "- 编辑组织契约(仅指导段落推进，不是固定目录): "
@@ -88,12 +99,12 @@ class StyleVariant:
                     )
         terminology = self.terminology or {}
         if terminology.get("preferred"):
-            block += "- 惯用表达: " + "、".join(terminology["preferred"]) + "\n"
+            block += "- 样本惯用表达(仅语境合适且依据充分时借鉴): " + "、".join(terminology["preferred"]) + "\n"
         if terminology.get("forbidden"):
             block += "- 避免表达: " + "、".join(terminology["forbidden"]) + "\n"
-        samples = self.select_exemplars(context, limit=2) if context else self.style_samples[:2]
+        samples = self.select_exemplars({**context, "match_dimension": "expression"}, limit=2) if context else self.style_samples[:2]
         if samples:
-            block += "- 匹配当前写作目的的已审核软范例(只借鉴组织与表达，不复制事实):\n"
+            block += "- 所选模板的表达范例(优先相近论证用途；主题不同仍可参考文体，不代表当前论证或事实):\n"
             for sample in samples:
                 label = _SAMPLE_TYPES_label(sample.get("sample_type", ""))
                 purpose = str(sample.get("purpose") or sample.get("section") or "").strip()
@@ -114,7 +125,7 @@ class StyleVariant:
                 )
         reasoning = self.reasoning_profile or {}
         if reasoning:
-            block += f"- 分析逻辑(本机构如何分析): {json_dumps(reasoning, limit=600)}\n"
+            block += f"- 样本分析方式(仅当前证据支持时参考，不得继承样本结论): {json_dumps(reasoning, limit=600)}\n"
         return block.strip()
 
     def select_exemplars(self, context: dict, limit: int = 3) -> list[dict]:

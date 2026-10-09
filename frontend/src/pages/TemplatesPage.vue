@@ -10,6 +10,8 @@ import UiButton from "@/components/ui/UiButton.vue";
 
 const qc = useQueryClient();
 const upload = ref<HTMLInputElement>();
+const selectedFiles = ref<File[]>([]);
+const roleSelections = ref<string[][]>([]);
 const selected = ref<any>(null);
 const schema = ref<any>(null);
 const tab = ref("document");
@@ -18,7 +20,11 @@ const editingName = ref("");
 const uploading = ref(false);
 const uploadPercent = ref(0);
 const learningJob = ref<any>(null);
-const assetRole = ref("auto");
+const roleOptions = [
+  { value: "editorial", label: "文体参考" },
+  { value: "structure", label: "结构参考" },
+  { value: "layout", label: "Word 版式母版" },
+];
 let pollTimer: number | undefined;
 const variants = useQuery({
   queryKey: ["templates"],
@@ -89,12 +95,72 @@ function format(value: any) {
   const parts = [font, size ? `${size}pt` : "", align].filter(Boolean);
   return parts.length ? parts.join(" / ") : "尚未识别";
 }
-function confidence(key: string) {
-  const value = selected.value?.profile_confidence?.[key];
-  if (value === "unavailable") return "暂无可用结果";
-  return ({ high: "高", medium: "中", low: "低" } as any)[value] || "未完成";
+function onFilesChanged(event: Event) {
+  const input = event.target as HTMLInputElement;
+  selectedFiles.value = Array.from(input.files || []);
+  roleSelections.value = selectedFiles.value.map(() => ["editorial"]);
+  error.value = "";
 }
+function rolesFor(_file: File, index: number) {
+  return roleSelections.value[index] || [];
+}
+function roleLabels(roles: string[]) {
+  return roles.map(
+    (item) => roleOptions.find((option) => option.value === item)?.label || item,
+  ).join("、");
+}
+function roleDisabled(file: File, index: number, roleName: string) {
+  if (roleName === "layout") {
+    const anotherMasterSelected = selectedFiles.value.some(
+      (candidate, candidateIndex) => candidateIndex !== index && rolesFor(candidate, candidateIndex).includes("layout"),
+    );
+    return !file.name.toLowerCase().endsWith(".docx") || anotherMasterSelected;
+  }
+  return false;
+}
+function toggleRole(file: File, index: number, roleName: string, event: Event) {
+  const checked = (event.target as HTMLInputElement).checked;
+  const current = rolesFor(file, index);
+  const next = checked
+    ? [...new Set([...current, roleName])]
+    : current.filter((item) => item !== roleName);
+  if (checked && roleName === "layout" && !file.name.toLowerCase().endsWith(".docx")) {
+    error.value = "Word 版式母版必须是 DOCX 文件";
+    return;
+  }
+  if (checked && roleName === "layout" && selectedFiles.value.some(
+    (candidate, candidateIndex) => candidateIndex !== index && rolesFor(candidate, candidateIndex).includes("layout"),
+  )) {
+    error.value = "一次模板学习只能指定一个 Word 版式母版";
+    return;
+  }
+  if (!next.length) {
+    error.value = "每份来源至少选择一种学习用途";
+    return;
+  }
+  roleSelections.value = roleSelections.value.map((roles, roleIndex) => roleIndex === index ? next : roles);
+  error.value = "";
+}
+const learningEvidence = computed(
+  () => selected.value?.learning_evidence || selected.value?.structure?.learning_evidence || {},
+);
+const promptSectionRows = computed(() => {
+  const labels: Record<string, string> = {
+    instruction: "学习规则",
+    editorial_reference_samples: "文体样本",
+    structural_reference_headings: "结构标题",
+    approved_editorial_exemplars: "成文范例",
+  };
+  const sections = learningEvidence.value.profile_prompt?.sections || {};
+  return Object.entries(sections).map(([key, value]: [string, any]) => ({
+    label: labels[key] || key,
+    selected: value.selected_items || 0,
+    candidate: value.candidate_items || 0,
+    omitted: value.omitted_items || 0,
+  }));
+});
 function capabilitySummary(roles: any) {
+  if (roles?.role_assignment_known === false) return "来源用途未记录";
   const capabilities = [
     roles?.editorial_reference && "文体",
     roles?.structural_reference && "结构",
@@ -235,6 +301,7 @@ const phaseLabel = computed(
       ({
         queued: "等待开始",
         parsing: "解析文件",
+        learning: "读取版式母版",
         classifying: "识别语言与结构",
         profiling: "生成模板画像",
         completed: "学习完成",
@@ -243,7 +310,7 @@ const phaseLabel = computed(
     )[learningJob.value?.phase] || "准备上传",
 );
 async function startLearning() {
-  const files = Array.from(upload.value?.files || []);
+  const files = selectedFiles.value;
   if (!files.length) {
     error.value = "请先选择模板或成品报告";
     return;
@@ -254,7 +321,10 @@ async function startLearning() {
   learningJob.value = null;
   const form = new FormData();
   files.forEach((file) => form.append("files", file));
-  form.append("asset_role", assetRole.value);
+  form.append(
+    "asset_roles_json",
+    JSON.stringify(files.map((file, index) => rolesFor(file, index))),
+  );
   try {
     learningJob.value = await uploadForm<any>(
       "/api/style/analyze-jobs",
@@ -306,22 +376,37 @@ onBeforeUnmount(() => window.clearTimeout(pollTimer));
         <span class="upload-mark">DOCX</span>
         <div>
           <h2>学习新模板</h2>
-          <p>上传参考报告、推送或 Word 母版，系统会分别学习文体、结构和版式能力。</p>
+          <p>一批来源生成一个模板画像；逐份指定它能提供的学习内容。</p>
         </div>
       </div>
       <div class="upload-controls">
-        <label class="upload-field"
-          ><span>选择参考文件</span
-          ><input ref="upload" type="file" accept=".pdf,.docx,.doc,.pptx,.ppt,.xlsx,.xls,.csv,.html,.htm,.md,.txt,.epub" multiple /></label
-        ><label class="asset-role-select"
-          ><span>本批用途</span
-          ><select v-model="assetRole">
-            <option value="auto">自动识别</option>
-            <option value="editorial">文体参考</option>
-            <option value="structure">结构参考</option>
-            <option value="layout">Word 版式母版</option>
-          </select></label
-        >
+        <label class="upload-field">
+          <span>选择参考文件</span>
+          <input
+            ref="upload"
+            type="file"
+            accept=".pdf,.docx,.doc,.pptx,.ppt,.xlsx,.xls,.csv,.html,.htm,.md,.txt,.epub"
+            multiple
+            @change="onFilesChanged"
+          />
+        </label>
+        <p class="role-explainer">
+          文体学习与结构参考可多选；Word 版式母版仅限一份 DOCX。默认仅作为文体参考。
+        </p>
+      </div>
+      <div v-if="selectedFiles.length" class="source-role-list">
+        <div v-for="(file, index) in selectedFiles" :key="`${file.name}:${file.size}:${index}`" class="source-role-row">
+          <strong :title="file.name">{{ file.name }}</strong>
+          <label v-for="option in roleOptions" :key="option.value" class="source-role-option">
+            <input
+              type="checkbox"
+              :checked="rolesFor(file, index).includes(option.value)"
+              :disabled="roleDisabled(file, index, option.value)"
+              @change="toggleRole(file, index, option.value, $event)"
+            />
+            <span>{{ option.label }}</span>
+          </label>
+        </div>
       </div>
       <UiButton
         :loading="learningBusy"
@@ -461,11 +546,58 @@ onBeforeUnmount(() => window.clearTimeout(pollTimer));
             <div class="profile-block asset-capabilities">
               <h3>模板用途</h3>
               <dl>
-                <dt>文体学习</dt><dd>{{ selected.structure?.asset_roles?.editorial_reference ? '可用' : '未识别' }}</dd>
-                <dt>结构参考</dt><dd>{{ selected.structure?.asset_roles?.structural_reference ? '可用' : '仅供语言参考' }}</dd>
-                <dt>Word 版式母版</dt><dd>{{ selected.structure?.asset_roles?.layout_master_available ? '可用' : '未提供，将按任务使用默认版式' }}</dd>
+                <dt>文体学习</dt><dd>{{ selected.structure?.asset_roles?.role_assignment_known === false ? '来源用途未记录' : selected.structure?.asset_roles?.editorial_reference ? '可用' : '未选择' }}</dd>
+                <dt>结构参考</dt><dd>{{ selected.structure?.asset_roles?.role_assignment_known === false ? '来源用途未记录' : !selected.structure?.asset_roles?.structural_reference ? '未选择' : selected.structure?.asset_roles?.structural_reference_available ? `已识别 ${learningEvidence.structure?.observed_headings || 0} 个标题` : '已选择，未识别标题层级' }}</dd>
+                <dt>Word 版式母版</dt><dd>{{ selected.structure?.asset_roles?.layout_master_available ? (selected.structure?.asset_roles?.role_assignment_known === false ? '存在，但用途未记录' : '可用') : '未提供，将按任务使用默认版式' }}</dd>
               </dl>
               <p class="schema-note">{{ selected.structure?.asset_roles?.note || '文体、结构与导出版式由系统分别处理。' }}</p>
+            </div>
+            <div class="profile-block learning-evidence">
+              <h3>学习依据</h3>
+              <div v-if="learningEvidence.source_count !== undefined">
+                <dl>
+                <dt>来源文件</dt><dd>{{ learningEvidence.source_count || 0 }} 份</dd>
+                <dt>文体自然段</dt><dd>{{ learningEvidence.editorial?.candidate_paragraphs || 0 }} 个候选，保留 {{ learningEvidence.editorial?.stored_examples || 0 }} 个范例</dd>
+                <dt>结构标题</dt><dd>{{ learningEvidence.structure?.observed_headings || 0 }} 个</dd>
+                <dt>类型识别调用</dt>
+                <dd>
+                  {{ learningEvidence.topic_probe?.attempts || 0 }} 次，
+                  {{ learningEvidence.topic_probe?.actual_tokens || 0 }} /
+                  {{ learningEvidence.topic_probe?.budget_tokens || 0 }} tokens
+                  <span v-if="learningEvidence.topic_probe?.truncated_sources" class="evidence-warning">
+                    {{ learningEvidence.topic_probe.truncated_sources }} 份输入有裁剪
+                  </span>
+                </dd>
+                <dt>画像输入</dt>
+                <dd>
+                  <template v-if="learningEvidence.profile_prompt?.called">
+                    {{ learningEvidence.profile_prompt?.actual_tokens || 0 }} /
+                    {{ learningEvidence.profile_prompt?.budget_tokens || 0 }} tokens
+                    <span v-if="learningEvidence.profile_prompt?.truncated" class="evidence-warning">存在预算裁剪</span>
+                    <span v-else>未发生输入裁剪</span>
+                  </template>
+                  <span v-else>未调用语义模型，仅提取 DOCX 版式</span>
+                </dd>
+                </dl>
+                <div v-if="promptSectionRows.length" class="prompt-section-audit">
+                  <div v-for="item in promptSectionRows" :key="item.label">
+                    <span>{{ item.label }}</span>
+                    <strong>{{ item.selected }} / {{ item.candidate }}</strong>
+                    <small v-if="item.omitted">未纳入 {{ item.omitted }}</small>
+                  </div>
+                </div>
+                <div v-if="learningEvidence.sources?.length" class="learning-source-list">
+                  <div v-for="source in learningEvidence.sources" :key="source.filename">
+                    <strong>{{ source.filename }}</strong>
+                    <span>{{ roleLabels(source.roles || []) }}</span>
+                    <small v-if="source.heading_count">识别标题 {{ source.heading_count }} 个</small>
+                    <small v-if="source.editorial_sample_count">文体采样 {{ source.editorial_sample_count }} 处</small>
+                  </div>
+                </div>
+              </div>
+              <p v-else class="schema-note">
+                该历史画像没有保存逐文件用途与模型输入覆盖记录，因此不推测哪些材料参与了哪类学习。
+              </p>
             </div>
             <div class="confidence-line">
               <span>导出可用性</span
@@ -522,7 +654,7 @@ onBeforeUnmount(() => window.clearTimeout(pollTimer));
             </div>
             <div v-if="editorialRows.length" class="profile-block">
               <h3>
-                表达与组织 <span>{{ confidence("editorial_style") }}</span>
+                表达与组织 <span>{{ learningEvidence.editorial?.source_count || 0 }} 份文体来源</span>
               </h3>
               <dl>
                 <template v-for="item in editorialRows" :key="item[0]"
@@ -1202,5 +1334,150 @@ onBeforeUnmount(() => window.clearTimeout(pollTimer));
 }
 .asset-count {
   display: none;
+}
+.upload-bar {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+}
+.upload-copy,
+.upload-controls,
+.source-role-list {
+  grid-column: 1 / -1;
+}
+.upload-controls {
+  grid-template-columns: minmax(240px, 0.8fr) minmax(0, 1.2fr);
+  align-items: center;
+}
+.role-explainer {
+  margin: 0;
+  color: var(--muted-foreground);
+  font-size: 12px;
+  line-height: 1.6;
+}
+.source-role-list {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  max-height: 260px;
+  overflow: auto;
+  padding: 8px 0;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+}
+.source-role-row {
+  display: grid;
+  grid-template-columns: minmax(140px, 1fr) repeat(3, minmax(100px, auto));
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface-raised);
+}
+.source-role-row > strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  font-weight: 550;
+}
+.source-role-option {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  color: var(--foreground);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.source-role-option input {
+  accent-color: var(--primary);
+}
+.learning-evidence dl {
+  grid-template-columns: 104px minmax(0, 1fr);
+}
+.learning-source-list {
+  display: grid;
+  gap: 6px;
+  margin-top: 12px;
+}
+.prompt-section-audit {
+  display: grid;
+  gap: 4px;
+  margin-top: 10px;
+}
+.prompt-section-audit > div {
+  display: grid;
+  grid-template-columns: minmax(100px, 1fr) auto auto;
+  gap: 10px;
+  align-items: baseline;
+  padding: 5px 8px;
+  border-radius: 5px;
+  background: var(--surface-raised);
+  font-size: 11px;
+}
+.prompt-section-audit span,
+.prompt-section-audit small {
+  color: var(--muted-foreground);
+}
+.prompt-section-audit strong {
+  font-weight: 600;
+}
+.learning-source-list > div {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 12px;
+  min-width: 0;
+  align-items: baseline;
+  padding: 7px 9px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.learning-source-list strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  font-weight: 550;
+}
+.learning-source-list span,
+.learning-source-list small {
+  color: var(--muted-foreground);
+  font-size: 11px;
+}
+.evidence-warning {
+  margin-left: 8px;
+  color: var(--warning-foreground, #e5b567);
+}
+@media (max-width: 800px) {
+  .source-role-row {
+    grid-template-columns: minmax(120px, 1fr) repeat(2, minmax(0, auto));
+  }
+  .source-role-option:last-child {
+    grid-column: 2 / -1;
+  }
+  .learning-source-list > div {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+  .learning-source-list small {
+    grid-column: 2;
+  }
+}
+@media (max-width: 650px) {
+  .upload-bar {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .upload-controls {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .source-role-row {
+    grid-template-columns: minmax(0, 1fr) minmax(0, auto);
+  }
+  .source-role-row > strong {
+    grid-column: 1 / -1;
+  }
+  .source-role-option:last-child {
+    grid-column: auto;
+  }
 }
 </style>

@@ -20,7 +20,7 @@ from app.material_comparison import (
     _fallback_decision,
     _lineage_impacts,
 )
-from app.memory.style import _editorial_confidence, _normalize_profile_label, _validate_profile_payload
+from app.memory.style import _normalize_profile_label, _validate_profile_payload
 from app.memory.style_profile import (
     aggregate_style_metrics,
     assess_style_alignment,
@@ -119,16 +119,6 @@ class ProductExtensionTests(unittest.TestCase):
         prompt_text = "报告类型,用 2-4 字简称,如:政策研究/情报快报/专题分析/风险研判/其他"
         self.assertEqual(_normalize_profile_label(prompt_text), "综合报告风格")
         self.assertEqual(_normalize_profile_label("工作总结"), "工作总结")
-
-    def test_editorial_confidence_requires_actual_model_profile(self):
-        self.assertEqual(
-            _editorial_confidence({}, {"observed_metrics": {"sample_count": 12}}, 2, 12),
-            "low",
-        )
-        self.assertEqual(
-            _editorial_confidence({"tone": "正式"}, {"information_progression": "先事实后判断"}, 2, 12),
-            "high",
-        )
 
     def test_style_profile_requires_fact_and_judgment_realization(self):
         with self.assertRaisesRegex(ValueError, "CONTENT_REALIZATION_INCOMPLETE"):
@@ -258,12 +248,15 @@ class ProductExtensionTests(unittest.TestCase):
         self.assertEqual(metrics["independent_finding_count"], 1)
 
     def test_structure_policy_separates_layout_from_content_planning(self):
-        variant = StyleVariant(library_id=1, structure={"sections": [{"title": "模板示例目录"}]})
+        variant = StyleVariant(library_id=1, structure={
+            "sections": [{"title": "模板示例目录"}],
+            "asset_roles": {"structural_reference": True},
+        })
         variant.structure_policy = {"mode": "FORMAT_ONLY"}
-        self.assertIn("不得继承", variant.planner_prompt_block())
+        self.assertIn("不得把模板示例目录", variant.planner_prompt_block())
         variant.structure_policy = {"mode": "SOFT_STRUCTURE"}
-        self.assertIn("弱参考", variant.planner_prompt_block())
-        variant.structure_policy = {"mode": "HARD_STRUCTURE"}
+        self.assertIn("仅供参考", variant.planner_prompt_block())
+        variant.structure_policy = {"mode": "HARD_STRUCTURE", "source": "user", "confirmed": True}
         self.assertIn("必须遵守", variant.planner_prompt_block())
         self.assertNotIn("模板结构策略", variant.writer_prompt_block())
 

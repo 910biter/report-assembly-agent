@@ -1,13 +1,44 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, ref } from "vue";
 import { useRoute, RouterLink } from "vue-router";
 import { useUiStore } from "@/stores/ui";
 import AppIcon from "./AppIcon.vue";
 import WorkflowAssistant from "./WorkflowAssistant.vue";
 import { navigationGroups } from "@/navigation";
+import { authMode, currentUser, signOut } from "@/lib/auth";
+import { api, jsonInit } from "@/api/http";
 
 const route = useRoute();
 const ui = useUiStore();
+const accountOpen = ref(false);
+const passwordOpen = ref(false);
+const currentPassword = ref("");
+const newPassword = ref("");
+const confirmPassword = ref("");
+const passwordError = ref("");
+const savingPassword = ref(false);
+async function changePassword() {
+  passwordError.value = "";
+  if (newPassword.value !== confirmPassword.value) {
+    passwordError.value = "两次输入的新密码不一致";
+    return;
+  }
+  if (newPassword.value.length < 12) {
+    passwordError.value = "新密码至少需要 12 位";
+    return;
+  }
+  savingPassword.value = true;
+  try {
+    await api("/api/auth/change-password", jsonInit("POST", {
+      current_password: currentPassword.value, new_password: newPassword.value,
+    }));
+    window.location.assign("/login");
+  } catch {
+    passwordError.value = "修改失败，请检查当前密码后重试";
+  } finally {
+    savingPassword.value = false;
+  }
+}
 const editor = computed(() => Boolean(route.meta.editor));
 const dockAssistantRoute = computed(
   () => route.path.startsWith("/tasks/") || editor.value,
@@ -54,6 +85,7 @@ const shellStyle = computed(
           <span class="nav-group-label" aria-hidden="true">{{ group.label }}</span>
           <RouterLink
             v-for="item in group.items"
+            v-show="item.to !== '/settings' || authMode === 'off' || currentUser?.role === 'admin'"
             :key="item.to"
             :to="item.to"
             class="nav-link"
@@ -67,10 +99,26 @@ const shellStyle = computed(
           >
             <AppIcon :name="item.icon" /> <span>{{ item.label }}</span>
           </RouterLink>
+          <RouterLink
+            v-if="group.label === '系统' && currentUser?.role === 'admin'"
+            to="/admin/users" class="nav-link" :class="{ active: route.path === '/admin/users' }"
+            @click="ui.closeNav()"
+          ><AppIcon name="settings" /><span>账号管理</span></RouterLink>
         </div>
       </nav>
       <div class="nav-foot">
-        <span class="health-dot"></span><span>服务运行正常</span>
+        <div v-if="currentUser" class="account-area">
+          <button class="account-trigger" type="button" :aria-expanded="accountOpen" aria-label="账户菜单" @click="accountOpen = !accountOpen">
+            <span class="account-avatar">{{ currentUser.username.slice(0, 1).toUpperCase() }}</span>
+            <span class="account-name">{{ currentUser.username }}</span>
+            <span class="account-caret">⌄</span>
+          </button>
+          <div v-if="accountOpen" class="account-menu">
+            <button type="button" @click="passwordOpen = true; accountOpen = false">修改密码</button>
+            <button type="button" @click="signOut">退出登录</button>
+          </div>
+        </div>
+        <div class="health-line"><span class="health-dot"></span><span>服务运行正常</span></div>
       </div>
     </aside>
     <div class="shell-main">
@@ -107,9 +155,41 @@ const shellStyle = computed(
       @click="ui.closeNav()"
     ></button>
     <WorkflowAssistant />
+    <div v-if="passwordOpen" class="account-dialog-backdrop" @click.self="passwordOpen = false">
+      <form class="account-dialog" @submit.prevent="changePassword">
+        <div class="account-dialog-head"><h2>修改密码</h2><button type="button" aria-label="关闭" @click="passwordOpen = false">×</button></div>
+        <label>当前密码<input v-model="currentPassword" type="password" autocomplete="current-password" required /></label>
+        <label>新密码<input v-model="newPassword" type="password" autocomplete="new-password" required /></label>
+        <label>确认新密码<input v-model="confirmPassword" type="password" autocomplete="new-password" required /></label>
+        <p v-if="passwordError" class="password-error" role="alert">{{ passwordError }}</p>
+        <div class="account-dialog-actions"><button type="button" @click="passwordOpen = false">取消</button><button type="submit" :disabled="savingPassword">{{ savingPassword ? "正在保存…" : "保存并重新登录" }}</button></div>
+      </form>
+    </div>
   </div>
 </template>
 <style scoped>
+.nav-foot { flex-direction: column; align-items: stretch !important; right: 18px; }
+.health-line { display: flex; align-items: center; gap: 7px; }
+.account-area { position: relative; margin-bottom: 14px; }
+.account-trigger { width: 100%; display: flex; align-items: center; gap: 10px; padding: 6px; border: 1px solid var(--border); border-radius: 8px; color: var(--foreground); background: var(--surface); cursor: pointer; text-align: left; }
+.account-trigger:hover { border-color: var(--border-strong); background: var(--surface-hover); }
+.account-avatar { display: grid; place-items: center; flex: 0 0 28px; height: 28px; border-radius: 6px; background: var(--primary-soft); color: var(--foreground); font-weight: 600; }
+.account-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.account-menu { position: absolute; bottom: calc(100% + 6px); left: 0; right: 0; padding: 5px; border: 1px solid var(--border-strong); border-radius: 10px; background: var(--surface); box-shadow: var(--shadow-float); }
+.account-menu button { width: 100%; padding: 9px; border: 0; border-radius: 6px; color: var(--foreground); background: transparent; text-align: left; cursor: pointer; }
+.account-menu button:hover { background: var(--surface-hover); }
+.account-dialog-backdrop { position: fixed; inset: 0; z-index: 100; display: grid; place-items: center; padding: 16px; background: var(--scrim); }
+.account-dialog { width: min(100%, 390px); display: grid; gap: 15px; padding: 22px; border: 1px solid var(--border-strong); border-radius: 12px; background: var(--surface); box-shadow: var(--shadow-float); }
+.account-dialog-head { display: flex; align-items: center; justify-content: space-between; }
+.account-dialog h2 { margin: 0; font-size: 18px; }
+.account-dialog-head button { border: 0; background: transparent; color: var(--foreground); font-size: 22px; cursor: pointer; }
+.account-dialog label { display: grid; gap: 7px; color: var(--foreground); font-size: 13px; }
+.account-dialog input { width: 100%; height: 38px; padding: 0 10px; border: 1px solid var(--border-strong); border-radius: 7px; color: var(--foreground); background: var(--background); }
+.account-dialog input:focus { outline: 2px solid var(--primary); outline-offset: 1px; }
+.account-dialog-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.account-dialog-actions button { padding: 9px 12px; border: 1px solid var(--border-strong); border-radius: 7px; color: var(--foreground); background: var(--surface-hover); cursor: pointer; }
+.account-dialog-actions button[type=submit] { background: var(--primary); color: white; }
+.password-error { margin: 0; color: var(--destructive); font-size: 12px; }
 .app-shell {
   min-height: 100vh;
   background: var(--background);
@@ -304,6 +384,14 @@ nav.primary-nav {
   left: 0;
   right: 0;
   justify-content: center;
+}
+.is-nav-collapsed .account-trigger { justify-content: center; padding: 4px; }
+.is-nav-collapsed .account-name, .is-nav-collapsed .account-caret, .is-nav-collapsed .health-line { display: none; }
+.is-nav-collapsed .account-menu { left: 40px; right: auto; bottom: 0; width: 150px; }
+@media (max-width: 1024px) {
+  .is-nav-collapsed .account-trigger { justify-content: flex-start; padding: 6px; }
+  .is-nav-collapsed .account-name, .is-nav-collapsed .account-caret, .is-nav-collapsed .health-line { display: flex; }
+  .is-nav-collapsed .account-menu { left: 0; right: 0; bottom: calc(100% + 6px); width: auto; }
 }
 .topbar {
   position: sticky;

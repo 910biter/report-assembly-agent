@@ -56,8 +56,8 @@ class DocumentShapeTests(unittest.TestCase):
 
     def test_docx_source_is_eligible_for_layout_reuse(self):
         roles = _aggregate_asset_roles(
-            [{"filename": "格式.docx", "path": "/tmp/layout.docx", "text": "正文", "headings": []}],
-            {}, {"dominant": {}},
+            [{"filename": "格式.docx", "path": "/tmp/layout.docx", "text": "正文", "headings": [], "asset_roles": ["layout"]}],
+            {}, {"dominant": {"template_schema": {"document": {"page": "A4"}}}},
         )
         self.assertTrue(roles["layout_master_available"])
 
@@ -71,6 +71,10 @@ class DocumentShapeTests(unittest.TestCase):
             {}, {},
         )
         self.assertFalse(roles["structural_reference"])
+
+    def test_editorial_docx_does_not_become_layout_master_by_default(self):
+        members = [{"path": "/tmp/reference.docx", "asset_role": "auto"}]
+        self.assertEqual(_eligible_layout_members(members), [])
 
     def test_editorial_contract_is_not_a_directory(self):
         contract = editorial_contract([{"content": "采购程序失控。随后，多项证据显示流程存在明显缺口。", "sample_type": "analysis"}])
@@ -100,7 +104,7 @@ class DocumentShapeTests(unittest.TestCase):
             },
         )
         with patch("app.memory.style.get_variant", return_value=variant):
-            result = _selected_template_profile({"template": {"id": 9}})
+            result = _selected_template_profile({"template": {"id": 9}}, owner_user_id=1)
         self.assertTrue(result["selected"])
         self.assertEqual(result["name"], "推送参考")
         self.assertEqual(

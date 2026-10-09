@@ -16,11 +16,16 @@ _JOBS: dict[str, dict] = {}
 _TERMINAL = {"completed", "failed"}
 
 
-def create_job(files: list[dict], job_id: str | None = None) -> dict:
+def create_job(files: list[dict], job_id: str | None = None,
+               owner_user_id: int | None = None) -> dict:
+    from app.config import settings
+    if settings.multiuser_enabled and owner_user_id is None:
+        raise ValueError("TEMPLATE_OWNER_REQUIRED")
     job_id = str(job_id or uuid.uuid4().hex[:16])
     now = _now()
     job = {
         "id": job_id,
+        "owner_user_id": owner_user_id,
         "status": "queued",
         "phase": "queued",
         "message": "文件已上传，等待开始学习",
@@ -55,6 +60,7 @@ def run_job(job_id: str) -> None:
     with _LOCK:
         job = _JOBS.get(job_id)
         files = deepcopy(job.get("files") or []) if job else []
+        owner_user_id = job.get("owner_user_id") if job else None
     if not files:
         _fail(job_id, "NO_UPLOADED_FILES")
         return
@@ -66,22 +72,28 @@ def run_job(job_id: str) -> None:
         for index, item in enumerate(files, start=1):
             filename = str(item.get("filename") or "")
             path = Path(str(item.get("path") or ""))
+            asset_roles = style.normalize_asset_roles(
+                item.get("asset_roles") or item.get("asset_role")
+            )
+            needs_text = bool({"editorial", "structure"}.intersection(asset_roles))
             _update(
                 job_id,
-                phase="parsing",
+                phase="parsing" if needs_text else "learning",
                 current_file=filename,
                 processed_files=index - 1,
                 progress_percent=round((index - 1) / max(1, total) * 45),
-                message=f"正在解析 {filename}",
+                message=(f"正在解析 {filename}" if needs_text else f"正在读取版式母版 {filename}"),
             )
             try:
-                units = parse_file(path)
-                text = "\n".join(unit.content for unit in units if str(unit.content or "").strip())
-                if not text:
-                    raise ValueError("NO_TEXT_CONTENT")
+                text = ""
+                if needs_text:
+                    units = parse_file(path)
+                    text = "\n".join(unit.content for unit in units if str(unit.content or "").strip())
+                    if not text:
+                        raise ValueError("NO_TEXT_CONTENT")
                 reports.append({
                     "filename": filename, "text": text, "path": str(path),
-                    "asset_role": str(item.get("asset_role") or "auto"),
+                    "asset_roles": asset_roles,
                 })
             except Exception as exc:
                 failures.append({"filename": filename, "error": str(exc)[:300]})
@@ -116,7 +128,9 @@ def run_job(job_id: str) -> None:
             )
 
         _update(job_id, phase="classifying", progress_percent=45, message="正在分析语言与结构")
-        variants = style.analyze_library(reports, progress_callback=progress)
+        variants = style.analyze_library(
+            reports, progress_callback=progress, owner_user_id=owner_user_id,
+        )
         _update(
             job_id,
             status="completed",

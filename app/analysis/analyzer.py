@@ -11,6 +11,14 @@ from app.config import settings
 
 from app.context_budget import ContextSection, build_prompt_from_sections
 from app.db import session_scope
+from app.analysis.evidence_semantics import analysis_fact_line, analysis_source_lines
+from app.assertion_semantics import (
+    normalize_semantic_profile,
+    semantic_profile_json,
+    semantic_profile_line,
+    source_semantics_line,
+    source_semantics_for_facts,
+)
 from app.infrastructure.orm import ORMInference, Base
 from sqlalchemy import select
 from app.models import Inference
@@ -22,7 +30,8 @@ _SYSTEM = """你是情报分析员。基于事实清单、来源冲突与历史�
 {
   "inferences": [
     {"content": "综合判断", "based_fact_ids": [1, 2], "short_rationale": "60字以内依据说明",
-     "dimension": "所属维度", "analysis_type": "模型判断的开放类型标签或 unknown"}
+     "dimension": "所属维度", "analysis_type": "开放类型标签",
+     "semantic_profile": {"facets": [{"axis": "命题类型", "label": "开放类别", "detail": "判定依据"}, {"axis": "情态/言语行为", "label": "开放类别", "detail": ""}, {"axis": "时间范围", "label": "开放类别", "detail": "时间锚点"}, {"axis": "实现状态", "label": "开放类别", "detail": ""}, {"axis": "知识依据", "label": "开放类别", "detail": ""}, {"axis": "主体/范围/量词", "label": "开放类别", "detail": ""}, {"axis": "条件/因果/关系", "label": "开放类别", "detail": "仅相关时填写"}, {"axis": "极性/否定/例外", "label": "开放类别", "detail": "仅相关时填写"}], "attribution": "来源归属", "conditions": [], "scope_qualifiers": [], "additional": {}}}
   ],
   "external_notes": [
     {"content": "模型常识/外部知识补充,与材料无关"}
@@ -37,6 +46,12 @@ _SYSTEM = """你是情报分析员。基于事实清单、来源冲突与历史�
 6. 不要判断或输出置信度与不确定性字段;系统将根据有效 based_fact_ids 确定性计算
 7. 不要输出长篇推理过程;short_rationale 只写必要依据链
 8. 不得扩大事实适用范围;保留依据中的主体、对象、版本、时间和条件限定,综合结论范围不得超出依据共同支持的范围
+9. assertion_mode/assertion_mode_raw 仅是粗粒度旧协议投影；完整分类和细类以每条事实的开放 semantic_profile 及其来源原文为准
+10. 目标、要求、计划或假设等语义不能单独证明已经实施、发生或达到效果；不得把来源报告等同系统独立核实；观点、转述和估计须保留归属，状态/来源不同须分别表述
+11. 来源陈述性质不同时,必须区分现状与目标,没有明确完成证据不得推断发生了状态转变
+12. 必须结合单条事实、原文引文及章节上下文判断,不得按领域关键词、文件名、标题词或材料整体角色作硬编码推断;材料级摘要标签不能替代单条事实证据
+13. 当推论依赖材料的陈述性质或状态边界时,short_rationale 必须简要说明该边界,content 使用与依据匹配的语气
+14. semantic_profile 是开放的多维分类，不使用封闭标签表。逐条检查所有影响推论真值、适用性或可比性的面向，按内容标注命题类型、情态、时间、实现状态、认识依据、归属、主体/范围/量词、条件/前提、因果/关系、极性/否定、例外/限制及其他相关细类；示例不构成穷举或必填清单，不相关不填，不得因类别未列出而归并或遗漏。source_semantics 是程序从引用事实继承的逐条语义画像，不得省略、合并成更强的状态或把计划/目标转成已实现。
 """
 
 
@@ -45,7 +60,8 @@ _GLOBAL_SYSTEM = """你是情报报告综合研判师。基于各维度局部推
 {
   "inferences": [
     {"content": "跨维度综合判断", "based_fact_ids": [1, 2], "short_rationale": "60字以内依据说明",
-     "dimension": "全局综合", "analysis_type": "模型判断的开放类型标签或 unknown"}
+     "dimension": "全局综合", "analysis_type": "开放类型标签",
+     "semantic_profile": {"facets": [{"axis": "命题类型", "label": "开放类别", "detail": "判定依据"}, {"axis": "情态/言语行为", "label": "开放类别", "detail": ""}, {"axis": "时间范围", "label": "开放类别", "detail": "时间锚点"}, {"axis": "实现状态", "label": "开放类别", "detail": ""}, {"axis": "知识依据", "label": "开放类别", "detail": ""}, {"axis": "主体/范围/量词", "label": "开放类别", "detail": ""}, {"axis": "条件/因果/关系", "label": "开放类别", "detail": "仅相关时填写"}, {"axis": "极性/否定/例外", "label": "开放类别", "detail": "仅相关时填写"}], "attribution": "来源归属", "conditions": [], "scope_qualifiers": [], "additional": {}}}
   ],
   "external_notes": [{"content": "模型常识/外部知识补充,与材料无关"}],
   "critical_fact_ids": [1],
@@ -62,6 +78,9 @@ _GLOBAL_SYSTEM = """你是情报报告综合研判师。基于各维度局部推
 6. 全局判断应形成主线、关键风险和证据边界,不要简单重复局部推断
 7. 不要为单条推论输出置信度与不确定性字段;系统将按有效依据事实数量计算置信度
 8. 不得扩大局部推断或事实的适用范围;保留依据中的主体、对象、版本、时间和条件限定
+9. 继承局部推论及所引事实的完整开放语义画像；不得把不同来源、不同时间、条件或范围的状态合并为更强结论，材料报告也不等于系统独立核实
+10. 只能依据逐条事实、对应原文和局部推论判断状态;不得依赖领域关键词、文件名、标题词或材料级汇总标签做硬编码分类
+11. semantic_profile 使用开放、多标签分类，不限于示例；逐条保留所有影响结论真值和适用性的维度，包括时间、条件、归属、范围、量化口径、极性、例外、因果关系及领域特有细类，不相关时不强行填写。不得将不同来源的语义状态合并为更强结论。
 """
 
 
@@ -242,8 +261,11 @@ class AnalysisAgent(BaseAgent):
             return []
         candidate_ids = {int(f["id"]) for f in facts if f.get("id") is not None}
         if not context_block:
-            fact_lines = [f"{f['id']}. [{f['sources']}] {f['content']}" for f in facts]
-            context_block = "事实清单(编号 + 来源):\n" + "\n".join(fact_lines)
+            fact_lines = [analysis_fact_line(f) for f in facts]
+            source_lines = analysis_source_lines(facts)
+            context_block = "事实清单(编号 + 来源陈述性质):\n" + "\n".join(fact_lines)
+            if source_lines:
+                context_block += "\n原文所在章节及上下文(辅助判读):\n" + "\n".join(source_lines)
         group_overview, group_count = _semantic_group_overview(facts)
         target_count = _target_local_inference_count(len(facts), group_count)
         instruction = (
@@ -307,14 +329,30 @@ class AnalysisAgent(BaseAgent):
         inference_lines = ["各维度局部推断:"]
         inference_lines.extend(
             f"- [{i.dimension or '未分类'}] {i.content} "
-            f"(type={i.analysis_type or 'SYNTHESIS'}, based_fact_ids={i.based_fact_ids})"
+            f"(type={i.analysis_type or 'SYNTHESIS'}, based_fact_ids={i.based_fact_ids}, "
+            f"semantic_profile={semantic_profile_line(i.semantic_profile)}, "
+            f"source_semantics={source_semantics_line(i.source_semantics)})"
             for i in local_inferences
         )
         instruction = ("请基于局部推断与关键事实做跨维度综合研判,输出 3-6 条全局推论。"
-                       "每条必须挂真实 based_fact_ids；不要输出单条置信度相关字段,输出 JSON。")
+                       "每条必须挂真实 based_fact_ids；不要输出单条置信度相关字段。"
+                       "保留所引事实和局部推论的陈述性质；目标/要求/建议不能升级为已实现状态。输出 JSON。")
+        referenced_fact_ids = {
+            int(fact_id)
+            for item in local_inferences
+            for fact_id in (item.based_fact_ids or [])
+        }
+        referenced_facts = [
+            fact for fact in facts
+            if fact.get("id") is not None and int(fact["id"]) in referenced_fact_ids
+        ]
+        fact_lines = [analysis_fact_line(fact) for fact in referenced_facts]
+        source_lines = analysis_source_lines(referenced_facts)
         prompt, _audit = build_prompt_from_sections("analysis", [
             ContextSection("instruction", [instruction], weight=5, required_items=1),
             ContextSection("local_inferences", inference_lines, weight=4, required_items=1),
+            ContextSection("supporting_facts_and_assertion_modes", fact_lines, weight=5, required_items=1),
+            ContextSection("source_sections_and_original_context", source_lines, weight=2),
             ContextSection("conflicts", [f"来源冲突:{conflicts}"] if conflicts else [], weight=4, required_items=1),
         ], stage_input_budget_tokens("analysis"))
         visible_inference_ids, visible_fact_ids = _visible_local_inference_refs(prompt, local_inferences)
@@ -373,6 +411,7 @@ class AnalysisAgent(BaseAgent):
                 content = item.strip()
                 based, analysis_type = [], ""
                 reasoning = dimension = ""
+                semantic_profile = {}
             else:
                 content = str(item.get("content", "")).strip()
                 based, invalid = _filter_fact_references(item.get("based_fact_ids"), valid_ids)
@@ -380,6 +419,7 @@ class AnalysisAgent(BaseAgent):
                 analysis_type = str(item.get("analysis_type") or "unknown").strip()[:64]
                 reasoning = str(item.get("short_rationale") or item.get("reasoning") or "")[:80]
                 dimension = str(item.get("dimension", ""))
+                semantic_profile = normalize_semantic_profile(item.get("semantic_profile"))
             if not content:
                 rejected_empty_content += 1
                 continue
@@ -397,6 +437,8 @@ class AnalysisAgent(BaseAgent):
                 confidence_level=confidence,
                 confidence_reason=confidence_reason,
                 uncertainty="",
+                semantic_profile=semantic_profile,
+                source_semantics=source_semantics_for_facts(based, facts),
             )
             inference.id = save_inference(inference, origin_call_id=call_id)
             inferences.append(inference)
@@ -442,6 +484,8 @@ def save_inference(inference: Inference, origin_call_id: str = "") -> int:
                 confidence_level=inference.confidence_level,
                 confidence_reason=inference.confidence_reason,
                 uncertainty=inference.uncertainty,
+                semantic_profile_json=semantic_profile_json(inference.semantic_profile),
+                source_semantics_json=json.dumps(inference.source_semantics, ensure_ascii=False),
                 origin_call_id=origin_call_id,
                 stable_key=stable_key, lifecycle_status="active", introduced_run_id=run_id,
             )

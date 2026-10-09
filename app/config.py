@@ -17,6 +17,10 @@ class Settings(BaseSettings):
     hf_offline: bool = True  # HF 离线模式(IRA_HF_OFFLINE):模型全本地化,禁止联网检查/下载
     torch_compile: bool = False  # torch.compile 编译(IRA_TORCH_COMPILE):缺 python3-dev 时编译必败,默认禁用走 eager
     db_url: str = ""  # PG 连接串(IRA_DB_URL, postgresql+psycopg://...);空 = 默认本地 PG(ira/ira@127.0.0.1:5432/ira)
+    multiuser_enabled: bool = False  # 仅在全部租户隔离测试通过后启用
+    auth_http_test_mode: bool = False  # 仅内网 HTTP 功能测试;正式部署必须 HTTPS
+    auth_allowed_origins: str = ""  # 反向代理 HTTPS 入口 Origin，逗号分隔；不得使用通配符
+    max_active_jobs_per_user: int = 3  # 排队和运行中的报告任务合计上限
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)

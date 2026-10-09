@@ -194,7 +194,16 @@ def select_exemplars(bank: list[dict], context: dict, limit: int = 3) -> list[di
     report_type = str(context.get("report_type") or "")
     desired_role = str(context.get("sample_type") or context.get("rhetorical_role") or "").lower()
     keywords = [str(item) for item in context.get("keywords") or []]
-    query = " ".join([title, purpose, report_type, *keywords]).strip()
+    expression_reference = context.get("match_dimension") == "expression"
+    if expression_reference:
+        # A link is a source locator, not a prose example. Retain the bank;
+        # exclude link-only records from this runtime reference selection.
+        candidates = [item for item in candidates if _usable_exemplar(
+            re.sub(r"https?://\S+", "", str(item.get("content") or ""))
+        )]
+        if not candidates:
+            return []
+    query = " ".join([purpose, desired_role] if expression_reference else [title, purpose, report_type, *keywords]).strip()
     query_terms = _terms(query)
     target_words = int(context.get("target_words") or 0)
     scored: list[tuple[float, int, dict]] = []
@@ -202,7 +211,7 @@ def select_exemplars(bank: list[dict], context: dict, limit: int = 3) -> list[di
         metadata = " ".join(str(item.get(key) or "") for key in (
             "chapter_type", "purpose", "sample_type", "structural_role", "tags"
         ))
-        candidate_terms = _terms(metadata + " " + str(item.get("content") or "")[:400])
+        candidate_terms = _terms(metadata if expression_reference else metadata + " " + str(item.get("content") or "")[:400])
         overlap = _jaccard(query_terms, candidate_terms)
         score = overlap * 5.0
         item_role = str(item.get("rhetorical_role") or item.get("sample_type") or "").lower()
@@ -211,7 +220,8 @@ def select_exemplars(bank: list[dict], context: dict, limit: int = 3) -> list[di
             score += 6.0
         if purpose and purpose in metadata:
             score += 2.0
-        if title and (title in metadata or str(item.get("section") or "") in title):
+        section = str(item.get("section") or "").strip()
+        if not expression_reference and title and (title in metadata or (section and section in title)):
             score += 1.5
         if target_words:
             paragraph_words = max(1, len(str(item.get("content") or "")))
@@ -219,10 +229,11 @@ def select_exemplars(bank: list[dict], context: dict, limit: int = 3) -> list[di
             score += max(0.0, 1.0 - abs(paragraph_words - expected_paragraph) / expected_paragraph)
         scored.append((score, -index, item))
     scored.sort(key=lambda row: (row[0], row[1]), reverse=True)
-    best_score = scored[0][0] if scored else 0.0
     selected: list[dict] = []
     seen_sections: set[tuple[str, str]] = set()
-    minimum_score = 1.0 if (query_terms or desired_role) else float("inf")
+    # A user-selected template may teach expression across unrelated subjects.
+    # This mode selects stylistic references, never task evidence.
+    minimum_score = 0.0 if expression_reference else (1.0 if (query_terms or desired_role) else float("inf"))
     for _score, _index, item in scored:
         if _score < minimum_score:
             break

@@ -18,6 +18,13 @@ from app.cache import stable_hash
 from app.config import settings
 from app.context_budget import ContextSection, build_prompt_from_sections, count_tokens
 from app.db import session_scope
+from app.assertion_semantics import (
+    normalize_assertion_mode,
+    normalize_assertion_semantics,
+    normalize_semantic_profile,
+    semantic_profile_json,
+    semantic_profile_line,
+)
 from app.infrastructure.orm import ORMFact, ORMEvidence, ORMClaim, ORMConflict
 from sqlalchemy import select, update
 from app.models import Claim, Conflict, Evidence, Fact, Unit
@@ -44,7 +51,7 @@ def _assert_not_paused(task_id: str) -> None:
 
 _SYSTEM = """你是情报事实提取员。从材料中提取可溯源的陈述(Claim),严格区分事实与推断。
 严格输出 JSON,不要任何解释:
-{"claims": [{"content": "陈述内容", "unit_id": 材料单元编号, "short_quote": "30字以内原文短摘", "fact_type": "模型判断的开放标签或 unknown"}, ...]}
+{"claims": [{"content": "保留原文时态、条件和语气的陈述", "unit_id": 材料单元编号, "short_quote": "30字以内原文短摘", "fact_type": "开放标签", "assertion_mode": "reported|prescriptive|prospective|conditional|opinion|unknown", "assertion_mode_raw": "粗粒度协议的原文描述", "semantic_profile": {"facets": [{"axis": "命题类型", "label": "事件/观察/定义/比较/建议/预测等开放类别", "detail": "原文依据"}, {"axis": "情态或言语行为", "label": "断言/义务/许可/计划/目标/可能/假设等开放类别", "detail": ""}, {"axis": "时间范围", "label": "过去/当前/进行中/未来/周期/无时间性/混合等开放类别", "detail": "明确时间锚点"}, {"axis": "实现状态", "label": "已发生/进行中/拟议/计划/目标/要求/假设/未证实等开放类别", "detail": ""}, {"axis": "知识依据", "label": "测量/观察/记录/转述/估算/推导/观点/争议等开放类别", "detail": ""}, {"axis": "主体/范围/量词", "label": "开放类别", "detail": "适用对象、范围边界或量化口径"}, {"axis": "条件/因果/关系", "label": "开放类别", "detail": "仅在相关时填写"}, {"axis": "极性/否定/例外", "label": "开放类别", "detail": "否定、限制或例外依据"}], "attribution": "来源/发言主体", "conditions": [], "scope_qualifiers": [], "additional": {}}}, ...]}
 
 要求:
 1. unit_id 必须来自材料文本标注的 U编号;short_quote 必须逐字摘自该单元,不得改写
@@ -54,7 +61,14 @@ _SYSTEM = """你是情报事实提取员。从材料中提取可溯源的陈述(
 5. 禁止输出推断、评价、总结(那些属于"分析人士认为"类观点时,content 须注明是来源观点)
 6. 分析维度和优先事实类别只是检索/提取重点,不是排除边界;材料中与用户目标明显相关的高价值事实即使不在维度内也应提取
 7. 面向综述或多材料任务时,同一维度应覆盖主要机制、标准、平台、时间线、威胁模型和比较要素;不要只抽取少数摘要性陈述
-8. 不要输出 file/page/完整原文,系统会根据 unit_id 回查来源"""
+8. semantic_profile 是主要语义分类，采用开放、多标签、多维画像，不存在封闭类别清单。逐条检查所有会影响陈述真值、适用性或可比性的面向；按内容填写相关维度，包括但不限于命题类型、情态/言语行为、时间、实现状态、认识依据/确定性、来源归属、主体/对象、范围/量词、条件/前提、因果/关系、极性/否定、例外/限制及其他领域细类。示例不是必填清单；不相关不填，不适用或未说明不得臆造。新维度直接使用贴合原文的开放轴名和类别，不得因示例未列出而遗漏或归并
+9. facets 中每项用 axis/label/detail 保存一个维度及其开放类别；同一陈述可以有多个轴或同轴多标签。additional 用于保留未放入标准字段的其他分类，不得因 schema 示例未列出而丢弃类别
+10. attribution、temporal_reference、conditions、scope_qualifiers 等保留原文明确的主体、时间、条件和范围；缺失时不得臆造。分类描述只刻画来源如何陈述，不代表系统独立核实
+11. assertion_mode 仅是旧接口的粗粒度投影，不作为完整分类；assertion_mode_raw 保留原文语义描述。二者无法涵盖的类别必须完整保存在 semantic_profile，不能归并丢弃
+12. content 必须保留陈述的时态、条件、情态和来源归属;材料提出创建/采用/实现某机制,应表述为“材料/方案提出或要求……”,不得改写成机制已经存在或已落地
+13. 必须依据该陈述本身及必要的前后文判断;不得用领域关键词、文件名、章节标题或固定词表规则推断陈述状态,也不得用材料整体角色替代逐条判断
+14. 示例类别仅用于解释分类维度，不是封闭词表；可输出任何跨领域或领域特有细类，禁止因不在示例中而降级为 unknown 或删除
+15. 不要输出 file/page/完整原文,系统会根据 unit_id 回查来源"""
 
 _CONFLICT_SYSTEM = """你是证据关系核验员。只比较给定 Claim 编号,判断同一事项的说法属于哪种关系。
 严格输出 JSON,不要任何解释:
@@ -63,9 +77,11 @@ _CONFLICT_SYSTEM = """你是证据关系核验员。只比较给定 Claim 编号
 1. direct_contradiction 仅限主体、事项、时间、范围和指标口径可比,且结论不能同时成立。
 2. 不同时间的变化是 temporal_difference;不同范围/对象是 scope_difference;不同统计定义是 metric_difference。
 3. 总体可用与局部限制、原则与例外、结论与适用条件并存时是 qualification,不是直接矛盾。
-4. 条件不足以确认可比性时标 needs_verification;没有任何需要核验的关系时输出空数组。
-5. 每个结果必须且只能包含两个 Claim 编号。一个候选组存在多组关系时,拆成多个两两比较结果,禁止把3条以上说法放进同一结果。
-6. 只能返回输入中真实存在的 Claim 编号;不要生成来源、页码、引文或改写陈述,这些由系统按编号回查。"""
+4. 陈述性质不同的事实与设计目标、要求、建议或预测不是同一语义状态;除非材料明确表明其针对同一时点/状态作出互斥断言,不得仅因内容不同标成 direct_contradiction。
+5. 条件不足以确认可比性时标 needs_verification;没有任何需要核验的关系时输出空数组。
+6. Claim 的 semantic_profile 是开放多维分类，类别清单不封闭。须检查其中所有时间、条件、范围、归属、实现状态和细类；不得因粗粒度 assertion_mode 相同就假设语义等价。
+7. 每个结果必须且只能包含两个 Claim 编号。一个候选组存在多组关系时,拆成多个两两比较结果,禁止把3条以上说法放进同一结果。
+8. 只能返回输入中真实存在的 Claim 编号;不要生成来源、页码、引文或改写陈述,这些由系统按编号回查。"""
 
 _CONFLICT_TYPES = {
     "direct_contradiction", "temporal_difference", "scope_difference",
@@ -244,7 +260,10 @@ def _normalize_needs(raw) -> list[dict]:
 
 
 def _claim_field_chars(items: list[dict]) -> dict[str, int]:
-    fields = {"content": 0, "short_quote": 0, "unit_id": 0, "fact_type": 0, "other": 0}
+    fields = {
+        "content": 0, "short_quote": 0, "unit_id": 0,
+        "fact_type": 0, "assertion_mode": 0, "assertion_mode_raw": 0, "other": 0,
+    }
     for item in items:
         for key, value in item.items():
             text = str(value if value is not None else "")
@@ -256,6 +275,10 @@ def _claim_field_chars(items: list[dict]) -> dict[str, int]:
                 fields["unit_id"] += len(text)
             elif key == "fact_type":
                 fields["fact_type"] += len(text)
+            elif key == "assertion_mode":
+                fields["assertion_mode"] += len(text)
+            elif key == "assertion_mode_raw":
+                fields["assertion_mode_raw"] += len(text)
             else:
                 fields["other"] += len(str(key)) + len(text)
     return fields
@@ -358,6 +381,15 @@ def _conflict_entries(claim_ids: list[int], claims_by_id: dict[int, dict]) -> li
             "paragraph": evidence.get("paragraph"),
             "quote": str(evidence.get("quote") or claim.get("quote") or ""),
             "statement": str(claim.get("content") or ""),
+            "semantic_profile": normalize_semantic_profile(
+                claim.get("semantic_profile") or claim.get("semantic_profile_json"),
+            ),
+            "assertion_mode": normalize_assertion_semantics(
+                claim.get("assertion_mode"), claim.get("assertion_mode_raw"),
+            )[0],
+            "assertion_mode_raw": normalize_assertion_semantics(
+                claim.get("assertion_mode"), claim.get("assertion_mode_raw"),
+            )[1],
         })
     return entries
 
@@ -621,6 +653,7 @@ class EvidenceAgent(BaseAgent):
         instruction = (
             "请提取与上述任一 Evidence Need 相关的陈述;每条必须标注属于哪个 need_id。"
             "若发现与用户目标明显相关但不属于任何 need 的高价值事实,也提取并标注 need_id=0。"
+            "必须识别每条陈述的开放语义状态并保留其时态、条件与情态;设计目标、要求、建议或预测不能改写成已实现事实。"
             "如果材料覆盖多个平台/标准/攻击/机制,请分别抽取,不要合并成过度概括的一条。输出 JSON。"
         )
         from app.runtime_profiles import stage_input_budget_tokens
@@ -734,6 +767,10 @@ class EvidenceAgent(BaseAgent):
             # Keep the model's semantic label. Protocol consumers may map it
             # later, but extraction must not discard an unfamiliar category.
             fact_type = str(item.get("fact_type") or "unknown").strip()[:64]
+            assertion_mode, assertion_mode_raw = normalize_assertion_semantics(
+                item.get("assertion_mode"), item.get("assertion_mode_raw"),
+            )
+            semantic_profile = normalize_semantic_profile(item.get("semantic_profile"))
             # 维度归属:模型标注 need_id(0=开放发现),无标注回退首个 need 的维度
             try:
                 need_idx = int(item.get("need_id", 0))
@@ -752,11 +789,14 @@ class EvidenceAgent(BaseAgent):
                 unit_id=unit_id,
                 content=content, quote=quote,
                 source=filenames.get(evidence_list[0].material_id, "") if evidence_list else "",
-                fact_type=fact_type, dimension=dimension, need_id=need_idx,
+                fact_type=fact_type, assertion_mode=assertion_mode,
+                assertion_mode_raw=assertion_mode_raw,
+                semantic_profile=semantic_profile,
+                dimension=dimension, need_id=need_idx,
             )
             if not evidence_list:
                 with _FACT_PERSIST_LOCK:
-                    if fact_exists(content, task_id):
+                    if fact_exists(content, task_id, assertion_mode, semantic_profile):
                         duplicate_claims += 1
                         continue
                 pending_claims += 1
@@ -765,11 +805,16 @@ class EvidenceAgent(BaseAgent):
             quote_bound_claims += 1
             contributed_materials.update(int(ev.material_id) for ev in evidence_list)
             contributed_units.update(int(ev.unit_id) for ev in evidence_list)
-            fact = Fact(content=content, dimension=dimension, fact_type=fact_type, need_id=need_idx)
+            fact = Fact(
+                content=content, dimension=dimension, fact_type=fact_type,
+                assertion_mode=assertion_mode, assertion_mode_raw=assertion_mode_raw,
+                semantic_profile=semantic_profile,
+                need_id=need_idx,
+            )
             # Check-and-insert is serialized within the process so concurrent
             # extraction batches cannot create duplicate task facts.
             with _FACT_PERSIST_LOCK:
-                if fact_exists(content, task_id):
+                if fact_exists(content, task_id, assertion_mode, semantic_profile):
                     duplicate_claims += 1
                     continue
                 fact.id = save_fact_with_evidence(fact, evidence_list, task_id, origin_call_id=call_id)
@@ -1058,7 +1103,10 @@ class EvidenceAgent(BaseAgent):
         candidate_ids = {cid for group in candidate_groups for cid in group.get("claim_ids", [])}
         candidate_claims = [c for c in candidate_claims if int(c.get("id") or 0) in candidate_ids]
         claim_lines = [
-            f"{c['id']}. [{c.get('source', '')}|{c.get('fact_type', 'unknown')}] {c['content']}"
+            f"{c['id']}. [{c.get('source', '')}|{c.get('fact_type', 'unknown')}|"
+            f"陈述性质={normalize_assertion_mode(c.get('assertion_mode'))}"
+            f"（{normalize_assertion_semantics(c.get('assertion_mode'), c.get('assertion_mode_raw'))[1]}）"
+            f"语义画像={semantic_profile_line(c.get('semantic_profile'), c.get('assertion_mode'), c.get('assertion_mode_raw'))}] {c['content']}"
             for c in candidate_claims
         ]
         group_lines = [
@@ -1234,9 +1282,14 @@ def _finish_unit_batch(prefix: str, blocks: list[str], material_ids: list[int],
     }
     return text, meta
 
-def fact_exists(content: str, task_id: str = "") -> bool:
+def fact_exists(content: str, task_id: str = "", assertion_mode: str = "unknown",
+                semantic_profile: dict | None = None) -> bool:
     with session_scope() as s:
-        query = select(ORMFact.c.id).where(ORMFact.c.content == content)
+        query = select(ORMFact.c.id).where(
+            ORMFact.c.content == content,
+            ORMFact.c.assertion_mode == normalize_assertion_mode(assertion_mode),
+            ORMFact.c.semantic_profile_json == semantic_profile_json(semantic_profile),
+        )
         if task_id:
             query = query.where(ORMFact.c.task_id == task_id)
         return s.execute(query).first() is not None
@@ -1253,7 +1306,13 @@ def save_fact_with_evidence(fact: Fact, evidence_list: list[Evidence], task_id: 
         result = s.execute(
             ORMFact.insert().values(
                 content=fact.content, dimension=fact.dimension, source_level=fact.source_level,
-                fact_type=fact.fact_type, need_id=fact.need_id,
+                fact_type=fact.fact_type,
+                assertion_mode=normalize_assertion_mode(fact.assertion_mode),
+                assertion_mode_raw=normalize_assertion_semantics(
+                    fact.assertion_mode, fact.assertion_mode_raw,
+                )[1],
+                semantic_profile_json=semantic_profile_json(fact.semantic_profile),
+                need_id=fact.need_id,
                 evidence_ids="[]", conflict_ids="[]", task_id=task_id, origin_call_id=origin_call_id,
                 stable_key=stable_key, lifecycle_status="active", introduced_run_id=run_id,
             )
@@ -1285,7 +1344,13 @@ def save_claim(claim: Claim, status: str, origin_call_id: str = "", task_id: str
                 fact_id=fact_id, material_id=claim.material_id,
                 unit_id=claim.unit_id,
                 content=claim.content, quote=claim.quote, source=claim.source,
-                fact_type=claim.fact_type, dimension=claim.dimension, need_id=claim.need_id,
+                fact_type=claim.fact_type,
+                assertion_mode=normalize_assertion_mode(claim.assertion_mode),
+                assertion_mode_raw=normalize_assertion_semantics(
+                    claim.assertion_mode, claim.assertion_mode_raw,
+                )[1],
+                semantic_profile_json=semantic_profile_json(claim.semantic_profile),
+                dimension=claim.dimension, need_id=claim.need_id,
                 status=status, task_id=task_id, origin_call_id=origin_call_id,
             )
         )
@@ -1307,7 +1372,12 @@ def load_claims_for_tasks(task_ids: list[str]) -> list[dict]:
         else:
             query = query.where(ORMClaim.c.task_id == "__no_task__")
         rows = s.execute(query.order_by(ORMClaim.c.id)).mappings().all()
-    return [dict(row) for row in rows]
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["semantic_profile"] = normalize_semantic_profile(item.pop("semantic_profile_json", None))
+        result.append(item)
+    return result
 
 
 def save_conflict(conflict: Conflict, origin_call_id: str = "", task_id: str = "") -> int:

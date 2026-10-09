@@ -28,6 +28,7 @@ _SYSTEM_PROMPT = """你是报告整编系统的任务需求助手。你负责在
 class TaskDraftAgentDeps:
     current: dict
     user_message: str
+    owner_user_id: int | None = None
     proposed: dict | None = None
     tool_trace: list[str] = field(default_factory=list)
 
@@ -58,7 +59,7 @@ class TaskDraftAgentDeps:
 
     def read_template(self) -> dict:
         self.tool_trace.append("read_selected_template")
-        return _selected_template_profile(self.current)
+        return _selected_template_profile(self.current, owner_user_id=self.owner_user_id)
 
     def read_materials(self) -> dict:
         self.tool_trace.append("read_selected_materials")
@@ -118,9 +119,11 @@ def run_task_draft_agent(
     current: dict,
     user_message: str,
     recent_history: list[dict[str, str]],
+    owner_user_id: int | None = None,
 ) -> TaskDraftAgentRunResult:
     draft_current = dict(current or {})
-    deps = TaskDraftAgentDeps(current=draft_current, user_message=user_message)
+    deps = TaskDraftAgentDeps(current=draft_current, user_message=user_message,
+                              owner_user_id=owner_user_id)
     history_text = "\n".join(
         f"{('用户' if item.get('role') == 'user' else '助手')}：{item.get('content', '')}"
         for item in recent_history
@@ -155,7 +158,8 @@ def run_task_draft_agent(
     )
 
 
-def _selected_template_profile(current: dict | None) -> dict:
+def _selected_template_profile(current: dict | None,
+                               owner_user_id: int | None = None) -> dict:
     """Read a compact authoritative profile only when the agent asks for it."""
     selection = current.get("template") if isinstance(current, dict) and isinstance(current.get("template"), dict) else {}
     try:
@@ -165,8 +169,13 @@ def _selected_template_profile(current: dict | None) -> dict:
     if not variant_id:
         return {"selected": False, "message": "当前未选择特定模板，任务将使用系统默认模板。"}
     from app.memory import style
+    from app.config import settings
 
-    variant = style.get_variant(variant_id)
+    if settings.multiuser_enabled and owner_user_id is None:
+        raise ValueError("TEMPLATE_OWNER_REQUIRED")
+
+    variant = (style.get_variant(variant_id, owner_user_id=owner_user_id)
+               if owner_user_id is not None else style.get_variant(variant_id))
     if variant is None:
         return {"selected": False, "message": "所选模板已不可用，请重新选择。"}
     structure = variant.structure if isinstance(variant.structure, dict) else {}

@@ -16,6 +16,9 @@ export const navigationGroups = [
   },
   {
     label: "系统",
-    items: [{ to: "/settings", label: "系统设置", icon: "settings" }],
+    items: [
+      { to: "/queue", label: "运行队列", icon: "clock" },
+      { to: "/settings", label: "系统设置", icon: "settings" },
+    ],
   },
 ] as const;

@@ -167,6 +167,16 @@ class VllmGatewayTests(unittest.TestCase):
         self.assertEqual(_Client.last_payload["priority"], PRIORITY_INTERACTIVE)
         self.assertFalse(_Client.last_payload["chat_template_kwargs"]["enable_thinking"])
         self.assertEqual(last_generation_stats()["output_tokens"], 5)
+        self.assertNotIn("temperature", _Client.last_payload)
+
+    def test_json_generation_accepts_stage_specific_temperature(self):
+        gateway = OpenAICompatibleGateway("http://vllm.test/v1")
+        with patch("app.gateway.httpx.Client", _Client), patch.object(
+            settings, "generation_model", "qwen3.6-27b"
+        ):
+            result = gateway.generate_json("return json", think=False, temperature=0.0)
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(_Client.last_payload["temperature"], 0.0)
 
     def test_queue_returns_worker_usage_to_calling_context(self):
         gateway = OpenAICompatibleGateway("http://vllm.test/v1")

@@ -130,7 +130,7 @@ class NarrativeScaleTests(unittest.TestCase):
             {"id": 2, "content": "omitted fact"},
         ]
         with patch(
-            "app.planning.narrative.build_prompt_from_sections",
+            "app.planning.narrative.planning_prompt",
             return_value=("1. shown fact", {}),
         ), patch("app.planning.narrative.update_call_funnel"):
             plan = agent.plan_document(
@@ -452,13 +452,14 @@ class NarrativeScaleTests(unittest.TestCase):
 
     def test_insufficient_evidence_can_underfill_without_weakening_sufficient_case(self):
         hint = writer_scale_prompt_hint(
-            {"target_words": 3000, "output_bounds": {"min_words": 2700}},
+            {"target_words": 3000, "output_bounds": {"min_words": 2700},
+             "evidence_supported_max_words": 2000, "underfill_reason": "Only one narrow observation is available."},
             unit_target_words=600,
             evidence_status="insufficient",
         )
 
-        self.assertIn("证据有限或不足", hint)
-        self.assertIn("允许低于", hint)
+        self.assertIn("篇幅承载估计约 2000 字", hint)
+        self.assertIn("低于用户下限", hint)
         self.assertNotIn("未达到本单元最低完成要求前不得收束", hint)
 
     def test_report_minimum_uses_explicit_output_bound_before_default_ratio(self):

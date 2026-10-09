@@ -10,13 +10,17 @@ LLM 检查:逻辑跳跃、引用与内容一致性。结果统一为 qa_notes �
 
 import hashlib
 import json
+import logging
 import re
 from decimal import Decimal, InvalidOperation
 
 from app.agents.base import BaseAgent
+from app.assertion_semantics import normalize_semantic_profile, semantic_profile_line
 from app.context_budget import ContextSection, build_prompt_from_sections
 from app.db import session_scope
 from app.runtime_profiles import stage_input_budget_tokens
+
+logger = logging.getLogger(__name__)
 
 _QA_SYSTEM = """你是报告质量检查员。输入中的章节、段落和句子均有稳定编号。
 检查逻辑跳跃、引用与内容不一致和明显重复，严格输出 JSON：
@@ -27,24 +31,32 @@ _QA_SYSTEM = """你是报告质量检查员。输入中的章节、段落和句�
   "section": "章节",
   "paragraph": 1,
   "quote": "必须来自被指向正文的原文片段",
+  "support_status": "PARTIALLY_SUPPORTED|UNSUPPORTED|CONTRADICTED|INSUFFICIENT_EVIDENCE",
   "note": "问题说明"
 }]}
 约束：
 1. 句子问题必须返回输入中真实存在的 sentence_ids，不得虚构编号。
 2. 段落问题返回该段涉及的 sentence_ids；章节或全文问题可以为空。
 3. quote 必须逐字摘自对应正文，不要概括或改写。
-4. 区分句子直接引用的事实与推断所依据的事实；置信度标签本身不是证据。
-5. 判断引用是否在语义上支持当前句的具体主张；不能仅因措辞不同或词面相似度低就判定无依据。
+4. 区分句子直接引用的事实与推断所依据的事实；对推断沿 BASED_FACT_IDS 检查对应原始事实的来源语义，置信度和推论画像本身都不是证据。
+5. 判断引用是否在语义上支持当前句的具体主张；不能仅因措辞不同或词面相似度低就判定无依据。主题相关、共享实体或共现不等于支持相同主张；例如“定义了 A 对象”不能推出“未实现 B 控制措施”。
 6. 逐条检查绑定的事实/推断是否相关；未进入本次上下文的依据不得推断为不存在。
 7. 检查无引用的实质性句子：凡没有绑定事实或推断 ID、却包含可核验事实、因果关系、数量、性能/效果描述或评价判断，必须报告 CITATION_MISMATCH；只有不含事实前提和判断的纯组织性过渡句可无引用。
-8. 对复合句中的每个可独立核验主张逐项核验；若现有引用只支持其中一部分，应报告 CITATION_MISMATCH，并在 note 中指出未被支持的具体分句。反问句也要检查其隐含事实前提。
+8. 对复合句中的每个可独立核验主张逐项核验；每个主张的支持度按该句绑定的全部 FACT 与 INFERENCE 联合判断，不要求每条依据都单独支持整句，不同依据可以分别支撑不同分句。判定前先核对句子的 FACT_IDS/INFERENCE_IDS 与证据记录中的 DIRECT_SENTENCES/INFERENCE_BASIS_SENTENCES/SENTENCES；只要双方映射包含该句，该依据就已绑定，不能报告“未绑定”或在联合判断时忽略。只有仍有具体主张未被任何已绑定依据支持时，才报告 CITATION_MISMATCH，并指出该分句。反问句也要检查其隐含事实前提。
 9. 语义等价的转述可以成立，不要求词面重合；不得仅凭低词面相似度报错，也不得因句子较短或语气像过渡而放过实质主张。
-10. 不要把一般写作偏好当成质量问题。没有问题时输出 {"issues": []}。"""
+10. 来源语义画像刻画的是材料如何陈述，不代表系统已独立核实。材料关于自身或某系统现状的描述，只能直接证明材料作出了该描述；若正文将其提升为当前已实现、已部署、正在运行或已验证的独立结论，而材料没有相应的可核验实现、运行或测试证据，应判为 INSUFFICIENT_EVIDENCE，并建议保留来源归属或时间边界。材料中的计划、目标、要求、建议、假设或预测，不能单独支持“已经发生/实现/达到效果”的正文主张。
+11. “本次提供的证据没有提到某事”只能判为 INSUFFICIENT_EVIDENCE，不能据此断言该事不存在；只有来源明确否认或反证时才判 CONTRADICTED。
+12. 若一个句子包含多个可独立核验的主张，分别判断；quote 应精确摘录存在问题的最小正文片段，不得用整段概括。
+13. support_status 含义：PARTIALLY_SUPPORTED=同一句的部分主张有依据、部分没有；UNSUPPORTED=绑定依据均不支持该主张；CONTRADICTED=绑定依据明确反证；INSUFFICIENT_EVIDENCE=现有材料不足以判断，不能据此断言相反事实。先按句子全部绑定依据联合核验，再选择状态。
+14. support_status 只用于引用/证据问题；逻辑或重复问题可省略。该状态是核验协议，不是封闭的事实语义分类。
+15. 不要把一般写作偏好当成质量问题。没有问题时输出 {"issues": []}。
+16. 输出 issues 前逐条做最终一致性核验：如果 note 的最终结论认为句子的绑定依据支持了全部主张且不存在未支持分句，必须移除该 issue；support_status 与 note 必须一致。note 只写最终确认的问题，不得保留相互矛盾的自我纠错过程。"""
 
 
 class _QualityAgent(BaseAgent):
     name = "qa"
     role = _QA_SYSTEM
+    temperature = 0.0
 
 
 def _source_ids_for_qa(rows: list[dict]) -> tuple[set[int], set[int]]:
@@ -70,8 +82,10 @@ def _source_ids_for_qa(rows: list[dict]) -> tuple[set[int], set[int]]:
 
 def _build_qa_context(rows: list[dict], *, fact_by_id: dict[int, str],
                       inference_by_id: dict[int, dict],
-                      evidence_by_fact: dict[int, list[dict]]) -> dict[str, list[str]]:
+                      evidence_by_fact: dict[int, list[dict]],
+                      fact_semantics_by_id: dict[int, dict] | None = None) -> dict[str, list[str]]:
     """Build compact QA records only from evidence linked to report sentences."""
+    fact_semantics_by_id = fact_semantics_by_id or {}
     direct_fact_sentences: dict[int, list[int]] = {}
     inference_basis_sentences: dict[int, list[int]] = {}
     inference_sentences: dict[int, list[int]] = {}
@@ -107,10 +121,18 @@ def _build_qa_context(rows: list[dict], *, fact_by_id: dict[int, str],
             continue
         direct_ids = sorted(set(direct_fact_sentences.get(fact_id, [])))
         inference_ids = sorted(set(inference_basis_sentences.get(fact_id, [])))
+        fact_semantics = fact_semantics_by_id.get(fact_id) or {}
+        profile = fact_semantics.get("semantic_profile", fact_semantics)
+        source_profile = semantic_profile_line(
+            profile,
+            fact_semantics.get("assertion_mode"),
+            fact_semantics.get("assertion_mode_raw"),
+        )
         fact_lines.append(
             f"[FACT:{fact_id}][DIRECT_SENTENCES:{','.join(map(str, direct_ids))}]"
             f"[INFERENCE_BASIS_SENTENCES:{','.join(map(str, inference_ids))}] "
-            f"{fact_by_id[fact_id]}"
+            f"{fact_by_id[fact_id]} "
+            f"[SOURCE_SEMANTICS:{source_profile}]"
         )
     inference_lines = []
     for inference_id, sentence_ids in sorted(inference_sentences.items()):
@@ -122,7 +144,8 @@ def _build_qa_context(rows: list[dict], *, fact_by_id: dict[int, str],
             f"[INFERENCE:{inference_id}][SOURCE_LEVEL:{inference.get('source_level', '')}]"
             f"[BASED_FACT_IDS:{','.join(map(str, based_fact_ids))}]"
             f"[SENTENCES:{','.join(map(str, sorted(set(sentence_ids))))}] "
-            f"{inference.get('content', '')}"
+            f"{inference.get('content', '')} "
+            f"[INFERENCE_SEMANTICS:{semantic_profile_line(inference.get('semantic_profile'))}]"
         )
 
     evidence_lines = []
@@ -289,7 +312,8 @@ def run_quality_check(report_id: int, plan_structure: list[str],
         inference_rows = (
             s.execute(
                 select(ORMInference.c.id, ORMInference.c.content, ORMInference.c.source_level,
-                       ORMInference.c.based_fact_ids, ORMInference.c.confidence_level)
+                       ORMInference.c.based_fact_ids, ORMInference.c.confidence_level,
+                       ORMInference.c.semantic_profile_json)
                 .where(ORMInference.c.id.in_(linked_inference_ids))
             ).mappings().all()
             if linked_inference_ids else []
@@ -305,13 +329,17 @@ def run_quality_check(report_id: int, plan_structure: list[str],
                 "source_level": row["source_level"],
                 "based_fact_ids": [int(value) for value in based_fact_ids if str(value).isdigit()],
                 "confidence_level": row["confidence_level"],
+                "semantic_profile": normalize_semantic_profile(row.get("semantic_profile_json")),
             }
         linked_fact_ids.update({
             fact_id for inference in inference_by_id.values()
             for fact_id in inference.get("based_fact_ids") or []
         })
         fact_rows = (
-            s.execute(select(ORMFact.c.id, ORMFact.c.content).where(ORMFact.c.id.in_(linked_fact_ids))).mappings().all()
+            s.execute(select(
+                ORMFact.c.id, ORMFact.c.content, ORMFact.c.semantic_profile_json,
+                ORMFact.c.assertion_mode, ORMFact.c.assertion_mode_raw,
+            ).where(ORMFact.c.id.in_(linked_fact_ids))).mappings().all()
             if linked_fact_ids else []
         )
         ev_rows = (
@@ -324,6 +352,14 @@ def run_quality_check(report_id: int, plan_structure: list[str],
             if linked_fact_ids else []
         )
     fact_by_id = {r["id"]: r["content"] for r in fact_rows}
+    fact_semantics_by_id = {
+        int(row["id"]): {
+            "semantic_profile": normalize_semantic_profile(row.get("semantic_profile_json")),
+            "assertion_mode": row.get("assertion_mode"),
+            "assertion_mode_raw": row.get("assertion_mode_raw"),
+        }
+        for row in fact_rows
+    }
     quote_by_fact: dict[int, list[str]] = {}
     evidence_by_fact: dict[int, list[dict]] = {}
     for ev in ev_rows:
@@ -436,9 +472,11 @@ def run_quality_check(report_id: int, plan_structure: list[str],
             qa_context = _build_qa_context(
                 rows, fact_by_id=fact_by_id, inference_by_id=inference_by_id,
                 evidence_by_fact=evidence_by_fact,
+                fact_semantics_by_id=fact_semantics_by_id,
             )
             sentence_lines = qa_context["sentence_lines"]
             valid_sentence_ids = {int(row["id"]) for row in rows}
+            sentence_by_id = {int(row["id"]): str(row.get("content") or "") for row in rows}
             prompt, _audit = build_prompt_from_sections("qa", [
                 ContextSection("instruction", [
                     "检查报告正文和其绑定的材料事实、推断及原文依据。问题必须引用真实句子编号。",
@@ -460,9 +498,19 @@ def run_quality_check(report_id: int, plan_structure: list[str],
                     if sentence_id in valid_sentence_ids:
                         sentence_ids.append(sentence_id)
                 sentence_ids = list(dict.fromkeys(sentence_ids))
+                quote = str(item.get("quote", ""))
+                if quote and sentence_ids and not any(
+                    quote in sentence_by_id.get(sentence_id, "") for sentence_id in sentence_ids
+                ):
+                    quote = ""
                 target_type = str(item.get("target_type") or "").strip().lower()
                 if target_type not in {"sentence", "paragraph", "section", "report"}:
                     target_type = "sentence" if len(sentence_ids) == 1 else "paragraph" if sentence_ids else "section" if item.get("section") else "report"
+                support_status = str(item.get("support_status") or "").strip().upper()
+                if support_status not in {
+                    "PARTIALLY_SUPPORTED", "UNSUPPORTED", "CONTRADICTED", "INSUFFICIENT_EVIDENCE",
+                }:
+                    support_status = ""
                 issues.append({
                     "type": str(item.get("type", "LOGIC_GAP")),
                     "target_type": target_type,
@@ -470,12 +518,22 @@ def run_quality_check(report_id: int, plan_structure: list[str],
                     "sentence_id": sentence_ids[0] if len(sentence_ids) == 1 else None,
                     "section": str(item.get("section", "")),
                     "paragraph": _safe_int(item.get("paragraph"), default=None),
-                    "quote": str(item.get("quote", ""))[:60],
+                    "quote": quote[:160],
+                    "support_status": support_status,
                     "note": str(item.get("note", "")),
                     "location_source": "model_stable_id" if sentence_ids else "model_scope",
                 })
         except Exception:
-            pass  # LLM 检查失败不阻塞;规则检查结果保留
+            logger.exception("LLM report quality check failed for report %s", report_id)
+            issues.append({
+                "type": "QA_CHECK_INCOMPLETE",
+                "target_type": "report",
+                "sentence_ids": [],
+                "section": "",
+                "quote": "",
+                "note": "语义与引用核验未完成；本地规则检查结果仍保留，不能据此认为正文没有问题。",
+                "location_source": "system_status",
+            })
 
     # Bind each issue to a stable report location. Rule and LLM checks use a
     # human-readable quote, but the UI must not have to guess where it belongs.
@@ -633,6 +691,9 @@ def _classify_issue(issue: dict) -> dict:
     elif type_ in {"MISSING_SECTION", "SECTION_ALIGNMENT_REVIEW", "CITATION_MISMATCH", "BUSINESS_MISMATCH"}:
         item["severity"] = "high"
         item["repair_route"] = "narrative_or_planner_rebuild"
+    elif type_ == "QA_CHECK_INCOMPLETE":
+        item["severity"] = "medium"
+        item["repair_route"] = "manual_review"
     elif type_ in {"TERM_VIOLATION", "RULE_VIOLATION"}:
         item["severity"] = "high"
         item["repair_route"] = "manual_review"

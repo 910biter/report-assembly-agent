@@ -62,11 +62,28 @@ def _migrate_columns() -> None:
     by_table: dict[str, set[str]] = {}
     for table in existing_tables:
         by_table[table] = {column["name"] for column in inspector.get_columns(table)}
+    added_columns: set[tuple[str, str]] = set()
     with engine.begin() as conn:
         for table, column, ddl in _MIGRATED_COLUMNS:
             if table not in existing_tables or column in by_table.get(table, set()):
                 continue
             conn.execute(text(f'ALTER TABLE "{table}" ADD COLUMN "{column}" {ddl}'))
+            added_columns.add((table, column))
+        # Earlier development builds stored open semantic labels directly in
+        # assertion_mode. Preserve them before moving the field to its protocol
+        # role; unknown labels are never guessed into a canonical state.
+        for table in ("facts", "claims"):
+            if (table, "assertion_mode_raw") not in added_columns:
+                continue
+            conn.execute(text(
+                f'UPDATE "{table}" SET assertion_mode_raw = SUBSTR(assertion_mode, 1, 120), '
+                "assertion_mode = 'unknown' "
+                "WHERE assertion_mode IS NOT NULL AND assertion_mode <> '' "
+                "AND assertion_mode NOT IN ('reported', 'prescriptive', 'prospective', "
+                "'conditional', 'opinion', 'unknown') "
+                "AND (assertion_mode_raw IS NULL OR assertion_mode_raw = '' "
+                "OR assertion_mode_raw = 'unknown')"
+            ))
 
 
 def _default_sql(column) -> str | None:
@@ -235,6 +252,27 @@ def _migrate_integrity() -> None:
 
     engine = _get_engine()
     with engine.begin() as conn:
+        conn.execute(text(
+            "ALTER TABLE materials DROP CONSTRAINT IF EXISTS materials_fingerprint_key"
+        ))
+        conn.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_material_owner_fingerprint "
+            "ON materials(owner_user_id, fingerprint)"
+        ))
+        conn.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_active_task_run_queue "
+            "ON task_queue_entries(task_id, run_id) "
+            "WHERE status IN ('queued', 'running')"
+        ))
+        conn.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_active_task_queue "
+            "ON task_queue_entries(task_id) "
+            "WHERE status IN ('queued', 'running')"
+        ))
+        conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS idx_task_queue_order "
+            "ON task_queue_entries(status, priority, id)"
+        ))
         conn.execute(text(
             "CREATE UNIQUE INDEX IF NOT EXISTS uq_report_versions_report_sequence "
             "ON report_versions(report_id, version_no)"

@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 from typing import Any
 from app.document_shape import normalize_document_shape
+from app.template_policy import resolve_structure_policy, structure_guidance
 
 
 def build_report_policy(task: dict | None = None, template_variant: Any = None,
@@ -89,59 +90,38 @@ def _domain_policy(profile: dict) -> list[str]:
 def _template_policy(template_variant: Any) -> dict:
     if not template_variant:
         return {}
-    structure = getattr(template_variant, "structure", {}) or {}
-    format_spec = getattr(template_variant, "format_spec", {}) or {}
-    institution_rules = getattr(template_variant, "institution_rules", {}) or {}
+    raw_structure = getattr(template_variant, "structure", {})
+    structure = raw_structure if isinstance(raw_structure, dict) else {}
+    raw_format_spec = getattr(template_variant, "format_spec", {})
+    format_spec = raw_format_spec if isinstance(raw_format_spec, dict) else {}
+    raw_institution_rules = getattr(template_variant, "institution_rules", {})
+    institution_rules = (
+        raw_institution_rules
+        if isinstance(raw_institution_rules, dict) and raw_institution_rules.get("confirmed") is True
+        else {}
+    )
     asset_roles = structure.get("asset_roles") if isinstance(structure, dict) else {}
-    structure_type = _structure_type(format_spec, institution_rules)
-    if structure_type == "FORMAT_ONLY" and isinstance(asset_roles, dict) and asset_roles.get("structural_reference"):
-        structure_type = "SOFT_STRUCTURE"
+    structure_policy = resolve_structure_policy(
+        getattr(template_variant, "structure_policy", {}), asset_roles,
+    )
+    structure_type = structure_policy["mode"]
     learned_shape = structure.get("document_shape") if isinstance(structure, dict) else {}
+    structure_hint = {}
+    if structure_type != "FORMAT_ONLY" and isinstance(structure, dict):
+        structure_hint = {
+            key: structure[key]
+            for key in ("sections", "summary_first", "conclusion_first", "heading_patterns")
+            if key in structure
+        }
     return {
         "structure_type": structure_type,
-        "structure_hint": structure if structure_type != "FORMAT_ONLY" else {},
+        "structure_policy": structure_policy,
+        "structure_hint": structure_hint,
         "institution_rules": institution_rules,
         "format_summary": _format_summary(format_spec),
         "document_shape_hint": normalize_document_shape(learned_shape),
-        "guidance": (
-            "模板只控制格式与导出呈现,不得把模板目录作为报告目录。"
-            if structure_type == "FORMAT_ONLY"
-            else "模板目录可参考,但最终结构仍由材料事实和分析结论决定。"
-            if structure_type == "SOFT_STRUCTURE"
-            else "模板目录为强制业务结构,最终报告应严格遵守。"
-        ),
+        "guidance": structure_guidance(structure_type),
     }
-
-
-def _structure_type(format_spec: dict, institution_rules: dict) -> str:
-    candidates = []
-    if isinstance(institution_rules, dict):
-        candidates.extend([
-            institution_rules.get("template_structure_type"),
-            institution_rules.get("structure_type"),
-        ])
-    if isinstance(format_spec, dict):
-        candidates.extend([
-            format_spec.get("template_structure_type"),
-            format_spec.get("structure_type"),
-        ])
-        dominant = format_spec.get("dominant")
-        if isinstance(dominant, dict):
-            candidates.extend([
-                dominant.get("template_structure_type"),
-                dominant.get("structure_type"),
-            ])
-            schema = dominant.get("template_schema")
-            if isinstance(schema, dict):
-                candidates.extend([
-                    schema.get("structure_type"),
-                    schema.get("template_structure_type"),
-                ])
-    for item in candidates:
-        value = str(item or "").upper()
-        if value in {"FORMAT_ONLY", "SOFT_STRUCTURE", "HARD_STRUCTURE"}:
-            return value
-    return "FORMAT_ONLY"
 
 
 def _format_summary(format_spec: dict) -> dict:

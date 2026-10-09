@@ -22,6 +22,7 @@ from app.config import settings
 from app.context_budget import count_tokens
 from app.db import session_scope
 from app.infrastructure.orm import (
+    Base,
     ORMGraphOutbox,
     ORMKGAssertion,
     ORMKGAssertionFact,
@@ -31,6 +32,19 @@ from app.infrastructure.orm import (
     ORMKGFactCoverage,
     ORMKGTaskMembership,
 )
+
+
+def workspace_for_task(task_id: str) -> str:
+    if not settings.multiuser_enabled:
+        return settings.graph_workspace_id
+    task_table = Base.metadata.tables["short_memory"]
+    with session_scope() as s:
+        owner = s.execute(select(task_table.c.owner_user_id).where(
+            task_table.c.task_id == task_id,
+        )).scalar_one_or_none()
+    if owner is None:
+        raise ValueError("TASK_OWNER_REQUIRED_FOR_GRAPH")
+    return f"{settings.graph_workspace_id}:user:{owner}"
 
 
 _GRAPH_SYSTEM = """你是证据约束的关系抽取员。只根据给定事实抽取实体和关系，不推断、不补全。
@@ -219,7 +233,19 @@ class Neo4jProjector:
 def _scope_ids(task_id: str, source_task_ids: list[str] | None = None) -> list[str]:
     values = [str(task_id or "")]
     values.extend(str(value or "") for value in (source_task_ids or []))
-    return list(dict.fromkeys(value for value in values if value))
+    values = list(dict.fromkeys(value for value in values if value))
+    if not settings.multiuser_enabled:
+        return values
+    task_table = Base.metadata.tables["short_memory"]
+    with session_scope() as session:
+        rows = session.execute(select(task_table.c.task_id, task_table.c.owner_user_id).where(
+            task_table.c.task_id.in_(values),
+        )).mappings().all()
+    owner_by_task = {str(row["task_id"]): row["owner_user_id"] for row in rows}
+    owner = owner_by_task.get(task_id)
+    if owner is None:
+        raise ValueError("TASK_OWNER_REQUIRED_FOR_GRAPH")
+    return [value for value in values if owner_by_task.get(value) == owner]
 
 
 def _projection_records(task_id: str, source_task_ids: list[str] | None = None,
@@ -358,7 +384,7 @@ class GraphService:
         ids = {int(value) for value in fact_ids if str(value).isdigit()}
         if not ids:
             return 0
-        workspace_id = workspace_id or settings.graph_workspace_id
+        workspace_id = workspace_for_task(task_id) if settings.multiuser_enabled else (workspace_id or settings.graph_workspace_id)
         with session_scope() as s:
             rows = s.execute(
                 select(ORMKGAssertionFact.c.assertion_id)
@@ -438,7 +464,7 @@ class GraphService:
                          progress_callback=None) -> GraphBuildResult:
         if not facts:
             return GraphBuildResult(status="skipped")
-        workspace_id = workspace_id or settings.graph_workspace_id
+        workspace_id = workspace_for_task(task_id) if settings.multiuser_enabled else (workspace_id or settings.graph_workspace_id)
         started = time.time()
         try:
             batches = _fact_batches(facts)
@@ -771,7 +797,7 @@ class GraphService:
             if not assertion_ids:
                 return 0
             s.execute(update(ORMKGAssertion).where(ORMKGAssertion.c.id.in_(assertion_ids), ORMKGAssertion.c.status == "validated").values(status="confirmed"))
-            workspace = settings.graph_workspace_id
+            workspace = workspace_for_task(task_id)
             self._changeset(
                 s, task_id, workspace, "PUBLISH_TASK_GRAPH",
                 {"assertion_ids": assertion_ids, "report_version_id": report_version_id},

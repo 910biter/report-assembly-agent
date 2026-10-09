@@ -10,6 +10,7 @@ import UiDataBrowser from "@/components/ui/UiDataBrowser.vue";
 import UiButton from "@/components/ui/UiButton.vue";
 import UiPageHeader from "@/components/ui/UiPageHeader.vue";
 import UiPagination from "@/components/ui/UiPagination.vue";
+import { usePersistentPageSize } from "@/lib/pagination";
 
 type TaskView =
   | "all"
@@ -28,7 +29,7 @@ const variant = ref("");
 const sortBy = ref("updated_desc");
 const selectedId = ref<string | null>(null);
 const page = ref(1);
-const pageSize = ref(20);
+const pageSize = usePersistentPageSize("tasks");
 const tasks = useQuery({
   queryKey: ["tasks"],
   queryFn: () => api<TaskSummary[]>("/api/tasks"),
@@ -304,7 +305,7 @@ function taskType(task: TaskSummary) {
                 ><span class="mono">{{ task.task_id }}</span></small
               >
             </div>
-            <StatusBadge :stage="task.stage" /><span
+            <span class="task-queue-cell"><StatusBadge :stage="task.stage" /><small v-if="task.queue_status?.status === 'queued' && task.queue_status?.ahead != null">前方 {{ task.queue_status.ahead }} 个任务</small></span><span
               >{{ task.material_count || 0 }} 份</span
             ><span class="truncate">{{
               task.run_mode === "material_comparison"
@@ -345,6 +346,7 @@ function taskType(task: TaskSummary) {
         </div>
         <h2>{{ selected.theme }}</h2>
         <StatusBadge :stage="selected.stage" />
+        <p v-if="selected.queue_status?.status === 'queued' && selected.queue_status?.ahead != null" class="queue-ahead">待运行 · 前方 {{ selected.queue_status.ahead }} 个任务</p>
         <dl>
           <dt>任务 ID</dt>
           <dd class="mono">{{ selected.task_id }}</dd>
@@ -684,4 +686,6 @@ function taskType(task: TaskSummary) {
   background: var(--info-soft);
   color: var(--info);
 }
+.task-queue-cell { display: grid; justify-items: start; gap: 3px; min-width: 0; }
+.task-queue-cell small, .queue-ahead { color: var(--muted-foreground); font-size: 12px; }
 </style>

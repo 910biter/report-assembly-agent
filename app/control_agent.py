@@ -869,7 +869,7 @@ def _load_task_template(task_id: str) -> dict[str, Any]:
     if not variant_id:
         from app.memory import style
 
-        locked = style.get_locked_variant()
+        locked = style.get_locked_variant(owner_user_id=style.owner_for_task(task_id))
         variant_id = int(locked.id or 0) if locked else 0
         source = "system_default"
     if not variant_id:
@@ -881,7 +881,7 @@ def _load_task_template(task_id: str) -> dict[str, Any]:
 
     from app.memory import style
 
-    variant = style.get_variant(variant_id)
+    variant = style.get_variant(variant_id, owner_user_id=style.owner_for_task(task_id))
     if variant is None:
         return {
             "selected": False,

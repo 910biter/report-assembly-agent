@@ -13,7 +13,8 @@ def _session_manager(_session):
     return session_scope() if _session is None else nullcontext(_session)
 
 
-def create_task(task_id: str, payload: dict, *, _session=None) -> None:
+def create_task(task_id: str, payload: dict, *, owner_user_id: int | None = None,
+                _session=None) -> None:
     """Insert a new task payload without ever replacing an existing task."""
     with _session_manager(_session) as s:
         existing = s.execute(
@@ -24,6 +25,7 @@ def create_task(task_id: str, payload: dict, *, _session=None) -> None:
         s.execute(
             ORMShortMemory.insert().values(
                 task_id=task_id,
+                owner_user_id=owner_user_id,
                 payload=json.dumps(payload, ensure_ascii=False),
             )
         )

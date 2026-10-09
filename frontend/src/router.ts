@@ -1,21 +1,40 @@
 import { createRouter, createWebHistory } from "vue-router";
 import DashboardPage from "@/pages/DashboardPage.vue";
+import { authMode, currentUser, ensureSession } from "@/lib/auth";
 
 const router = createRouter({
   history: createWebHistory(),
   routes: [
+    { path: "/login", component: () => import("@/pages/LoginPage.vue"), meta: { title: "登录", public: true } },
     { path: "/", component: DashboardPage, meta: { title: "工作台" } },
     { path: "/tasks", component: () => import("@/pages/TasksPage.vue"), meta: { title: "任务" } },
     { path: "/tasks/:taskId", component: () => import("@/pages/TaskWorkspacePage.vue"), meta: { title: "任务工作台", wide: true } },
     { path: "/documents", component: () => import("@/pages/DocumentsPage.vue"), meta: { title: "文档解析" } },
     { path: "/materials", component: () => import("@/pages/MaterialsPage.vue"), meta: { title: "材料库" } },
     { path: "/style", component: () => import("@/pages/TemplatesPage.vue"), meta: { title: "模板中心" } },
-    { path: "/settings", component: () => import("@/pages/SettingsPage.vue"), meta: { title: "系统设置" } },
+    { path: "/queue", component: () => import("@/pages/QueuePage.vue"), meta: { title: "运行队列" } },
+    { path: "/settings", component: () => import("@/pages/SettingsPage.vue"), meta: { title: "系统设置", admin: true } },
+    { path: "/admin/users", component: () => import("@/pages/AdminUsersPage.vue"), meta: { title: "账号管理", admin: true } },
     { path: "/reports", redirect: "/tasks" },
     { path: "/reports/:reportId", component: () => import("@/pages/ReportEditorPage.vue"), meta: { title: "报告编辑", editor: true } },
     { path: "/:pathMatch(.*)*", redirect: "/" },
   ],
   scrollBehavior: () => ({ top: 0 }),
+});
+
+router.beforeEach(async (to) => {
+  try {
+    await ensureSession();
+  } catch {
+    return to.path === "/login" ? true : { path: "/login", query: { redirect: to.fullPath } };
+  }
+  if (authMode.value === "off") return to.path === "/login" ? "/" : true;
+  if (!currentUser.value && to.path !== "/login") {
+    return { path: "/login", query: { redirect: to.fullPath } };
+  }
+  if (currentUser.value && to.path === "/login") return "/";
+  if (to.meta.admin && currentUser.value?.role !== "admin") return "/";
+  return true;
 });
 
 // Hashed chunks change on every deployment. A tab that has kept an older SPA

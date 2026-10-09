@@ -785,6 +785,10 @@ const createTask = useMutation({
 }
 .recent-workspace {
   min-width: 0;
+  padding: 20px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-panel);
+  background: var(--card);
 }
 .recent-workspace :deep(.ui-section-header) {
   margin-bottom: 14px;
@@ -792,17 +796,17 @@ const createTask = useMutation({
 .side-stack {
   display: grid;
   align-content: start;
-  gap: 0;
-  padding-left: 24px;
-  border-left: 1px solid var(--border);
+  gap: 16px;
 }
 .side-section {
   min-width: 0;
-  padding: 0 0 18px;
+  padding: 20px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-panel);
+  background: var(--card);
 }
 .side-section + .side-section {
-  padding-top: 18px;
-  border-top: 1px solid var(--border);
+  padding-top: 20px;
 }
 .section-kicker {
   margin-bottom: 3px;

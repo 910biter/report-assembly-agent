@@ -29,6 +29,7 @@ class BaseAgent:
     # chat template enables hidden thinking when this value is omitted, which
     # can consume the output budget before the JSON result is produced.
     thinking: bool | None = False
+    temperature: float | None = None
     output_token_limit: int | None = settings.structured_output_tokens
     last_call_id = ""
 
@@ -44,10 +45,15 @@ class BaseAgent:
             audit = consume_context_audit()
         audit["final_user_prompt_tokens"] = count_tokens(prompt)
         audit["estimated_request_tokens"] = count_tokens(f"{system or self.role}\n{prompt}")
+        generation_options = {
+            "system": system or self.role,
+            "max_tokens": output_tokens,
+        }
+        if self.temperature is not None:
+            generation_options["temperature"] = self.temperature
         return self._with_retry(
             lambda: submit_llm_call(lambda: invoke(
-                "agent", model_gateway.generate, prompt,
-                system=system or self.role, max_tokens=output_tokens,
+                "agent", model_gateway.generate, prompt, **generation_options,
             )),
             len(prompt), audit,
         )
@@ -61,11 +67,16 @@ class BaseAgent:
             audit = consume_context_audit()
         audit["final_user_prompt_tokens"] = count_tokens(prompt)
         audit["estimated_request_tokens"] = count_tokens(f"{system or self.role}\n{prompt}")
+        generation_options = {
+            "system": system or self.role,
+            "think": self.thinking,
+            "max_tokens": output_tokens,
+        }
+        if self.temperature is not None:
+            generation_options["temperature"] = self.temperature
         return self._with_retry(
             lambda: submit_llm_call(lambda: invoke(
-                "agent", model_gateway.generate_json, prompt,
-                system=system or self.role, think=self.thinking,
-                max_tokens=output_tokens,
+                "agent", model_gateway.generate_json, prompt, **generation_options,
             )),
             len(prompt), audit,
         )

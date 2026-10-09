@@ -18,7 +18,7 @@ from difflib import SequenceMatcher
 from app.agents.base import BaseAgent
 from app.planning.narrative import narrative_agent, unit_evidence_ids
 from app.db import session_scope
-from app.infrastructure.orm import Base, ORMReport, ORMSentence, ORMTaskArtifact
+from app.infrastructure.orm import Base, ORMReport, ORMSentence, ORMTaskArtifact, ORMShortMemory
 from sqlalchemy import select, update, delete
 from app.models import Report
 from app.policy import policy_prompt_block
@@ -28,6 +28,8 @@ from app.planning.scale import normalize_execution_plan
 from app.rendering.headings import has_heading_prefix, strip_heading_prefix
 from app.document_shape import normalize_composition_mode
 from app.task_artifacts import latest_task_artifact, save_task_artifact
+from app.assertion_semantics import semantic_profile_line, source_semantics_line
+from app.planning.evidence_context import fact_line, inference_line, evidence_ids
 from app.token_monitor import update_call_funnel, update_call_metrics, update_call_products
 from app.config import settings
 from app.context_budget import (
@@ -45,21 +47,56 @@ from app.writing.scale_execution import (
     writer_scale_prompt_hint,
     report_minimum_words,
 )
-from app.observability.core_chain import aggregate_generation_units, build_generation_unit_stats, extract_numbered_ids
+from app.observability.core_chain import aggregate_generation_units, build_generation_unit_stats, extract_numbered_ids, collect_assigned_ids
 
 
 ORMSentenceFact = Base.metadata.tables["report_sentence_fact"]
 ORMSentenceInference = Base.metadata.tables["report_sentence_inference"]
 
 
-_SYSTEM = """你是情报报告撰稿人。依据 Narrative Plan、ChapterPlan 与机构风格,撰写成文的自然语言报告。
+def _writer_json_overhead(paragraphs: list[dict], fact_ids=(), inference_ids=()) -> int:
+    """Reserve schema and citation space independently of visible prose.
+
+    One placeholder per planned evidence record is a capacity estimate, not a
+    requirement to write separate sentences for facts and judgments.
+    """
+    rows = []
+    for paragraph in paragraphs or [{"fact_ids": fact_ids, "inference_ids": inference_ids}]:
+        sentences = [
+            {"text": "", "fact_ids": [fid], "inference_ids": []}
+            for fid in evidence_ids(paragraph.get("fact_ids"))
+        ] + [
+            {"text": "", "fact_ids": [], "inference_ids": [iid]}
+            for iid in evidence_ids(paragraph.get("inference_ids"))
+        ]
+        rows.append({"paragraph_id": paragraph.get("paragraph_id") or "P1",
+                     "sentences": sentences or [{"text": "", "fact_ids": [], "inference_ids": []}]})
+    return max(256, count_tokens(json.dumps({"paragraphs": rows}, ensure_ascii=False)))
+
+
+def _writer_argument_contract(value):
+    """Keep evidence organization without forwarding planner-authored prose bridges."""
+    if isinstance(value, dict):
+        return {
+            key: _writer_argument_contract(item) for key, item in value.items()
+            if key not in {"transition", "transition_hint", "writing_hint", "next_bridge", "relation_to_prev"}
+        }
+    if isinstance(value, list):
+        return [_writer_argument_contract(item) for item in value]
+    return value
+
+
+_SYSTEM = """你是文档撰稿人。依据 Narrative Plan、ChapterPlan 与机构风格,撰写成文的自然语言文档。
 每次只撰写提示中指定的一个交付单元。交付单元可能是一整章,也可能是 Narrative Plan 规划的小节或连续文章段落组；严格输出 JSON,不要任何解释:
 {"paragraphs": [{"sentences": [{"text": "句子内容", "fact_ids": [1], "inference_ids": []}]}]}
 要求:
-1. 严格按 Narrative Plan 与 ChapterPlan 的核心问题、事实主次和逻辑顺序组织内容,不得偏离
+1. 按 Narrative Plan 与 ChapterPlan 的核心问题、事实主次和逻辑顺序组织内容；它们是论证指令，不是正文底稿。
+   purpose、transition、completion_criteria 等内部说明不能直接改写为正文。用证据之间的具体关系衔接，避免向读者讲解写作过程。
+   规划负责证据、论证关系与范围，模板表达参考负责适用的句式、节奏和展开方式；不得用通用报告腔覆盖模板文体，也不得继承模板业务结论。没有匹配参考时按当前文体自然表达。
 2. 不重复 Report Memory 中"前文已表述"的内容(其他章节/前章摘要)
 3. 每个段落围绕一个核心观点,事实与分析自然融合,判断必须有依据
-4. 事实句引用 fact_ids,推断句引用 inference_ids,id 必须真实存在
+4. 引用按句中的具体主张绑定，id 必须真实存在。事实与有依据的判断可以自然融合在一句中，分别绑定直接相关的 fact_ids/inference_ids。
+   若推断只是概括已表达的事实关系，不要为引用推断再写一句同义复述；证据类型不是句子类型，也不是逐项输出清单。
 5. 正文不得出现来源标签、内部编号或证据标注;引用关系只写在 JSON 的 fact_ids/inference_ids 中
 6. 只撰写当前指定交付单元,不要扩写成整章或输出其他章节内容
 7. 只有纯粹组织结构、且不包含事实前提或评价判断的过渡句可以没有引用；这类句子必须显式标记 source_level="TRANSITION"，并保持少量简短。事实性或评价性内容不得伪装成过渡句。
@@ -67,7 +104,9 @@ _SYSTEM = """你是情报报告撰稿人。依据 Narrative Plan、ChapterPlan �
 9. 段落、句式、详略、表格或分项表达由 ChapterPlan、模板风格、材料信息量和分层策略共同决定;不要机械套用固定格式
 10. 不要把无关 Fact 压缩拼接进同一句;一段一主题,一个句子通常只承担一个核心事实或一个直接相关的事实组
 11. 具体事实优先,少使用“机制完善、顶层定标、全面就位”等没有新增信息的抽象套话
-12. 不要把事实清单直接排列成正文;每段应有主题句、必要解释和自然承接,使读者能理解事实之间的关系
+12. 不要把事实清单直接排列成正文;每段应围绕具体问题自然组织证据，使读者理解事实之间的关系。
+    paragraph.argument 指明应完成的实质论证，结合原始事实展开其比较、解释和适用范围，不得仅缩写为一句结论；也不得把该内部安排照抄为正文。
+    不强制每段都有抽象主题句或过渡句；直接相关的比较与限制可一起表达。已说明的限制和结论不再完整复述，收束应回应核心问题而非再次列清单。
 13. Narrative Plan 中 detail_level=expand 的话题应适度展开;brief/reference 只简要承接,不得平均铺陈
 14. paragraphs 是文档自然段,sentences 是段内溯源单位;同一自然段中的多句话应放入同一个 paragraphs[].sentences,不要把每句话都拆成一个 paragraph
 15. 当前交付单元的目标字数是近似目标,不是最低字数。证据充分时完成本单元核心论证并接近目标后收束；
@@ -75,7 +114,8 @@ _SYSTEM = """你是情报报告撰稿人。依据 Narrative Plan、ChapterPlan �
 16. Narrative Plan 中 paragraph.target_words 是段落篇幅的分配参考,不是自然段硬下限;相邻计划段若一段只承担引出或过渡、无法独立形成论证,应合并成自然段。不得为保留计划段数制造单句段,也不得靠空泛扩写凑段落目标;交付单元篇幅要求仍按篇幅提示执行。
 17. 引用采用最小且逐句绑定:每个 fact_id/inference_id 都必须直接支持当前句中的具体主张,不得仅因其出现在本段、本小节或 Narrative Plan 中就引用。
     不得把整段证据列表复制到每一句;一句含多个可独立核验的主张时应拆句并分别绑定。
-    事实陈述优先引用直接事实,分析判断引用对应推断;只有句子确实同时陈述两者时才同时引用。未绑定 ID 的句子只有在纯组织性过渡且显式标记 source_level="TRANSITION" 时才可保留。"""
+    事实陈述优先引用直接事实,分析判断引用对应推断;只有句子确实同时陈述两者时才同时引用。未绑定 ID 的句子只有在纯组织性过渡且显式标记 source_level="TRANSITION" 时才可保留。
+18. 来源语义画像采用开放分类，不是少数标签的封闭清单。必须逐条保留来源给出的实现状态、时间、归属、条件、范围、否定和例外；多个来源语义不同时应分别表述，不能综合成更确定或更强的现状陈述。"""
 
 
 def _filter_facts_by_roles(
@@ -324,8 +364,9 @@ def _focused_unit_evidence(
         fact_ids = set(_int_ids(chapter_plan.get("primary_fact_ids")))
     if not inference_ids:
         inference_ids = set(_int_ids(chapter_plan.get("primary_inference_ids")))
-    selected_facts = [item for item in facts if int(item.get("id") or 0) in fact_ids] if fact_ids else list(facts)
     selected_inferences = [item for item in inferences if int(item.get("id") or 0) in inference_ids] if inference_ids else list(inferences)
+    fact_ids.update(fid for item in selected_inferences for fid in evidence_ids(item.get("based_fact_ids")))
+    selected_facts = [item for item in facts if int(item.get("id") or 0) in fact_ids] if fact_ids else list(facts)
     # Older plans may not contain assignments; preserve their usable fallback.
     return selected_facts or list(facts), selected_inferences or list(inferences)
 
@@ -429,9 +470,38 @@ def _pack_writer_evidence(
     fact_lines: list[str],
     inference_lines: list[str],
     available_tokens: int,
+    inference_fact_ids: dict[int, list[int]] | None = None,
 ) -> tuple[list[str], list[str]]:
     """Pack complete traceable lines, preserving both facts and inferences."""
     available = max(0, int(available_tokens or 0))
+    if inference_fact_ids is not None:
+        fact_by_id = {ids[0]: line for line in fact_lines if (ids := extract_numbered_ids([line]))}
+        selected_facts, selected_inferences = {}, []
+        used = 0
+
+        def take(fact_ids, inference=None):
+            nonlocal used
+            bases = set(fact_ids)
+            if bases - set(fact_by_id):
+                return
+            new = {fid: fact_by_id[fid] for fid in fact_ids if fid not in selected_facts}
+            cost = sum(count_tokens(line + "\n") for line in new.values())
+            cost += count_tokens(inference + "\n") if inference else 0
+            if used + cost > available:
+                return
+            selected_facts.update(new)
+            if inference:
+                selected_inferences.append(inference)
+            used += cost
+
+        for index in range(max(len(fact_lines), len(inference_lines), 0)):
+            if index < len(fact_lines):
+                take(extract_numbered_ids([fact_lines[index]]))
+            if index < len(inference_lines):
+                line = inference_lines[index]
+                ids = extract_numbered_ids([line])
+                take(inference_fact_ids.get(ids[0], []) if ids else [], line)
+        return list(selected_facts.values()), selected_inferences
 
     def take(lines: list[str], budget: int) -> tuple[list[str], int]:
         selected: list[str] = []
@@ -769,7 +839,7 @@ class WriterAgent(BaseAgent):
                 str(chapter_plan.get("judgment") or ""),
                 " ".join(normalize_text_list(chapter_plan.get("required_facts"))),
             ]))
-            support_fact_ids = set(int(x) for x in (chapter_plan.get("primary_fact_ids") or []))
+            support_fact_ids = set(collect_assigned_ids(chapter_plan, "fact"))
             if cm is not None:
                 chapter_facts, chapter_inferences, chapter_style = cm.for_writer_section(
                     query, facts, inferences, style_block,
@@ -791,6 +861,7 @@ class WriterAgent(BaseAgent):
                 inferences=chapter_inferences,
                 report_memory=report_memory,
                 run_id=run_id,
+                style_block=chapter_style,
             )
             previous_chapter_text = "".join(self._chapter_texts(report.id, chapter_title))
             # 2. 执行 ChapterPlan 生成(不再重复规划)。生成阶段不持有 SQLite 写事务。
@@ -1048,6 +1119,7 @@ class WriterAgent(BaseAgent):
             facts=article_facts,
             inferences=article_inferences,
             run_id=run_id,
+            style_block=style_block,
         )
         paragraph_plan = list(article_plan.get("paragraphs") or [])
         evidence_units = paragraph_plan or list(article_plan.get("beats") or [])
@@ -1062,15 +1134,6 @@ class WriterAgent(BaseAgent):
         article_facts = [item for item in article_facts if int(item.get("id") or 0) in allowed_fact_ids]
         article_inferences = [item for item in article_inferences if int(item.get("id") or 0) in allowed_inference_ids]
         article_style = style_block
-        if style_variant is not None:
-            article_style = style_variant.writer_prompt_block({
-                "title": str(plan.get("title") or ""),
-                "purpose": str(article_plan.get("central_thread") or plan.get("core_judgment") or ""),
-                "report_type": str(plan.get("report_type") or ""),
-                "keywords": [str(beat.get("purpose") or "") for beat in article_plan.get("beats") or []],
-                "target_words": int((plan.get("budget") or {}).get("target_words") or 0),
-                "sample_type": "opening",
-            })
         safe_words = max(
             500,
             int(settings.writer_output_tokens * settings.writer_visible_word_token_ratio * 0.82),
@@ -1097,6 +1160,14 @@ class WriterAgent(BaseAgent):
                 "group_index": group_index,
                 "group_count": len(groups),
             }
+            if style_variant is not None:
+                article_style = style_variant.writer_prompt_block({
+                    "title": str(plan.get("title") or ""),
+                    "purpose": "；".join(str(unit.get("purpose") or "") for unit in group),
+                    "report_type": str(plan.get("report_type") or ""),
+                    "keywords": [str(unit.get("argument") or unit.get("purpose") or "") for unit in group],
+                    "target_words": int(group_plan["target_words"]),
+                })
             group_result = self._generate_article_pass(
                 plan=plan,
                 article_plan=group_plan,
@@ -1274,14 +1345,19 @@ class WriterAgent(BaseAgent):
         target_words = int(
             article_plan.get("target_words") or (plan.get("budget") or {}).get("target_words") or 0
         )
-        fact_lines = [f"{item['id']}. {item.get('content', '')}" for item in facts]
-        inference_lines = [f"{item['id']}. ({item.get('source_level', '')}) {item.get('content', '')}" for item in inferences]
+        fact_lines = [fact_line(item) for item in facts]
+        inference_lines = [inference_line(item) for item in inferences]
         # The current group is the Writer contract. Do not duplicate the whole
         # article or truncate serialized JSON halfway through a paragraph.
         contract = json.dumps({
             "central_thread": article_plan.get("central_thread") or "",
-            "beats": article_plan.get("beats") or [],
-            "paragraphs": article_plan.get("paragraphs") or [],
+            "evidence_boundaries": [
+                {"beat_id": beat.get("beat_id"), "must_not_claim": beat.get("must_not_claim") or [],
+                 "excluded_content": beat.get("excluded_content") or []}
+                for beat in article_plan.get("beats") or []
+                if beat.get("must_not_claim") or beat.get("excluded_content")
+            ],
+            "paragraphs": _writer_argument_contract(article_plan.get("paragraphs") or []),
             "closing": article_plan.get("closing") if
             int(article_plan.get("group_index") or 1) >= int(article_plan.get("group_count") or 1) else "",
         }, ensure_ascii=False)
@@ -1290,6 +1366,16 @@ class WriterAgent(BaseAgent):
             rules = "机构已确认业务规则:" + json.dumps(institution_rules, ensure_ascii=False) + "\n"
         group_index = int(article_plan.get("group_index") or 1)
         group_count = max(1, int(article_plan.get("group_count") or 1))
+        planned_paragraphs = article_plan.get("paragraphs") or []
+        paragraph_positions = {
+            str(item.get("paragraph_id")): index
+            for index, item in enumerate(planned_paragraphs, start=1) if item.get("paragraph_id")
+        }
+        output_shape = json.dumps({"paragraphs": [
+            {"paragraph_id": item.get("paragraph_id") or f"P{index}",
+             "sentences": [{"text": "正文句子", "fact_ids": [], "inference_ids": []}]}
+            for index, item in enumerate(planned_paragraphs, start=1)
+        ] or [{"sentences": [{"text": "正文句子", "fact_ids": [], "inference_ids": []}]}]}, ensure_ascii=False)
         if group_index < group_count:
             pass_contract = (
                 f"这是连续文章的第 {group_index}/{group_count} 段写作，不是全文结尾。"
@@ -1298,13 +1384,14 @@ class WriterAgent(BaseAgent):
             )
         else:
             pass_contract = (
-                "这是连续文章的最后一段写作。承接上文完成剩余论证，"
+                "这是连续文章的最后一个写作片段，可能包含多个自然段。承接上文完成剩余论证，"
                 "只在确有必要时给出一次简洁收束，不重复前文已经得出的结论。"
             )
 
         def build_prompt(selected_facts: list[str], selected_inferences: list[str]) -> str:
             return (
                 f"报告标题:{plan.get('title', '')}\n"
+                f"用户成文要求:{plan.get('user_requirements') or ''}\n"
                 f"文档形态:{(plan.get('document_shape') or {}).get('kind', '')}；本次必须写成一篇连续文章，不要章节标题、编号、Markdown 标题或分节标签。\n"
                 + writer_scale_prompt_hint(
                     plan.get("budget"), unit_target_words=target_words,
@@ -1313,7 +1400,7 @@ class WriterAgent(BaseAgent):
                 ) + "\n"
                 f"核心判断:{plan.get('core_judgment', '')}\n"
                 f"全文叙事逻辑:{plan.get('narrative_logic', '')}\n"
-                f"当前片段 Narrative Plan(按段落目的和顺序执行，不得合并不同论证段):\n{contract}\n\n"
+                f"当前片段论证契约(内部指令，不是正文底稿；保持实质性论证次序，纯引出与相邻论证可自然合段):\n{contract}\n\n"
                 + f"连续写作位置:{pass_contract}\n\n"
                 + (f"上一连续片段结尾(只用于自然承接，不得重复):{article_plan.get('previous_tail')}\n\n" if article_plan.get("previous_tail") else "")
                 + (rules + "\n" if rules else "")
@@ -1322,9 +1409,12 @@ class WriterAgent(BaseAgent):
                 + "允许引用的事实:\n" + "\n".join(selected_facts) + "\n\n"
                 + "允许引用的推断:\n" + "\n".join(selected_inferences) + "\n\n"
                 + f"{style_block}\n"
-                + "请先按段落执行计划安排开篇、展开、转折与收束，再输出连贯正文。自然段由论证关系决定，不要逐条复述事实；每句事实性或评价性内容必须绑定下列允许 ID。"
+                + "按当前论证关系和匹配的模板表达参考自然成文，不额外套入固定的开篇、转折或总结流程。相邻段可直接由具体事实承接，不要求显式过渡句；每句事实性或评价性内容必须绑定下列允许 ID。"
                   "纯组织性过渡句若无引用，必须显式标记 source_level=\"TRANSITION\"，且不得含事实前提或评价判断。"
-                  "严格输出 JSON 对象：{\"paragraphs\":[{\"sentences\":[{\"text\":\"...\",\"fact_ids\":[1],\"inference_ids\":[]}]}]}；source_level 仅在纯过渡句时可选填 TRANSITION。"
+                  "每个有独立论证目的的计划段对应一个 paragraph_id，按计划顺序输出；不得把整个片段放入一个段落对象。"
+                  "只承担纯引出或过渡、没有独立论证的计划段可并入相邻段，不得合并不同实质论证。"
+                + f"输出 JSON 结构示例(空引用须替换为支持实际主张的允许 ID):{output_shape}；"
+                  "source_level 仅在纯过渡句时可选填 TRANSITION。"
             )
 
         empty_prompt = build_prompt([], [])
@@ -1333,7 +1423,10 @@ class WriterAgent(BaseAgent):
             raise ValueError("ARTICLE_PLAN_EXCEEDS_WRITER_CONTEXT")
         candidate_fact_ids = extract_numbered_ids(fact_lines)
         candidate_inference_ids = extract_numbered_ids(inference_lines)
-        fact_lines, inference_lines = _pack_writer_evidence(fact_lines, inference_lines, available)
+        fact_lines, inference_lines = _pack_writer_evidence(
+            fact_lines, inference_lines, available,
+            {int(item['id']): evidence_ids(item.get('based_fact_ids')) for item in inferences},
+        )
         prompt = build_prompt(fact_lines, inference_lines)
         supplied_fact_ids = extract_numbered_ids(fact_lines)
         supplied_inference_ids = extract_numbered_ids(inference_lines)
@@ -1357,6 +1450,9 @@ class WriterAgent(BaseAgent):
             target_words,
             settings.writer_output_tokens,
             settings.writer_output_tokens_per_word,
+            structured_output_overhead_tokens=_writer_json_overhead(
+                article_plan.get("paragraphs") or [], supplied_fact_ids, supplied_inference_ids,
+            ),
         )
         try:
             payload, effective_output_limit = self._generate_json_with_budget_retry(prompt, output_limit)
@@ -1392,6 +1488,7 @@ class WriterAgent(BaseAgent):
         rejected_inference_ids: set[int] = set()
         seen: set[str] = set()
         for paragraph_number, paragraph in enumerate(_coerce_paragraphs(payload), start=1):
+            paragraph_number = paragraph_positions.get(str(paragraph.get("paragraph_id")), paragraph_number)
             for sentence in paragraph.get("sentences") or []:
                 if not isinstance(sentence, dict):
                     dropped_untraced_sentences += 1
@@ -1520,10 +1617,12 @@ class WriterAgent(BaseAgent):
                 ], weight=6, required_items=4),
                 ContextSection("前后文", context_lines, weight=2),
                 ContextSection("可用事实", [
-                    f"fact_id={item.get('id')}：{item.get('content', '')}" for item in support_facts
+                    f"fact_id={item.get('id')}：{item.get('content', '')} [来源语义={semantic_profile_line(item.get('semantic_profile'), item.get('assertion_mode'), item.get('assertion_mode_raw'))}]"
+                    for item in support_facts
                 ], weight=5),
                 ContextSection("可用推论", [
-                    f"inference_id={item.get('id')}；依据事实={item.get('based_fact_ids') or []}：{item.get('content', '')}"
+                    f"inference_id={item.get('id')}；依据事实={item.get('based_fact_ids') or []}：{item.get('content', '')} "
+                    f"[推论语义={semantic_profile_line(item.get('semantic_profile'))}; 来源语义={source_semantics_line(item.get('source_semantics'))}]"
                     for item in support_inferences
                 ], weight=4),
             ],
@@ -1704,10 +1803,14 @@ class WriterAgent(BaseAgent):
             task_id=task_id,
         )
         with session_scope() as s:
+            owner_user_id = s.execute(select(ORMShortMemory.c.owner_user_id).where(
+                ORMShortMemory.c.task_id == task_id,
+            )).scalar_one_or_none()
             result = s.execute(
                 ORMReport.insert().values(
                     plan_id=report.plan_id, title=report.title,
                     task_id=task_id,
+                    owner_user_id=owner_user_id,
                     style_profile_id=report.style_profile_id, status="draft",
                 )
             )
@@ -2032,7 +2135,7 @@ class WriterAgent(BaseAgent):
                 key: value for key, value in narrative_plan.items()
                 if key not in {"target_words", "subsections"}
             }
-        execution_contract = json.dumps({
+        execution_contract = json.dumps(_writer_argument_contract({
             "chapter": {
                 "questions": chapter_plan.get("questions") or [],
                 "judgment": chapter_plan.get("judgment") or "",
@@ -2043,7 +2146,7 @@ class WriterAgent(BaseAgent):
                 "next_bridge": chapter_plan.get("next_bridge") or "",
             },
             "narrative": narrative_contract,
-        }, ensure_ascii=False)
+        }), ensure_ascii=False)
         rules_block = ""
         if institution_rules:
             rules_block = (
@@ -2061,13 +2164,13 @@ class WriterAgent(BaseAgent):
             chapter_facts,
             key=lambda item: 0 if int(item.get("id") or 0) in preferred_fact_ids else 1,
         )
-        fact_lines = [f"{_f['id']}. {_f['content']}" for _f in ordered_facts]
+        fact_lines = [fact_line(item) for item in ordered_facts]
         preferred_inference_ids = set(_int_ids(unit_plan.get("inference_ids")))
         ordered_inferences = sorted(
             chapter_inferences,
             key=lambda item: 0 if int(item.get("id") or 0) in preferred_inference_ids else 1,
         )
-        inference_lines = [f"{i['id']}. ({i['source_level']}) {i['content']}" for i in ordered_inferences]
+        inference_lines = [inference_line(item) for item in ordered_inferences]
         memory_block = self._memory_block(report_memory)
         planned_subsections = [
             strip_heading_prefix(str(item.get("title") or ""))
@@ -2077,6 +2180,7 @@ class WriterAgent(BaseAgent):
         def build_prompt(selected_facts: list[str], selected_inferences: list[str]) -> str:
             return (
             f"报告标题:{plan.get('title', '')}\n"
+            f"用户成文要求:{plan.get('user_requirements') or ''}\n"
             + f"文档形态:{document_shape['kind']}；一级标题:{document_shape['heading_policy']}；二级标题:{document_shape['subheading_policy']}。"
               "内部语义单元只用于组织证据；是否显示标题由文档形态决定，不得自行添加编号或 Markdown 标题。\n"
             f"报告核心判断:{plan.get('core_judgment', '')}\n"
@@ -2104,10 +2208,11 @@ class WriterAgent(BaseAgent):
             + "本章相关推断清单:\n" + "\n".join(selected_inferences) + "\n\n"
             + f"{chapter_style}\n"
             + "请按当前交付单元契约撰写当前章节或小节。若提供段落执行计划，必须遵守其边界和顺序；"
-              "否则先在内部设计自然段的主题、顺序和承接关系，再输出正式、连贯、可阅读的正文;"
+              "否则依据证据关系和当前文体设计自然段。句式、节奏和承接方式由匹配的模板表达参考指导，不要求每段添加主题句或过渡句;"
               "自然段数量和每段篇幅由规划的语义关系、证据密度与阅读需要决定，不要套用固定段数;"
               "不要把 fact 清单改写成一串短句。输出必须是一个 JSON 对象,优先只包含 paragraphs 字段;"
-              "paragraphs 每项代表一个自然段,包含 sentences 数组;sentences 每项包含 text/fact_ids/inference_ids。"
+              "paragraphs 每项代表一个自然段,包含 paragraph_id 和 sentences 数组;paragraph_id 对应当前计划中的段落标识。"
+              "计划中不同论证段应分别输出,不得把全部段落压缩成一个对象;sentences 每项包含 text/fact_ids/inference_ids。"
               "无引用句仅可用于纯组织性过渡,必须额外标记 source_level=\"TRANSITION\"；实质性事实、判断以及反问句中的事实前提都必须绑定依据。"
               "同一自然段内多句话应放在同一个 paragraph 中,不要每句话单独建段。"
               "不要输出小标题或 source_level=\"SUBHEADING\";小标题由系统按 Narrative Plan 渲染。不要输出解释、备选文本、Markdown 代码块或额外字段。"
@@ -2120,6 +2225,7 @@ class WriterAgent(BaseAgent):
         candidate_inference_ids = extract_numbered_ids(inference_lines)
         fact_lines, inference_lines = _pack_writer_evidence(
             fact_lines, inference_lines, evidence_tokens,
+            {int(item['id']): evidence_ids(item.get('based_fact_ids')) for item in ordered_inferences},
         )
         prompt = build_prompt(fact_lines, inference_lines)
         supplied_fact_ids = extract_numbered_ids(fact_lines)
@@ -2157,6 +2263,10 @@ class WriterAgent(BaseAgent):
             unit_target_words,
             settings.writer_output_tokens,
             settings.writer_output_tokens_per_word,
+            structured_output_overhead_tokens=_writer_json_overhead(
+                (unit_plan or narrative_plan).get("paragraphs") or [],
+                supplied_fact_ids, supplied_inference_ids,
+            ),
         )
         try:
             payload, effective_output_limit = self._generate_json_with_budget_retry(prompt, output_limit)
@@ -2188,6 +2298,11 @@ class WriterAgent(BaseAgent):
         paragraphs = _coerce_paragraphs(payload)
         result: list[dict] = []
         paragraph_number = 0
+        planned_paragraphs = (unit_plan or narrative_plan).get("paragraphs") or []
+        paragraph_positions = {
+            str(item.get("paragraph_id")): index
+            for index, item in enumerate(planned_paragraphs, start=1) if item.get("paragraph_id")
+        }
         transition_budget = (
             4
             if chapter_facts or chapter_inferences else 0
@@ -2203,6 +2318,7 @@ class WriterAgent(BaseAgent):
             if not sentences:
                 continue
             paragraph_number += 1
+            paragraph_number = paragraph_positions.get(str(paragraph.get("paragraph_id")), paragraph_number)
             for sentence in sentences:
                 if not isinstance(sentence, dict):
                     dropped_untraced_sentences += 1

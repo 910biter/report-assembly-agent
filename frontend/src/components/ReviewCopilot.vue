@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
 import { api, jsonInit } from "@/api/http";
+import UiMarkdown from "@/components/ui/UiMarkdown.vue";
 
 const props = defineProps<{
   taskId?: string;
@@ -732,7 +733,8 @@ async function archiveCurrent() {
               :class="item.role"
             >
               <small>{{ item.role === "user" ? "你" : "助手" }}</small>
-              <p>{{ item.content }}</p>
+              <UiMarkdown v-if="item.role !== 'user'" :content="item.content" />
+              <p v-else>{{ item.content }}</p>
             </div>
             <article v-else class="proposal conversation-proposal">
               <div class="proposal-head">
@@ -1034,24 +1036,30 @@ async function archiveCurrent() {
 }
 .messages {
   display: grid;
-  gap: 11px;
+  gap: 24px;
   min-width: 0;
 }
 .message {
-  max-width: 88%;
-  padding: 10px 12px;
-  border-left: 2px solid var(--color-border-strong);
-  background: var(--color-surface-soft);
+  width: 100%;
+  max-width: 100%;
+  padding: 0 4px;
+  background: transparent;
   overflow-wrap: anywhere;
 }
 .message.user {
+  width: auto;
+  max-width: 88%;
   justify-self: end;
-  border-left: 0;
-  border-right: 2px solid var(--primary);
-  background: var(--color-primary-soft);
+  padding: 12px 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-panel);
+  background: var(--surface-raised);
 }
 .message small {
-  color: var(--color-muted);
+  display: block;
+  margin-bottom: 8px;
+  font-size: 12px;
+  color: var(--muted-foreground);
 }
 .message p {
   margin: 3px 0;

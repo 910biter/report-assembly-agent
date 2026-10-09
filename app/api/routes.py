@@ -9,12 +9,13 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import APIRouter, BackgroundTasks, File, Form, Query, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, Query, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from sqlalchemy import delete, func, insert, select, update
 from sqlalchemy.exc import IntegrityError
 
 from app.config import settings
+from app.assertion_semantics import normalize_semantic_profile
 from app.pagination import page_ids
 from app.db import session_scope
 from app.export import export_report
@@ -82,8 +83,43 @@ from app.token_monitor import build_token_efficiency, build_workload_profile, li
 from app.workflow import WorkflowController
 from app.workflow.queue import enqueue_task, request_control, task_queue_status
 from app.workflow.progress import progress_for_display
+from app.auth.authorization import authorize_request
+from app.auth.ownership import require_owner
 
-router = APIRouter(prefix="/api")
+router = APIRouter(prefix="/api", dependencies=[Depends(authorize_request)])
+
+
+def _request_owner(request: Request | None) -> int | None:
+    if not settings.multiuser_enabled:
+        return None
+    if request is None:
+        raise RuntimeError("AUTHENTICATED_REQUEST_REQUIRED")
+    return request.state.principal.user_id
+
+
+def _source_semantics_payload(value) -> list[dict]:
+    """Return readable, shape-checked source profiles without exposing raw JSON."""
+    try:
+        items = value if isinstance(value, list) else json.loads(value or "[]")
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(items, list):
+        return []
+    result = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        try:
+            fact_id = int(item.get("fact_id"))
+        except (TypeError, ValueError):
+            continue
+        result.append({
+            "fact_id": fact_id,
+            "profile": normalize_semantic_profile(item.get("profile")),
+            "legacy_assertion_mode": str(item.get("legacy_assertion_mode") or ""),
+            "legacy_assertion_detail": str(item.get("legacy_assertion_detail") or ""),
+        })
+    return result
 
 
 def _ui_timestamp(value) -> str:
@@ -112,6 +148,7 @@ def create_task(
     requirement_review: str = Form("auto"),
     directory_review: str = Form("auto"),
     files: list[UploadFile] | None = File(default=None),
+    request: Request = None,
 ):
     """创建任务:上传材料 + 指定主题 + 可选模板(不选则用全局默认模板)。"""
     workflow_mode = workflow_mode if workflow_mode in {"automatic", "collaborative"} else "automatic"
@@ -120,8 +157,14 @@ def create_task(
     if workflow_mode == "automatic" and not theme.strip():
         return JSONResponse({"error": "THEME_REQUIRED"}, status_code=400)
     task_id = uuid.uuid4().hex[:12]
+    owner = _request_owner(request)
+    if variant_id is not None and owner is not None:
+        require_owner("template", variant_id, request.state.principal)
     try:
-        material_ids = _collect_material_ids(task_id, existing_material_ids, files)
+        material_ids = _collect_material_ids(
+            task_id, existing_material_ids, files,
+            **({"owner_user_id": owner} if owner is not None else {}),
+        )
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=409)
     material_ids = list(dict.fromkeys(material_ids))
@@ -152,7 +195,8 @@ def create_task(
     with session_scope() as tx:
         run_id = create_task_run(task_id, revision=1, run_mode="initial", _session=tx)
         task_payload["run_id"] = run_id
-        short_term.create_task(task_id, task_payload, _session=tx)
+        short_term.create_task(task_id, task_payload, _session=tx,
+                               **({"owner_user_id": owner} if owner is not None else {}))
     attach_draft_thread(interaction_draft_id, task_id)
     queue = enqueue_task(task_id) if workflow_mode == "collaborative" else {}
     return {"task_id": task_id, "material_count": len(material_ids), "queue": queue}
@@ -161,11 +205,15 @@ def create_task(
 @router.post("/documents/parse")
 def create_document_analysis(
     files: list[UploadFile] | None = File(default=None),
+    request: Request = None,
 ):
     """Parse uploaded documents and stop after reusable material understanding."""
     task_id = uuid.uuid4().hex[:12]
+    owner = _request_owner(request)
     try:
-        material_ids = _collect_material_ids(task_id, files=files)
+        material_ids = _collect_material_ids(
+            task_id, files=files, **({"owner_user_id": owner} if owner is not None else {}),
+        )
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=409)
     if not material_ids:
@@ -174,6 +222,7 @@ def create_document_analysis(
         names = [str(row["filename"]) for row in s.execute(
             select(ORMMaterial.c.filename).where(ORMMaterial.c.id.in_(material_ids))
         ).mappings().all()]
+    run_id = None
     task_payload = {
         "theme": f"文档解析：{'、'.join(names[:2])}{'等' if len(names) > 2 else ''}",
         "user_requirements": "解析所选材料，形成可追溯的摘要、提纲与关键信息，供后续理解和复用。",
@@ -190,15 +239,19 @@ def create_document_analysis(
     with session_scope() as tx:
         run_id = create_task_run(task_id, revision=1, run_mode="document_analysis", _session=tx)
         task_payload["run_id"] = run_id
-        short_term.create_task(task_id, task_payload, _session=tx)
+        short_term.create_task(task_id, task_payload, _session=tx,
+                               **({"owner_user_id": owner} if owner is not None else {}))
     return {"task_id": task_id, "material_count": len(material_ids), "queue": enqueue_task(task_id)}
 
 
 @router.get("/documents")
-def list_document_analyses():
+def list_document_analyses(request: Request):
     """List dedicated document-understanding runs without mixing them into report tasks."""
     with session_scope() as s:
-        rows = s.execute(select(ORMShortMemory.c.task_id, ORMShortMemory.c.payload)).mappings().all()
+        query = select(ORMShortMemory.c.task_id, ORMShortMemory.c.payload)
+        if (owner := _request_owner(request)) is not None:
+            query = query.where(ORMShortMemory.c.owner_user_id == owner)
+        rows = s.execute(query).mappings().all()
     items = []
     for row in rows:
         payload = json.loads(row["payload"])
@@ -240,6 +293,7 @@ def get_document_analysis(task_id: str):
 @router.post("/reports/{report_id}/incremental/tasks")
 def create_incremental_task(
     report_id: int,
+    request: Request,
     update_reason: str = Form(""),
     existing_material_ids: str = Form(""),
     source_comparison_id: int | None = Form(None),
@@ -254,7 +308,10 @@ def create_incremental_task(
         if report is None:
             return JSONResponse({"error": "REPORT_NOT_FOUND"}, status_code=404)
     try:
-        submitted_material_ids = _collect_material_ids(task_id, existing_material_ids, files)
+        submitted_material_ids = _collect_material_ids(
+            task_id, existing_material_ids, files,
+            owner_user_id=_request_owner(request),
+        )
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=409)
     comparison_handoff = None
@@ -292,9 +349,11 @@ def create_material_comparison(
     base_version_id: int | None = Form(None),
     existing_material_ids: str = Form(""),
     files: list[UploadFile] | None = File(default=None),
+    request: Request = None,
 ):
     """Create an independent, read-only new-material comparison task."""
     root_task_id = _find_task_by_report(report_id)
+    owner = _request_owner(request)
     if root_task_id is None:
         return JSONResponse({"error": "REPORT_NOT_FOUND"}, status_code=404)
     base_task = short_term.load_task(root_task_id) or {}
@@ -310,7 +369,10 @@ def create_material_comparison(
         version = get_report_version(snapshot.version_id)
     comparison_task_id = f"cmp-{uuid.uuid4().hex[:12]}"
     try:
-        material_ids = _collect_material_ids(comparison_task_id, existing_material_ids, files)
+        material_ids = _collect_material_ids(
+            comparison_task_id, existing_material_ids, files,
+            **({"owner_user_id": owner} if owner is not None else {}),
+        )
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=409)
     if not material_ids:
@@ -343,7 +405,8 @@ def create_material_comparison(
         )
         task_payload["run_id"] = run_id
         task_payload["comparison_id"] = comparison["id"]
-        short_term.create_task(comparison_task_id, task_payload, _session=tx)
+        short_term.create_task(comparison_task_id, task_payload, _session=tx,
+                               **({"owner_user_id": owner} if owner is not None else {}))
     queue = enqueue_task(comparison_task_id)
     return {
         "comparison_id": comparison["id"], "task_id": comparison_task_id,
@@ -397,23 +460,34 @@ def material_comparison_update_handoff(comparison_id: int):
 
 
 def _collect_material_ids(task_id: str, existing_material_ids: str = "",
-                          files: list[UploadFile] | None = None) -> list[int]:
+                          files: list[UploadFile] | None = None,
+                          owner_user_id: int | None = None) -> list[int]:
     """Create/reuse Material rows from uploaded files and existing IDs."""
     settings.ensure_dirs()
     material_ids: list[int] = []
     for item in (existing_material_ids or "").split(","):
         item = item.strip()
         if item.isdigit():
-            material_ids.append(int(item))
+            material_id = int(item)
+            if owner_user_id is not None:
+                with session_scope() as s:
+                    found = s.execute(select(ORMMaterial.c.id).where(
+                        ORMMaterial.c.id == material_id,
+                        ORMMaterial.c.owner_user_id == owner_user_id,
+                    )).first()
+                if found is None:
+                    raise ValueError("MATERIAL_NOT_FOUND")
+            material_ids.append(material_id)
     for upload in files or []:
         if not upload.filename:
             continue
         content = upload.file.read()
         file_hash = hashlib.sha256(content).hexdigest()
         with session_scope() as s:
-            existing = s.execute(
-                select(ORMMaterial.c.id).where(ORMMaterial.c.file_hash == file_hash)
-            ).mappings().first()
+            match = select(ORMMaterial.c.id).where(ORMMaterial.c.file_hash == file_hash)
+            if owner_user_id is not None:
+                match = match.where(ORMMaterial.c.owner_user_id == owner_user_id)
+            existing = s.execute(match).mappings().first()
             if existing is not None:
                 material_ids.append(existing["id"])
                 continue
@@ -429,14 +503,13 @@ def _collect_material_ids(task_id: str, existing_material_ids: str = "",
                         path=str(dest),
                         fingerprint=file_hash,
                         file_hash=file_hash,
+                        owner_user_id=owner_user_id,
                     )
                 )
                 material_ids.append(result.inserted_primary_key[0])
             except IntegrityError:
                 s.rollback()
-                existing = s.execute(
-                    select(ORMMaterial.c.id).where(ORMMaterial.c.file_hash == file_hash)
-                ).mappings().first()
+                existing = s.execute(match).mappings().first()
                 dest.unlink(missing_ok=True)
                 if existing is None:
                     raise ValueError(f"MATERIAL_SAVE_FAILED:{filename}")
@@ -445,17 +518,24 @@ def _collect_material_ids(task_id: str, existing_material_ids: str = "",
 
 
 @router.get("/tasks")
-def list_tasks():
+def list_tasks(request: Request):
     """历史任务列表(按创建时间倒序),含主题/状态/报告链接。"""
     with session_scope() as s:
-        rows = s.execute(
-            select(ORMShortMemory.c.task_id, ORMShortMemory.c.payload)
-        ).mappings().all()
+        query = select(ORMShortMemory.c.task_id, ORMShortMemory.c.payload)
+        if (owner := _request_owner(request)) is not None:
+            query = query.where(ORMShortMemory.c.owner_user_id == owner)
+        rows = s.execute(query).mappings().all()
     tasks = []
+    queue_position = None
+    if settings.multiuser_enabled:
+        from app.workflow.queue_store import position as queue_position
     for row in rows:
         payload = _task_view(json.loads(row["payload"]))
         if payload.get("run_mode") in {"document_analysis", "material_discussion"}:
             continue
+        queue_status = dict(payload.get("queue_status") or {})
+        if queue_position is not None and queue_status.get("status") in {"queued", "running"}:
+            queue_status["ahead"] = queue_position(row["task_id"])
         tasks.append({
             "task_id": row["task_id"],
             "theme": payload.get("theme", ""),
@@ -470,11 +550,12 @@ def list_tasks():
             "incremental_update": bool(payload.get("incremental_update")),
             "incremental_added_material_count": len(payload.get("incremental_added_material_ids") or []),
             "update_reason": payload.get("incremental_delta", {}).get("update_reason", "") if isinstance(payload.get("incremental_delta"), dict) else "",
+            "queue_status": queue_status,
             # Lists only need enough state to classify a task. Detailed timing,
             # token and resource samples remain available from the task detail API.
             "progress": {
                 "stage": payload.get("stage", ""),
-                "queue_status": payload.get("queue_status") or {},
+                "queue_status": queue_status,
             },
         })
     return tasks
@@ -488,6 +569,8 @@ def run_task(task_id: str):
     result = enqueue_task(task_id)
     if result.get("status") == "not_found":
         return JSONResponse({"error": "TASK_NOT_FOUND"}, status_code=404)
+    if result.get("status") == "queue_limit":
+        return JSONResponse({"error": "USER_QUEUE_LIMIT_REACHED"}, status_code=409)
     return result
 
 
@@ -508,6 +591,10 @@ def get_task(task_id: str):
     if task is None:
         return JSONResponse({"error": "TASK_NOT_FOUND"}, status_code=404)
     view = _task_view(task)
+    queue_status = dict(view.get("queue_status") or {})
+    if settings.multiuser_enabled and queue_status.get("status") in {"queued", "running"}:
+        from app.workflow.queue_store import position
+        queue_status["ahead"] = position(task_id)
     comparison = view.get("material_comparison") or {}
     return {
         "task_id": task_id,
@@ -529,7 +616,7 @@ def get_task(task_id: str):
         "directory_review": view.get("directory_review") or "auto",
         "directory_review_pending": bool(view.get("directory_review_pending")),
         "directory_review_completed": bool(view.get("directory_review_completed")),
-        "queue_status": view.get("queue_status") or {},
+        "queue_status": queue_status,
         "parse_progress": view.get("parse_progress") or {},
         "material_analysis_progress": view.get("material_analysis_progress") or {},
         "evidence_progress": view.get("evidence_progress") or {},
@@ -782,6 +869,9 @@ def task_analysis_page(
             by_id = {int(row["id"]): row for row in rows}
             items = [{
                 "id": row["id"], "content": row["content"], "dimension": row["dimension"],
+                "assertion_mode": row.get("assertion_mode"),
+                "assertion_mode_raw": row.get("assertion_mode_raw"),
+                "semantic_profile": normalize_semantic_profile(row.get("semantic_profile_json")),
                 "evidence": evidence_by_fact.get(fact_id, []),
             } for fact_id in visible_ids if (row := by_id.get(fact_id)) is not None]
         else:
@@ -794,6 +884,8 @@ def task_analysis_page(
                 "analysis_type": row["analysis_type"],
                 "confidence_level": row["confidence_level"],
                 "confidence_reason": row["confidence_reason"], "uncertainty": row["uncertainty"],
+                "semantic_profile": normalize_semantic_profile(row.get("semantic_profile_json")),
+                "source_semantics": _source_semantics_payload(row.get("source_semantics_json")),
             } for inference_id in visible_ids if (row := by_id.get(inference_id)) is not None]
     return {"items": items, "total": total, "page": page, "page_size": page_size}
 
@@ -826,6 +918,9 @@ def task_analysis(task_id: str):
         fact_by_id = {int(row["id"]): row for row in fact_rows}
         facts = [{
             "id": row["id"], "content": row["content"], "dimension": row["dimension"],
+            "assertion_mode": row.get("assertion_mode"),
+            "assertion_mode_raw": row.get("assertion_mode_raw"),
+            "semantic_profile": normalize_semantic_profile(row.get("semantic_profile_json")),
             "evidence": evidence_by_fact.get(fact_id, []),
         } for fact_id in fact_ids if (row := fact_by_id.get(fact_id)) is not None]
         inferences = []
@@ -848,6 +943,8 @@ def task_analysis(task_id: str):
                 "confidence_level": row["confidence_level"],
                 "confidence_reason": row["confidence_reason"],
                 "uncertainty": row["uncertainty"],
+                "semantic_profile": normalize_semantic_profile(row.get("semantic_profile_json")),
+                "source_semantics": _source_semantics_payload(row.get("source_semantics_json")),
             }
             (external_inferences if inference_id in external_ids else inferences).append(item)
         from app.evidence.extractor import load_conflict_records
@@ -941,11 +1038,12 @@ def task_token_efficiency(task_id: str):
 # ---------- 材料 ----------
 
 @router.get("/materials")
-def list_materials():
+def list_materials(request: Request):
     """材料库:材料列表 + 解析状态(单元数/重复标记)。"""
-    material_tasks = _material_task_index()
+    owner = _request_owner(request)
+    material_tasks = _material_task_index(owner)
     with session_scope() as s:
-        rows = s.execute(
+        query = (
             select(
                 ORMMaterial.c.id, ORMMaterial.c.filename, ORMMaterial.c.file_type,
                 ORMMaterial.c.parsed_at,
@@ -961,7 +1059,10 @@ def list_materials():
                 ORMMaterial.c.is_duplicate, ORMMaterial.c.duplicate_of,
             )
             .order_by(ORMMaterial.c.id.desc())
-        ).mappings().all()
+        )
+        if owner is not None:
+            query = query.where(ORMMaterial.c.owner_user_id == owner)
+        rows = s.execute(query).mappings().all()
     return [{
         "id": r["id"], "filename": r["filename"], "file_type": r["file_type"],
         "unit_count": r["unit_count"], "is_duplicate": r["is_duplicate"],
@@ -974,9 +1075,9 @@ def list_materials():
 
 
 @router.get("/materials/{material_id}")
-def get_material(material_id: int):
+def get_material(material_id: int, request: Request = None):
     """Material detail with parsed units and its reusable understanding result."""
-    material_tasks = _material_task_index()
+    material_tasks = _material_task_index(_request_owner(request))
     with session_scope() as s:
         material = s.execute(
             select(ORMMaterial).where(ORMMaterial.c.id == material_id)
@@ -1015,13 +1116,14 @@ def get_material(material_id: int):
 
 
 @router.post("/materials/{material_id}/assistant-session")
-def create_material_assistant_session(material_id: int):
+def create_material_assistant_session(material_id: int, request: Request = None):
     """Create a material-scoped assistant context without entering report generation."""
     with session_scope() as s:
         material = s.execute(select(ORMMaterial).where(ORMMaterial.c.id == material_id)).mappings().first()
     if material is None:
         return JSONResponse({"error": "MATERIAL_NOT_FOUND"}, status_code=404)
     task_id = uuid.uuid4().hex[:12]
+    owner = _request_owner(request)
     short_term.create_task(task_id, {
         "theme": f"材料理解：{material['filename']}",
         "user_requirements": "解释所选材料的内容、结构、关键信息、可证明范围与缺失信息；不得引用未选材料。",
@@ -1034,18 +1136,19 @@ def create_material_assistant_session(material_id: int):
         "queue_status": {"status": "completed"},
         "requirement_review_completed": True,
         "directory_review_completed": True,
-    })
+    }, **({"owner_user_id": owner} if owner is not None else {}))
     return {"task_id": task_id}
 
 
 # ---------- 报告 ----------
 
 @router.get("/reports")
-def list_reports():
+def list_reports(request: Request):
     """报告库列表(按生成时间倒序)。"""
-    report_tasks = _report_task_index()
+    owner = _request_owner(request)
+    report_tasks = _report_task_index(owner)
     with session_scope() as s:
-        rows = s.execute(
+        query = (
             select(
                 ORMReport.c.id, ORMReport.c.title, ORMReport.c.status, ORMReport.c.created_at,
                 func.count(ORMSentence.c.id).label("sentence_count"),
@@ -1057,7 +1160,10 @@ def list_reports():
                 ORMReport.c.id, ORMReport.c.title, ORMReport.c.status, ORMReport.c.created_at,
             )
             .order_by(ORMReport.c.id.desc())
-        ).mappings().all()
+        )
+        if owner is not None:
+            query = query.where(ORMReport.c.owner_user_id == owner)
+        rows = s.execute(query).mappings().all()
         report_ids = [int(row["id"]) for row in rows]
         version_rows = s.execute(
             select(ORMReportVersion).where(ORMReportVersion.c.report_id.in_(report_ids))
@@ -1417,9 +1523,18 @@ def report_version_detail(version_id: int):
 
 
 @router.post("/reports/{report_id}/incremental/preview")
-def incremental_update_preview(report_id: int, payload: dict):
+def incremental_update_preview(report_id: int, payload: dict, request: Request = None):
     """增量更新预检:只记录 Delta,不改报告正文、不重写章节。"""
     material_ids = payload.get("material_ids") or payload.get("added_material_ids") or []
+    if (owner := _request_owner(request)) is not None:
+        if not isinstance(material_ids, list):
+            return JSONResponse({"error": "INVALID_MATERIAL_IDS"}, status_code=400)
+        with session_scope() as s:
+            allowed = set(s.execute(select(ORMMaterial.c.id).where(
+                ORMMaterial.c.id.in_(material_ids), ORMMaterial.c.owner_user_id == owner,
+            )).scalars().all())
+        if any(not str(item).isdigit() or int(item) not in allowed for item in material_ids):
+            return JSONResponse({"error": "MATERIAL_NOT_FOUND"}, status_code=404)
     try:
         delta = create_incremental_delta(
             report_id,
@@ -1460,14 +1575,18 @@ def export(report_id: int):
 def create_style_learning_job(
     background_tasks: BackgroundTasks,
     files: list[UploadFile] = File(...),
-    asset_role: str = Form("auto"),
+    asset_roles_json: str = Form(...),
+    request: Request = None,
 ):
     """Accept uploads quickly, then learn the template asynchronously."""
     if not files:
         return JSONResponse({"error": "NO_FILES"}, status_code=400)
-    asset_role = str(asset_role or "auto").lower()
-    if asset_role not in {"auto", "editorial", "structure", "layout"}:
-        return JSONResponse({"error": "INVALID_ASSET_ROLE"}, status_code=400)
+    try:
+        roles_by_file = style.validate_asset_role_assignments(
+            [upload.filename or "" for upload in files], asset_roles_json,
+        )
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc) or "INVALID_ASSET_ROLES"}, status_code=400)
     job_id = uuid.uuid4().hex[:16]
     job_dir = settings.runtime_root / "style_jobs" / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
@@ -1480,12 +1599,12 @@ def create_style_learning_job(
                 shutil.copyfileobj(upload.file, handle)
             stored.append({
                 "filename": filename, "path": str(target), "size": target.stat().st_size,
-                "asset_role": asset_role,
+                "asset_roles": roles_by_file[index - 1],
             })
     except Exception as exc:
         shutil.rmtree(job_dir, ignore_errors=True)
         return JSONResponse({"error": f"UPLOAD_SAVE_FAILED:{exc}"}, status_code=500)
-    job = create_style_job(stored, job_id=job_id)
+    job = create_style_job(stored, job_id=job_id, owner_user_id=_request_owner(request))
     background_tasks.add_task(run_style_job, job["id"])
     return job
 
@@ -1498,10 +1617,10 @@ def style_learning_job(job_id: str):
     return job
 
 @router.get("/style/variants")
-def list_style_variants():
+def list_style_variants(request: Request):
     # The exemplar bank can contain hundreds of long paragraphs. Keep the
     # selector/list payload light and load the full profile only on inspection.
-    return [variant_summary_fields(v) for v in style.list_variants()]
+    return [variant_summary_fields(v) for v in style.list_variants(owner_user_id=_request_owner(request))]
 
 
 @router.get("/style/variants/{variant_id}/template-schema")
@@ -1569,7 +1688,14 @@ def update_style_profile(variant_id: int, payload: dict):
 # ---------- 异步用户介入 ----------
 
 @router.post("/interactions")
-def start_interaction(payload: dict):
+def start_interaction(payload: dict, request: Request = None):
+    owner = _request_owner(request)
+    if owner is not None:
+        principal = request.state.principal
+        if payload.get("task_id"):
+            require_owner("task", str(payload["task_id"]), principal)
+        if payload.get("report_id") is not None:
+            require_owner("report", int(payload["report_id"]), principal)
     try:
         return create_interaction_thread(
             task_id=str(payload.get("task_id") or ""),
@@ -1578,14 +1704,26 @@ def start_interaction(payload: dict):
             artifact_version=str(payload.get("artifact_version") or ""),
             object_id=str(payload.get("object_id") or ""),
             scope=payload.get("scope") if isinstance(payload.get("scope"), dict) else {},
+            **({"owner_user_id": owner} if owner is not None else {}),
         )
     except (TypeError, ValueError) as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)
 
 
 @router.get("/interactions")
-def interactions(task_id: str = "", report_id: int | None = None, draft_id: str = ""):
-    return list_interaction_threads(task_id=task_id, report_id=report_id, draft_id=draft_id)
+def interactions(task_id: str = "", report_id: int | None = None, draft_id: str = "",
+                 request: Request = None):
+    owner = _request_owner(request)
+    if owner is not None:
+        principal = request.state.principal
+        if task_id:
+            require_owner("task", task_id, principal)
+        if report_id is not None:
+            require_owner("report", report_id, principal)
+    return list_interaction_threads(
+        task_id=task_id, report_id=report_id, draft_id=draft_id,
+        **({"owner_user_id": owner} if owner is not None else {}),
+    )
 
 
 @router.get("/tasks/{task_id}/review-workspace")
@@ -1598,7 +1736,14 @@ def task_review_workspace(task_id: str, artifact_type: str = "task_brief", q: st
 
 
 @router.get("/interaction-notifications")
-def interaction_notifications(task_id: str = "", report_id: int | None = None):
+def interaction_notifications(task_id: str = "", report_id: int | None = None,
+                              request: Request = None):
+    if _request_owner(request) is not None:
+        principal = request.state.principal
+        if task_id:
+            require_owner("task", task_id, principal)
+        if report_id is not None:
+            require_owner("report", report_id, principal)
     return list_interaction_notifications(task_id=task_id, report_id=report_id)
 
 
@@ -1659,6 +1804,8 @@ def decide_change_proposal(proposal_id: int, payload: dict):
 @router.get("/health")
 def health():
     """网关连通与模型在位状态(系统设置页使用)。"""
+    if settings.multiuser_enabled:
+        return {"status": "ok"}
     from app.gateway import model_gateway
     from app.runtime_profiles import runtime_profile_manifest
     from app.context_budget import tokenizer_method
@@ -1968,10 +2115,7 @@ def variant_fields(variant) -> dict:
         "institution_rules": variant.institution_rules,
         "structure_policy": variant.structure_policy,
         "exemplar_bank": variant.exemplar_bank,
-        "profile_confidence": {
-            key: value for key, value in (variant.profile_confidence or {}).items()
-            if key != "evidence_usage"
-        },
+        "learning_evidence": structure.get("learning_evidence", {}),
         "profile_version": variant.profile_version,
         "source_reports": variant.source_reports,
         "status": variant.status,
@@ -1979,16 +2123,22 @@ def variant_fields(variant) -> dict:
 
 
 def variant_summary_fields(variant) -> dict:
+    evidence = (variant.structure or {}).get("learning_evidence", {})
+    evidence_summary = {
+        key: evidence.get(key)
+        for key in (
+            "source_count", "role_source_counts", "editorial", "structure", "layout",
+            "profile_prompt", "topic_probe",
+        )
+        if isinstance(evidence, dict) and key in evidence
+    }
     return {
         "id": variant.id,
         "name": variant.name,
         "description": variant.description,
         "status": variant.status,
         "profile_version": variant.profile_version,
-        "profile_confidence": {
-            key: value for key, value in (variant.profile_confidence or {}).items()
-            if key != "evidence_usage"
-        },
+        "learning_evidence": evidence_summary,
         "source_reports": variant.source_reports,
         "exemplar_count": len(variant.exemplar_bank or []),
         "asset_roles": _variant_asset_roles(variant),
@@ -2007,53 +2157,46 @@ def _variant_asset_roles(variant) -> dict:
         or dominant.get("source_template_path")
         or dominant.get("template_schema")
     )
-    has_structure = bool(
-        saved.get("structural_reference")
-        or structure.get("sections")
-        or structure.get("heading_patterns")
-    )
     has_editorial = bool(
         saved.get("editorial_reference")
         or variant.exemplar_bank
         or variant.style_samples
         or variant.writing_style
     )
-    if saved:
+    if saved.get("role_assignment_known") is True:
         result = dict(saved)
         result.update({
             "editorial_reference": has_editorial,
-            "structural_reference": has_structure,
             "layout_master_available": has_layout,
-            "layout_master": bool(saved.get("layout_master") or has_layout),
+            "layout_master": bool(saved.get("layout_master") and has_layout),
         })
-    else:
-        result = {
-            "editorial_reference": has_editorial,
-            "structural_reference": has_structure,
-            "layout_master": has_layout,
-            "layout_master_available": has_layout,
-        }
-    result.setdefault(
-        "note",
-        "该模板包含可复用的原始 DOCX 版式母版。" if has_layout
-        else "该模板用于文体和结构参考；Word 导出将使用任务默认版式。",
-    )
-    return result
+        return result
+    return {
+        "role_assignment_known": False,
+        "editorial_reference": has_editorial,
+        "structural_reference": False,
+        "layout_master": has_layout,
+        "layout_master_available": has_layout,
+        "note": (
+            "该历史画像未记录逐文件用途；只能确认已有语言画像和版式文件，"
+            "不能据此认定历史目录具有结构参考权限。"
+        ),
+    }
 
 
-def _task_rows() -> list:
+def _task_rows(owner_user_id: int | None = None) -> list:
     from app.infrastructure.orm import ORMShortMemory
     from sqlalchemy import select
     with session_scope() as s:
-        return s.execute(
-            select(ORMShortMemory.c.task_id, ORMShortMemory.c.payload)
-            .order_by(ORMShortMemory.c.task_id.desc())
-        ).mappings().all()
+        query = select(ORMShortMemory.c.task_id, ORMShortMemory.c.payload)
+        if owner_user_id is not None:
+            query = query.where(ORMShortMemory.c.owner_user_id == owner_user_id)
+        return s.execute(query.order_by(ORMShortMemory.c.task_id.desc())).mappings().all()
 
 
-def _material_task_index() -> dict[int, list[dict]]:
+def _material_task_index(owner_user_id: int | None = None) -> dict[int, list[dict]]:
     index: dict[int, list[dict]] = {}
-    for row in _task_rows():
+    for row in _task_rows(owner_user_id):
         payload = json.loads(row["payload"])
         for material_id in payload.get("material_ids", []) or []:
             try:
@@ -2069,9 +2212,9 @@ def _material_task_index() -> dict[int, list[dict]]:
     return index
 
 
-def _report_task_index() -> dict[int, dict]:
+def _report_task_index(owner_user_id: int | None = None) -> dict[int, dict]:
     index: dict[int, dict] = {}
-    for row in _task_rows():
+    for row in _task_rows(owner_user_id):
         payload = json.loads(row["payload"])
         report_id = payload.get("report_id")
         if report_id is None:

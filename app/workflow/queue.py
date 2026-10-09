@@ -9,8 +9,10 @@ import itertools
 import queue
 import threading
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 
+from app.config import settings
 from app.memory import short_term
 
 TASK_PRIORITY_NORMAL = 50
@@ -46,6 +48,8 @@ _ACTIVE_QUEUE_STATES = {"queued", "running", "pause_requested"}
 
 def reconcile_interrupted_tasks() -> int:
     """Pause persisted in-process jobs that cannot survive a service restart."""
+    if settings.multiuser_enabled:
+        return 0
     reconciled = 0
     now = round(time.time(), 1)
     for task_id, task in short_term.list_tasks():
@@ -95,6 +99,41 @@ def enqueue_task(task_id: str, priority: int = TASK_PRIORITY_NORMAL) -> dict:
     """Queue a task if it is not already queued/running."""
     if short_term.load_task(task_id) is None:
         return {"status": "not_found"}
+    if settings.multiuser_enabled:
+        from app.workflow import queue_store
+        from app.infrastructure.orm import ORMShortMemory
+        from sqlalchemy import select
+
+        result = {}
+
+        def transition(payload, session):
+            owner = session.execute(select(ORMShortMemory.c.owner_user_id).where(
+                ORMShortMemory.c.task_id == task_id,
+            )).scalar_one()
+            if owner is None:
+                raise ValueError("TASK_OWNER_REQUIRED_FOR_QUEUE")
+            run_id = str(payload.get("run_id") or "")
+            if not run_id:
+                raise ValueError("RUN_ID_REQUIRED_FOR_QUEUE")
+            result.update(queue_store.enqueue(task_id, run_id, owner, priority, _session=session))
+            if not result["duplicate"]:
+                payload["error"] = ""
+                payload["queue_status"] = {"status": "queued", "queued_at": round(time.time(), 1)}
+            return payload
+
+        try:
+            short_term.transition_task(task_id, transition)
+        except ValueError as exc:
+            if str(exc) == "USER_QUEUE_LIMIT_REACHED":
+                return {"status": "queue_limit"}
+            raise
+        _ensure_worker()
+        position = queue_store.position(task_id)
+        return {
+            "status": "already_running" if result["duplicate"] and result["status"] == "running"
+            else "already_queued" if result["duplicate"] else "queued",
+            "queue_position": position,
+        }
     _ensure_worker()
     with _LOCK:
         if task_id == _RUNNING_TASK_ID:
@@ -120,6 +159,8 @@ def request_control(task_id: str, action: str) -> dict:
     task = short_term.load_task(task_id)
     if task is None:
         return {"status": "not_found"}
+    if settings.multiuser_enabled:
+        return _durable_request_control(task_id, task, action)
     state = task.get("queue_status") or {}
     if action == "pause":
         with _LOCK:
@@ -165,6 +206,9 @@ def request_control(task_id: str, action: str) -> dict:
 
 
 def task_queue_status() -> dict:
+    if settings.multiuser_enabled:
+        from app.workflow.queue_store import snapshot
+        return snapshot()
     with _LOCK:
         stats = dict(_STATS)
         completed = int(stats.get("completed") or 0)
@@ -191,18 +235,92 @@ def _ensure_worker() -> None:
         _WORKER_STARTED = True
 
 
-def _worker_loop() -> None:
-    global _RUNNING_TASK_ID
-    # Import inside the worker to avoid import cycles during app startup.
-    from app.workflow.controller import WorkflowController
+def _durable_request_control(task_id: str, task: dict, action: str) -> dict:
+    from app.workflow import queue_store
 
+    entry = queue_store.active_state(task_id)
+    if action == "pause":
+        if entry is None:
+            return {"status": "not_running"}
+        if entry["status"] == "queued":
+            def transition(payload, session):
+                if not queue_store.cancel(task_id, _session=session):
+                    raise ValueError("TASK_STARTED_DURING_PAUSE")
+                payload.update(stage="paused", control_request="", queue_status={
+                    "status": "paused", "finished_at": round(time.time(), 1),
+                })
+                return payload
+            try:
+                short_term.transition_task(task_id, transition)
+            except ValueError:
+                return {"status": "already_running"}
+            return {"status": "paused"}
+        short_term.update_task(task_id, control_request="pause",
+                               control_requested_at=round(time.time(), 1),
+                               queue_status={"status": "pause_requested"})
+        from app import task_control
+        task_control.request_pause(task_id)
+        return {"status": "pause_requested"}
+    if action == "resume":
+        if task.get("stage") != "paused":
+            return {"status": "not_paused"}
+        short_term.update_task(task_id, control_request="resume",
+                               control_requested_at=round(time.time(), 1))
+        from app import task_control
+        task_control.clear_pause(task_id)
+        return enqueue_task(task_id)
+    if action == "restart":
+        if entry is not None:
+            return {"status": "already_running"}
+        short_term.update_task(task_id, stage="created", control_request="restart",
+                               control_requested_at=round(time.time(), 1), error="")
+        return enqueue_task(task_id)
+    return {"status": "unsupported"}
+
+
+def _worker_loop() -> None:
     while True:
+        if settings.multiuser_enabled:
+            try:
+                ran = _durable_claim_and_run()
+            except Exception:
+                import logging
+                logging.getLogger(__name__).exception("Durable report worker failed")
+                ran = False
+            if not ran:
+                time.sleep(1)
+            continue
         item = _QUEUE.get()
         with _LOCK:
             if item.task_id in _CANCELLED_TASK_IDS:
                 _CANCELLED_TASK_IDS.discard(item.task_id)
                 _QUEUE.task_done()
                 continue
+        _process_item(item)
+
+
+def _durable_claim_and_run() -> bool:
+    from app.workflow import queue_store
+    from app.workflow.execution import execution_slot
+
+    with execution_slot(wait=True) as slot:
+        queue_store.reconcile_running()
+        claimed = queue_store.claim_next()
+        if claimed is None:
+            return False
+        item = _QueuedTask(
+            priority=int(claimed["priority"]), sequence=int(claimed["id"]),
+            task_id=str(claimed["task_id"]), queued_at=float(claimed["queued_at"]),
+        )
+        _process_item(item, held_slot=slot, entry_id=int(claimed["id"]))
+    return True
+
+
+def _process_item(item: _QueuedTask, *, held_slot=None, entry_id: int | None = None) -> None:
+    global _RUNNING_TASK_ID
+    from app.workflow.controller import WorkflowController
+    # Both queue modes run the same report workflow and completion path.
+    if item is not None:
         wait = time.time() - item.queued_at
         with _LOCK:
             _QUEUED_TASK_IDS.discard(item.task_id)
@@ -217,14 +335,17 @@ def _worker_loop() -> None:
         })
         heartbeat_stop = threading.Event()
         heartbeat = threading.Thread(
-            target=_heartbeat_loop, args=(item.task_id, heartbeat_stop),
+            target=_heartbeat_loop, args=(item.task_id, heartbeat_stop, entry_id),
             daemon=True, name=f"heartbeat-{item.task_id}",
         )
         heartbeat.start()
         outcome = None
+        finish_status = "failed"
+        finish_error = ""
+        final_fields = None
         try:
             from app.workflow.execution import execution_slot
-            with execution_slot(wait=True) as slot:
+            with (nullcontext(held_slot) if held_slot is not None else execution_slot(wait=True)) as slot:
                 with slot.task(item.task_id):
                     from app import task_control
                     task_control.begin_task(item.task_id)
@@ -237,23 +358,31 @@ def _worker_loop() -> None:
                             pass
                     outcome = WorkflowController(item.task_id).run_to_review()
             if outcome in {"awaiting_requirements", "awaiting_directory"}:
+                finish_status = "paused"
                 with _LOCK:
                     _STATS["waiting_for_user"] += 1
-                short_term.update_task(item.task_id, queue_status={
+                final_fields = {"queue_status": {
                     "status": "waiting_for_user",
                     "checkpoint": outcome,
                     "queue_wait_seconds": round(wait, 1),
-                })
+                }}
+                if entry_id is None:
+                    short_term.update_task(item.task_id, **final_fields)
             else:
+                finish_status = "completed"
                 with _LOCK:
                     _STATS["completed"] += 1
-                short_term.update_task(item.task_id, queue_status={
+                final_fields = {"queue_status": {
                     "status": "completed",
                     "queue_wait_seconds": round(wait, 1),
                     "finished_at": round(time.time(), 1),
-                })
+                }}
+                if entry_id is None:
+                    short_term.update_task(item.task_id, **final_fields)
         except Exception as exc:
             paused = str(exc) == "TASK_PAUSED"
+            finish_status = "paused" if paused else "failed"
+            finish_error = str(exc)
             if not paused:
                 with _LOCK:
                     _STATS["failed"] += 1
@@ -287,21 +416,23 @@ def _worker_loop() -> None:
             # A revision runs against the current report and is versioned on success.
             # Its failure must restore the last reviewable report.
             next_stage = "paused" if paused else ("review" if interaction_revision else "failed")
-            short_term.update_task(
-                item.task_id,
-                stage=next_stage,
-                error="" if (paused or interaction_revision) else str(exc),
-                revision_error=(
+            final_fields = {
+                "stage": next_stage,
+                "error": "" if (paused or interaction_revision) else str(exc),
+                "revision_error": (
                     f"{str(exc)}; rollback_error={rollback_error}"
                     if interaction_revision and rollback_error else str(exc)
                     if interaction_revision else ""
                 ),
-                queue_status={
+                "queue_status": {
                 "status": "paused" if paused else "failed",
                 "queue_wait_seconds": round(wait, 1),
                 "finished_at": round(time.time(), 1),
                 "error": "" if paused else str(exc),
-            })
+                },
+            }
+            if entry_id is None:
+                short_term.update_task(item.task_id, **final_fields)
         finally:
             from app import task_control
             task_control.end_task(item.task_id)
@@ -309,7 +440,12 @@ def _worker_loop() -> None:
             with _LOCK:
                 if _RUNNING_TASK_ID == item.task_id:
                     _RUNNING_TASK_ID = None
-            _QUEUE.task_done()
+            if entry_id is None:
+                _QUEUE.task_done()
+            else:
+                from app.workflow.queue_store import finish
+                finish(entry_id, finish_status, finish_error,
+                       task_id=item.task_id, task_updates=final_fields)
             try:
                 # A checkpoint is deliberately idle: accepted report revisions
                 # must not start competing work before the user resumes it.
@@ -322,8 +458,11 @@ def _worker_loop() -> None:
                 pass
 
 
-def _heartbeat_loop(task_id: str, stop: threading.Event) -> None:
+def _heartbeat_loop(task_id: str, stop: threading.Event, entry_id: int | None = None) -> None:
     while not stop.wait(10):
+        if entry_id is not None:
+            from app.workflow.queue_store import heartbeat
+            heartbeat(entry_id)
         task = short_term.load_task(task_id) or {}
         short_term.update_task(
             task_id,

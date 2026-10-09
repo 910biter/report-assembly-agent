@@ -11,12 +11,67 @@ from sqlalchemy.orm import DeclarativeBase
 # 表结构唯一真源(CREATE TABLE 语句;业务 schema 的历史基线,
 # SQLAlchemy create_all 在 PG 下按类型映射生成兼容 DDL)
 _SCHEMA = """
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'user',
+    disabled INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+);
+
+CREATE TABLE IF NOT EXISTS user_sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    token_hash TEXT NOT NULL UNIQUE,
+    expires_at REAL NOT NULL,
+    revoked INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+);
+
+CREATE TABLE IF NOT EXISTS user_preferences (
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    preference_key TEXT NOT NULL,
+    value_json TEXT NOT NULL,
+    PRIMARY KEY (user_id, preference_key)
+);
+
+CREATE TABLE IF NOT EXISTS account_audit_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    actor_user_id INTEGER NOT NULL REFERENCES users(id),
+    target_user_id INTEGER NOT NULL REFERENCES users(id),
+    action TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+);
+
+CREATE TABLE IF NOT EXISTS auth_login_attempts (
+    attempt_key TEXT PRIMARY KEY,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    window_started REAL NOT NULL,
+    blocked_until REAL NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS task_queue_entries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    owner_user_id INTEGER REFERENCES users(id),
+    priority INTEGER NOT NULL DEFAULT 50,
+    status TEXT NOT NULL DEFAULT 'queued',
+    queued_at REAL NOT NULL,
+    started_at REAL,
+    finished_at REAL,
+    heartbeat_at REAL,
+    error TEXT NOT NULL DEFAULT ''
+);
+
 CREATE TABLE IF NOT EXISTS materials (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_user_id INTEGER REFERENCES users(id),
     filename TEXT NOT NULL,
     file_type TEXT NOT NULL,
     path TEXT NOT NULL,
-    fingerprint TEXT NOT NULL UNIQUE DEFAULT '',
+    fingerprint TEXT NOT NULL DEFAULT '',
     file_hash TEXT NOT NULL DEFAULT '',
     parser_version TEXT NOT NULL DEFAULT '',
     parsed_at TEXT,
@@ -74,6 +129,9 @@ CREATE TABLE IF NOT EXISTS facts (
     content TEXT NOT NULL,
     dimension TEXT NOT NULL DEFAULT '',
     fact_type TEXT NOT NULL DEFAULT 'unknown',
+    assertion_mode TEXT NOT NULL DEFAULT 'unknown',
+    assertion_mode_raw TEXT NOT NULL DEFAULT 'unknown',
+    semantic_profile_json TEXT NOT NULL DEFAULT '{}',
     need_id INTEGER NOT NULL DEFAULT 0,
     source_level TEXT NOT NULL DEFAULT 'MATERIAL_FACT',
     evidence_ids TEXT NOT NULL DEFAULT '[]',
@@ -123,6 +181,8 @@ CREATE TABLE IF NOT EXISTS inferences (
     confidence_level TEXT NOT NULL DEFAULT 'medium',
     confidence_reason TEXT NOT NULL DEFAULT '',
     uncertainty TEXT NOT NULL DEFAULT '',
+    semantic_profile_json TEXT NOT NULL DEFAULT '{}',
+    source_semantics_json TEXT NOT NULL DEFAULT '[]',
     origin_call_id TEXT NOT NULL DEFAULT '',
     stable_key TEXT NOT NULL DEFAULT '',
     lifecycle_status TEXT NOT NULL DEFAULT 'active',
@@ -138,6 +198,7 @@ CREATE TABLE IF NOT EXISTS style_library (
 
 CREATE TABLE IF NOT EXISTS style_variants (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_user_id INTEGER REFERENCES users(id),
     library_id INTEGER NOT NULL REFERENCES style_library(id),
     name TEXT NOT NULL,
     description TEXT NOT NULL DEFAULT '',
@@ -198,6 +259,7 @@ CREATE TABLE IF NOT EXISTS material_comparison_items (
 
 CREATE TABLE IF NOT EXISTS interaction_threads (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_user_id INTEGER REFERENCES users(id),
     thread_key TEXT NOT NULL UNIQUE,
     task_id TEXT NOT NULL DEFAULT '',
     report_id INTEGER REFERENCES reports(id),
@@ -267,6 +329,9 @@ CREATE TABLE IF NOT EXISTS claims (
     quote TEXT NOT NULL DEFAULT '',
     source TEXT NOT NULL DEFAULT '',
     fact_type TEXT NOT NULL DEFAULT 'unknown',
+    assertion_mode TEXT NOT NULL DEFAULT 'unknown',
+    assertion_mode_raw TEXT NOT NULL DEFAULT 'unknown',
+    semantic_profile_json TEXT NOT NULL DEFAULT '{}',
     dimension TEXT NOT NULL DEFAULT '',
     need_id INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'pending',
@@ -415,6 +480,7 @@ CREATE TABLE IF NOT EXISTS report_plans (
 
 CREATE TABLE IF NOT EXISTS reports (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_user_id INTEGER REFERENCES users(id),
     plan_id INTEGER NOT NULL REFERENCES report_plans(id),
     task_id TEXT NOT NULL DEFAULT '',
     title TEXT NOT NULL,
@@ -518,6 +584,7 @@ CREATE TABLE IF NOT EXISTS report_sentences (
 
 CREATE TABLE IF NOT EXISTS short_memory (
     task_id TEXT PRIMARY KEY,
+    owner_user_id INTEGER REFERENCES users(id),
     payload TEXT NOT NULL
 );
 
@@ -705,8 +772,21 @@ CREATE INDEX IF NOT EXISTS idx_interaction_notifications_task ON interaction_not
 """
 # 迁移/演进补充列(历史 ALTER 汇总;新库 create_all 直接含,旧库靠 _migrate 补齐)
 _MIGRATED_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ('materials', 'owner_user_id', 'INTEGER REFERENCES users(id)'),
+    ('style_variants', 'owner_user_id', 'INTEGER REFERENCES users(id)'),
+    ('interaction_threads', 'owner_user_id', 'INTEGER REFERENCES users(id)'),
+    ('reports', 'owner_user_id', 'INTEGER REFERENCES users(id)'),
+    ('short_memory', 'owner_user_id', 'INTEGER REFERENCES users(id)'),
     ('claims', 'need_id', 'INTEGER NOT NULL DEFAULT 0'),
     ('facts', 'need_id', 'INTEGER NOT NULL DEFAULT 0'),
+    ('claims', 'assertion_mode', "TEXT NOT NULL DEFAULT 'unknown'"),
+    ('facts', 'assertion_mode', "TEXT NOT NULL DEFAULT 'unknown'"),
+    ('claims', 'assertion_mode_raw', "TEXT NOT NULL DEFAULT 'unknown'"),
+    ('facts', 'assertion_mode_raw', "TEXT NOT NULL DEFAULT 'unknown'"),
+    ('claims', 'semantic_profile_json', "TEXT NOT NULL DEFAULT '{}'"),
+    ('facts', 'semantic_profile_json', "TEXT NOT NULL DEFAULT '{}'"),
+    ('inferences', 'semantic_profile_json', "TEXT NOT NULL DEFAULT '{}'"),
+    ('inferences', 'source_semantics_json', "TEXT NOT NULL DEFAULT '[]'"),
     ('style_variants', 'source_hash', "TEXT NOT NULL DEFAULT ''"),
     ('report_sentences', 'paragraph', 'INTEGER NOT NULL DEFAULT 1'),
     ('report_sentences', 'edit_history', "TEXT NOT NULL DEFAULT '[]'"),

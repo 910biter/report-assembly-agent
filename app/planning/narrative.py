@@ -11,6 +11,7 @@ from app.task_artifacts import save_task_artifact
 from app.context_budget import ContextSection, build_prompt_from_sections
 from app.observability.core_chain import collect_assigned_ids
 from app.token_monitor import update_call_funnel
+from app.planning.evidence_context import planning_prompt, bind_plan_evidence
 
 
 def _prompt_visible_ids(prompt: str, items: list[dict]) -> list[int]:
@@ -21,7 +22,7 @@ def _prompt_visible_ids(prompt: str, items: list[dict]) -> list[int]:
         if item.get("id") is None:
             continue
         record = f"{int(item['id'])}. {item.get('content', '')}"
-        if "\n" + record + "\n" in rendered:
+        if record in rendered:
             visible.add(int(item["id"]))
     return sorted(visible)
 
@@ -56,14 +57,14 @@ _SYSTEM = """你是报告章节叙事规划师。你的任务不是写正文,而
         {"role": "analysis", "fact_ids": [2], "inference_ids": [3]}
       ],
       "paragraphs": [
-        {"paragraph_id": "P1", "purpose": "本段承担的论证作用", "fact_ids": [1], "inference_ids": [], "target_words": 300}
+        {"paragraph_id": "P1", "purpose": "本段承担的论证作用", "argument": "具体哪些证据形成什么关系、支持什么判断及其范围", "fact_ids": [1], "inference_ids": [], "target_words": 300}
       ],
-      "writing_hint": "一句话说明如何自然展开"
+      "writing_hint": "可留空，不预写正文措辞"
     }
   ],
   "background_fact_ids": [1],
   "must_not_claim": ["不能写成什么"],
-  "transition_hint": "本章与前后章节如何衔接"
+  "transition_hint": "可留空，证据关系在段落 argument 中说明"
 }
 要求:
 1. 只使用输入中真实存在的 fact_ids/inference_ids,不得编造编号。
@@ -90,7 +91,12 @@ _SYSTEM = """你是报告章节叙事规划师。你的任务不是写正文,而
     Writer 负责把它自然写成多句正文，不得逐条罗列。相邻论证连续且前段仅承担引出或过渡时,
     不要把它单独规划成自然段; paragraph.target_words 只是篇幅分配参考,不是每段必须独立达到的字数。
 13. evidence_status 判断“当前事实与推断能否支撑计划目的和目标篇幅”。证据有限时保留原目标预算，
-    但明确缺口；不得通过重复、常识扩写或无依据概括把 limited/insufficient 伪装成 sufficient。"""
+    但明确缺口；不得通过重复、常识扩写或无依据概括把 limited/insufficient 伪装成 sufficient。
+14. 输入中的来源语义画像是开放分类与事实边界，不是封闭标签。保留其全部相关细类、时间锚点、实现状态、归属、条件和范围；规划的论证不得把来源提出的目标/方案写成既成现状。
+15. 模板表达参考用于决定论证组织和详略，不提供业务事实。每段目的必须说明新增的信息或判断；同一局限不要在展开与结尾反复完整陈述。purpose、writing_hint 和 transition_hint 是内部写作指令，不是正文措辞。
+16. paragraph.argument 是具体论证安排：说明所选事实之间如何比较、解释或限定，哪些依据支撑哪些判断，哪些仍不能确定。
+    同时说明与相邻论证的证据关系，不预写过渡句或正文句式。不要只写“展现优势”“说明局限”等目的，也不要编造因果；材料能够支撑的关系应充分展开，使目标篇幅由实质内容承载。
+17. 模板指导适用的组织方式和详略；规划只约定论证边界，不替 Writer 决定句式和连接措辞。writing_hint、transition_hint 可留空，不要求每段先总结或先转折。"""
 
 _QA_SYSTEM = """你是章节叙事质量评审。根据 Narrative Plan 判断本章每个 Topic 是否按计划完成。
 严格输出 JSON,不要任何解释:
@@ -118,7 +124,7 @@ _QA_SYSTEM = """你是章节叙事质量评审。根据 Narrative Plan 判断本
 4. target_paragraph 指向草稿中该话题所在段落编号(1 起);无对应段落的 replan 可为 0。
 5. 只判断计划内的话题,不评判文风。"""
 
-_DOCUMENT_SYSTEM = """你是连续文章的叙事总编。Facts/Inferences 已完成核验，Final ReportPlan 的 chapters 是内部证据弧线，不是必须展示给读者的标题。
+_DOCUMENT_SYSTEM = """你是连续文章的叙事总编。Facts/Inferences 是已提取的材料事实与分析判断，不代表所有判断已被证实；应保留各自的来源语义和证据边界。Final ReportPlan 的 chapters 是内部证据弧线，不是必须展示给读者的标题。
 严格输出 JSON，不要正文、不要解释：
 {
   "composition_mode": "article_beats",
@@ -127,7 +133,6 @@ _DOCUMENT_SYSTEM = """你是连续文章的叙事总编。Facts/Inferences 已�
     {
       "beat_id": "B1",
       "purpose": "这一段论证承担什么作用",
-      "transition": "与前一段如何自然衔接，开篇为空",
       "fact_ids": [1, 2],
       "inference_ids": [3],
       "target_words": 260,
@@ -140,7 +145,7 @@ _DOCUMENT_SYSTEM = """你是连续文章的叙事总编。Facts/Inferences 已�
       "paragraph_id": "P1",
       "beat_ids": ["B1"],
       "purpose": "本段如何推进全文主线",
-      "transition": "与上一段的衔接，开篇为空",
+      "argument": "所选证据之间的具体关系、支持的判断及其适用范围",
       "fact_ids": [1, 2],
       "inference_ids": [3],
       "target_words": 260
@@ -158,7 +163,19 @@ _DOCUMENT_SYSTEM = """你是连续文章的叙事总编。Facts/Inferences 已�
    每个 paragraph 的 purpose 应说明具体要解释或比较什么，不要只写“介绍背景”“分析影响”等空泛任务。
 5. target_words 总和应接近全文目标。证据有限时不得用常识、重复或虚构补足。
 6. paragraphs 必须覆盖全部 beat；每段指定的 fact_ids/inference_ids 必须来自该段所含 beat。
-7. 模板的文风只影响组织与表达，不得覆盖事实边界。"""
+7. 模板的文风只影响组织与表达，不得覆盖事实边界。
+8. 输入中的语义画像是开放分类，不是封闭标签；规划段落时保留与该论证有关的来源状态、时间、条件、归属和范围，不能将方案或目标转成已发生事实。
+9. 根据论证目的选择能解释规模、机制、比较基准、进展和边界的具体补充事实；不要只保留结论和缺失说明。
+   每个段落的 purpose 要说明这些事实如何支撑或限定判断，证据充分时按目标篇幅展开这一关系。
+10. 数值、比较和状态陈述必须选择直接支持它们的事实 ID；数据本身与对数据的限制说明分别引用。
+    每条所选推断的 based_fact_ids 也是该段可核验的依据，不能以推断摘要替代原始事实。
+11. 模板表达参考参与开篇、论证推进、详略和收束的设计，不提供业务事实，不得复制范例中的事件或结论。
+12. 每段必须推进一个具体问题；限制说明放在它所限定的比较或判断附近，除非确有独立论证目的，不要另设重复的风险汇总段。
+    closing 只规定尚未完成的收束；若最后一段已完成收束，应留空，不再要求额外总结。
+13. purpose、transition、central_thread 是内部组织说明，不是待改写的正文。不要用“前一章”“本节”“纠偏”等组织说明代替事实之间的实际关系。
+14. 每段 argument 要落实到所选证据：它们如何比较、解释、形成判断或限定适用范围。不要重复 purpose，也不能虚构因果。
+    与相邻段的联系也以具体证据关系说明，不预写正文过渡句；句式与连接措辞交给 Writer 根据模板表达参考决定。
+    按目标篇幅规划能够展开的实质关系；如果所选证据只能支持简述，应重新考虑可用的相关补充证据，而不是安排抽象过渡或重复总结。"""
 
 
 class NarrativeAgent(BaseAgent):
@@ -180,6 +197,7 @@ class NarrativeAgent(BaseAgent):
         business_block: str = "",
         report_memory: dict | None = None,
         run_id: str = "",
+        style_block: str = "",
     ) -> dict:
         from app.config import settings
 
@@ -202,22 +220,19 @@ class NarrativeAgent(BaseAgent):
             "不得为了切分长度制造无意义小节。\n"
             "请输出本章 Narrative Plan JSON。"
         )
-        prompt, context_audit = build_prompt_from_sections(
+        prompt, context_audit = planning_prompt(
             "narrative",
             [
                 ContextSection("章节契约", [chapter_contract], weight=5),
                 ContextSection("任务要求", [instructions], weight=5),
+                ContextSection("模板表达参考", [style_block] if style_block else [], weight=2),
                 ContextSection("证据边界", [business_block], weight=4),
                 ContextSection("前文记忆", [
                     f"前文记忆:{json.dumps(serializable_memory(report_memory or {}), ensure_ascii=False)}",
                 ], weight=1),
-                ContextSection("事实", ["可用 Facts:"] + [
-                    f"{f['id']}. {f.get('content', '')}" for f in facts
-                ], weight=5, required_items=2),
-                ContextSection("推断", ["可用 Inferences:"] + [
-                    f"{i['id']}. {i.get('content', '')}" for i in inferences
-                ], weight=3, required_items=2),
-            ], stage_input_budget_tokens("narrative"),
+            ], facts, inferences, stage_input_budget_tokens("narrative"),
+            required_facts=collect_assigned_ids(chapter_plan, "fact"),
+            required_inferences=collect_assigned_ids(chapter_plan, "inference"),
         )
         generation_error = ""
         self.last_call_id = ""
@@ -240,6 +255,7 @@ class NarrativeAgent(BaseAgent):
             fact_ids if generation_error else set(input_fact_ids),
             inference_ids if generation_error else set(input_inference_ids),
         )
+        bind_plan_evidence(plan, facts, inferences)
         plan.update(
             generation_status="fallback" if generation_error else "generated",
             generation_error=generation_error,
@@ -280,13 +296,14 @@ class NarrativeAgent(BaseAgent):
         facts: list[dict],
         inferences: list[dict],
         run_id: str = "",
+        style_block: str = "",
     ) -> dict:
         """Create an article-level contract without replacing Final ReportPlan."""
         fact_ids = {int(item["id"]) for item in facts if item.get("id") is not None}
         inference_ids = {int(item["id"]) for item in inferences if item.get("id") is not None}
         from app.runtime_profiles import stage_input_budget_tokens, stage_profile
 
-        prompt, _audit = build_prompt_from_sections(
+        prompt, _audit = planning_prompt(
             "narrative_document",
             [
                 ContextSection("全文任务", [
@@ -294,16 +311,14 @@ class NarrativeAgent(BaseAgent):
                     f"核心判断:{report_plan.get('core_judgment', '')}",
                     f"叙事逻辑:{report_plan.get('narrative_logic', '')}",
                     f"目标字数:{int((report_plan.get('budget') or {}).get('target_words') or 0)}",
+                    f"用户要求:{report_plan.get('user_requirements') or ''}",
                 ], weight=5, required_items=2),
                 ContextSection("内部证据弧线", [json.dumps(report_plan.get("chapter_plans") or [], ensure_ascii=False)], weight=5),
-                ContextSection("可用事实", [
-                    f"{item['id']}. {item.get('content', '')}" for item in facts
-                ], weight=5, required_items=1),
-                ContextSection("可用推断", [
-                    f"{item['id']}. {item.get('content', '')}" for item in inferences
-                ], weight=3),
+                ContextSection("模板表达参考", [style_block] if style_block else [], weight=2),
             ],
-            stage_input_budget_tokens("narrative"),
+            facts, inferences, stage_input_budget_tokens("narrative"),
+            required_facts=collect_assigned_ids(report_plan.get("chapter_plans") or [], "fact"),
+            required_inferences=collect_assigned_ids(report_plan.get("chapter_plans") or [], "inference"),
         )
         generation_error = ""
         try:
@@ -322,11 +337,15 @@ class NarrativeAgent(BaseAgent):
         if not isinstance(payload, dict) or not payload.get("beats"):
             payload = {}
             generation_error = generation_error or "EMPTY_NARRATIVE_PLAN"
+        # Resolve evidence dependencies before testing coverage or assigning
+        # space. An inference's basis is not a separate missing discourse arc.
+        bind_plan_evidence(payload, facts, inferences)
         plan = _sanitize_document_plan(
             payload, report_plan,
             fact_ids if generation_error else set(input_fact_ids),
             inference_ids if generation_error else set(input_inference_ids),
         )
+        bind_plan_evidence(plan, facts, inferences)
         plan.update(
             generation_status="fallback" if generation_error else "generated",
             generation_error=generation_error,
@@ -687,6 +706,7 @@ def _sanitize_paragraph_plan(raw, default_facts: list[int], default_inferences: 
         paragraphs.append({
             "paragraph_id": str(item.get("paragraph_id") or f"P{index}")[:16],
             "purpose": str(item.get("purpose") or "组织相关证据并推进当前小节")[:200],
+            "argument": str(item.get("argument") or ""),
             "transition": str(item.get("transition") or "")[:160],
             "fact_ids": list(dict.fromkeys(fids)),
             "inference_ids": list(dict.fromkeys(iids)),
@@ -846,12 +866,12 @@ def _sanitize_document_plan(payload: dict, report_plan: dict,
                 "inference_ids": iids,
                 "target_words": max(0, _safe_int(chapter.get("target_words"))),
                 "detail_level": "expand",
-                "must_not_claim": [str(value)[:160] for value in chapter.get("exclude") or [] if str(value).strip()],
+                "must_not_claim": [],
+                "excluded_content": [str(value)[:160] for value in chapter.get("exclude") or [] if str(value).strip()],
             })
     else:
-        # A model may produce an elegant but incomplete arc. FinalPlan is the
-        # authority for required evidence, so append only the still-unassigned
-        # remainder as a new beat rather than silently dropping it.
+        # Use FinalPlan's explicit evidence ownership, not title semantics.
+        # Complete an existing arc before creating a genuinely missing arc.
         assigned_facts = {value for beat in beats for value in beat["fact_ids"]}
         assigned_inferences = {value for beat in beats for value in beat["inference_ids"]}
         for chapter in report_plan.get("chapter_plans") or []:
@@ -867,6 +887,23 @@ def _sanitize_document_plan(payload: dict, report_plan: dict,
             ]
             if not missing_facts and not missing_inferences:
                 continue
+            chapter_facts = set(_int_ids(chapter.get("primary_fact_ids")))
+            chapter_inferences = set(_int_ids(chapter.get("primary_inference_ids")))
+            matching = [
+                beat for beat in beats
+                if chapter_facts.intersection(beat["fact_ids"])
+                or chapter_inferences.intersection(beat["inference_ids"])
+            ]
+            if matching:
+                owner = max(matching, key=lambda beat: (
+                    len(chapter_facts.intersection(beat["fact_ids"]))
+                    + len(chapter_inferences.intersection(beat["inference_ids"]))
+                ))
+                owner["fact_ids"].extend(missing_facts)
+                owner["inference_ids"].extend(missing_inferences)
+                assigned_facts.update(missing_facts)
+                assigned_inferences.update(missing_inferences)
+                continue
             beats.append({
                 "beat_id": f"B{len(beats) + 1}",
                 "purpose": str(chapter.get("judgment") or chapter.get("core_question") or "补足必要证据")[:220],
@@ -875,7 +912,8 @@ def _sanitize_document_plan(payload: dict, report_plan: dict,
                 "inference_ids": missing_inferences,
                 "target_words": max(0, _safe_int(chapter.get("target_words"))),
                 "detail_level": "brief",
-                "must_not_claim": [str(value)[:160] for value in chapter.get("exclude") or [] if str(value).strip()],
+                "must_not_claim": [],
+                "excluded_content": [str(value)[:160] for value in chapter.get("exclude") or [] if str(value).strip()],
             })
             assigned_facts.update(missing_facts)
             assigned_inferences.update(missing_inferences)
@@ -935,6 +973,7 @@ def _sanitize_document_paragraphs(raw, beats: list[dict], target_words: int) -> 
             "paragraph_id": str(item.get("paragraph_id") or f"P{index}")[:16],
             "beat_ids": beat_ids,
             "purpose": str(item.get("purpose") or "推进全文叙事")[:220],
+            "argument": str(item.get("argument") or ""),
             "transition": str(item.get("transition") or "")[:180],
             "fact_ids": list(dict.fromkeys(fids or sorted(allowed_facts))),
             "inference_ids": list(dict.fromkeys(iids or sorted(allowed_inferences))),
@@ -956,6 +995,15 @@ def _sanitize_document_paragraphs(raw, beats: list[dict], target_words: int) -> 
             "inference_ids": list(_int_ids(beat.get("inference_ids"))),
             "target_words": max(0, _safe_int(beat.get("target_words"))),
         })
+    # A covered beat can still lose evidence when its paragraph lists only a
+    # subset. Preserve the selected beat's remaining evidence in that same arc.
+    for beat in beats:
+        related = [item for item in paragraphs if str(beat.get("beat_id")) in item["beat_ids"]]
+        if not related:
+            continue
+        for key in ("fact_ids", "inference_ids"):
+            assigned = {value for item in related for value in item[key]}
+            related[0][key].extend(value for value in _int_ids(beat.get(key)) if value not in assigned)
     return _normalize_paragraph_targets(paragraphs, target_words)
 
 

@@ -35,6 +35,7 @@ withDefaults(defineProps<{
   border: 1px solid var(--border);
   border-radius: var(--radius-panel);
   background: var(--card);
+  align-items: start;
 }
 
 .ui-data-browser--detail-open {
@@ -56,6 +57,8 @@ withDefaults(defineProps<{
   overflow-y: auto;
   border-left: 1px solid var(--border);
   background: var(--surface-raised);
+  overflow-wrap: anywhere;
+  scrollbar-gutter: stable;
 }
 
 @media (max-width: 1180px) {

@@ -103,6 +103,8 @@ def writer_scale_prompt_hint(
     chapter_target = max(0, int(chapter_target_words or 0))
     unit_minimum = max(0, int(unit_minimum_words or 0))
     evidence = str(evidence_status or "unknown").strip().lower()
+    supported_maximum = max(0, int(budget.get("evidence_supported_max_words") or 0))
+    capacity_shortfall = bool(supported_maximum and supported_maximum < minimum and budget.get("underfill_reason"))
     if minimum and target and unit_target and not unit_minimum:
         unit_minimum = round(unit_target * min(1.0, minimum / target))
 
@@ -122,7 +124,7 @@ def writer_scale_prompt_hint(
     if unit_target:
         constraints.append(f"{unit_label}目标约 {unit_target} 字")
     if minimum and unit_minimum:
-        minimum_label = "最低完成要求" if evidence == "sufficient" else "最低参考"
+        minimum_label = "最低参考" if capacity_shortfall else "最低完成要求"
         constraints.append(f"{unit_label}{minimum_label}约 {unit_minimum} 字")
     if not constraints:
         return ""
@@ -142,7 +144,16 @@ def writer_scale_prompt_hint(
                 "不得因核心观点已被简要提及而提前结束。"
             )
         elif evidence in {"limited", "insufficient"}:
-            hint += "最终规模评估判定证据有限或不足；允许低于本单元最低参考，但须保留证据边界，不得重复扩写或编造。"
+            if capacity_shortfall:
+                hint += (
+                    f"现有材料的篇幅承载估计约 {supported_maximum} 字，低于用户下限；"
+                    "保留真实证据边界，并明确不能满足篇幅的具体原因，不得重复扩写或编造。"
+                )
+            else:
+                hint += (
+                    "部分判断存在证据边界，不代表材料不能支撑约定篇幅；"
+                    "须在已有事实、比较和适用范围内充分展开，不能仅因存在未知项而自行放宽用户下限。"
+                )
         else:
             hint += "不得仅因正文简洁而自行判断证据不足；确有具体证据缺口时才可欠填，并保留证据边界。"
     hint += "完成当前论证且接近对应目标后收束；不得重复、泛化扩写或为凑字数编造内容。"

@@ -21,6 +21,7 @@ from app.planning.structure import normalize_contract
 from app.runtime_profiles import stage_input_budget_tokens
 from app.observability.core_chain import collect_assigned_ids, extract_tagged_ids
 from app.token_monitor import update_call_funnel
+from app.planning.evidence_context import bind_plan_evidence
 
 _SYSTEM = """你是情报报告分析规划师。根据用户主题、材料摘要与机构风格,只制定分析问题与证据提取方向,不要冻结最终报告章节。
 严格输出 JSON,不要任何解释:
@@ -144,11 +145,16 @@ _FINAL_SYSTEM = """你是情报报告结构总规划师。现在 Evidence 与 An
 8. 证据不足的主题不得硬设独立章节或小节凑结构,应合并为边界、风险或待补充说明。
 9. report_budget 是 Analysis 后形成的全文规模预算。用户明确字数/范围时必须遵守；用户未明确时,
    不得机械复制初步预算,应依据实际 Facts/Inferences 的覆盖广度、信息丰富度、证据支撑深度和最终章节任务重新估算。
-   min_words/max_words 必须与该估算相符；证据不足时允许 underfill,但必须给出 underfill_reason,禁止为写满而重复或虚构。
+   min_words/max_words 必须与该估算相符；它们评估已有材料能够承载的篇幅，不是判断的确定程度。
+   缺少某类数据会限制对应结论，但已有事实及其适用边界仍可充分展开，不得仅因存在未知项判定无法达到篇幅。
+   只有实际承载规模不足时才给出 underfill_reason，禁止为写满而重复或虚构。
 10. 【文档形态】先判断本次应是正式报告、研究综述、分节文章、连续文章、推送还是新闻稿。文档形态由用户目标、受众、材料和已学习文风共同决定；模板的目录样例不是默认答案。
 11. 连续文章或新闻稿可使用内部语义单元组织证据，但 section_policy 应为 hidden，导出和阅读界面不得显示章节标题或自动编号。分节文章的标题通常为 plain，只有正式报告或明确要求编号时才用 numbered。
 12. composition_mode 决定 Writer 的调用边界，而非标题是否显示：正式报告/研究综述通常为 chaptered；连续文章、推送和新闻稿通常为 article_beats。article_beats 下 chapters 仍是内部证据弧线，必须保留事实归属，但不能要求 Writer 分章拼接成文。
-13. render_base 只决定导出母版：参考文档缺少可用标题层级而任务又需要正式分级报告时，选择 default_structured；纯文章/推送可选择 blank_article；其余优先 selected_template。"""
+13. render_base 只决定导出母版：参考文档缺少可用标题层级而任务又需要正式分级报告时，选择 default_structured；纯文章/推送可选择 blank_article；其余优先 selected_template。
+14. required_facts、core_message 中准备写入的数值、比较项和状态必须对应直接支持它们的 primary_fact_ids。
+    描述数据缺口的事实不能替代数据本身。推断的 based_fact_ids 是依据索引，选中推断时同步规划这些有效事实。
+    按本章目的选择具体背景、规模、机制、对比和边界证据，在预算内说明它们如何推进论证，不能只规划简要结论。"""
 
 _LOCAL_RESTRUCTURE_SYSTEM = """你只负责调整最终报告中发生变化的局部章节契约，不重新规划全文。
 严格输出 JSON：{"chapters":[章节契约]}。章节标题和顺序必须与用户确认的新标题完全一致。
@@ -330,7 +336,9 @@ class PlannerAgent(BaseAgent):
     def finalize_report_plan(self, plan_id: int, context_block: str,
                              required_structure: list[str] | None = None,
                              required_chapter_count: int = 0,
-                             document_shape_hint: dict | None = None) -> ReportPlan:
+                             document_shape_hint: dict | None = None,
+                             facts: list[dict] | None = None,
+                             inferences: list[dict] | None = None) -> ReportPlan:
         """Freeze the final report structure after Evidence + Analysis."""
         with session_scope() as s:
             existing = s.execute(
@@ -439,6 +447,7 @@ class PlannerAgent(BaseAgent):
             plan_stage="final",
         )
         normalized = normalize_contract({"chapter_plans": chapters})
+        bind_plan_evidence(normalized, facts or [], inferences or [])
         plan.chapter_plans = normalized["chapter_plans"]
         plan.structure = [c.get("title", "") for c in plan.chapter_plans]
         update_call_funnel(
