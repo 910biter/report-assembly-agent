@@ -6,8 +6,8 @@ import router from "./router";
 import "./styles/tokens.css";
 import "./styles/base.css";
 
-const savedTheme = localStorage.getItem("ira-theme");
-document.documentElement.dataset.theme = savedTheme === "light" ? "light" : "dark";
+const savedTheme = localStorage.getItem("ira-workspace-theme");
+document.documentElement.dataset.theme = savedTheme === "dark" ? "dark" : "light";
 const savedPalette = localStorage.getItem("ira-palette");
 const paletteVersion = localStorage.getItem("ira-palette-version");
 // The earlier steel default was not an explicit user preference. Migrate it once

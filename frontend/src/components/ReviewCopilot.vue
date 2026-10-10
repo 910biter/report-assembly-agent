@@ -702,9 +702,8 @@ async function archiveCurrent() {
         <small v-if="thread?.id">{{
           thread.status === "closed"
             ? "已归档，只读"
-            : decisionSummary || "修改前需确认提案"
+            : decisionSummary
         }}</small>
-        <small v-else>围绕当前产物开始讨论</small>
       </div>
       <div class="copilot-head-actions">
         <button
@@ -919,7 +918,7 @@ async function archiveCurrent() {
     <form v-else class="composer" @submit.prevent="send">
       <textarea
         v-model="message"
-        rows="3"
+        rows="2"
         placeholder="输入问题或修改要求…"
       ></textarea
       ><button
@@ -1042,8 +1041,10 @@ async function archiveCurrent() {
 .message {
   width: 100%;
   max-width: 100%;
-  padding: 0 4px;
-  background: transparent;
+  padding: 16px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-panel);
   overflow-wrap: anywhere;
 }
 .message.user {
@@ -1053,7 +1054,7 @@ async function archiveCurrent() {
   padding: 12px 16px;
   border: 1px solid var(--border);
   border-radius: var(--radius-panel);
-  background: var(--surface-raised);
+  background: var(--primary-soft);
 }
 .message small {
   display: block;
@@ -1364,15 +1365,22 @@ async function archiveCurrent() {
   display: grid;
   grid-template-columns: 1fr auto;
   align-items: end;
-  gap: 8px;
-  padding-top: 10px;
-  border-top: 1px solid var(--color-border);
-  background: var(--card);
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-panel);
+  background: var(--surface-raised);
 }
 .composer textarea {
   min-height: 66px;
+  max-height: 200px;
+  border: 0;
+  background: transparent;
+  padding: 4px;
   resize: vertical;
 }
+.composer:focus-within { border-color: var(--primary); }
+.composer textarea:focus { box-shadow: none; outline: none; }
 .composer .btn {
   height: 36px;
 }

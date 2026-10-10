@@ -232,7 +232,7 @@ const createTask = useMutation({
             ><span>使用模板</span
             ><select v-model="selectedTemplateId" name="variant_id">
               <option value="">使用默认模板</option>
-              <option v-for="item in templates.data.value || []" :key="item.id" :value="String(item.id)">{{ item.name || item.label || `模板 ${item.id}` }}</option>
+              <option v-for="item in (templates.data.value || []).filter(item => ['confirmed', 'locked'].includes(item.status))" :key="item.id" :value="String(item.id)">{{ item.name || item.label || `模板 ${item.id}` }}</option>
             </select>
           </label>
         </section>
@@ -785,10 +785,7 @@ const createTask = useMutation({
 }
 .recent-workspace {
   min-width: 0;
-  padding: 20px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-panel);
-  background: var(--card);
+  padding: 8px 0;
 }
 .recent-workspace :deep(.ui-section-header) {
   margin-bottom: 14px;
@@ -800,13 +797,12 @@ const createTask = useMutation({
 }
 .side-section {
   min-width: 0;
-  padding: 20px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-panel);
-  background: var(--card);
+  padding: 16px;
+  border-radius: var(--radius-control);
+  background: var(--muted);
 }
 .side-section + .side-section {
-  padding-top: 20px;
+  padding-top: 16px;
 }
 .section-kicker {
   margin-bottom: 3px;

@@ -51,7 +51,7 @@ button {
 }
 .ui-button.bg-primary {
   color: var(--primary-foreground);
-  background: var(--primary-gradient);
+  background: var(--primary);
   border-color: transparent;
 }
 a {
@@ -91,6 +91,14 @@ h3 {
   font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
 }
 .btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  flex-shrink: 0;
+  white-space: nowrap;
+  font-size: 13px;
+  line-height: 1.5;
   min-height: 36px;
   padding: 7px 14px;
   border: 1px solid var(--color-border-strong);
@@ -110,7 +118,7 @@ h3 {
 }
 .btn.primary {
   color: var(--primary-foreground);
-  background: var(--primary-gradient);
+  background: var(--primary);
   border-color: transparent;
   box-shadow: none;
 }
@@ -150,7 +158,7 @@ h3 {
 }
 .field > span {
   font-size: 13px;
-  font-weight: 600;
+  font-weight: 500;
 }
 input,
 textarea,
@@ -159,6 +167,9 @@ select {
   border: 1px solid var(--color-border);
   border-radius: var(--radius-control);
   background: var(--surface-raised);
+  color: var(--foreground);
+  font-size: 13px;
+  line-height: 1.5;
   padding: 9px 11px;
   outline: none;
   transition:
@@ -218,7 +229,7 @@ textarea {
 }
 .data-row:hover,
 .data-row.selected {
-  background: color-mix(in srgb, var(--primary-soft) 55%, var(--surface-hover));
+  background: var(--surface-hover);
 }
 .data-row::after {
   content: "›";
@@ -335,8 +346,9 @@ textarea {
 }
 .tabs {
   display: flex;
-  gap: 24px;
-  min-height: 45px;
+  gap: 16px;
+  min-height: 40px;
+  overflow-x: auto;
   border-bottom: 1px solid var(--color-border);
 }
 .tab {
@@ -347,8 +359,8 @@ textarea {
   color: var(--color-muted);
 }
 .tab.active {
-  color: var(--color-primary);
-  font-weight: 650;
+  color: var(--foreground);
+  font-weight: 600;
 }
 .tab.active::after {
   content: "";

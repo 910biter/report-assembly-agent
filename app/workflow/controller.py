@@ -3109,6 +3109,8 @@ class WorkflowController:
             from app.memory.style import owner_for_task
             variant = get_variant(int(variant_id), owner_user_id=owner_for_task(self.task_id))
             if variant is not None:
+                if variant.status not in {"confirmed", "locked"}:
+                    raise ValueError("TEMPLATE_NOT_CONFIRMED")
                 return variant
         from app.memory.style import owner_for_task
         return get_locked_variant(owner_user_id=owner_for_task(self.task_id))

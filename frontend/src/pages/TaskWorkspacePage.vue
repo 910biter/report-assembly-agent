@@ -1249,10 +1249,9 @@ function versionsList() {
 .workspace-tabs {
   position: sticky;
   z-index: 5;
-  top: 0;
+  top: var(--header-height);
   padding: 7px 4px 9px;
-  background: color-mix(in srgb, var(--background) 92%, transparent);
-  backdrop-filter: blur(8px);
+  background: var(--background);
 }
 .workspace-browser {
   display: grid;

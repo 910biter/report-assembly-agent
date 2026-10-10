@@ -492,7 +492,7 @@ onBeforeUnmount(() => window.clearTimeout(pollTimer));
               >
                 确认</button
               ><button
-                v-if="item.status !== 'locked'"
+                v-if="item.status === 'confirmed'"
                 class="btn tertiary"
                 @click.stop="action.mutate({ id: item.id, op: 'lock' })"
               >
@@ -805,26 +805,29 @@ onBeforeUnmount(() => window.clearTimeout(pollTimer));
 }
 .template-layout {
   display: grid;
-  grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr);
+  grid-template-columns: minmax(260px, 0.65fr) minmax(0, 1.35fr);
   min-width: 0;
-  gap: 24px;
+  gap: 16px;
 }
 .templates,
 .profile-panel {
-  padding: 24px;
+  padding: 20px;
+  min-width: 0;
 }
 .template-list {
   border-top: 1px solid var(--color-border);
 }
 .template-item {
   display: grid;
-  grid-template-columns: 58px minmax(0, 1fr) auto;
-  gap: 14px;
+  grid-template-columns: 40px minmax(0, 1fr);
+  gap: 12px;
   align-items: center;
   padding: 14px 8px;
   border-bottom: 1px solid var(--color-border);
   cursor: pointer;
 }
+.template-item .item-actions { grid-column: 2; justify-content: flex-start; }
+.upload-bar > .btn { justify-self: end; width: auto; }
 .template-item:hover,
 .template-item.selected {
   background: var(--color-surface-soft);
@@ -833,9 +836,9 @@ onBeforeUnmount(() => window.clearTimeout(pollTimer));
   box-shadow: inset 3px 0 var(--color-primary);
 }
 .paper-preview {
-  width: 48px;
-  height: 64px;
-  padding: 10px 7px;
+  width: 32px;
+  height: 44px;
+  padding: 6px 4px;
   background: var(--document-paper);
   border: 1px solid var(--border-strong);
 }
@@ -1244,17 +1247,6 @@ onBeforeUnmount(() => window.clearTimeout(pollTimer));
   background: transparent;
   font-size: 12px;
 }
-.templates,
-.profile-panel {
-  border-color: var(--border);
-}
-.templates {
-  padding: 22px 22px 8px;
-}
-.profile-panel {
-  padding: 22px;
-  background: var(--card);
-}
 .template-item {
   margin: 0 -8px;
   padding: 14px 10px;
@@ -1322,15 +1314,6 @@ onBeforeUnmount(() => window.clearTimeout(pollTimer));
   .upload-bar .btn {
     width: 100%;
   }
-}
-.asset-count {
-  border-color: var(--border-strong);
-  color: var(--primary);
-  background: var(--surface-raised);
-}
-.upload-bar {
-  border-color: var(--border-strong);
-  background: var(--card);
 }
 .asset-count {
   display: none;

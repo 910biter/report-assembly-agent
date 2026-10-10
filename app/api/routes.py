@@ -160,6 +160,12 @@ def create_task(
     owner = _request_owner(request)
     if variant_id is not None and owner is not None:
         require_owner("template", variant_id, request.state.principal)
+    if variant_id is not None:
+        variant = style.get_variant(variant_id)
+        if variant is None:
+            return JSONResponse({"error": "VARIANT_NOT_FOUND"}, status_code=404)
+        if variant.status not in {"confirmed", "locked"}:
+            return JSONResponse({"error": "TEMPLATE_NOT_CONFIRMED", "message": "请先在模板中心确认该模板。"}, status_code=409)
     try:
         material_ids = _collect_material_ids(
             task_id, existing_material_ids, files,
@@ -1664,6 +1670,11 @@ def confirm_style_variant(variant_id: int):
 
 @router.post("/style/variants/{variant_id}/lock")
 def lock_style_variant(variant_id: int):
+    variant = style.get_variant(variant_id)
+    if variant is None:
+        return JSONResponse({"error": "VARIANT_NOT_FOUND"}, status_code=404)
+    if variant.status not in {"confirmed", "locked"}:
+        return JSONResponse({"error": "TEMPLATE_NOT_CONFIRMED", "message": "确认模板后才能设为默认。"}, status_code=409)
     style.lock_variant(variant_id)
     return {"ok": True}
 

@@ -655,16 +655,17 @@ function qaStatusLabel(issue: QualityIssue) {
             { value: 'review', label: '审阅' },
           ]"
         />
-        <StatusBadge :stage="report.data.value.status" /><button
-          class="btn"
-          @click="versionOpen = true"
-        >
-          版本审阅</button
-        ><button class="btn" @click="comparisonOpen = true">新增材料对比</button
-        ><button class="btn" @click="incrementOpen = !incrementOpen">
-          增量更新</button
-        ><button class="btn primary" @click="finalize(false)">审核通过</button
-        ><a class="btn" :href="`/api/reports/${reportId}/export`">导出 Word</a>
+        <StatusBadge :stage="report.data.value.status" />
+        <details class="report-actions-menu">
+          <summary class="btn">更多操作</summary>
+          <div class="report-actions-popover" @click="($event.currentTarget as HTMLElement).closest('details')?.removeAttribute('open')">
+            <button class="btn" @click="versionOpen = true">版本审阅</button>
+            <button class="btn" @click="comparisonOpen = true">新增材料对比</button>
+            <button class="btn" @click="incrementOpen = !incrementOpen">增量更新</button>
+          </div>
+        </details>
+        <button class="btn primary" @click="finalize(false)">审核通过</button>
+        <a class="btn" :href="`/api/reports/${reportId}/export`">导出 Word</a>
       </div>
     </header>
 
@@ -1089,18 +1090,16 @@ function qaStatusLabel(issue: QualityIssue) {
   background: transparent;
 }
 .editor-toolbar {
-  position: sticky;
-  top: var(--header-height);
-  z-index: 15;
-  display: flex;
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
   justify-content: space-between;
-  gap: 20px;
+  gap: 12px;
   min-height: 64px;
   padding: 10px 28px;
-  background: color-mix(in srgb, var(--background) 96%, transparent);
+  background: var(--background);
   border-bottom: 1px solid var(--border);
-  backdrop-filter: blur(10px);
 }
 .toolbar-left,
 .toolbar-actions {
@@ -1108,6 +1107,27 @@ function qaStatusLabel(issue: QualityIssue) {
   align-items: center;
   gap: 8px;
 }
+.toolbar-left { min-width: 0; }
+.toolbar-left > a { flex: 0 0 auto; white-space: nowrap; }
+.toolbar-left > div { min-width: 0; }
+.toolbar-actions { flex-wrap: wrap; justify-content: flex-end; }
+.report-actions-menu { position: relative; }
+.report-actions-menu > summary { list-style: none; cursor: pointer; }
+.report-actions-menu > summary::-webkit-details-marker { display: none; }
+.report-actions-popover {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 30;
+  display: grid;
+  gap: 4px;
+  min-width: 160px;
+  padding: 6px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-raised);
+}
+.report-actions-popover .btn { justify-content: flex-start; }
 .toolbar-left > div b,
 .toolbar-left > div span {
   display: block;
@@ -1140,10 +1160,10 @@ function qaStatusLabel(issue: QualityIssue) {
 }
 .editor-grid {
   display: grid;
-  grid-template-columns: 224px minmax(640px, 900px) 340px;
+  grid-template-columns: minmax(150px, 190px) minmax(0, 900px) minmax(220px, 280px);
   justify-content: center;
-  gap: 20px;
-  padding: 28px 28px 56px;
+  gap: 24px;
+  padding: 24px 20px 48px;
   min-width: 0;
   max-width: 100%;
 }
@@ -1153,13 +1173,13 @@ function qaStatusLabel(issue: QualityIssue) {
 .toc-panel,
 .context-panel {
   position: sticky;
-  top: calc(var(--header-height) + 82px);
+  top: calc(var(--header-height) + 16px);
   align-self: start;
-  max-height: calc(100vh - 166px);
+  max-height: calc(100vh - var(--header-height) - 32px);
   overflow: auto;
-  background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: 10px;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
   box-shadow: none;
   backdrop-filter: none;
 }
@@ -1188,7 +1208,7 @@ function qaStatusLabel(issue: QualityIssue) {
 }
 .toc-panel > a:hover {
   color: var(--foreground);
-  background: var(--primary-soft);
+  background: var(--surface-hover);
 }
 .toc-qa-count {
   float: right;
@@ -1563,7 +1583,7 @@ function qaStatusLabel(issue: QualityIssue) {
 }
 @media (max-width: 1350px) {
   .editor-grid {
-    grid-template-columns: 190px minmax(600px, 820px) 300px;
+    grid-template-columns: 160px minmax(0, 1fr) 240px;
     gap: 14px;
   }
   .paper {
@@ -1583,9 +1603,6 @@ function qaStatusLabel(issue: QualityIssue) {
   .drawer-strip {
     grid-template-columns: 1fr 1fr;
   }
-  .toolbar-actions > .btn:not(.primary) {
-    display: none;
-  }
 }
 @media (max-width: 800px) {
   .toc-panel {
@@ -1599,7 +1616,11 @@ function qaStatusLabel(issue: QualityIssue) {
     padding: 44px 30px;
   }
   .editor-toolbar {
+    grid-template-columns: minmax(0, 1fr);
     align-items: flex-start;
+  }
+  .toolbar-actions {
+    justify-content: flex-start;
   }
   .toolbar-left > div {
     display: none;

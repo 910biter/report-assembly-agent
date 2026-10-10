@@ -9,7 +9,7 @@ const router = createRouter({
     { path: "/", component: DashboardPage, meta: { title: "工作台" } },
     { path: "/tasks", component: () => import("@/pages/TasksPage.vue"), meta: { title: "任务" } },
     { path: "/tasks/:taskId", component: () => import("@/pages/TaskWorkspacePage.vue"), meta: { title: "任务工作台", wide: true } },
-    { path: "/documents", component: () => import("@/pages/DocumentsPage.vue"), meta: { title: "文档解析" } },
+    { path: "/documents", component: () => import("@/pages/DocumentsPage.vue"), meta: { title: "资料解析" } },
     { path: "/materials", component: () => import("@/pages/MaterialsPage.vue"), meta: { title: "材料库" } },
     { path: "/style", component: () => import("@/pages/TemplatesPage.vue"), meta: { title: "模板中心" } },
     { path: "/queue", component: () => import("@/pages/QueuePage.vue"), meta: { title: "运行队列" } },

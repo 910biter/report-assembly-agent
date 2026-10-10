@@ -20,11 +20,11 @@ withDefaults(
 <style scoped>
 .ui-panel {
   border: 1px solid var(--border);
-  border-radius: var(--radius-control);
+  border-radius: var(--radius-panel);
   background: var(--card);
 }
 .ui-panel--padded {
-  padding: var(--space-6);
+  padding: var(--space-5);
 }
 .ui-panel--raised {
   border-color: var(--border-strong);

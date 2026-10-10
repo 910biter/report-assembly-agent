@@ -75,8 +75,8 @@ const emit = defineEmits<{ "update:modelValue": [value: string] }>();
 }
 
 .ui-tabs__item--active {
-  color: var(--foreground);
-  background: var(--card);
+  color: var(--primary);
+  background: var(--primary-soft);
   border-color: var(--border-strong);
 }
 

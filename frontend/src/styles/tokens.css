@@ -20,22 +20,22 @@
 :root {
   color-scheme: dark;
   /* Framework-neutral semantic tokens. Mirror these values in future React Tailwind variables. */
-  --background: #0b0c10;
-  --card: #11131a;
-  --surface-raised: #171922;
-  --surface-hover: #1f212b;
-  --muted: #151720;
+  --background: #141414;
+  --card: #1b1b1b;
+  --surface-raised: #232323;
+  --surface-hover: #2b2b2b;
+  --muted: #202020;
   --muted-foreground: rgba(255, 255, 255, 0.68);
   --foreground: rgba(255, 255, 255, 0.92);
   --subtle-foreground: rgba(255, 255, 255, 0.52);
   --border: rgba(255, 255, 255, 0.09);
   --border-strong: rgba(255, 255, 255, 0.15);
-  --primary: #7c5cff;
-  --primary-hover: #8a70ff;
+  --primary: #7969aa;
+  --primary-hover: #8c7bbb;
   --primary-foreground: #ffffff;
-  --primary-gradient: linear-gradient(135deg, #5b40d6 0%, #7c5cff 62%, #927bff 100%);
-  --primary-soft: rgba(124, 92, 255, 0.15);
-  --secondary: #1a1c25;
+  --primary-gradient: linear-gradient(#7969aa, #7969aa);
+  --primary-soft: rgba(154, 134, 205, 0.13);
+  --secondary: #292929;
   --success: #4fb286;
   --success-soft: rgba(79, 178, 134, 0.14);
   --warning: #e4a34b;
@@ -44,8 +44,8 @@
   --destructive-soft: rgba(239, 107, 115, 0.14);
   --info: #8e7cff;
   --info-soft: rgba(142, 124, 255, 0.14);
-  --nav: #0d0e14;
-  --nav-deep: #090a0f;
+  --nav: #101010;
+  --nav-deep: #101010;
   --nav-raised: rgba(255, 255, 255, 0.055);
   --nav-foreground: rgba(255, 255, 255, 0.92);
   --nav-muted: rgba(255, 255, 255, 0.62);
@@ -95,15 +95,15 @@
   --space-12: 48px;
   --radius-sm: 6px;
   --radius-control: 8px;
-  --radius-panel: 12px;
-  --radius-feature: 16px;
+  --radius-panel: 10px;
+  --radius-feature: 10px;
   --shadow-panel: none;
   --shadow-float:
     0 24px 64px rgba(0, 0, 0, 0.46), 0 4px 16px rgba(0, 0, 0, 0.3);
   --shadow-paper:
     0 8px 24px rgba(0, 0, 0, 0.28), 0 28px 64px rgba(0, 0, 0, 0.38);
   --focus-ring: 0 0 0 3px var(--ring);
-  --nav-width: 220px;
+  --nav-width: 176px;
   --header-height: 56px;
   --content-max: 1360px;
   --motion-fast: 160ms cubic-bezier(0.2, 0.8, 0.2, 1);
@@ -134,22 +134,22 @@
 
 [data-theme="light"] {
   color-scheme: light;
-  --background: #f7f7f8;
+  --background: #f3f5fb;
   --card: #ffffff;
-  --surface-raised: #f5f5f6;
-  --surface-hover: #eeeeef;
-  --muted: #f0f0f1;
-  --muted-foreground: #606167;
-  --foreground: #26272b;
-  --subtle-foreground: #77787e;
+  --surface-raised: #f8f9fd;
+  --surface-hover: #e8ecf6;
+  --muted: #eef1f8;
+  --muted-foreground: #586880;
+  --foreground: #202b3e;
+  --subtle-foreground: #66758d;
   --border: rgba(27, 31, 38, 0.12);
   --border-strong: rgba(27, 31, 38, 0.2);
-  --primary: #6653bc;
-  --primary-hover: #5644a5;
+  --primary: #6267d9;
+  --primary-hover: #5156c5;
   --primary-foreground: #ffffff;
   --primary-gradient: linear-gradient(135deg, #5945b2 0%, #725cd1 100%);
-  --primary-soft: rgba(102, 83, 188, 0.1);
-  --secondary: #eeeeef;
+  --primary-soft: rgba(98, 103, 217, 0.10);
+  --secondary: #edf0f8;
   --success: #287e61;
   --success-soft: rgba(40, 126, 97, 0.12);
   --warning: #a86c17;
@@ -158,9 +158,9 @@
   --destructive-soft: rgba(189, 76, 83, 0.1);
   --info: #6f5fba;
   --info-soft: rgba(111, 95, 186, 0.11);
-  --nav: #fbfbfc;
-  --nav-deep: #f4f4f5;
-  --nav-raised: rgba(27, 31, 38, 0.055);
+  --nav: #edf2f9;
+  --nav-deep: #edf2f9;
+  --nav-raised: rgba(98, 103, 217, 0.10);
   --nav-foreground: #26272b;
   --nav-muted: #65666b;
   --accent: #6653bc;
@@ -183,7 +183,7 @@
   --shadow-panel: none;
   --shadow-float: 0 24px 64px rgba(54, 67, 91, 0.16), 0 4px 16px rgba(54, 67, 91, 0.1);
   --shadow-paper: 0 8px 24px rgba(54, 67, 91, 0.12), 0 28px 64px rgba(54, 67, 91, 0.14);
-  --document-paper: #fffefa;
+  --document-paper: #ffffff;
   --document-ink: #17191c;
   --document-fact: #dcecf9;
   --document-fact-border: #6293ba;

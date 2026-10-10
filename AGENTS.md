@@ -2,6 +2,20 @@
 
 ## 1. Purpose
 
+### Current Workspace Direction (2026-10-09)
+
+The user-selected reference is the supplied intelligence collection agent design.
+Use a light-first research workspace: pale blue-gray canvas and sidebar, white
+reading surfaces, dark slate text, and restrained indigo selection states. Keep
+dark mode as an alternative using the same proportions and semantic tokens.
+This direction supersedes the earlier dark-first visual examples below.
+
+Browsers use compact object lists and detail panes; editors prioritize readable
+documents with supporting context; workflow pages separate progress, artifacts,
+and conversation. Do not use fixed minimum column widths that force horizontal
+page scrolling. Reuse shared controls, tabs, and spacing. Theme bootstrap and UI
+state must read the same persisted preference key.
+
 This document defines the visual language, interaction principles, component conventions, and implementation constraints for this project.
 
 All AI coding agents and human contributors MUST follow these rules when creating or modifying frontend UI.

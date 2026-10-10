@@ -382,7 +382,7 @@ async function discussMaterial() {
 }
 .material-browser--detail-open .table-head,
 .material-browser--detail-open .file-row {
-  grid-template-columns: minmax(230px, 1fr) 56px 80px 68px;
+  grid-template-columns: minmax(0, 1fr) 56px 80px 68px;
 }
 .material-browser--detail-open .table-head > *:nth-child(5),
 .material-browser--detail-open .table-head > *:nth-child(6),

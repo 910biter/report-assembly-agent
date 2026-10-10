@@ -517,7 +517,7 @@ dd {
 .steel-swatch { background: linear-gradient(135deg, #151a20 50%, #4d7f9f 50%); }
 .graphite-swatch { background: linear-gradient(135deg, #151a20 50%, #8896a4 50%); }
 .performance-panel {
-  padding: 26px;
+  padding: 20px;
   overflow: hidden;
   background: var(--card);
 }

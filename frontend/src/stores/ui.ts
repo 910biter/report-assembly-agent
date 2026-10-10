@@ -2,7 +2,7 @@ import { defineStore } from "pinia";
 
 export const useUiStore = defineStore("ui", {
   state: () => ({
-    theme: (typeof localStorage !== "undefined" && localStorage.getItem("ira-theme") === "light" ? "light" : "dark") as "dark" | "light",
+    theme: (typeof localStorage !== "undefined" && localStorage.getItem("ira-workspace-theme") === "dark" ? "dark" : "light") as "dark" | "light",
     palette: (typeof localStorage !== "undefined" && ["violet", "steel", "graphite"].includes(localStorage.getItem("ira-palette") || "") ? localStorage.getItem("ira-palette") : "violet") as "violet" | "steel" | "graphite",
     navCollapsed: typeof localStorage !== "undefined" && localStorage.getItem("ira-nav-collapsed") === "true",
     navOpen: false,
@@ -28,7 +28,7 @@ export const useUiStore = defineStore("ui", {
     setTheme(theme: "dark" | "light") {
       this.theme = theme;
       if (typeof document !== "undefined") document.documentElement.dataset.theme = theme;
-      if (typeof localStorage !== "undefined") localStorage.setItem("ira-theme", theme);
+      if (typeof localStorage !== "undefined") localStorage.setItem("ira-workspace-theme", theme);
     },
     toggleTheme() { this.setTheme(this.theme === "dark" ? "light" : "dark"); },
     setPalette(palette: "violet" | "steel" | "graphite") {

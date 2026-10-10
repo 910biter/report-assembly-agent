@@ -6,6 +6,7 @@ import AppIcon from "@/components/AppIcon.vue";
 import ReviewCopilot from "@/components/ReviewCopilot.vue";
 import { useUiStore } from "@/stores/ui";
 import { stageMeta } from "@/domain/workflowStages";
+import { usesDockedAssistant } from "@/lib/assistantLayout";
 
 const route = useRoute();
 const ui = useUiStore();
@@ -91,7 +92,7 @@ let timer: number | undefined;
 let stopResize: (() => void) | undefined;
 const viewportWidth = ref(window.innerWidth);
 const dockableRoute = computed(
-  () => route.path.startsWith("/tasks/") || route.path.startsWith("/reports/"),
+  () => usesDockedAssistant(route.path),
 );
 const isDocked = computed(
   () => open.value && dockableRoute.value && viewportWidth.value >= 1280,
@@ -446,7 +447,7 @@ watch(
   () => route.fullPath,
   async () => {
     ui.closeAssistant();
-    tab.value = "progress";
+    tab.value = "discuss";
     selected.value = null;
     references.value = [];
     await loadContext();
@@ -497,8 +498,7 @@ onBeforeUnmount(() => {
       ></button>
       <header @pointerdown="startPanelMove">
         <div>
-          <small>{{ assistantCaption }}</small
-          ><b>{{ assistantName }}</b>
+          <b :title="assistantCaption">{{ assistantName }}</b>
         </div>
         <div class="panel-actions">
           <button aria-label="关闭助手" @click="open = false">
@@ -651,7 +651,9 @@ onBeforeUnmount(() => {
           <div v-else class="assistant-empty">该阶段尚未形成可审阅产物。</div>
         </div>
         <div v-else class="discussion-view">
-          <div v-if="references.length" class="reference-list discussion-references">
+          <details v-if="references.length" class="discussion-references">
+            <summary>已引用 {{ references.length }} 项</summary>
+            <div class="reference-list">
             <span
               v-for="(item, index) in references"
               :key="referenceKey(item)"
@@ -672,7 +674,8 @@ onBeforeUnmount(() => {
             >
               清除引用
             </button>
-          </div>
+            </div>
+          </details>
           <ReviewCopilot
             v-if="interactionScopeReady"
             :key="isDraft ? `draft:${draftId}` : `task:${taskId}`"
@@ -698,7 +701,7 @@ onBeforeUnmount(() => {
     <button
       class="assistant-orb"
       :aria-label="open ? '关闭报告协作助手' : '打开报告协作助手'"
-      @click="open = !open"
+      @click="open ? (open = false) : (open = true, switchTab('discuss'))"
     >
       <span class="orb-mark"><AppIcon name="activity" :size="15" /></span>
       <span class="orb-label">{{ isDraft ? "讨论需求" : isMaterialPage ? "材料助手" : "任务助手" }}</span>
@@ -766,9 +769,9 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 17px 18px 15px;
+  padding: 8px 16px;
   border-bottom: 1px solid var(--border);
-  background: var(--surface-raised);
+  background: var(--card);
   cursor: grab;
   user-select: none;
 }
@@ -783,8 +786,8 @@ onBeforeUnmount(() => {
   letter-spacing: 0.08em;
 }
 .assistant-panel > header b {
-  margin-top: 3px;
-  font-size: 15px;
+  margin-top: 0;
+  font-size: 14px;
 }
 .assistant-panel > header button {
   display: grid;
@@ -807,12 +810,12 @@ onBeforeUnmount(() => {
   grid-auto-flow: column;
   grid-auto-columns: 1fr;
   gap: 5px;
-  padding: 8px 12px;
+  padding: 4px 12px;
   border-bottom: 1px solid var(--border);
   background: var(--card);
 }
 .assistant-panel > nav button {
-  padding: 8px 4px;
+  padding: 6px 4px;
   border: 0;
   border-radius: 6px;
   background: transparent;
@@ -825,7 +828,7 @@ onBeforeUnmount(() => {
 }
 .assistant-panel > nav button.active {
   background: var(--primary-soft);
-  color: var(--foreground);
+  color: var(--primary);
   font-weight: 600;
 }
 .assistant-body {
@@ -1160,5 +1163,16 @@ onBeforeUnmount(() => {
   margin: 0;
   padding: 0 0 10px;
   border-bottom: 1px solid var(--border);
+}
+.discussion-references > summary {
+  cursor: pointer;
+  color: var(--foreground);
+  font-size: 12px;
+  padding: 4px 0;
+}
+.discussion-references .reference-list {
+  max-height: 112px;
+  overflow-y: auto;
+  margin-top: 6px;
 }
 </style>

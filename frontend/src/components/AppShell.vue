@@ -7,6 +7,7 @@ import WorkflowAssistant from "./WorkflowAssistant.vue";
 import { navigationGroups } from "@/navigation";
 import { authMode, currentUser, signOut } from "@/lib/auth";
 import { api, jsonInit } from "@/api/http";
+import { usesDockedAssistant } from "@/lib/assistantLayout";
 
 const route = useRoute();
 const ui = useUiStore();
@@ -41,12 +42,12 @@ async function changePassword() {
 }
 const editor = computed(() => Boolean(route.meta.editor));
 const dockAssistantRoute = computed(
-  () => route.path.startsWith("/tasks/") || editor.value,
+  () => usesDockedAssistant(route.path),
 );
 const shellStyle = computed(
   () =>
     ({
-      "--assistant-dock-width": `min(${ui.assistant.dockWidth}px, 42vw, calc(100vw - ${ui.navCollapsed ? 56 : 220}px - 640px))`,
+      "--assistant-dock-width": `min(${ui.assistant.dockWidth}px, 42vw, calc(100vw - ${ui.navCollapsed ? 56 : 176}px - 640px))`,
     }) as Record<string, string>,
 );
 </script>
@@ -130,10 +131,7 @@ const shellStyle = computed(
         >
           <AppIcon name="menu" />
         </button>
-        <div v-if="route.meta.editor" class="topbar-title">
-          <strong>{{ route.meta.title }}</strong
-          ><span v-if="route.meta.editor">报告工作区</span>
-        </div>
+        <div class="topbar-title"><span>工作区</span><span aria-hidden="true">›</span><strong>{{ route.meta.title || '报告整编' }}</strong></div>
         <button
           class="theme-toggle"
           type="button"
@@ -168,10 +166,9 @@ const shellStyle = computed(
   </div>
 </template>
 <style scoped>
-.nav-foot { flex-direction: column; align-items: stretch !important; right: 18px; }
 .health-line { display: flex; align-items: center; gap: 7px; }
-.account-area { position: relative; margin-bottom: 14px; }
-.account-trigger { width: 100%; display: flex; align-items: center; gap: 10px; padding: 6px; border: 1px solid var(--border); border-radius: 8px; color: var(--foreground); background: var(--surface); cursor: pointer; text-align: left; }
+.account-area { position: relative; width: 100%; min-width: 0; margin-bottom: 8px; }
+.account-trigger { width: 100%; display: flex; align-items: center; gap: 10px; padding: 6px; border: 1px solid transparent; border-radius: 8px; color: var(--foreground); background: transparent; cursor: pointer; text-align: left; }
 .account-trigger:hover { border-color: var(--border-strong); background: var(--surface-hover); }
 .account-avatar { display: grid; place-items: center; flex: 0 0 28px; height: 28px; border-radius: 6px; background: var(--primary-soft); color: var(--foreground); font-weight: 600; }
 .account-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -210,7 +207,7 @@ const shellStyle = computed(
   display: flex;
   align-items: center;
   gap: 9px;
-  padding: 0 16px;
+  padding: 0 12px;
   border-bottom: 1px solid var(--border);
 }
 .sidebar-toggle {
@@ -234,20 +231,20 @@ const shellStyle = computed(
   place-items: center;
   width: 30px;
   height: 30px;
-  color: var(--accent);
-  background: var(--primary-soft);
-  border: 1px solid color-mix(in srgb, var(--primary) 32%, var(--border));
+  color: var(--nav-foreground);
+  background: transparent;
+  border: 0;
   border-radius: 8px;
 }
 .brand strong {
   color: var(--nav-foreground);
-  font-size: 15px;
+  font-size: 14px;
   letter-spacing: -0.01em;
 }
 nav.primary-nav {
   display: grid;
-  gap: 12px;
-  padding: 16px 10px;
+  gap: 14px;
+  padding: 16px 8px;
 }
 .nav-group {
   display: grid;
@@ -255,14 +252,14 @@ nav.primary-nav {
 }
 .nav-group + .nav-group {
   padding-top: 9px;
-  border-top: 1px solid var(--border);
+  border-top: 0;
 }
 .nav-group-label {
   padding: 0 10px 4px;
   color: var(--subtle-foreground);
-  font-size: 10px;
-  font-weight: 600;
-  letter-spacing: 0.06em;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0;
   line-height: 1.5;
 }
 .nav-link {
@@ -270,7 +267,7 @@ nav.primary-nav {
   display: flex;
   align-items: center;
   gap: 10px;
-  min-height: 38px;
+  min-height: 34px;
   padding: 0 10px;
   color: var(--nav-muted);
   border-radius: 8px;
@@ -285,12 +282,12 @@ nav.primary-nav {
 }
 .nav-link.active {
   color: var(--nav-foreground);
-  background: var(--primary-soft);
+  background: var(--nav-raised);
   font-weight: 500;
   box-shadow: none;
 }
 .nav-link.active::before {
-  content: "";
+  content: none;
   position: absolute;
   left: -10px;
   top: 9px;
@@ -301,10 +298,12 @@ nav.primary-nav {
 }
 .nav-foot {
   position: absolute;
-  bottom: 22px;
-  left: 18px;
+  bottom: 16px;
+  left: 12px;
+  right: 12px;
   display: flex;
-  align-items: center;
+  flex-direction: column;
+  align-items: stretch;
   gap: 7px;
   color: var(--nav-muted);
   font-size: 11px;

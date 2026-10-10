@@ -400,9 +400,9 @@ function taskType(task: TaskSummary) {
   min-width: 0;
   overflow-x: auto;
   gap: 4px;
-  padding: 16px 18px 0;
+  padding: 8px 0;
   border-bottom: 1px solid var(--border);
-  background: var(--muted);
+  background: transparent;
   scrollbar-width: thin;
   scrollbar-color: var(--border-strong) transparent;
 }
@@ -411,7 +411,7 @@ function taskType(task: TaskSummary) {
   flex: 0 0 auto;
   align-items: center;
   gap: 7px;
-  padding: 8px 12px 12px;
+  padding: 8px 12px;
   border: 0;
   border-bottom: 2px solid transparent;
   background: transparent;
@@ -425,9 +425,11 @@ function taskType(task: TaskSummary) {
   background: var(--muted);
 }
 .view-tabs button.active {
-  color: var(--primary);
-  border-bottom-color: var(--primary);
-  font-weight: 700;
+  color: var(--foreground);
+  border-bottom-color: transparent;
+  border-radius: var(--radius-control);
+  background: var(--surface-hover);
+  font-weight: 600;
 }
 .view-tabs span {
   min-width: 21px;
@@ -438,8 +440,8 @@ function taskType(task: TaskSummary) {
   font-size: 11px;
 }
 .view-tabs button.active span {
-  background: var(--primary-soft);
-  color: var(--primary);
+  background: var(--muted);
+  color: var(--foreground);
 }
 .filter-bar {
   display: flex;
@@ -566,12 +568,12 @@ function taskType(task: TaskSummary) {
   white-space: nowrap;
 }
 .open-link {
-  color: var(--primary);
+  color: var(--foreground);
   font-size: 13px;
   font-weight: 650;
 }
 .task-detail {
-  padding: 22px;
+  padding: 20px;
 }
 .detail-head {
   display: flex;

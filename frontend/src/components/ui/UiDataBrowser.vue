@@ -32,9 +32,9 @@ withDefaults(defineProps<{
   min-height: 520px;
   overflow: clip;
   grid-template-columns: minmax(0, 1fr);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-panel);
-  background: var(--card);
+  border-block: 1px solid var(--border);
+  border-radius: 0;
+  background: transparent;
   align-items: start;
 }
 
@@ -56,7 +56,7 @@ withDefaults(defineProps<{
   max-height: calc(100dvh - var(--header-height));
   overflow-y: auto;
   border-left: 1px solid var(--border);
-  background: var(--surface-raised);
+  background: var(--card);
   overflow-wrap: anywhere;
   scrollbar-gutter: stable;
 }
