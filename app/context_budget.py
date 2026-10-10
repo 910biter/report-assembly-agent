@@ -26,9 +26,11 @@ class TokenCounter:
             if self._loaded:
                 return
             self._loaded = True
-            configured = str(settings.generation_tokenizer_path or "").strip()
+            from app.model_connection import public_connection
+            configured = str(public_connection().get("tokenizer_path") or "").strip()
             candidates = [configured] if configured else []
-            model = str(settings.generation_model or "").strip()
+            from app.model_connection import model_name
+            model = model_name()
             if model and ":" not in model:
                 candidates.append(model)
             for candidate in dict.fromkeys(value for value in candidates if value):
@@ -38,12 +40,18 @@ class TokenCounter:
                     self._tokenizer = AutoTokenizer.from_pretrained(
                         candidate,
                         local_files_only=bool(settings.context_tokenizer_local_only),
-                        trust_remote_code=True,
+                        trust_remote_code=False,
                     )
                     self.method = f"tokenizer:{candidate}"
                     return
                 except Exception:
                     continue
+
+    def reset(self) -> None:
+        with self._lock:
+            self._loaded = False
+            self._tokenizer = None
+            self.method = "estimated"
 
     def count(self, text: str) -> int:
         value = str(text or "")

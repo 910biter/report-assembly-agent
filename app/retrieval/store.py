@@ -76,6 +76,84 @@ class QdrantVectorStore:
         payload["kind"] = "unit"
         return self._upsert(self.units_collection, int(unit_id), vector, payload)
 
+    def save_unit_vectors(self, pairs: list[tuple[int, list[float]]],
+                          batch_size: int = 64) -> set[int]:
+        """Bulk-index units without per-unit PostgreSQL/Qdrant round trips.
+
+        Return only IDs acknowledged by Qdrant. Invalid points are isolated
+        locally; transport failures stop this attempt without recursive retries.
+        This does not weaken the lexical retrieval fallback for missing IDs.
+        """
+        if not self.enabled or self.client is None or not pairs:
+            return set()
+        try:
+            from qdrant_client.models import PointStruct
+        except ImportError:
+            return set()
+
+        pairs = [(int(unit_id), vector) for unit_id, vector in pairs]
+        payloads = self._unit_payloads([unit_id for unit_id, _ in pairs])
+        size = max(1, int(batch_size))
+        try:
+            self.ensure_collection(self.units_collection, len(pairs[0][1]))
+        except Exception:
+            return set()
+        indexed: set[int] = set()
+
+        for offset in range(0, len(pairs), size):
+            points = []
+            for unit_id, vector in pairs[offset:offset + size]:
+                if unit_id not in payloads:
+                    continue
+                try:
+                    values = np.asarray(vector, dtype=np.float32)
+                    if values.ndim != 1 or not len(values) or not np.isfinite(values).all():
+                        continue
+                    points.append(PointStruct(
+                        id=unit_id, vector=values.tolist(),
+                        payload={**payloads[unit_id], "kind": "unit"},
+                    ))
+                except (TypeError, ValueError):
+                    continue
+            if not points:
+                continue
+            try:
+                self.client.upsert(collection_name=self.units_collection, points=points, wait=True)
+                indexed.update(int(point.id) for point in points)
+            except Exception:
+                break
+        return indexed
+
+    @staticmethod
+    def _unit_payloads(unit_ids: list[int]) -> dict[int, dict]:
+        """Fetch provenance once for an indexing batch, not once per unit."""
+        from app.db import session_scope
+        from app.infrastructure.orm import ORMUnit, ORMMaterial
+        from sqlalchemy import select
+
+        if not unit_ids:
+            return {}
+        payloads: dict[int, dict] = {}
+        with session_scope() as s:
+            for offset in range(0, len(unit_ids), 500):
+                rows = s.execute(
+                    select(ORMUnit.c.id, ORMUnit.c.material_id, ORMUnit.c.kind, ORMUnit.c.page,
+                           ORMUnit.c.paragraph, ORMMaterial.c.filename, ORMMaterial.c.file_type)
+                    .join(ORMMaterial, ORMMaterial.c.id == ORMUnit.c.material_id)
+                    .where(ORMUnit.c.id.in_(unit_ids[offset:offset + 500]))
+                ).mappings().all()
+                for row in rows:
+                    payloads[int(row["id"])] = {
+                        "unit_id": int(row["id"]),
+                        "material_id": int(row["material_id"]),
+                        "kind": row["kind"],
+                        "page": row["page"],
+                        "paragraph": row["paragraph"],
+                        "filename": row["filename"],
+                        "file_type": row["file_type"],
+                    }
+        return payloads
+
     def save_fact_vector(self, fact_id: int, vector: list[float], task_id: str = "") -> bool:
         return self._upsert(
             self.facts_collection,

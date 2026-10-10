@@ -19,7 +19,9 @@ def stable_hash(value: Any) -> str:
 
 def cache_key(stage: str, effective_inputs: Any, model_version: str = "",
               prompt_version: str = "", config_version: str = "") -> tuple[str, str]:
+    from app.model_connection import connection_identity
     input_hash = stable_hash({
+        "connection": connection_identity(),
         "schema": CACHE_SCHEMA_VERSION,
         "stage": stage,
         "inputs": effective_inputs,

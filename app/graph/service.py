@@ -131,7 +131,7 @@ class GraphExtractionAgent(BaseAgent):
     def should_retry(self, exc: Exception) -> bool:
         # Repeating an output-limited request cannot recover. The graph service
         # splits that batch and retries the smaller semantic units instead.
-        return str(exc) != "MODEL_OUTPUT_TRUNCATED"
+        return str(exc) != "MODEL_OUTPUT_TRUNCATED" and super().should_retry(exc)
 
     def extract(self, facts: list[dict]) -> dict:
         lines = []

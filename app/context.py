@@ -8,6 +8,7 @@ from app.planning.structure import normalize_text_list
 from app.retrieval.query_compiler import QueryCompiler, RetrievalQuery
 from app.retrieval import embed_texts, vector_store
 from app.retrieval.rag import hybrid_retrieve_units
+import time
 
 def _fit(text: str, budget_tokens: int) -> str:
     return truncate_tokens(text, budget_tokens)
@@ -167,6 +168,12 @@ class ContextManager:
         self.units_by_material = units_by_material or {}
         self.filenames = filenames or {}
         self._query_compiler = QueryCompiler(task_id=str(task.get("id") or ""))
+        # Reuse one task-scoped fact-vector snapshot across chapter/subsection
+        # queries. Invalidate when the fact registry changes (e.g. incremental
+        # revision), so new evidence is not hidden by an old cache.
+        self._fact_vector_cache_key: tuple | None = None
+        self._fact_vector_cache: dict = {}
+        self._fact_vector_cached_at = 0.0
         self._unit_index: dict[int, tuple[int, Unit]] = {}
         for material_id, units in self.units_by_material.items():
             for unit in units:
@@ -373,12 +380,19 @@ class ContextManager:
 
         queries = normalize_text_list(queries)
         need_text = " ".join(queries)
+        # Only the vector backend needs CPU embeddings. Compute each distinct
+        # query once, rather than on every material or on lexical-only runs.
+        vector_enabled = bool(getattr(vector_store, "enabled", False))
+        query_vectors = {
+            query: self._query_compiler.query_vector(RetrievalQuery(query))
+            for query in dict.fromkeys(queries)
+        } if vector_enabled else {}
         # 检索候选:Qdrant 粗召回(查询相关)→ rerank;Qdrant 不可用时回退 Python 打分
         per_material: list[tuple[int, list[tuple[float, object]]]] = []
         for material_id, units in self.units_by_material.items():
             candidates: dict[int, object] = {}
             for query in queries:
-                query_vector = self._query_compiler.query_vector(RetrievalQuery(query))
+                query_vector = query_vectors.get(query)
                 hit_ids: set[int] = set()
                 try:
                     from app.retrieval import vector_store
@@ -500,16 +514,20 @@ class ContextManager:
         except Exception:
             unit_vectors = {}
 
+        query_vectors = {}
+        if unit_vectors:
+            from app.retrieval.embedder import embed_texts
+            for query in dict.fromkeys(queries):
+                try:
+                    query_vectors[query] = embed_texts([query], query=True)[0]
+                except Exception:
+                    query_vectors[query] = None
+
         per_material: list[tuple[int, list]] = []
         for material_id, units in self.units_by_material.items():
             candidates: dict[int, object] = {}
             for query in queries:
-                query_vector = None
-                try:
-                    from app.retrieval.embedder import embed_texts
-                    query_vector = embed_texts([query], query=True)[0]
-                except Exception:
-                    query_vector = None
+                query_vector = query_vectors.get(query)
                 scored = sorted(
                     [(_unit_relevance(unit, query, keywords, query_vector, unit_vectors), unit)
                      for unit in units if (unit.content or "").strip()],
@@ -838,11 +856,23 @@ class ContextManager:
             return []
         used_fact_ids = used_fact_ids or set()
         try:
-            query_vector = embed_texts([query], query=True)[0]
-            vec_by_id = {
-                int(fact_id): vector
-                for fact_id, vector in vector_store.fact_vectors(str(self.task.get("id") or self.task.get("task_id") or ""))
-            }
+            if not getattr(vector_store, "enabled", False):
+                raise ValueError("vector backend off")
+            scope = str(self.task.get("id") or self.task.get("task_id") or "")
+            signature = (scope, tuple(sorted((int(fact["id"]), str(fact.get("content") or "")) for fact in facts if fact.get("id") is not None)))
+            if self._fact_vector_cache_key != signature or time.monotonic() - self._fact_vector_cached_at >= 5:
+                self._fact_vector_cache = {
+                    int(fact_id): vector
+                    for fact_id, vector in vector_store.fact_vectors(scope)
+                }
+                self._fact_vector_cache_key = signature
+                self._fact_vector_cached_at = time.monotonic()
+            vec_by_id = self._fact_vector_cache
+            if not vec_by_id:
+                raise ValueError("no cached vectors")
+            query_vector = self._query_compiler.query_vector(RetrievalQuery(query))
+            if query_vector is None:
+                raise ValueError("query embedding unavailable")
             scored = []
             for fact in facts:
                 vector = vec_by_id.get(fact["id"])

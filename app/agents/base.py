@@ -35,7 +35,13 @@ class BaseAgent:
 
     def should_retry(self, exc: Exception) -> bool:
         """Return whether retrying the same request can reasonably recover."""
-        return True
+        message = str(exc)
+        code = message.split(":", 1)[0]
+        return code not in {
+            "MODEL_CONNECTION_NOT_CONFIGURED", "MODEL_HTTP_400", "MODEL_HTTP_401",
+            "MODEL_HTTP_403", "MODEL_HTTP_404", "MODEL_HTTP_405", "MODEL_HTTP_413",
+            "MODEL_HTTP_422",
+        }
 
     def generate(self, prompt: str, system: str | None = None) -> str:
         output_tokens = stage_profile(self.name).output_tokens

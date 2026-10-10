@@ -32,6 +32,7 @@ from app.assertion_semantics import semantic_profile_line, source_semantics_line
 from app.planning.evidence_context import fact_line, inference_line, evidence_ids
 from app.token_monitor import update_call_funnel, update_call_metrics, update_call_products
 from app.config import settings
+from app.model_connection import capacity
 from app.context_budget import (
     ContextSection,
     build_prompt_from_sections,
@@ -1626,7 +1627,7 @@ class WriterAgent(BaseAgent):
                     for item in support_inferences
                 ], weight=4),
             ],
-            min(6000, settings.model_context_window_tokens // 3),
+            min(6000, capacity()[0] // 3),
         )
         payload = self.generate_json(prompt, max_tokens=min(3072, settings.writer_output_tokens))
         generated = []

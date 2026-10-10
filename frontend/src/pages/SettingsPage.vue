@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
 import { useQuery } from "@tanstack/vue-query";
-import { api } from "@/api/http";
+import { api, jsonInit } from "@/api/http";
+import { currentUser } from "@/lib/auth";
 import UiPageHeader from "@/components/ui/UiPageHeader.vue";
 import UiPanel from "@/components/ui/UiPanel.vue";
 import UiSectionHeader from "@/components/ui/UiSectionHeader.vue";
@@ -9,6 +10,47 @@ import UiButton from "@/components/ui/UiButton.vue";
 import { useUiStore } from "@/stores/ui";
 
 const ui = useUiStore();
+const modelForm = ref({ base_url: "", model_name: "", api_key: "", service_kind: "openai", context_tokens: 18432, output_tokens: 8192, tokenizer_path: "", output_parameter: "max_tokens", send_temperature: true, vllm_priority: false });
+const keyStored = ref(false);
+const clearKey = ref(false);
+const modelBusy = ref(false);
+const modelMessage = ref("");
+const connection = useQuery({
+  queryKey: ["model-connection"],
+  enabled: computed(() => currentUser.value?.role === "admin"),
+  queryFn: async () => {
+    const value = await api<any>("/api/system/model-connection");
+    const { configured, has_api_key, ...form } = value;
+    modelForm.value = { ...modelForm.value, ...form, api_key: "" };
+    keyStored.value = value.has_api_key;
+    return value;
+  },
+});
+const modelStatus = useQuery({
+  queryKey: ["model-connection-status"],
+  enabled: computed(() => currentUser.value?.role === "admin"),
+  queryFn: () => api<any>("/api/system/model-connection/status"),
+  refetchInterval: 30_000,
+});
+async function configureModel(test: boolean) {
+  modelBusy.value = true;
+  modelMessage.value = "";
+  const { api_key, ...fields } = modelForm.value;
+  const payload: Record<string, unknown> = { ...fields };
+  if (clearKey.value || modelForm.value.api_key) payload.api_key = clearKey.value ? "" : modelForm.value.api_key;
+  try {
+    const result = await api<any>(`/api/system/model-connection${test ? '/test' : ''}`, jsonInit(test ? "POST" : "PUT", payload));
+    modelMessage.value = test ? (result.model_available ? "连接正常，模型可用" : "连接正常，但服务中未找到该模型") : "模型接入已保存，后续调用立即生效";
+    if (!test) {
+      modelForm.value.api_key = "";
+      clearKey.value = false;
+      await connection.refetch();
+      await modelStatus.refetch();
+    }
+  } catch (error: any) {
+    modelMessage.value = error.message || "操作失败";
+  } finally { modelBusy.value = false; }
+}
 
 const health = useQuery({
   queryKey: ["health"],
@@ -125,6 +167,30 @@ async function restartServices() {
 <template>
   <div class="page-stack settings-page">
     <UiPageHeader title="系统设置" />
+    <UiPanel v-if="currentUser?.role === 'admin'" class="section-block">
+      <UiSectionHeader title="模型接入" description="全系统共用 · OpenAI 兼容接口" />
+      <form class="model-connection-form" @submit.prevent="configureModel(false)">
+        <label class="field">接入地址<input v-model="modelForm.base_url" type="url" required placeholder="http://IP:端口/v1" /></label>
+        <label class="field">模型名称<input v-model="modelForm.model_name" required placeholder="服务发布的模型名称" /></label>
+        <label class="field">服务类型<select v-model="modelForm.service_kind"><option value="openai">通用 OpenAI 兼容接口</option><option value="vllm">vLLM</option></select></label>
+        <label class="field">API Key<input v-model="modelForm.api_key" type="password" autocomplete="new-password" :placeholder="keyStored ? '已设置；留空保留原 Key' : '本地无鉴权服务可留空'" /></label>
+        <label v-if="keyStored"><input v-model="clearKey" type="checkbox" />清除已保存的 Key</label>
+        <details class="connection-options">
+          <summary>容量与接口能力</summary>
+          <label class="field">上下文窗口（Token）<input v-model.number="modelForm.context_tokens" type="number" min="4096" max="2000000" required /></label>
+          <label class="field">最大输出（Token）<input v-model.number="modelForm.output_tokens" type="number" min="256" required /></label>
+          <label class="field">输出参数<select v-model="modelForm.output_parameter"><option value="max_tokens">max_tokens</option><option value="max_completion_tokens">max_completion_tokens</option></select></label>
+          <label class="field">本机 Tokenizer 目录（可选）<input v-model="modelForm.tokenizer_path" placeholder="留空使用显式估算，不沿用旧模型 Tokenizer" /></label>
+          <label><input v-model="modelForm.send_temperature" type="checkbox" />服务支持 temperature 参数</label>
+          <label v-if="modelForm.service_kind === 'vllm'"><input v-model="modelForm.vllm_priority" type="checkbox" />vLLM 已启用 priority 调度</label>
+        </details>
+        <div class="service-actions">
+          <button class="btn" type="button" :disabled="modelBusy" @click="configureModel(true)">测试连接</button>
+          <button class="btn primary" type="submit" :disabled="modelBusy">保存接入</button>
+        </div>
+        <p v-if="modelMessage" role="status">{{ modelMessage }}</p>
+      </form>
+    </UiPanel>
 
     <section class="settings-grid">
       <UiPanel class="section-block">
@@ -133,8 +199,8 @@ async function restartServices() {
             <div class="service-actions">
               <span
                 class="badge"
-                :class="health.data.value?.error ? 'danger' : 'success'"
-                >{{ health.data.value?.error ? "连接异常" : "服务可用" }}</span
+                :class="modelStatus.data.value?.status === 'error' ? 'danger' : ''"
+                >{{ modelStatus.data.value?.message || '尚未检查' }}</span
               ><UiButton
                 variant="outline"
                 size="sm"
@@ -149,9 +215,9 @@ async function restartServices() {
         </UiSectionHeader>
         <dl>
           <dt>网关地址</dt>
-          <dd class="mono">{{ health.data.value?.gateway_url || "—" }}</dd>
-          <dt>服务版本</dt>
-          <dd>{{ health.data.value?.version || "—" }}</dd>
+          <dd class="mono">{{ connection.data.value?.base_url || "未配置" }}</dd>
+          <dt>模型名称</dt>
+          <dd>{{ connection.data.value?.model_name || "未配置" }}</dd>
           <dt>运行目录</dt>
           <dd class="mono">{{ health.data.value?.runtime_root || "—" }}</dd>
         </dl>
@@ -238,8 +304,8 @@ async function restartServices() {
     <UiPanel class="performance-panel">
       <UiSectionHeader
         class="performance-head"
-        title="性能概览"
-        description="实时资源状态与最近一次完整任务的推理负载"
+        title="应用主机资源与模型调用"
+        description="硬件采样仅来自本机；远端 API 的 GPU、显存不在采集范围内。调用耗时包含网络与服务端排队。"
       >
         <template #actions>
           <div v-if="performance.data.value?.task" class="task-context">
@@ -265,21 +331,20 @@ async function restartServices() {
             :value="resources.data.value?.gpu?.utilization || 0"
             max="100"
           ></progress
-          ><small>当前加速器计算负载</small>
+          ><small>应用主机 GPU；不代表远端 API 算力</small>
         </article>
         <article>
           <div>
             <span>显存</span
             ><b
-              >{{ compact(resources.data.value?.gpu?.used_mb || 0) }} /
-              {{ compact(resources.data.value?.gpu?.total_mb || 0) }} MB</b
+              >{{ resources.data.value?.gpu?.available ? `${compact(resources.data.value.gpu.used_mb)} / ${compact(resources.data.value.gpu.total_mb)} MB` : '未接入 GPU 采样' }}</b
             >
           </div>
           <progress
             :value="resources.data.value?.gpu?.used_mb || 0"
             :max="resources.data.value?.gpu?.total_mb || 1"
           ></progress
-          ><small>模型与 KV Cache 占用</small>
+          ><small>应用主机显存；远端模型显存未采集</small>
         </article>
         <article>
           <div>
@@ -520,6 +585,21 @@ dd {
   padding: 20px;
   overflow: hidden;
   background: var(--card);
+}
+.model-connection-form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+}
+.connection-options,
+.model-connection-form > p,
+.model-connection-form > .service-actions {
+  grid-column: 1 / -1;
+}
+.connection-options > summary { cursor: pointer; margin-bottom: 12px; }
+.connection-options[open] { display: grid; gap: 12px; }
+@media (max-width: 700px) {
+  .model-connection-form { grid-template-columns: minmax(0, 1fr); }
 }
 .performance-head {
   align-items: flex-start;

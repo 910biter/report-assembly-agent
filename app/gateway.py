@@ -9,6 +9,7 @@ from typing import Protocol
 import httpx
 
 from app.config import settings
+from app.model_connection import load_connection
 
 _GENERATION_STATS_LOCK = threading.Lock()
 _GENERATION_STATS = {
@@ -43,9 +44,12 @@ class OpenAICompatibleGateway:
     """vLLM generation client with an independent CPU embedding runtime."""
 
     def __init__(self, base_url: str = "") -> None:
-        self.generation_url = (
-            base_url or settings.generation_url or "http://127.0.0.1:8100/v1"
-        ).rstrip("/")
+        self._base_url = base_url.rstrip("/")
+
+    @property
+    def generation_url(self) -> str:
+        from app.model_connection import load_connection
+        return self._base_url or load_connection().base_url
 
     def generate(self, prompt: str, system: str | None = None,
                  max_tokens: int | None = None,
@@ -85,9 +89,9 @@ class OpenAICompatibleGateway:
         return value
 
     def _headers(self) -> dict[str, str]:
+        from app.model_connection import load_connection
         headers = {"Content-Type": "application/json"}
-        if settings.generation_api_key:
-            headers["Authorization"] = f"Bearer {settings.generation_api_key}"
+        headers.update(load_connection().headers())
         return headers
 
     def embed(self, texts: list[str], query: bool = False, **kwargs) -> list[list[float]]:
@@ -98,26 +102,22 @@ class OpenAICompatibleGateway:
     def _chat(self, prompt: str, system: str | None = None, json_mode: bool = False,
               think: bool | None = None, max_tokens: int | None = None,
               temperature: float | None = None) -> str:
+        connection = load_connection()
+        base_url = self._base_url or connection.base_url
+        headers = {"Content-Type": "application/json", **connection.headers()}
         messages = []
         if system:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
         payload = {
-            "model": settings.generation_model,
+            "model": connection.model_name,
             "messages": messages,
             "stream": False,
-            "max_tokens": int(max_tokens or settings.generation_reserve_tokens),
+            connection.output_parameter: min(int(max_tokens or settings.generation_reserve_tokens), connection.output_tokens),
         }
-        if temperature is not None:
+        if temperature is not None and connection.send_temperature:
             payload["temperature"] = float(temperature)
-        # Lower values are more urgent in vLLM's priority scheduler.
-        from app.llm_queue import current_llm_priority
-        payload["priority"] = current_llm_priority()
-        if think is not None:
-            payload["chat_template_kwargs"] = {
-                "enable_thinking": bool(think),
-                "preserve_thinking": False,
-            }
+        payload.update(connection.extra_body(think))
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
         from app import task_control
@@ -128,19 +128,19 @@ class OpenAICompatibleGateway:
         started = time.perf_counter()
         try:
             response = client.post(
-                f"{self.generation_url}/chat/completions",
-                headers=self._headers(),
+                f"{base_url}/chat/completions",
+                headers=headers,
                 json=payload,
             )
             adjusted_max_tokens = _context_safe_max_tokens(
                 response,
-                requested_max_tokens=int(payload["max_tokens"]),
+                requested_max_tokens=int(payload[connection.output_parameter]),
             )
             if adjusted_max_tokens is not None:
-                payload["max_tokens"] = adjusted_max_tokens
+                payload[connection.output_parameter] = adjusted_max_tokens
                 response = client.post(
-                    f"{self.generation_url}/chat/completions",
-                    headers=self._headers(),
+                    f"{base_url}/chat/completions",
+                    headers=headers,
                     json=payload,
                 )
         except Exception:
@@ -156,9 +156,8 @@ class OpenAICompatibleGateway:
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
-            detail = response.text.strip().replace("\n", " ")[:500]
             raise RuntimeError(
-                f"MODEL_HTTP_{response.status_code}:{detail or 'empty response'}"
+                f"MODEL_HTTP_{response.status_code}"
             ) from exc
         result = response.json()
         _record_openai_generation_stats(result, time.perf_counter() - started)
@@ -169,9 +168,10 @@ class OpenAICompatibleGateway:
         return content
 
     def health(self) -> dict:
+        connection = load_connection()
         response = httpx.get(
-            f"{self.generation_url}/models",
-            headers=self._headers(),
+            f"{connection.base_url}/models",
+            headers=connection.headers(),
             timeout=5,
         )
         response.raise_for_status()
@@ -181,9 +181,9 @@ class OpenAICompatibleGateway:
         embedding_health = local_embedding_runtime.health()
         return {
             "version": "openai-compatible",
-            "backend": "vllm",
+            "backend": connection.service_kind,
             "models": {
-                settings.generation_model: settings.generation_model in available,
+                connection.model_name: connection.model_name in available,
                 settings.embedding_model: bool(embedding_health["available"]),
             },
             "embedding": embedding_health,

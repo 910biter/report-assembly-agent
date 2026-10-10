@@ -66,6 +66,10 @@ def hybrid_retrieve_units(
 
 
 def _semantic_hits(query: str, limit: int, filters: dict | None) -> list[RetrievalHit]:
+    # Avoid loading/running the heavyweight CPU embedding model when the
+    # vector backend is absent. Lexical retrieval is the intended fallback.
+    if not getattr(vector_store, "enabled", False):
+        return []
     try:
         query_vector = embed_texts([query], query=True)[0]
         return [
@@ -109,9 +113,15 @@ def _merge_hits(hits: list[RetrievalHit]) -> list[RetrievalHit]:
 
 def _rerank(hits: list[RetrievalHit], units_by_material: dict[int, list[Unit]],
             query: str, terms: list[str]) -> list[RetrievalHit]:
+    """Greedy diversity-aware ranking; no extra model calls.
+
+    Previously material_seen was only populated *after* every score was
+    calculated, making the diversity factor equal for every hit. Recompute
+    that small term for each selection so independent sources actually get a
+    chance to surface among otherwise comparable candidates.
+    """
     index = _unit_index(units_by_material)
-    material_seen: dict[int, int] = {}
-    scored = []
+    remaining = []
     for hit in hits:
         pair = index.get(hit.unit_id)
         if not pair:
@@ -120,15 +130,35 @@ def _rerank(hits: list[RetrievalHit], units_by_material: dict[int, list[Unit]],
         text = unit.content or ""
         term_hits = [term for term in terms if term and term in text]
         lexical = _ngram_similarity(query, text)
-        diversity = 1.0 / (1 + material_seen.get(material_id, 0))
-        final = hit.score * 0.55 + min(1.0, len(term_hits) / max(len(terms), 1)) * 0.25 + lexical * 0.15 + diversity * 0.05
+        base = (hit.score * 0.55
+                + min(1.0, len(term_hits) / max(len(terms), 1)) * 0.25
+                + lexical * 0.15)
         hit.coverage_terms = list(dict.fromkeys(hit.coverage_terms + term_hits))
-        scored.append((final, hit, material_id))
-    scored.sort(key=lambda item: item[0], reverse=True)
+        remaining.append((base, hit, material_id))
+    import heapq
+    from collections import deque
+
+    groups = {}
+    for position, (base, hit, material_id) in enumerate(remaining):
+        groups.setdefault(material_id, []).append((base, position, hit))
+    groups = {
+        material_id: deque(sorted(items, key=lambda item: (-item[0], item[1])))
+        for material_id, items in groups.items()
+    }
+    material_seen: dict[int, int] = {}
+    heap = []
+    for material_id, items in groups.items():
+        base, position, _hit = items[0]
+        heapq.heappush(heap, (-(base + 0.05), position, material_id))
     result = []
-    for _score, hit, material_id in scored:
+    while heap:
+        _score, _position, material_id = heapq.heappop(heap)
+        _base, _position, hit = groups[material_id].popleft()
         result.append(hit)
         material_seen[material_id] = material_seen.get(material_id, 0) + 1
+        if groups[material_id]:
+            base, position, _hit = groups[material_id][0]
+            heapq.heappush(heap, (-(base + 0.05 / (1 + material_seen[material_id])), position, material_id))
     return result
 
 

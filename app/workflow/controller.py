@@ -23,6 +23,7 @@ from app.writing.writer import WriterAgent, _chapter_position
 from app.report_tools import build_task_profile, business_block
 from app.cache import get_cached, set_cached, stable_hash
 from app.config import settings
+from app.model_connection import model_name
 from app.db import session_scope
 from app.infrastructure.orm import (
     Base,
@@ -1045,18 +1046,36 @@ class WorkflowController:
             return ""
         from app.retrieval.embedder import embed_texts_adaptive
         vectors, errors = embed_texts_adaptive([u.content for _, u in pairs])
-        unit_vecs: list[np.ndarray] = []
-        save_failures = 0
-        for (uid, _unit), vector in zip(pairs, vectors):
-            if vector is None:
-                continue
-            try:
-                if vector_store.save_unit_vector(uid, vector):
-                    unit_vecs.append(np.asarray(vector, dtype=np.float32))
-                else:
-                    save_failures += 1
-            except Exception:
-                save_failures += 1
+        # The legacy path made one metadata SELECT + collection check +
+        # upsert per Unit. Bulk upserts cut remote round trips by ~batch_size,
+        # while preserving per-ID success tracking and keyword fallback.
+        valid_pairs = [
+            (uid, vector) for (uid, _unit), vector in zip(pairs, vectors)
+            if vector is not None
+        ]
+        indexed: set[int] = set()
+        if valid_pairs:
+            bulk_save = getattr(vector_store, "save_unit_vectors", None)
+            if callable(bulk_save):
+                try:
+                    indexed = set(bulk_save(valid_pairs))
+                except Exception as exc:
+                    errors.append(f"VECTOR_STORE_BULK_FAILED:{type(exc).__name__}")
+                    # Continue with lexical fallback; don't silently claim
+                    # that an unacknowledged vector has been indexed.
+            else:
+                # Compatibility with injected/custom vector backends.
+                for uid, vector in valid_pairs:
+                    try:
+                        if vector_store.save_unit_vector(uid, vector):
+                            indexed.add(uid)
+                    except Exception:
+                        pass
+        save_failures = len(valid_pairs) - len(indexed)
+        unit_vecs = [
+            np.asarray(vector, dtype=np.float32)
+            for uid, vector in valid_pairs if uid in indexed
+        ]
         if errors:
             return "; ".join(errors[:3])
         if unit_vecs:
@@ -1278,7 +1297,7 @@ class WorkflowController:
             }
             cached = get_cached(
                 "material_analysis", effective_inputs,
-                model_version=settings.generation_model,
+                model_version=model_name(),
                 prompt_version=_MATERIAL_ANALYSIS_PROMPT_VERSION,
                 config_version=_MATERIAL_ROUTING_VERSION,
             )
@@ -1298,7 +1317,7 @@ class WorkflowController:
                 historical["context_meta"] = text_meta
                 set_cached(
                     "material_analysis", effective_inputs, historical,
-                    model_version=settings.generation_model,
+                    model_version=model_name(),
                     prompt_version=_MATERIAL_ANALYSIS_PROMPT_VERSION,
                     config_version=_MATERIAL_ROUTING_VERSION,
                 )
@@ -1347,7 +1366,7 @@ class WorkflowController:
             }
             set_cached(
                 "material_analysis", effective_inputs, insight,
-                model_version=settings.generation_model,
+                model_version=model_name(),
                 prompt_version=_MATERIAL_ANALYSIS_PROMPT_VERSION,
                 config_version=_MATERIAL_ROUTING_VERSION,
             )

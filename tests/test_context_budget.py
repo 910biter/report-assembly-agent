@@ -1,4 +1,6 @@
 import unittest
+from unittest.mock import patch
+from app.model_connection import Connection
 
 from app.context_budget import (
     ContextSection,
@@ -11,6 +13,11 @@ from app.token_monitor import _aggregate_context_capacity
 
 
 class ContextBudgetTests(unittest.TestCase):
+    def setUp(self):
+        mock = patch("app.model_connection.load_connection", return_value=Connection("http://test/v1", "test"))
+        mock.start()
+        self.addCleanup(mock.stop)
+
     def tearDown(self):
         consume_context_audit()
 

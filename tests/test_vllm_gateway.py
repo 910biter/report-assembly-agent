@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from app.agents.base import BaseAgent
 from app.config import settings
+from app.model_connection import Connection
 from app.gateway import (
     OpenAICompatibleGateway,
     _completion_was_truncated,
@@ -79,6 +80,12 @@ class _HealthResponse:
 
 
 class VllmGatewayTests(unittest.TestCase):
+    def setUp(self):
+        connection = Connection("http://vllm.test/v1", "qwen3.6-27b", service_kind="vllm", vllm_priority=True)
+        for target in ("app.model_connection.load_connection", "app.gateway.load_connection"):
+            mock = patch(target, return_value=connection)
+            mock.start()
+            self.addCleanup(mock.stop)
     def test_length_finish_reason_is_never_accepted_as_complete_json(self):
         self.assertTrue(_completion_was_truncated({
             "choices": [{"finish_reason": "length", "message": {"content": "{}"}}],
@@ -158,9 +165,7 @@ class VllmGatewayTests(unittest.TestCase):
 
     def test_json_generation_propagates_priority_and_thinking_control(self):
         gateway = OpenAICompatibleGateway("http://vllm.test/v1")
-        with patch("app.gateway.httpx.Client", _Client), patch.object(
-            settings, "generation_model", "qwen3.6-27b"
-        ):
+        with patch("app.gateway.httpx.Client", _Client):
             with llm_priority(PRIORITY_INTERACTIVE):
                 result = gateway.generate_json("return json", think=False)
         self.assertEqual(result, {"ok": True})
@@ -171,18 +176,14 @@ class VllmGatewayTests(unittest.TestCase):
 
     def test_json_generation_accepts_stage_specific_temperature(self):
         gateway = OpenAICompatibleGateway("http://vllm.test/v1")
-        with patch("app.gateway.httpx.Client", _Client), patch.object(
-            settings, "generation_model", "qwen3.6-27b"
-        ):
+        with patch("app.gateway.httpx.Client", _Client):
             result = gateway.generate_json("return json", think=False, temperature=0.0)
         self.assertEqual(result, {"ok": True})
         self.assertEqual(_Client.last_payload["temperature"], 0.0)
 
     def test_queue_returns_worker_usage_to_calling_context(self):
         gateway = OpenAICompatibleGateway("http://vllm.test/v1")
-        with patch("app.gateway.httpx.Client", _Client), patch.object(
-            settings, "generation_model", "qwen3.6-27b"
-        ):
+        with patch("app.gateway.httpx.Client", _Client):
             result = submit_llm_call(
                 lambda: gateway.generate_json("return json", think=False)
             )
@@ -192,9 +193,7 @@ class VllmGatewayTests(unittest.TestCase):
 
     def test_queue_returns_worker_usage_when_json_parsing_fails(self):
         gateway = OpenAICompatibleGateway("http://vllm.test/v1")
-        with patch("app.gateway.httpx.Client", _InvalidJsonClient), patch.object(
-            settings, "generation_model", "qwen3.6-27b"
-        ):
+        with patch("app.gateway.httpx.Client", _InvalidJsonClient):
             with self.assertRaisesRegex(ValueError, "MODEL_JSON_NOT_FOUND"):
                 submit_llm_call(
                     lambda: gateway.generate_json("return json", think=False)
@@ -210,9 +209,7 @@ class VllmGatewayTests(unittest.TestCase):
                 return _HealthResponse({"data": [{"id": "qwen3.6-27b"}]})
             return _HealthResponse({"models": [{"name": "qwen-embed:latest"}]})
 
-        with patch("app.gateway.httpx.get", side_effect=fake_get), patch.object(
-            settings, "generation_model", "qwen3.6-27b"
-        ), patch.object(settings, "embedding_model", "Qwen3-Embedding-0.6B"), patch(
+        with patch("app.gateway.httpx.get", side_effect=fake_get), patch.object(settings, "embedding_model", "Qwen3-Embedding-0.6B"), patch(
             "app.local_embedding.local_embedding_runtime.health",
             return_value={"backend": "transformers-cpu", "model": "/models/qwen", "available": True, "loaded": False},
         ):

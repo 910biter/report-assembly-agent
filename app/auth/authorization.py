@@ -39,7 +39,8 @@ def required_resources(path_params: dict) -> list[tuple[str, str | int]]:
 
 
 def authorize_request(request: Request) -> None:
-    if not settings.multiuser_enabled or request.url.path == "/api/health":
+    model_settings = request.url.path.startswith("/api/system/model-connection")
+    if (not settings.multiuser_enabled and not model_settings) or request.url.path == "/api/health":
         return
     from app.api.auth_routes import current_principal
 

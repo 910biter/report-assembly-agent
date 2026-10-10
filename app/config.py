@@ -46,10 +46,6 @@ class Settings(BaseSettings):
     runtime_root: Path = _PROJECT_ROOT / "runtime"
     host: str = "127.0.0.1"  # 服务监听地址(IRA_HOST,支持 .env;容器/远端部署设 0.0.0.0)
     port: int = 8000  # 服务监听端口(IRA_PORT)
-    generation_url: str = ""  # OpenAI-compatible base URL, e.g. http://127.0.0.1:8100/v1
-    generation_api_key: str = ""
-    generation_model: str = "qwen-agent:latest"
-    generation_tokenizer_path: str = ""  # 本地生成模型 tokenizer 目录；用于精确上下文装箱
     context_tokenizer_local_only: bool = True  # 禁止上下文计量在运行时访问外网
     embedding_backend: str = "transformers-cpu"
     embedding_model: str = "Qwen3-Embedding-0.6B"

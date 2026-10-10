@@ -2,11 +2,17 @@ import unittest
 from unittest.mock import patch
 
 from app.config import settings
+from app.model_connection import Connection
 from app.evidence.extractor import EvidenceAgent, _normalize_conflict_type, _split_unit_blocks
 from app.runtime_profiles import runtime_profile_manifest, stage_profile
 
 
 class RuntimeProfilesAndConflictTests(unittest.TestCase):
+    def setUp(self):
+        mock = patch("app.model_connection.load_connection", side_effect=lambda: Connection("http://test/v1", "test", context_tokens=settings.model_context_window_tokens, output_tokens=settings.generation_reserve_tokens))
+        mock.start()
+        self.addCleanup(mock.stop)
+
     def test_stage_profiles_share_physical_invariant_but_keep_distinct_contracts(self):
         profiles = {item["stage"]: item for item in runtime_profile_manifest()}
         for profile in profiles.values():

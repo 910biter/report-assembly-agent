@@ -72,6 +72,8 @@ def log_llm_call(call_id: str, agent: str, input_chars: int, stats_delta: dict,
         "model_total_seconds": round(float(stats_delta.get("total_seconds") or 0), 3),
         "wall_latency_seconds": round(float(latency_seconds or 0), 3),
     }
+    from app.model_connection import public_connection, connection_identity
+    connection = public_connection()
     timing["prompt_tokens_per_second"] = round(prompt_tokens / timing["prompt_eval_seconds"], 2) if timing["prompt_eval_seconds"] else 0
     timing["output_tokens_per_second"] = round(output_tokens / timing["output_eval_seconds"], 2) if timing["output_eval_seconds"] else 0
     with session_scope() as s:
@@ -103,6 +105,7 @@ def log_llm_call(call_id: str, agent: str, input_chars: int, stats_delta: dict,
             update(ORMLLMCall).where(ORMLLMCall.c.call_id == call_id)
             .values(funnel_json=json.dumps({
                 "model_timing": timing,
+                "model_connection": {"identity": connection_identity(), "model": connection["model_name"], "service_kind": connection["service_kind"]},
                 "context_audit": _json_safe(context_audit or {}),
             }, ensure_ascii=False))
         )

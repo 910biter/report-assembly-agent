@@ -8,6 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from app.config import settings
+from app.model_connection import capacity
 
 
 @dataclass(frozen=True)
@@ -21,12 +22,13 @@ class StageRuntimeProfile:
 
     @property
     def output_tokens(self) -> int:
-        return max(1, int(getattr(settings, self.output_setting)))
+        from app.model_connection import capacity
+        return min(capacity()[1], max(1, int(getattr(settings, self.output_setting))))
 
     @property
     def physical_input_tokens(self) -> int:
         return (
-            int(settings.model_context_window_tokens)
+            capacity()[0]
             - self.output_tokens
             - int(settings.prompt_overhead_tokens)
             - int(settings.safety_margin_tokens)

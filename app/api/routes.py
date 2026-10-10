@@ -1812,6 +1812,54 @@ def decide_change_proposal(proposal_id: int, payload: dict):
 
 # ---------- 系统 ----------
 
+@router.get("/system/model-connection")
+def get_model_connection():
+    from app.model_connection import public_connection
+    return public_connection()
+
+
+@router.get("/system/model-connection/status")
+def model_connection_status():
+    from app.model_connection import load_connection
+    import httpx
+    try:
+        connection = load_connection()
+        response = httpx.get(f"{connection.base_url}/models", headers=connection.headers(), timeout=5, follow_redirects=False)
+        if response.status_code in {404, 405}:
+            return {"status": "unknown", "message": "服务不支持模型列表，请使用测试连接验证推理"}
+        response.raise_for_status()
+        available = any(str(item.get("id")) == connection.model_name for item in response.json().get("data", []))
+        return {"status": "ready" if available else "unknown", "message": "模型已就绪" if available else "模型列表未找到配置名称，请测试连接"}
+    except ValueError:
+        return {"status": "unconfigured", "message": "尚未配置模型接入"}
+    except Exception:
+        return {"status": "error", "message": "模型服务连接异常"}
+
+
+@router.put("/system/model-connection")
+def update_model_connection(payload: dict):
+    from app.model_connection import connection_from_payload, public_connection, save_connection
+    lanes = model_lane_stats()
+    from app.memory.style_jobs import has_active_jobs
+    if task_queue_status().get("running_task_id") or has_active_jobs() or any(v.get("active") or v.get("submitted", 0) > v.get("completed", 0) + v.get("failed", 0) for v in lanes.values()):
+        return JSONResponse({"error": "服务正在执行任务或对话，请空闲后修改模型接入"}, status_code=409)
+    try:
+        save_connection(connection_from_payload(payload))
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    return public_connection()
+
+
+@router.post("/system/model-connection/test")
+def probe_model_connection(payload: dict):
+    from app.model_connection import connection_from_payload, test_connection
+    try:
+        return test_connection(connection_from_payload(payload))
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except Exception:
+        return JSONResponse({"error": "模型连接失败，请检查地址、凭据和服务状态"}, status_code=502)
+
 @router.get("/health")
 def health():
     """网关连通与模型在位状态(系统设置页使用)。"""
@@ -1821,7 +1869,8 @@ def health():
     from app.runtime_profiles import runtime_profile_manifest
     from app.context_budget import tokenizer_method
 
-    generation_url = settings.generation_url or "http://127.0.0.1:8100/v1"
+    from app.model_connection import public_connection
+    generation_url = public_connection()["base_url"]
     embedding_runtime = {
         "backend": settings.embedding_backend,
         "model": settings.embedding_model_path or settings.embedding_model,
@@ -1848,7 +1897,7 @@ def health():
             "runtime_profiles": runtime_profile_manifest(),
             "context_tokenizer": {
                 "method": tokenizer_method(),
-                "configured_path": settings.generation_tokenizer_path,
+                "configured_path": public_connection().get("tokenizer_path", ""),
                 "exact": tokenizer_method().startswith("tokenizer:"),
             },
         }

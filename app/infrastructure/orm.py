@@ -11,6 +11,15 @@ from sqlalchemy.orm import DeclarativeBase
 # 表结构唯一真源(CREATE TABLE 语句;业务 schema 的历史基线,
 # SQLAlchemy create_all 在 PG 下按类型映射生成兼容 DDL)
 _SCHEMA = """
+CREATE TABLE IF NOT EXISTS model_connection (
+    id INTEGER PRIMARY KEY,
+    base_url TEXT NOT NULL,
+    model_name TEXT NOT NULL,
+    encrypted_api_key TEXT NOT NULL DEFAULT '',
+    options_json TEXT NOT NULL DEFAULT '{}',
+    updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+);
+
 CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     username TEXT NOT NULL UNIQUE,

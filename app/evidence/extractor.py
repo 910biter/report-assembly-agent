@@ -855,14 +855,7 @@ class EvidenceAgent(BaseAgent):
         )
         for dimension_key, scan in material_scan.items():
             self._record_material_scan(task_id, f"need_pass_{round_tag or 0}", {int(dimension_key): scan})
-        # 本批 Fact 向量持久化(失败回退关键词检索)
-        if facts:
-            try:
-                vectors = embed_texts([f.content for f in facts])
-                for fact, vector in zip(facts, vectors):
-                    vector_store.save_fact_vector(fact.id, vector, task_id=task_id)
-            except Exception:
-                pass
+        _index_fact_vectors(facts, task_id)
         return facts
 
     def _material_sweep_batches(self, units_by_material: dict[int, list[Unit]],
@@ -1281,6 +1274,20 @@ def _finish_unit_batch(prefix: str, blocks: list[str], material_ids: list[int],
         "recovery": True,
     }
     return text, meta
+
+def _index_fact_vectors(facts: list[Fact], task_id: str) -> None:
+    """Optional fact indexing; skip CPU encoding entirely without Qdrant."""
+    if not facts or not getattr(vector_store, "enabled", False):
+        return
+    try:
+        vectors = embed_texts([fact.content for fact in facts])
+        for fact, vector in zip(facts, vectors):
+            vector_store.save_fact_vector(fact.id, vector, task_id=task_id)
+    except Exception:
+        # Canonical facts and provenance are already committed; lexical fallback
+        # must remain available even when vector indexing degrades.
+        pass
+
 
 def fact_exists(content: str, task_id: str = "", assertion_mode: str = "unknown",
                 semantic_profile: dict | None = None) -> bool:

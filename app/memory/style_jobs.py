@@ -53,6 +53,11 @@ def get_job(job_id: str) -> dict | None:
         return _public(job) if job else None
 
 
+def has_active_jobs() -> bool:
+    with _LOCK:
+        return any(job.get("status") not in _TERMINAL for job in _JOBS.values())
+
+
 def run_job(job_id: str) -> None:
     """Parse uploaded files and build StyleVariants after the request returns."""
     from app.memory import style
