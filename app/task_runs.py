@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
+from contextlib import nullcontext
 
 from sqlalchemy import insert, select, update
 
@@ -17,9 +18,11 @@ from app.infrastructure.orm import ORMTaskRun
 
 
 def create_task_run(task_id: str, revision: int, run_mode: str = "initial",
-                    base_version_id: int | None = None, update_reason: str = "") -> str:
+                    base_version_id: int | None = None, update_reason: str = "",
+                    _session=None) -> str:
     run_id = uuid.uuid4().hex[:16]
-    with session_scope() as s:
+    manager = session_scope() if _session is None else nullcontext(_session)
+    with manager as s:
         s.execute(insert(ORMTaskRun).values(
             run_id=run_id,
             task_id=task_id,

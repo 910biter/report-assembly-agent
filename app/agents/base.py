@@ -6,6 +6,7 @@ import threading
 import time
 
 from app.config import settings
+from app.runtime_profiles import stage_profile
 from app.gateway import (
     generation_stats,
     last_generation_meta,
@@ -17,6 +18,25 @@ from app.gateway import (
 from app.llm_queue import submit_llm_call
 from app.llm_scheduler import invoke
 from app.token_monitor import log_llm_call, new_call_id
+from app.context_budget import audit_plain_prompt, consume_context_audit, count_tokens
+
+
+def _validate_request_capacity(prompt: str, system: str, output_tokens: int) -> dict:
+    from app.model_connection import capacity, load_connection
+    window, maximum_output = capacity()
+    incoming = count_tokens(system) + count_tokens(prompt)
+    # The profile's overhead already reserves the system prompt. Do not charge
+    # it twice; retain any unused overhead for chat framing and safety.
+    reserve = max(0, int(settings.prompt_overhead_tokens) - count_tokens(system)) + int(settings.safety_margin_tokens)
+    try:
+        uses_vllm = load_connection().service_kind == "vllm"
+    except ValueError:
+        uses_vllm = False
+    # vLLM validates the fully serialized request, including chat framing and tools.
+    if output_tokens > maximum_output or (not uses_vllm and incoming + output_tokens + reserve > window):
+        raise ValueError("MODEL_INPUT_OVER_BUDGET")
+    return {"physical_window_tokens": window, "system_and_user_tokens": incoming,
+            "request_reserve_tokens": reserve, "effective_output_ceiling": output_tokens}
 
 
 class BaseAgent:
@@ -27,30 +47,70 @@ class BaseAgent:
     # chat template enables hidden thinking when this value is omitted, which
     # can consume the output budget before the JSON result is produced.
     thinking: bool | None = False
+    temperature: float | None = None
     output_token_limit: int | None = settings.structured_output_tokens
     last_call_id = ""
 
+    def should_retry(self, exc: Exception) -> bool:
+        """Return whether retrying the same request can reasonably recover."""
+        message = str(exc)
+        code = message.split(":", 1)[0]
+        return code not in {
+            "MODEL_CONNECTION_NOT_CONFIGURED", "MODEL_HTTP_400", "MODEL_HTTP_401",
+            "MODEL_HTTP_403", "MODEL_HTTP_404", "MODEL_HTTP_405", "MODEL_HTTP_413",
+            "MODEL_HTTP_422",
+            "MODEL_CONTEXT_EXCEEDED", "MODEL_INPUT_OVER_BUDGET",
+        }
+
     def generate(self, prompt: str, system: str | None = None) -> str:
+        output_tokens = stage_profile(self.name).output_tokens
+        audit = consume_context_audit()
+        capacity_audit = _validate_request_capacity(prompt, system or self.role, output_tokens)
+        if not audit:
+            audit_plain_prompt(self.name, prompt, stage_profile(self.name).input_tokens)
+            audit = consume_context_audit()
+        audit["final_user_prompt_tokens"] = count_tokens(prompt)
+        audit["estimated_request_tokens"] = count_tokens(f"{system or self.role}\n{prompt}")
+        audit.update(capacity_audit)
+        generation_options = {
+            "system": system or self.role,
+            "max_tokens": output_tokens,
+        }
+        if self.temperature is not None:
+            generation_options["temperature"] = self.temperature
         return self._with_retry(
             lambda: submit_llm_call(lambda: invoke(
-                "agent", model_gateway.generate, prompt,
-                system=system or self.role, max_tokens=self.output_token_limit,
+                "agent", model_gateway.generate, prompt, **generation_options,
             )),
-            len(prompt),
+            len(prompt), audit,
         )
 
     def generate_json(self, prompt: str, system: str | None = None,
                       max_tokens: int | None = None) -> dict:
+        output_tokens = int(max_tokens or stage_profile(self.name).output_tokens)
+        audit = consume_context_audit()
+        capacity_audit = _validate_request_capacity(prompt, system or self.role, output_tokens)
+        if not audit:
+            audit_plain_prompt(self.name, prompt, stage_profile(self.name).input_tokens)
+            audit = consume_context_audit()
+        audit["final_user_prompt_tokens"] = count_tokens(prompt)
+        audit["estimated_request_tokens"] = count_tokens(f"{system or self.role}\n{prompt}")
+        audit.update(capacity_audit)
+        generation_options = {
+            "system": system or self.role,
+            "think": self.thinking,
+            "max_tokens": output_tokens,
+        }
+        if self.temperature is not None:
+            generation_options["temperature"] = self.temperature
         return self._with_retry(
             lambda: submit_llm_call(lambda: invoke(
-                "agent", model_gateway.generate_json, prompt,
-                system=system or self.role, think=self.thinking,
-                max_tokens=max_tokens or self.output_token_limit,
+                "agent", model_gateway.generate_json, prompt, **generation_options,
             )),
-            len(prompt),
+            len(prompt), audit,
         )
 
-    def _with_retry(self, fn, chars: int):
+    def _with_retry(self, fn, chars: int, context_audit: dict | None = None):
         last_error = None
         for attempt in range(self.max_retries + 1):
             call_id = new_call_id()
@@ -66,6 +126,7 @@ class BaseAgent:
                     call_id, self.name, chars,
                     last_generation_stats(),
                     elapsed, retry_count=attempt, success=True,
+                    context_audit=context_audit,
                     **last_generation_meta(),
                 )
                 return result
@@ -78,12 +139,13 @@ class BaseAgent:
                     call_id, self.name, chars,
                     last_generation_stats(),
                     elapsed, retry_count=attempt, success=False, error=str(exc),
+                    context_audit=context_audit,
                     **last_generation_meta(),
                 )
                 last_error = exc
-                count_llm_retry()
-                if attempt >= self.max_retries:
+                if attempt >= self.max_retries or not self.should_retry(exc):
                     break
+                count_llm_retry()
                 time.sleep(1.5 * (attempt + 1))
         raise last_error
 

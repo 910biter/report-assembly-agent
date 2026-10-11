@@ -1,8 +1,4 @@
-"""Bounded priority dispatcher for model generation.
-
-Ollama remains serialized. A batching backend such as vLLM may run a bounded
-number of requests concurrently so its scheduler can continuously batch them.
-"""
+"""Bounded priority dispatcher for OpenAI-compatible model generation."""
 from __future__ import annotations
 
 import contextlib
@@ -57,8 +53,6 @@ _STATS = {
 
 
 def _configured_concurrency() -> int:
-    if str(settings.generation_backend).lower() != "vllm":
-        return 1
     return max(1, int(settings.llm_concurrency or 1))
 
 
@@ -152,7 +146,7 @@ def llm_queue_stats() -> dict:
         stats = dict(_STATS)
     stats["pending"] = _QUEUE.qsize()
     stats["configured_concurrency"] = _configured_concurrency()
-    stats["backend"] = str(settings.generation_backend).lower()
+    stats["backend"] = "openai-compatible"
     completed = int(stats.get("completed") or 0)
     stats["avg_queue_wait_seconds"] = (
         round(float(stats.get("queue_wait_seconds") or 0.0) / completed, 3)

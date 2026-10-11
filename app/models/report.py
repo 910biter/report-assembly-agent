@@ -16,6 +16,11 @@ class ReportPlan:
     evidence_needs: list[dict] = field(default_factory=list)  # [{need, dimension, priority}]:待证实信息需求
     required_facts: list[str] = field(default_factory=list)
     budget: dict = field(default_factory=dict)  # ReportBudget: target_words/soft_max_words/hard_max_words/summary_budget
+    document_shape: dict = field(default_factory=dict)  # semantic form + visible-heading policy
+    # Rendering and composition are independent: a document may hide headings
+    # while still needing chaptered generation, or keep optional headings while
+    # being written as one continuous article.
+    composition_mode: str = "chaptered"  # chaptered/article_beats
     chapter_plans: list[dict] = field(default_factory=list)  # [{title, questions, judgment, relation_to_prev, required_facts, required_inferences, exclude, next_bridge, target_words, importance, evidence_density}]
     user_requirements: str = ""
     plan_stage: str = "analysis"
@@ -31,6 +36,7 @@ class Report:
     title: str
     style_profile_id: int | None = None
     status: str = "draft"
+    task_id: str = ""
     id: int | None = None
 
 

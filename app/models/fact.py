@@ -8,7 +8,10 @@ class Fact:
     dimension: str = ""
     need_id: int = 0  # EvidenceNeed 归属(0=开放发现)
     source_level: str = "MATERIAL_FACT"
-    fact_type: str = "STATEMENT"  # EVENT / PERSON / LOCATION / TIME / NUMBER / STATEMENT
+    fact_type: str = "unknown"  # Open semantic label; legacy rows may contain canonical values
+    assertion_mode: str = "unknown"  # Cross-domain protocol state; never inferred with keyword rules
+    assertion_mode_raw: str = "unknown"  # Open model description grounded in the source
+    semantic_profile: dict = field(default_factory=dict)
     evidence_ids: list[int] = field(default_factory=list)
     conflict_ids: list[int] = field(default_factory=list)
     id: int | None = None
@@ -17,8 +20,11 @@ class Fact:
 @dataclass
 class Conflict:
     fact_key: str
-    entries: list[dict] = field(default_factory=list)  # [{source_file, quote, statement}]
+    entries: list[dict] = field(default_factory=list)
     claim_ids: list[int] = field(default_factory=list)
+    conflict_type: str = "needs_verification"
+    reason: str = ""
+    confidence: str = "medium"
     status: str = "unresolved"
     id: int | None = None
 
@@ -34,4 +40,6 @@ class Inference:
     confidence_level: str = "medium"  # high / medium / low
     confidence_reason: str = ""
     uncertainty: str = ""
+    semantic_profile: dict = field(default_factory=dict)
+    source_semantics: list[dict] = field(default_factory=list)
     id: int | None = None

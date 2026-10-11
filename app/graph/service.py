@@ -11,42 +11,54 @@ import re
 import time
 import unicodedata
 import contextvars
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
 from typing import Any
 
-from sqlalchemy import and_, delete, select, update
+from sqlalchemy import select, update
 
 from app.agents.base import BaseAgent
 from app.config import settings
+from app.context_budget import count_tokens
 from app.db import session_scope
 from app.infrastructure.orm import (
+    Base,
     ORMGraphOutbox,
     ORMKGAssertion,
     ORMKGAssertionFact,
     ORMKGChangeSet,
     ORMKGEntity,
     ORMKGEntityAlias,
+    ORMKGFactCoverage,
     ORMKGTaskMembership,
 )
 
 
-_GRAPH_SYSTEM = """你是证据约束的关系抽取员。只根据给定事实抽取实体和关系，不推断、不补全。
-严格输出 JSON：
+def workspace_for_task(task_id: str) -> str:
+    if not settings.multiuser_enabled:
+        return settings.graph_workspace_id
+    task_table = Base.metadata.tables["short_memory"]
+    with session_scope() as s:
+        owner = s.execute(select(task_table.c.owner_user_id).where(
+            task_table.c.task_id == task_id,
+        )).scalar_one_or_none()
+    if owner is None:
+        raise ValueError("TASK_OWNER_REQUIRED_FOR_GRAPH")
+    return f"{settings.graph_workspace_id}:user:{owner}"
+
+
+_GRAPH_SYSTEM = """你是关系抽取员。将本次给定 Fact 明确表达、且有分析价值的主体—关系—客体整理为图谱。只输出 JSON：
 {
-  "entities": [{"name":"实体原文","type":"人物/机构/地点/项目/技术/事件/其他","fact_ids":[1]}],
+  "entities": [{"name":"实体原文","type":"模型判断的开放实体类型标签或 unknown","fact_ids":[1]}],
   "assertions": [{
     "subject":"实体原文", "predicate":"简短关系", "object":"实体原文或明确值",
     "object_kind":"entity/value", "event_name":"可选事件", "valid_from":"可选时间",
     "valid_to":"可选时间", "fact_ids":[1], "confidence":"high/medium/low"
   }]
 }
-约束：
-1. fact_ids 必须来自输入且直接支撑该实体或关系。
-2. 不要把抽象判断、预测、建议、标题当成实体关系。
-3. 关系必须是输入事实明确表达的主体-谓词-客体，不要把同段文字强行串联。
-4. object_kind 只能为 entity 或 value；不确定时使用 value。
-5. 同一事实可有多个关系，但只保留有分析价值且可解释的关系。"""
+工作方法：
+1. 每个实体和关系绑定直接支持它的本次 fact_ids；同一事实可形成多个可解释关系。主体、谓词、客体应在同一事实中有明确联系，抽象判断、建议和标题保留在原始事实层。
+2. object_kind 使用 entity 或 value；客体尚未稳定识别为实体时使用 value。时间和事件只填写事实明确给出的内容。"""
 
 
 def _normalized(value: str) -> str:
@@ -76,6 +88,12 @@ class GraphBuildResult:
     changes: int = 0
     projected: int = 0
     error: str = ""
+    batch_count: int = 0
+    succeeded_batches: int = 0
+    failed_batches: int = 0
+    split_count: int = 0
+    failed_fact_ids: list[int] = field(default_factory=list)
+    processed_fact_count: int = 0
 
     def as_dict(self) -> dict:
         return {
@@ -85,13 +103,31 @@ class GraphBuildResult:
             "changeset_count": self.changes,
             "projected_events": self.projected,
             "error": self.error,
+            "batch_count": self.batch_count,
+            "succeeded_batches": self.succeeded_batches,
+            "failed_batches": self.failed_batches,
+            "adaptive_split_count": self.split_count,
+            "failed_fact_ids": self.failed_fact_ids,
+            "processed_fact_count": self.processed_fact_count,
         }
+
+
+@dataclass
+class GraphExtractionOutcome:
+    payloads: list[dict]
+    failures: list[dict]
+    split_count: int = 0
 
 
 class GraphExtractionAgent(BaseAgent):
     name = "graph_extract"
     role = _GRAPH_SYSTEM
     output_token_limit = settings.graph_output_tokens
+
+    def should_retry(self, exc: Exception) -> bool:
+        # Repeating an output-limited request cannot recover. The graph service
+        # splits that batch and retries the smaller semantic units instead.
+        return str(exc) != "MODEL_OUTPUT_TRUNCATED" and super().should_retry(exc)
 
     def extract(self, facts: list[dict]) -> dict:
         lines = []
@@ -145,7 +181,7 @@ class Neo4jProjector:
                         "MERGE (s)-[r:ASSERTS {assertion_key:$assertion_key}]->"
                         "(target:KGEntity {entity_key:$target_key}) "
                         "ON CREATE SET target.name=$target_name,"
-                        "target.entity_type=CASE WHEN $object_key IS NULL THEN 'value' ELSE 'other' END "
+                        "target.entity_type=CASE WHEN $object_key IS NULL THEN 'value' ELSE 'unknown' END "
                         "SET r.predicate=$predicate,r.status=$status,r.confidence=$confidence,"
                         "r.fact_ids=reduce(ids=coalesce(r.fact_ids,[]), fid IN $fact_ids | CASE WHEN fid IN ids THEN ids ELSE ids + fid END),"
                         "r.task_ids=reduce(ids=coalesce(r.task_ids,[]), tid IN $task_ids | CASE WHEN tid IN ids THEN ids ELSE ids + tid END),"
@@ -190,11 +226,31 @@ class Neo4jProjector:
             return []
 
 
-def _projection_records(task_id: str) -> dict:
+def _scope_ids(task_id: str, source_task_ids: list[str] | None = None) -> list[str]:
+    values = [str(task_id or "")]
+    values.extend(str(value or "") for value in (source_task_ids or []))
+    values = list(dict.fromkeys(value for value in values if value))
+    if not settings.multiuser_enabled:
+        return values
+    task_table = Base.metadata.tables["short_memory"]
+    with session_scope() as session:
+        rows = session.execute(select(task_table.c.task_id, task_table.c.owner_user_id).where(
+            task_table.c.task_id.in_(values),
+        )).mappings().all()
+    owner_by_task = {str(row["task_id"]): row["owner_user_id"] for row in rows}
+    owner = owner_by_task.get(task_id)
+    if owner is None:
+        raise ValueError("TASK_OWNER_REQUIRED_FOR_GRAPH")
+    return [value for value in values if owner_by_task.get(value) == owner]
+
+
+def _projection_records(task_id: str, source_task_ids: list[str] | None = None,
+                        active_fact_ids: set[int] | None = None) -> dict:
+    task_ids = _scope_ids(task_id, source_task_ids)
     with session_scope() as s:
         memberships = s.execute(
             select(ORMKGTaskMembership.c.entity_id, ORMKGTaskMembership.c.assertion_id)
-            .where(ORMKGTaskMembership.c.task_id == task_id, ORMKGTaskMembership.c.status == "active")
+            .where(ORMKGTaskMembership.c.task_id.in_(task_ids), ORMKGTaskMembership.c.status == "active")
         ).mappings().all()
         assertion_ids = {int(row["assertion_id"]) for row in memberships if row["assertion_id"] is not None}
         entity_ids = {int(row["entity_id"]) for row in memberships if row["entity_id"] is not None}
@@ -209,6 +265,23 @@ def _projection_records(task_id: str) -> dict:
     fact_map: dict[int, list[int]] = {}
     for row in facts:
         fact_map.setdefault(int(row["assertion_id"]), []).append(int(row["fact_id"]))
+    if active_fact_ids is not None:
+        active_assertion_ids = {
+            assertion_id for assertion_id, fact_ids in fact_map.items()
+            if set(fact_ids) & set(active_fact_ids)
+        }
+        assertions = [row for row in assertions if int(row["id"]) in active_assertion_ids]
+        entity_ids = {
+            int(row["entity_id"]) for row in memberships
+            if row["entity_id"] is not None
+            and (row["assertion_id"] is None or int(row["assertion_id"]) in active_assertion_ids)
+        }
+        for item in assertions:
+            entity_ids.add(int(item["subject_entity_id"]))
+            if item["object_entity_id"] is not None:
+                entity_ids.add(int(item["object_entity_id"]))
+        entities = [row for row in entities if int(row["id"]) in entity_ids]
+        by_id = {int(row["id"]): row for row in entities}
     return {
         "entities": [{
             "key": row["entity_key"], "name": row["canonical_name"], "entity_type": row["entity_type"],
@@ -223,10 +296,30 @@ def _projection_records(task_id: str) -> dict:
             "target_key": by_id.get(int(row["object_entity_id"]))["entity_key"] if row["object_entity_id"] is not None and by_id.get(int(row["object_entity_id"])) else "value-" + _stable_key(row["workspace_id"], row["object_value"]),
             "target_name": by_id.get(int(row["object_entity_id"]))["canonical_name"] if row["object_entity_id"] is not None and by_id.get(int(row["object_entity_id"])) else row["object_value"],
             "predicate": row["predicate"], "status": row["status"], "confidence": row["confidence"],
-            "fact_ids": fact_map.get(int(row["id"]), []), "task_ids": [task_id], "workspace_id": row["workspace_id"],
+            "fact_ids": fact_map.get(int(row["id"]), []), "task_ids": task_ids, "workspace_id": row["workspace_id"],
             "valid_from": row["valid_from"], "valid_to": row["valid_to"], "event_name": row["event_name"],
         } for row in assertions],
     }
+
+
+def _visualization_nodes(records: dict) -> list[dict]:
+    """Complete the UI node set for assertions whose object is a literal value."""
+    nodes = [dict(item) for item in records.get("entities") or []]
+    known = {str(item.get("key") or "") for item in nodes}
+    for edge in records.get("assertions") or []:
+        target_key = str(edge.get("target_key") or "")
+        if not target_key or target_key in known:
+            continue
+        nodes.append({
+            "key": target_key,
+            "name": str(edge.get("target_name") or edge.get("object_value") or "明确值"),
+            "entity_type": "value",
+            "workspace_id": str(edge.get("workspace_id") or ""),
+            "aliases": [],
+            "status": str(edge.get("status") or "validated"),
+        })
+        known.add(target_key)
+    return nodes
 
 
 class GraphService:
@@ -236,51 +329,262 @@ class GraphService:
 
     @property
     def mode(self) -> str:
-        return str(settings.graph_mode or "off").strip().lower()
+        """Compatibility label; Graph execution is not controlled by this value."""
+        return "active"
+    def capability_status(self) -> dict[str, dict[str, str]]:
+        """Report canonical PG Graph RAG and optional Neo4j projection separately."""
+        return {
+            "graph_rag": {"status": "available", "backend": "postgresql"},
+            "neo4j_projection": {
+                "status": "configured" if self.projector.available() else "not_configured",
+            },
+        }
+
+    def covered_fact_ids(self, fact_ids: list[int] | set[int], workspace_id: str = "") -> set[int]:
+        """Return facts already processed by Graph extraction in this workspace.
+
+        The coverage ledger is authoritative for both relations and explicit
+        no-relation outcomes. Existing assertion links are included as a
+        migration bridge for graph rows created before the ledger existed.
+        """
+        ids = {int(value) for value in fact_ids if str(value).isdigit()}
+        if not ids:
+            return set()
+        workspace_id = workspace_id or settings.graph_workspace_id
+        with session_scope() as s:
+            covered = {
+                int(row["fact_id"])
+                for row in s.execute(
+                    select(ORMKGFactCoverage.c.fact_id).where(
+                        ORMKGFactCoverage.c.workspace_id == workspace_id,
+                        ORMKGFactCoverage.c.fact_id.in_(ids),
+                        ORMKGFactCoverage.c.status == "processed",
+                    )
+                ).mappings().all()
+            }
+            legacy = s.execute(
+                select(ORMKGAssertionFact.c.fact_id)
+                .join(ORMKGAssertion, ORMKGAssertion.c.id == ORMKGAssertionFact.c.assertion_id)
+                .where(
+                    ORMKGAssertion.c.workspace_id == workspace_id,
+                    ORMKGAssertion.c.status.in_(["validated", "confirmed"]),
+                    ORMKGAssertionFact.c.fact_id.in_(ids),
+                )
+            ).mappings().all()
+        covered.update(int(row["fact_id"]) for row in legacy)
+        return covered
+
+    def link_existing_fact_graph(self, task_id: str, fact_ids: set[int] | list[int],
+                                 workspace_id: str = "") -> int:
+        """Attach existing validated assertions without re-running extraction."""
+        ids = {int(value) for value in fact_ids if str(value).isdigit()}
+        if not ids:
+            return 0
+        workspace_id = workspace_for_task(task_id) if settings.multiuser_enabled else (workspace_id or settings.graph_workspace_id)
+        with session_scope() as s:
+            rows = s.execute(
+                select(ORMKGAssertionFact.c.assertion_id)
+                .join(ORMKGAssertion, ORMKGAssertion.c.id == ORMKGAssertionFact.c.assertion_id)
+                .where(
+                    ORMKGAssertion.c.workspace_id == workspace_id,
+                    ORMKGAssertion.c.status.in_(["validated", "confirmed"]),
+                    ORMKGAssertionFact.c.fact_id.in_(ids),
+                )
+                .distinct()
+            ).mappings().all()
+            assertion_ids = [int(row["assertion_id"]) for row in rows]
+            for assertion_id in assertion_ids:
+                self._membership(s, task_id, assertion_id=assertion_id, role="inherited")
+            if assertion_ids:
+                self._enqueue_projection(s, task_id, workspace_id)
+        return len(assertion_ids)
+
+    def _record_fact_coverage(
+        self,
+        workspace_id: str,
+        task_id: str,
+        processed_fact_ids: set[int],
+        failed_fact_ids: set[int],
+        assertion_count_by_fact: dict[int, int],
+        failures: list[dict],
+    ) -> None:
+        rows_by_fact: dict[int, dict] = {}
+        failure_text = {
+            int(fact_id): str(item.get("error") or "")[:300]
+            for item in failures
+            for fact_id in item.get("fact_ids") or []
+            if str(fact_id).isdigit()
+        }
+        for fact_id in processed_fact_ids:
+            rows_by_fact[int(fact_id)] = {
+                "workspace_id": workspace_id,
+                "fact_id": int(fact_id),
+                "status": "processed",
+                "source_task_id": task_id,
+                "assertion_count": int(assertion_count_by_fact.get(int(fact_id), 0)),
+                "last_error": "",
+            }
+        for fact_id in failed_fact_ids:
+            rows_by_fact[int(fact_id)] = {
+                "workspace_id": workspace_id,
+                "fact_id": int(fact_id),
+                "status": "failed",
+                "source_task_id": task_id,
+                "assertion_count": 0,
+                "last_error": failure_text.get(int(fact_id), "graph extraction failed"),
+            }
+        if not rows_by_fact:
+            return
+        from sqlalchemy import case, text
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+        with session_scope() as s:
+            stmt = pg_insert(ORMKGFactCoverage).values(list(rows_by_fact.values()))
+            excluded = stmt.excluded
+            s.execute(stmt.on_conflict_do_update(
+                index_elements=["workspace_id", "fact_id"],
+                set_={
+                    "status": case(
+                        (ORMKGFactCoverage.c.status == "processed", "processed"),
+                        else_=excluded.status,
+                    ),
+                    "source_task_id": excluded.source_task_id,
+                    "assertion_count": excluded.assertion_count,
+                    "last_error": excluded.last_error,
+                    "updated_at": text("CURRENT_TIMESTAMP"),
+                },
+            ))
 
     def build_task_graph(self, task_id: str, facts: list[dict], workspace_id: str = "",
-                         active_fact_ids: set[int] | None = None) -> GraphBuildResult:
-        if self.mode == "off" or not facts:
+                         active_fact_ids: set[int] | None = None,
+                         progress_callback=None) -> GraphBuildResult:
+        if not facts:
             return GraphBuildResult(status="skipped")
-        workspace_id = workspace_id or settings.graph_workspace_id
+        workspace_id = workspace_for_task(task_id) if settings.multiuser_enabled else (workspace_id or settings.graph_workspace_id)
         started = time.time()
         try:
             batches = _fact_batches(facts)
             concurrency = max(1, int(settings.graph_batch_concurrency or 1))
+            completed_batches = completed_facts = 0
 
-            def extract_one(batch: list[dict]) -> dict:
-                return GraphExtractionAgent().extract(batch)
+            def report_progress(phase: str, **extra) -> None:
+                if progress_callback:
+                    progress_callback({
+                        "phase": phase,
+                        "completed_batches": completed_batches,
+                        "total_batches": len(batches),
+                        "completed_facts": completed_facts,
+                        "total_facts": len(facts),
+                        **extra,
+                    })
+
+            report_progress("extracting")
+
+            def extract_one(batch: list[dict]) -> GraphExtractionOutcome:
+                return _extract_adaptive(batch, GraphExtractionAgent().extract)
 
             if concurrency == 1 or len(batches) <= 1:
-                payloads = [extract_one(batch) for batch in batches]
+                outcomes = []
+                for batch in batches:
+                    outcomes.append(extract_one(batch))
+                    completed_batches += 1
+                    completed_facts += len(batch)
+                    report_progress("extracting")
             else:
-                payloads = [None] * len(batches)
+                outcomes = [None] * len(batches)
                 with ThreadPoolExecutor(
                     max_workers=min(concurrency, len(batches)),
                     thread_name_prefix="graph-batch",
                 ) as pool:
-                    futures = []
+                    futures = {}
                     for index, batch in enumerate(batches):
                         context = contextvars.copy_context()
-                        futures.append((index, pool.submit(context.run, extract_one, batch)))
-                    for index, future in futures:
-                        payloads[index] = future.result()
+                        futures[pool.submit(context.run, extract_one, batch)] = (index, batch)
+                    for future in as_completed(futures):
+                        index, batch = futures[future]
+                        outcomes[index] = future.result()
+                        completed_batches += 1
+                        completed_facts += len(batch)
+                        report_progress("extracting")
+            payload_records = [record for outcome in outcomes for record in outcome.payloads]
+            failures = [failure for outcome in outcomes for failure in outcome.failures]
+            split_count = sum(outcome.split_count for outcome in outcomes)
             entity_count = assertion_count = changes = 0
-            with session_scope() as s:
-                valid_fact_ids = {int(item["id"]) for item in facts if item.get("id") is not None}
-                for payload in payloads:
-                    entities = self._upsert_entities(s, task_id, workspace_id, payload.get("entities") or [], valid_fact_ids)
-                    entity_count += len(entities)
-                    assertion_count += self._upsert_assertions(
-                        s, task_id, workspace_id, payload.get("assertions") or [], entities, valid_fact_ids
-                    )
-                self._reconcile_task_assertions(
-                    s, task_id, workspace_id,
-                    active_fact_ids if active_fact_ids is not None else valid_fact_ids,
+            persisted_batches = 0
+            assertion_count_by_fact: dict[int, int] = {}
+            valid_fact_ids = {int(item["id"]) for item in facts if item.get("id") is not None}
+            persisted_records = 0
+            report_progress("persisting", completed_records=0, total_records=len(payload_records))
+            for record in payload_records:
+                payload = record["payload"]
+                batch_fact_ids = list(record.get("fact_ids") or [])
+                try:
+                    with session_scope() as s:
+                        entities = self._upsert_entities(
+                            s, task_id, workspace_id,
+                            payload.get("entities") or [], valid_fact_ids,
+                        )
+                        entity_count += len(entities)
+                        assertion_count += self._upsert_assertions(
+                            s, task_id, workspace_id,
+                            payload.get("assertions") or [], entities, valid_fact_ids,
+                        )
+                        for assertion in payload.get("assertions") or []:
+                            for fact_id in _int_ids(assertion.get("fact_ids"), set(batch_fact_ids)):
+                                assertion_count_by_fact[fact_id] = assertion_count_by_fact.get(fact_id, 0) + 1
+                    persisted_batches += 1
+                except Exception as exc:
+                    failures.append({
+                        "fact_ids": batch_fact_ids,
+                        "error": f"PERSISTENCE_ERROR:{str(exc)[:180]}",
+                    })
+                persisted_records += 1
+                report_progress(
+                    "persisting", completed_records=persisted_records,
+                    total_records=len(payload_records),
                 )
-                changes = self._enqueue_projection(s, task_id, workspace_id)
-            projected = self.project_pending(limit=1) if self.mode == "active" else 0
-            return GraphBuildResult("ready", entity_count, assertion_count, changes, projected)
+            if persisted_batches:
+                with session_scope() as s:
+                    self._reconcile_task_assertions(
+                        s, task_id, workspace_id,
+                        active_fact_ids if active_fact_ids is not None else valid_fact_ids,
+                    )
+                    changes = self._enqueue_projection(s, task_id, workspace_id)
+            failed_facts = sorted({
+                int(fact_id) for item in failures
+                for fact_id in item.get("fact_ids") or []
+            })
+            failed_fact_set = set(failed_facts)
+            processed_fact_ids = {
+                int(fact_id)
+                for record in payload_records
+                for fact_id in record.get("fact_ids") or []
+                if int(fact_id) in valid_fact_ids
+            } - failed_fact_set
+            self._record_fact_coverage(
+                workspace_id,
+                task_id,
+                processed_fact_ids,
+                failed_fact_set,
+                assertion_count_by_fact,
+                failures,
+            )
+            projected = self.project_pending(limit=1) if persisted_batches else 0
+            status = "ready" if not failures else "partial_ready" if persisted_batches else "degraded"
+            error = ""
+            if failures:
+                error = f"{len(failures)} terminal batch(es) failed; {len(failed_facts)} fact(s) not processed"
+            else:
+                failed_facts = []
+            return GraphBuildResult(
+                status, entity_count, assertion_count, changes, projected, error,
+                batch_count=persisted_batches + len(failures),
+                succeeded_batches=persisted_batches,
+                failed_batches=len(failures),
+                split_count=split_count,
+                failed_fact_ids=failed_facts,
+                processed_fact_count=len(processed_fact_ids),
+            )
         except Exception as exc:
             return GraphBuildResult("degraded", error=str(exc)[:300])
         finally:
@@ -314,7 +618,7 @@ class GraphService:
                 key = "ent-" + _stable_key(workspace_id, normalized)
                 result = s.execute(ORMKGEntity.insert().values(
                     entity_key=key, workspace_id=workspace_id, canonical_name=name,
-                    entity_type=str(item.get("type") or "other")[:64], aliases_json=json.dumps([name], ensure_ascii=False),
+                    entity_type=str(item.get("type") or "unknown").strip()[:64], aliases_json=json.dumps([name], ensure_ascii=False),
                 ))
                 entity_id = int(result.inserted_primary_key[0])
             else:
@@ -371,21 +675,43 @@ class GraphService:
             self._membership(s, task_id, assertion_id=assertion_id)
         return count
 
-    def _membership(self, s, task_id: str, entity_id: int | None = None, assertion_id: int | None = None) -> None:
+    def _membership(self, s, task_id: str, entity_id: int | None = None,
+                    assertion_id: int | None = None, role: str = "observed") -> None:
+        def ensure_membership(column, value: int, extra: dict) -> None:
+            rows = s.execute(select(
+                ORMKGTaskMembership.c.id, ORMKGTaskMembership.c.role, ORMKGTaskMembership.c.status,
+            ).where(
+                ORMKGTaskMembership.c.task_id == task_id,
+                column == value,
+            )).mappings().all()
+            observed = next((row for row in rows if row["role"] == "observed"), None)
+            same_role = next((row for row in rows if row["role"] == role), None)
+            if role == "observed":
+                if observed:
+                    s.execute(update(ORMKGTaskMembership).where(
+                        ORMKGTaskMembership.c.id == observed["id"],
+                    ).values(status="active"))
+                elif same_role:
+                    s.execute(update(ORMKGTaskMembership).where(
+                        ORMKGTaskMembership.c.id == same_role["id"],
+                    ).values(role="observed", status="active"))
+                else:
+                    s.execute(ORMKGTaskMembership.insert().values(
+                        task_id=task_id, **extra, role="observed", status="active",
+                    ))
+            elif same_role:
+                s.execute(update(ORMKGTaskMembership).where(
+                    ORMKGTaskMembership.c.id == same_role["id"],
+                ).values(status="active"))
+            elif not observed:
+                s.execute(ORMKGTaskMembership.insert().values(
+                    task_id=task_id, **extra, role=role, status="active",
+                ))
+
         if entity_id is not None:
-            exists = s.execute(select(ORMKGTaskMembership.c.id).where(
-                ORMKGTaskMembership.c.task_id == task_id, ORMKGTaskMembership.c.entity_id == entity_id,
-                ORMKGTaskMembership.c.role == "observed",
-            )).mappings().first()
-            if not exists:
-                s.execute(ORMKGTaskMembership.insert().values(task_id=task_id, entity_id=entity_id, role="observed"))
+            ensure_membership(ORMKGTaskMembership.c.entity_id, entity_id, {"entity_id": entity_id})
         if assertion_id is not None:
-            exists = s.execute(select(ORMKGTaskMembership.c.id).where(
-                ORMKGTaskMembership.c.task_id == task_id, ORMKGTaskMembership.c.assertion_id == assertion_id,
-                ORMKGTaskMembership.c.role == "observed",
-            )).mappings().first()
-            if not exists:
-                s.execute(ORMKGTaskMembership.insert().values(task_id=task_id, assertion_id=assertion_id, role="observed"))
+            ensure_membership(ORMKGTaskMembership.c.assertion_id, assertion_id, {"assertion_id": assertion_id})
 
     def _reconcile_task_assertions(self, s, task_id: str, workspace_id: str,
                                    active_fact_ids: set[int]) -> None:
@@ -461,12 +787,13 @@ class GraphService:
     def promote_task_graph(self, task_id: str, report_version_id: int | None = None) -> int:
         with session_scope() as s:
             assertion_ids = [int(row["assertion_id"]) for row in s.execute(select(ORMKGTaskMembership.c.assertion_id).where(
-                ORMKGTaskMembership.c.task_id == task_id, ORMKGTaskMembership.c.assertion_id.is_not(None), ORMKGTaskMembership.c.status == "active",
+                ORMKGTaskMembership.c.task_id == task_id, ORMKGTaskMembership.c.assertion_id.is_not(None),
+                ORMKGTaskMembership.c.role == "observed", ORMKGTaskMembership.c.status == "active",
             )).mappings().all()]
             if not assertion_ids:
                 return 0
             s.execute(update(ORMKGAssertion).where(ORMKGAssertion.c.id.in_(assertion_ids), ORMKGAssertion.c.status == "validated").values(status="confirmed"))
-            workspace = settings.graph_workspace_id
+            workspace = workspace_for_task(task_id)
             self._changeset(
                 s, task_id, workspace, "PUBLISH_TASK_GRAPH",
                 {"assertion_ids": assertion_ids, "report_version_id": report_version_id},
@@ -475,13 +802,12 @@ class GraphService:
             self._enqueue_projection(s, task_id, workspace)
         return len(assertion_ids)
 
-    def context_for_analysis(self, task_id: str, facts: list[dict], limit: int = 12) -> str:
-        if self.mode != "active":
-            return ""
+    def context_for_analysis(self, task_id: str, facts: list[dict], limit: int = 12,
+                             source_task_ids: list[str] | None = None) -> str:
         fact_ids = [int(item["id"]) for item in facts if item.get("id") is not None]
-        rows = self.projector.neighborhood_for_fact_ids(task_id, fact_ids, limit=limit)
+        rows = [] if source_task_ids else self.projector.neighborhood_for_fact_ids(task_id, fact_ids, limit=limit)
         if not rows:
-            rows = self._postgres_neighborhood(task_id, fact_ids, limit)
+            rows = self._postgres_neighborhood(_scope_ids(task_id, source_task_ids), fact_ids, limit)
         if not rows:
             return ""
         lines = []
@@ -490,7 +816,7 @@ class GraphService:
             lines.append(f"- {row.get('subject','')} —{row.get('predicate','相关')}→ {row.get('object','')}（依据 Fact:{fact_refs}；{row.get('confidence','medium')}）")
         return "关系图谱（仅作交叉印证；必须以 Fact 与 Evidence 为准）：\n" + "\n".join(lines)
 
-    def _postgres_neighborhood(self, task_id: str, fact_ids: list[int], limit: int) -> list[dict]:
+    def _postgres_neighborhood(self, task_ids: list[str], fact_ids: list[int], limit: int) -> list[dict]:
         if not fact_ids:
             return []
         with session_scope() as s:
@@ -499,7 +825,7 @@ class GraphService:
                 .join(ORMKGAssertionFact, ORMKGAssertionFact.c.assertion_id == ORMKGAssertion.c.id)
                 .join(ORMKGTaskMembership, ORMKGTaskMembership.c.assertion_id == ORMKGAssertion.c.id)
                 .join(ORMKGEntity, ORMKGEntity.c.id == ORMKGAssertion.c.subject_entity_id)
-                .where(ORMKGTaskMembership.c.task_id == task_id, ORMKGAssertionFact.c.fact_id.in_(fact_ids), ORMKGAssertion.c.status.in_(["validated", "confirmed"]))
+                .where(ORMKGTaskMembership.c.task_id.in_(task_ids), ORMKGAssertionFact.c.fact_id.in_(fact_ids), ORMKGAssertion.c.status.in_(["validated", "confirmed"]))
                 .limit(limit)
             ).mappings().all()
             object_ids = {int(row["object_entity_id"]) for row in rows if row["object_entity_id"] is not None}
@@ -515,20 +841,26 @@ class GraphService:
             item["fact_ids"].append(int(row["fact_id"]))
         return list(grouped.values())
 
-    def task_graph(self, task_id: str) -> dict:
-        records = _projection_records(task_id)
+    def task_graph(self, task_id: str, source_task_ids: list[str] | None = None,
+                   active_fact_ids: set[int] | None = None) -> dict:
+        records = _projection_records(task_id, source_task_ids, active_fact_ids)
+        nodes = _visualization_nodes(records)
+        capability = self.capability_status()
         return {
             "mode": self.mode,
-            "neo4j_configured": self.projector.available(),
-            "nodes": records["entities"],
+            "neo4j_configured": capability["neo4j_projection"]["status"] == "configured",
+            "graph_rag_status": capability["graph_rag"],
+            "neo4j_projection_status": capability["neo4j_projection"],
+            "nodes": nodes,
             "edges": records["assertions"],
-            "stats": {"entity_count": len(records["entities"]), "assertion_count": len(records["assertions"])},
+            "stats": {"entity_count": len(nodes), "assertion_count": len(records["assertions"])},
         }
 
-    def has_task_graph(self, task_id: str) -> bool:
+    def has_task_graph(self, task_id: str, source_task_ids: list[str] | None = None) -> bool:
+        task_ids = _scope_ids(task_id, source_task_ids)
         with session_scope() as s:
             row = s.execute(select(ORMKGTaskMembership.c.id).where(
-                ORMKGTaskMembership.c.task_id == task_id,
+                ORMKGTaskMembership.c.task_id.in_(task_ids),
                 ORMKGTaskMembership.c.assertion_id.is_not(None),
                 ORMKGTaskMembership.c.status == "active",
             ).limit(1)).mappings().first()
@@ -540,25 +872,45 @@ class GraphService:
         return [{**dict(row), "payload": _loads(row["payload_json"], {})} for row in rows]
 
 
+def _extract_adaptive(facts: list[dict], extractor) -> GraphExtractionOutcome:
+    """Split output-limited graph batches while preserving every Fact."""
+    try:
+        return GraphExtractionOutcome(payloads=[{
+            "payload": extractor(facts),
+            "fact_ids": [int(item.get("id") or 0) for item in facts if item.get("id")],
+        }], failures=[])
+    except Exception as exc:
+        if str(exc) == "MODEL_OUTPUT_TRUNCATED" and len(facts) > 1:
+            midpoint = max(1, len(facts) // 2)
+            left = _extract_adaptive(facts[:midpoint], extractor)
+            right = _extract_adaptive(facts[midpoint:], extractor)
+            return GraphExtractionOutcome(
+                payloads=left.payloads + right.payloads,
+                failures=left.failures + right.failures,
+                split_count=left.split_count + right.split_count + 1,
+            )
+        return GraphExtractionOutcome(
+            payloads=[],
+            failures=[{
+                "fact_ids": [int(item.get("id") or 0) for item in facts if item.get("id")],
+                "error": str(exc)[:200],
+            }],
+        )
+
+
 def _fact_batches(facts: list[dict]) -> list[list[dict]]:
-    """Partition facts by both prompt capacity and estimated JSON capacity."""
-    prompt_tokens = max(
-        1024,
-        settings.model_context_window_tokens
-        - settings.graph_output_tokens
-        - settings.prompt_overhead_tokens
-        - settings.safety_margin_tokens,
-    )
-    max_chars = max(4_000, int(prompt_tokens * 2.2))
+    """Partition facts by exact prompt tokens and output-capacity guardrails."""
+    from app.runtime_profiles import stage_profile
+    prompt_tokens = stage_profile("graph").input_tokens
     # Entity + assertion JSON is output-heavy. This is a protocol/resource
     # estimate, not a semantic selection rule: every Fact remains included.
-    max_facts = max(12, int(settings.graph_output_tokens / 80))
+    max_facts = max(1, int(settings.graph_facts_per_batch or 1))
     batches: list[list[dict]] = []
     current: list[dict] = []
     size = 0
     for fact in facts:
-        text_size = len(str(fact.get("content") or "")) + 32
-        if current and (size + text_size > max_chars or len(current) >= max_facts):
+        text_size = count_tokens(str(fact.get("content") or "")) + 12
+        if current and (size + text_size > prompt_tokens or len(current) >= max_facts):
             batches.append(current)
             current, size = [], 0
         current.append(fact)

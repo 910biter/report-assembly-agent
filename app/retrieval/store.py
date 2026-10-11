@@ -63,21 +63,99 @@ class QdrantVectorStore:
         except Exception:
             pass  # 集合创建失败不致命:检索回退关键词,下次写入再试
 
-    def save_material_vector(self, material_id: int, vector: list[float]) -> None:
-        self._upsert(
+    def save_material_vector(self, material_id: int, vector: list[float]) -> bool:
+        return self._upsert(
             self.materials_collection,
             int(material_id),
             vector,
             {"material_id": int(material_id), "kind": "material"},
         )
 
-    def save_unit_vector(self, unit_id: int, vector: list[float]) -> None:
+    def save_unit_vector(self, unit_id: int, vector: list[float]) -> bool:
         payload = self._unit_payload(unit_id)
         payload["kind"] = "unit"
-        self._upsert(self.units_collection, int(unit_id), vector, payload)
+        return self._upsert(self.units_collection, int(unit_id), vector, payload)
 
-    def save_fact_vector(self, fact_id: int, vector: list[float], task_id: str = "") -> None:
-        self._upsert(
+    def save_unit_vectors(self, pairs: list[tuple[int, list[float]]],
+                          batch_size: int = 64) -> set[int]:
+        """Bulk-index units without per-unit PostgreSQL/Qdrant round trips.
+
+        Return only IDs acknowledged by Qdrant. Invalid points are isolated
+        locally; transport failures stop this attempt without recursive retries.
+        This does not weaken the lexical retrieval fallback for missing IDs.
+        """
+        if not self.enabled or self.client is None or not pairs:
+            return set()
+        try:
+            from qdrant_client.models import PointStruct
+        except ImportError:
+            return set()
+
+        pairs = [(int(unit_id), vector) for unit_id, vector in pairs]
+        payloads = self._unit_payloads([unit_id for unit_id, _ in pairs])
+        size = max(1, int(batch_size))
+        try:
+            self.ensure_collection(self.units_collection, len(pairs[0][1]))
+        except Exception:
+            return set()
+        indexed: set[int] = set()
+
+        for offset in range(0, len(pairs), size):
+            points = []
+            for unit_id, vector in pairs[offset:offset + size]:
+                if unit_id not in payloads:
+                    continue
+                try:
+                    values = np.asarray(vector, dtype=np.float32)
+                    if values.ndim != 1 or not len(values) or not np.isfinite(values).all():
+                        continue
+                    points.append(PointStruct(
+                        id=unit_id, vector=values.tolist(),
+                        payload={**payloads[unit_id], "kind": "unit"},
+                    ))
+                except (TypeError, ValueError):
+                    continue
+            if not points:
+                continue
+            try:
+                self.client.upsert(collection_name=self.units_collection, points=points, wait=True)
+                indexed.update(int(point.id) for point in points)
+            except Exception:
+                break
+        return indexed
+
+    @staticmethod
+    def _unit_payloads(unit_ids: list[int]) -> dict[int, dict]:
+        """Fetch provenance once for an indexing batch, not once per unit."""
+        from app.db import session_scope
+        from app.infrastructure.orm import ORMUnit, ORMMaterial
+        from sqlalchemy import select
+
+        if not unit_ids:
+            return {}
+        payloads: dict[int, dict] = {}
+        with session_scope() as s:
+            for offset in range(0, len(unit_ids), 500):
+                rows = s.execute(
+                    select(ORMUnit.c.id, ORMUnit.c.material_id, ORMUnit.c.kind, ORMUnit.c.page,
+                           ORMUnit.c.paragraph, ORMMaterial.c.filename, ORMMaterial.c.file_type)
+                    .join(ORMMaterial, ORMMaterial.c.id == ORMUnit.c.material_id)
+                    .where(ORMUnit.c.id.in_(unit_ids[offset:offset + 500]))
+                ).mappings().all()
+                for row in rows:
+                    payloads[int(row["id"])] = {
+                        "unit_id": int(row["id"]),
+                        "material_id": int(row["material_id"]),
+                        "kind": row["kind"],
+                        "page": row["page"],
+                        "paragraph": row["paragraph"],
+                        "filename": row["filename"],
+                        "file_type": row["file_type"],
+                    }
+        return payloads
+
+    def save_fact_vector(self, fact_id: int, vector: list[float], task_id: str = "") -> bool:
+        return self._upsert(
             self.facts_collection,
             int(fact_id),
             vector,
@@ -133,8 +211,8 @@ class QdrantVectorStore:
             return []
 
     def search_units(self, query_vector: list[float] | np.ndarray, top_k: int = 10,
-                     query_text: str = "", filters: dict | None = None) -> list[tuple[int, float]]:
-        """Qdrant 向量检索;query_text 仅作兼容参数(关键词候选由 rag 层内存补充)。"""
+                     filters: dict | None = None) -> list[tuple[int, float]]:
+        """Run task-filtered Qdrant unit vector retrieval."""
         if not self.enabled or self.client is None:
             return []
         try:
@@ -151,9 +229,27 @@ class QdrantVectorStore:
         except Exception:
             return []
 
-    def _upsert(self, collection: str, point_id: int, vector: list[float], payload: dict) -> None:
+    def search_facts(self, query_vector: list[float] | np.ndarray, top_k: int = 10,
+                     filters: dict | None = None) -> list[tuple[int, float]]:
+        """Run task-filtered semantic fact retrieval for interactive review."""
         if not self.enabled or self.client is None:
-            return
+            return []
+        try:
+            query = np.asarray(query_vector, dtype=np.float32).tolist()
+            hits = self.client.search(
+                collection_name=self.facts_collection,
+                query_vector=query,
+                query_filter=self._qdrant_filter(filters or {}),
+                limit=max(top_k, 1),
+                with_payload=False,
+            )
+            return [(int(hit.id), float(hit.score or 0)) for hit in hits]
+        except Exception:
+            return []
+
+    def _upsert(self, collection: str, point_id: int, vector: list[float], payload: dict) -> bool:
+        if not self.enabled or self.client is None:
+            return False
         try:
             from qdrant_client.models import PointStruct
 
@@ -163,8 +259,9 @@ class QdrantVectorStore:
                 collection_name=collection,
                 points=[PointStruct(id=point_id, vector=values, payload=payload)],
             )
+            return True
         except Exception:
-            pass  # 单点写入失败跳过,不中断任务;检索层自动回退关键词
+            return False  # Retrieval falls back to lexical search; caller records degradation.
 
     def _unit_payload(self, unit_id: int) -> dict:
         from app.db import session_scope

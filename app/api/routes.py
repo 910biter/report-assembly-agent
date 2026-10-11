@@ -9,20 +9,22 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import APIRouter, BackgroundTasks, File, Form, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, Query, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from sqlalchemy import delete, func, insert, select, update
 from sqlalchemy.exc import IntegrityError
 
 from app.config import settings
+from app.assertion_semantics import normalize_semantic_profile
+from app.pagination import page_ids
 from app.db import session_scope
 from app.export import export_report
 from app.infrastructure.orm import (
     Base,
-    ORMConflict,
     ORMEvidence,
     ORMFact,
     ORMInference,
+    ORMInsight,
     ORMMaterial,
     ORMPlan,
     ORMReport,
@@ -31,6 +33,7 @@ from app.infrastructure.orm import (
     ORMShortMemory,
     ORMTaskArtifact,
     ORMUnit,
+    ORMGraphJob,
 )
 from app.llm_queue import llm_queue_stats
 from app.llm_scheduler import invoke, model_lane_stats
@@ -47,18 +50,19 @@ from app.interaction import mark_notification_read, review_workspace
 from app.interaction import post_message as post_interaction_message
 from app.interaction import queue_message as queue_interaction_message
 from app.interaction import attach_draft_thread
+from app.interaction import rename_sections_in_task
 from app.material_comparison import (
     accepted_update_handoff,
     create_comparison_run,
     get_comparison,
+    get_comparison_item,
     list_comparisons,
     update_comparison_item,
 )
-from app.parser import parse_file
 from app.rendering.headings import detect_numbering_strategy, format_heading, strip_heading_prefix
 from app.report_versions import (
-    attach_delta_version,
     create_incremental_delta,
+    compare_report_versions,
     diff_report_version_to_current,
     diff_report_version_sentences,
     ensure_report_version,
@@ -69,15 +73,53 @@ from app.report_versions import (
     save_report_change_decision,
     list_report_change_decisions,
     apply_report_change_decisions,
-    latest_report_version,
     list_report_versions,
 )
 from app.task_runs import create_task_run
+from app.task_activation import activate_incremental_task
+from app.template_engine import compile_template
+from app.template_engine.compiler import COMPILER_VERSION
 from app.token_monitor import build_token_efficiency, build_workload_profile, list_llm_calls
 from app.workflow import WorkflowController
 from app.workflow.queue import enqueue_task, request_control, task_queue_status
+from app.workflow.progress import progress_for_display
+from app.auth.authorization import authorize_request
+from app.auth.ownership import require_owner
 
-router = APIRouter(prefix="/api")
+router = APIRouter(prefix="/api", dependencies=[Depends(authorize_request)])
+
+
+def _request_owner(request: Request | None) -> int | None:
+    if not settings.multiuser_enabled:
+        return None
+    if request is None:
+        raise RuntimeError("AUTHENTICATED_REQUEST_REQUIRED")
+    return request.state.principal.user_id
+
+
+def _source_semantics_payload(value) -> list[dict]:
+    """Return readable, shape-checked source profiles without exposing raw JSON."""
+    try:
+        items = value if isinstance(value, list) else json.loads(value or "[]")
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(items, list):
+        return []
+    result = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        try:
+            fact_id = int(item.get("fact_id"))
+        except (TypeError, ValueError):
+            continue
+        result.append({
+            "fact_id": fact_id,
+            "profile": normalize_semantic_profile(item.get("profile")),
+            "legacy_assertion_mode": str(item.get("legacy_assertion_mode") or ""),
+            "legacy_assertion_detail": str(item.get("legacy_assertion_detail") or ""),
+        })
+    return result
 
 
 def _ui_timestamp(value) -> str:
@@ -97,24 +139,45 @@ def _ui_timestamp(value) -> str:
 
 @router.post("/tasks")
 def create_task(
-    theme: str = Form(...),
+    theme: str = Form(""),
     requirements: str = Form(""),
     variant_id: int | None = Form(None),
     existing_material_ids: str = Form(""),
     interaction_draft_id: str = Form(""),
+    workflow_mode: str = Form("automatic"),
+    requirement_review: str = Form("auto"),
+    directory_review: str = Form("auto"),
     files: list[UploadFile] | None = File(default=None),
+    request: Request = None,
 ):
     """创建任务:上传材料 + 指定主题 + 可选模板(不选则用全局默认模板)。"""
+    workflow_mode = workflow_mode if workflow_mode in {"automatic", "collaborative"} else "automatic"
+    requirement_review = requirement_review if requirement_review in {"auto", "required"} else "auto"
+    directory_review = directory_review if directory_review in {"auto", "required"} else "auto"
+    if workflow_mode == "automatic" and not theme.strip():
+        return JSONResponse({"error": "THEME_REQUIRED"}, status_code=400)
     task_id = uuid.uuid4().hex[:12]
+    owner = _request_owner(request)
+    if variant_id is not None and owner is not None:
+        require_owner("template", variant_id, request.state.principal)
+    if variant_id is not None:
+        variant = style.get_variant(variant_id)
+        if variant is None:
+            return JSONResponse({"error": "VARIANT_NOT_FOUND"}, status_code=404)
+        if variant.status not in {"confirmed", "locked"}:
+            return JSONResponse({"error": "TEMPLATE_NOT_CONFIRMED", "message": "请先在模板中心确认该模板。"}, status_code=409)
     try:
-        material_ids = _collect_material_ids(task_id, existing_material_ids, files)
+        material_ids = _collect_material_ids(
+            task_id, existing_material_ids, files,
+            **({"owner_user_id": owner} if owner is not None else {}),
+        )
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=409)
     material_ids = list(dict.fromkeys(material_ids))
     if not material_ids:
         return JSONResponse({"error": "NO_MATERIALS"}, status_code=400)
-    run_id = create_task_run(task_id, revision=1, run_mode="initial")
-    short_term.save_task(task_id, {
+    run_id = None
+    task_payload = {
         "theme": theme,
         "user_requirements": requirements,
         "variant_id": variant_id,
@@ -125,14 +188,118 @@ def create_task(
         "run_id": run_id,
         "run_mode": "initial",
         "run_history": [],
-    })
+        "workflow_mode": workflow_mode,
+        "requirement_review": requirement_review,
+        "directory_review": directory_review,
+        # The requirement checkpoint becomes available only after material
+        # understanding; it must not occupy the queue before that artifact exists.
+        "requirement_review_pending": False,
+        "requirement_review_completed": workflow_mode == "automatic" or requirement_review == "auto",
+        "directory_review_pending": False,
+        "directory_review_completed": directory_review == "auto" or workflow_mode == "automatic",
+    }
+    with session_scope() as tx:
+        run_id = create_task_run(task_id, revision=1, run_mode="initial", _session=tx)
+        task_payload["run_id"] = run_id
+        short_term.create_task(task_id, task_payload, _session=tx,
+                               **({"owner_user_id": owner} if owner is not None else {}))
     attach_draft_thread(interaction_draft_id, task_id)
-    return {"task_id": task_id, "material_count": len(material_ids)}
+    queue = enqueue_task(task_id) if workflow_mode == "collaborative" else {}
+    return {"task_id": task_id, "material_count": len(material_ids), "queue": queue}
+
+
+@router.post("/documents/parse")
+def create_document_analysis(
+    files: list[UploadFile] | None = File(default=None),
+    request: Request = None,
+):
+    """Parse uploaded documents and stop after reusable material understanding."""
+    task_id = uuid.uuid4().hex[:12]
+    owner = _request_owner(request)
+    try:
+        material_ids = _collect_material_ids(
+            task_id, files=files, **({"owner_user_id": owner} if owner is not None else {}),
+        )
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=409)
+    if not material_ids:
+        return JSONResponse({"error": "NO_MATERIALS"}, status_code=400)
+    with session_scope() as s:
+        names = [str(row["filename"]) for row in s.execute(
+            select(ORMMaterial.c.filename).where(ORMMaterial.c.id.in_(material_ids))
+        ).mappings().all()]
+    run_id = None
+    task_payload = {
+        "theme": f"文档解析：{'、'.join(names[:2])}{'等' if len(names) > 2 else ''}",
+        "user_requirements": "解析所选材料，形成可追溯的摘要、提纲与关键信息，供后续理解和复用。",
+        "material_ids": material_ids,
+        "stage": "created",
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "run_revision": 1,
+        "run_id": run_id,
+        "run_mode": "document_analysis",
+        "workflow_mode": "automatic",
+        "requirement_review_completed": True,
+        "directory_review_completed": True,
+    }
+    with session_scope() as tx:
+        run_id = create_task_run(task_id, revision=1, run_mode="document_analysis", _session=tx)
+        task_payload["run_id"] = run_id
+        short_term.create_task(task_id, task_payload, _session=tx,
+                               **({"owner_user_id": owner} if owner is not None else {}))
+    return {"task_id": task_id, "material_count": len(material_ids), "queue": enqueue_task(task_id)}
+
+
+@router.get("/documents")
+def list_document_analyses(request: Request):
+    """List dedicated document-understanding runs without mixing them into report tasks."""
+    with session_scope() as s:
+        query = select(ORMShortMemory.c.task_id, ORMShortMemory.c.payload)
+        if (owner := _request_owner(request)) is not None:
+            query = query.where(ORMShortMemory.c.owner_user_id == owner)
+        rows = s.execute(query).mappings().all()
+    items = []
+    for row in rows:
+        payload = json.loads(row["payload"])
+        if payload.get("run_mode") != "document_analysis":
+            continue
+        analysis = payload.get("document_analysis") or {}
+        items.append({
+            "task_id": row["task_id"],
+            "theme": payload.get("theme", "文档解析"),
+            "stage": payload.get("stage", "created"),
+            "created_at": payload.get("created_at", ""),
+            "updated_at": _ui_timestamp(payload.get("updated_at") or payload.get("last_progress_at") or payload.get("created_at", "")),
+            "material_ids": payload.get("material_ids") or [],
+            "material_count": len(payload.get("material_ids") or []),
+            "summary": analysis.get("summary", ""),
+        })
+    return sorted(items, key=lambda item: item["updated_at"], reverse=True)
+
+
+@router.get("/documents/{task_id}")
+def get_document_analysis(task_id: str):
+    task = short_term.load_task(task_id)
+    if task is None or task.get("run_mode") != "document_analysis":
+        return JSONResponse({"error": "DOCUMENT_ANALYSIS_NOT_FOUND"}, status_code=404)
+    return {
+        "task_id": task_id,
+        "theme": task.get("theme", "文档解析"),
+        "stage": task.get("stage", "created"),
+        "material_ids": task.get("material_ids") or [],
+        "parse_progress": task.get("parse_progress") or {},
+        "material_analysis_progress": task.get("material_analysis_progress") or {},
+        "material_analysis_status": task.get("material_analysis_status") or {},
+        "queue_status": task.get("queue_status") or {},
+        "analysis": task.get("document_analysis") or {},
+        "error": task.get("error") or task.get("failure_reason") or "",
+    }
 
 
 @router.post("/reports/{report_id}/incremental/tasks")
 def create_incremental_task(
     report_id: int,
+    request: Request,
     update_reason: str = Form(""),
     existing_material_ids: str = Form(""),
     source_comparison_id: int | None = Form(None),
@@ -142,74 +309,17 @@ def create_incremental_task(
     task_id = _find_task_by_report(report_id)
     if task_id is None:
         return JSONResponse({"error": "REPORT_NOT_FOUND"}, status_code=404)
-    base_task = short_term.load_task(task_id) or {}
-    queues = task_queue_status()
-    queue_state = str((base_task.get("queue_status") or {}).get("status") or "")
-    terminal_stage = str(base_task.get("stage") or "") in {"review", "done", "failed", "paused"}
-    live_in_queue = (
-        queues.get("running_task_id") == task_id
-        or task_id in set(queues.get("queued_task_ids") or [])
-    )
-    # 阶段终态优先于遗留的 queue_status。历史版本曾在 review 后留下
-    # queue_status=running，不能因此阻止增量轮次创建；只有实际仍在队列
-    # 中的任务才视为忙。
-    if live_in_queue or (queue_state in {"queued", "running"} and not terminal_stage):
-        return JSONResponse({"error": "TASK_BUSY", "task_id": task_id}, status_code=409)
-    if terminal_stage and queue_state in {"queued", "running"}:
-        base_task = short_term.update_task(
-            task_id,
-            queue_status={
-                "status": "completed" if str(base_task.get("stage")) in {"review", "done"} else str(base_task.get("stage")),
-                "finished_at": (base_task.get("queue_status") or {}).get("finished_at") or round(time.time(), 1),
-            },
-        )
     with session_scope() as s:
         report = s.execute(select(ORMReport).where(ORMReport.c.id == report_id)).mappings().first()
         if report is None:
             return JSONResponse({"error": "REPORT_NOT_FOUND"}, status_code=404)
-    # Always snapshot the current working tree. This preserves edits made after
-    # the last version before an incremental run starts.
-    version = ensure_report_version(
-        report_id, task_id=task_id, status="snapshot",
-        change_summary="增量更新前自动生成基线快照", kind="minor",
-    )
-    base_version = get_report_version(version.version_id)
     try:
-        submitted_material_ids = _collect_material_ids(task_id, existing_material_ids, files)
+        submitted_material_ids = _collect_material_ids(
+            task_id, existing_material_ids, files,
+            owner_user_id=_request_owner(request),
+        )
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=409)
-    # 允许"无新增材料"的增量更新(补写模式):仅通过 update_reason 触发全章节重写。
-    # 此时 material_ids = 旧材料全集, delta 不含新材料,
-    # 影响范围由 _prepare_incremental_write_scope 判定(无章节映射 → no_mapped_section_rewrite_all → 全章节重写)。
-    old_material_ids = [
-        int(item.get("material_id"))
-        for item in (base_version or {}).get("material_fingerprints", [])
-        if str(item.get("material_id", "")).isdigit()
-    ]
-    old_fact_ids = [
-        int(item.get("id"))
-        for item in (base_version or {}).get("fact_snapshot", [])
-        if str(item.get("id", "")).isdigit()
-    ]
-    old_inference_ids = [
-        int(item.get("id"))
-        for item in (base_version or {}).get("inference_snapshot", [])
-        if str(item.get("id", "")).isdigit()
-        and str(item.get("source_level") or "") != "EXTERNAL_INFORMATION"
-    ]
-    old_external_ids = [
-        int(item.get("id"))
-        for item in (base_version or {}).get("inference_snapshot", [])
-        if str(item.get("id", "")).isdigit()
-        and str(item.get("source_level") or "") == "EXTERNAL_INFORMATION"
-    ]
-    old_conflict_ids = [
-        int(item.get("id"))
-        for item in (base_version or {}).get("conflict_snapshot", [])
-        if str(item.get("id", "")).isdigit()
-    ]
-    if not submitted_material_ids and not update_reason.strip():
-        return JSONResponse({"error": "UPDATE_REASON_REQUIRED"}, status_code=400)
     comparison_handoff = None
     if source_comparison_id is not None:
         try:
@@ -218,106 +328,24 @@ def create_incremental_task(
             return JSONResponse({"error": str(exc)}, status_code=400)
         if int(comparison_handoff["report_id"]) != int(report_id):
             return JSONResponse({"error": "COMPARISON_REPORT_MISMATCH"}, status_code=409)
-    previous_revision = max(1, int(base_task.get("run_revision") or 1))
-    revision = previous_revision + 1
-    run_id = create_task_run(
-        task_id, revision=revision, run_mode="incremental",
-        base_version_id=int((base_version or {}).get("id") or 0) or None,
-        update_reason=update_reason,
-    )
-    delta = create_incremental_delta(
-        report_id, submitted_material_ids, update_reason=update_reason, run_id=run_id,
-    )
-    added_material_ids = [
-        int(item.get("material_id"))
-        for item in delta.get("added_materials", [])
-        if str(item.get("material_id", "")).isdigit()
-    ]
-    material_ids = list(dict.fromkeys(old_material_ids + added_material_ids))
-    plan_snapshot = (base_version or {}).get("report_plan_snapshot") or {}
-    run_history = list(base_task.get("run_history") or [])
-    run_history.append({
-        "revision": previous_revision,
-        "mode": str(base_task.get("run_mode") or "initial"),
-        "stage": str(base_task.get("stage") or ""),
-        "report_version_id": (base_version or {}).get("id"),
-        "material_count": len(old_material_ids),
-        "fact_count": len(old_fact_ids),
-        "inference_count": len(old_inference_ids) + len(old_external_ids),
-        "finished_at": (base_task.get("queue_status") or {}).get("finished_at"),
-    })
-    next_payload = dict(base_task)
-    next_payload.update({
-        "theme": base_task.get("theme") or plan_snapshot.get("title") or report["title"],
-        "user_requirements": base_task.get("user_requirements", ""),
-        "variant_id": base_task.get("variant_id") or report["style_profile_id"],
-        "material_ids": material_ids,
-        "stage": "created",
-        "report_id": report_id,
-        "plan_id": report["plan_id"],
-        "plan_title": plan_snapshot.get("title") or report["title"],
-        "fact_ids": old_fact_ids,
-        "inference_ids": old_inference_ids,
-        "external_ids": old_external_ids,
-        "conflict_ids": old_conflict_ids,
-        "run_revision": revision,
-        "run_id": run_id,
-        "run_mode": "incremental",
-        "run_history": run_history[-50:],
-        "revision_started_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
-        "incremental_update": True,
-        "incremental_base_task_id": task_id,
-        "incremental_base_version_id": (base_version or {}).get("id"),
-        "incremental_delta_id": delta.get("id"),
-        "incremental_added_material_ids": added_material_ids,
-        "incremental_update_reason": update_reason,
-        "incremental_inherited_fact_ids": old_fact_ids,
-        "incremental_inherited_inference_ids": old_inference_ids,
-        "incremental_inherited_external_ids": old_external_ids,
-        "incremental_inherited_conflict_ids": old_conflict_ids,
-        "incremental_new_fact_ids": [],
-        "incremental_generated_inference_ids": [],
-        "incremental_generated_external_ids": [],
-        "incremental_plan": {},
-        "incremental_delta": {},
-        "incremental_structure_review_required": False,
-        "incremental_source_comparison_id": source_comparison_id,
-        "incremental_selected_change_ids": (comparison_handoff or {}).get("accepted_item_ids", []),
-        "analysis_done": False,
-        # 增量默认沿用已冻结目录;受影响范围由 Delta 决定,避免重写旧 Plan。
-        "final_plan_frozen": bool(plan_snapshot.get("structure")),
-        "parse_progress": {},
-        "material_analysis_progress": {},
-        "evidence_progress": {},
-        "write_progress": {},
-        "parse_errors": [],
-        "embed_errors": [],
-        "qa_notes": [],
-        "stage_timings": {},
-        "stage_durations": {},
-        "llm_stats": {},
-        "token_efficiency": {},
-        "workload_profile": {},
-        "resource_samples": [],
-        "background_jobs": {},
-        "artifact_status": {},
-        "queue_status": {"status": "created"},
-        "control_request": "",
-        "error": "",
-        "critical_path_done": False,
-    })
-    short_term.save_task(task_id, next_payload)
-    return {
-        "task_id": task_id,
-        "report_id": report_id,
-        "revision": revision,
-        "base_version_id": (base_version or {}).get("id"),
-        "delta_id": delta.get("id"),
-        "material_count": len(material_ids),
-        "added_material_count": len(added_material_ids),
-        "status": "created",
-        "source_comparison_id": source_comparison_id,
-    }
+    try:
+        return activate_incremental_task(
+            task_id, dict(report), submitted_material_ids,
+            update_reason=update_reason,
+            source_comparison_id=source_comparison_id,
+            comparison_handoff=comparison_handoff,
+        )
+    except ValueError as exc:
+        error = str(exc)
+        if error == "UPDATE_REASON_REQUIRED":
+            return JSONResponse({"error": error}, status_code=400)
+        if error == "PREVIOUS_INCREMENT_PENDING":
+            return JSONResponse({"error": error, "message": "上一增量轮次尚未运行"}, status_code=409)
+        if error == "TASK_BUSY":
+            return JSONResponse({"error": error, "task_id": task_id}, status_code=409)
+        if error in {"REPORT_NOT_FOUND", "REPORT_VERSION_REQUIRED"}:
+            return JSONResponse({"error": "REPORT_NOT_FOUND"}, status_code=404)
+        raise
 
 
 @router.post("/reports/{report_id}/material-comparisons")
@@ -327,9 +355,11 @@ def create_material_comparison(
     base_version_id: int | None = Form(None),
     existing_material_ids: str = Form(""),
     files: list[UploadFile] | None = File(default=None),
+    request: Request = None,
 ):
     """Create an independent, read-only new-material comparison task."""
     root_task_id = _find_task_by_report(report_id)
+    owner = _request_owner(request)
     if root_task_id is None:
         return JSONResponse({"error": "REPORT_NOT_FOUND"}, status_code=404)
     base_task = short_term.load_task(root_task_id) or {}
@@ -345,19 +375,15 @@ def create_material_comparison(
         version = get_report_version(snapshot.version_id)
     comparison_task_id = f"cmp-{uuid.uuid4().hex[:12]}"
     try:
-        material_ids = _collect_material_ids(comparison_task_id, existing_material_ids, files)
+        material_ids = _collect_material_ids(
+            comparison_task_id, existing_material_ids, files,
+            **({"owner_user_id": owner} if owner is not None else {}),
+        )
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=409)
     if not material_ids:
         return JSONResponse({"error": "NO_NEW_MATERIALS"}, status_code=400)
-    run_id = create_task_run(
-        comparison_task_id, revision=1, run_mode="material_comparison",
-        base_version_id=int(version["id"]), update_reason=focus,
-    )
-    comparison = create_comparison_run(
-        comparison_task_id, report_id, int(version["id"]), material_ids, focus=focus,
-    )
-    short_term.save_task(comparison_task_id, {
+    task_payload = {
         "theme": f"新增材料对比：{version.get('title') or base_task.get('theme') or '报告'}",
         "user_requirements": (
             "只分析新增材料相对于基线报告带来的新增、补强、细化、更新、冲突、削弱与无关信息；"
@@ -368,14 +394,25 @@ def create_material_comparison(
         "stage": "created",
         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
         "run_revision": 1,
-        "run_id": run_id,
         "run_mode": "material_comparison",
-        "comparison_id": comparison["id"],
         "comparison_report_id": report_id,
         "comparison_base_version_id": int(version["id"]),
         "comparison_base_task_id": root_task_id,
         "queue_status": {"status": "created"},
-    })
+    }
+    with session_scope() as tx:
+        run_id = create_task_run(
+            comparison_task_id, revision=1, run_mode="material_comparison",
+            base_version_id=int(version["id"]), update_reason=focus, _session=tx,
+        )
+        comparison = create_comparison_run(
+            comparison_task_id, report_id, int(version["id"]), material_ids,
+            focus=focus, _session=tx,
+        )
+        task_payload["run_id"] = run_id
+        task_payload["comparison_id"] = comparison["id"]
+        short_term.create_task(comparison_task_id, task_payload, _session=tx,
+                               **({"owner_user_id": owner} if owner is not None else {}))
     queue = enqueue_task(comparison_task_id)
     return {
         "comparison_id": comparison["id"], "task_id": comparison_task_id,
@@ -390,10 +427,18 @@ def report_material_comparisons(report_id: int):
 
 
 @router.get("/material-comparisons/{comparison_id}")
-def material_comparison_detail(comparison_id: int):
-    result = get_comparison(comparison_id)
+def material_comparison_detail(comparison_id: int, compact: bool = False):
+    result = get_comparison(comparison_id, compact=compact)
     if result is None:
         return JSONResponse({"error": "COMPARISON_NOT_FOUND"}, status_code=404)
+    return result
+
+
+@router.get("/material-comparisons/{comparison_id}/items/{item_id}")
+def material_comparison_item_detail(comparison_id: int, item_id: int):
+    result = get_comparison_item(comparison_id, item_id)
+    if result is None:
+        return JSONResponse({"error": "COMPARISON_ITEM_NOT_FOUND"}, status_code=404)
     return result
 
 
@@ -421,23 +466,34 @@ def material_comparison_update_handoff(comparison_id: int):
 
 
 def _collect_material_ids(task_id: str, existing_material_ids: str = "",
-                          files: list[UploadFile] | None = None) -> list[int]:
+                          files: list[UploadFile] | None = None,
+                          owner_user_id: int | None = None) -> list[int]:
     """Create/reuse Material rows from uploaded files and existing IDs."""
     settings.ensure_dirs()
     material_ids: list[int] = []
     for item in (existing_material_ids or "").split(","):
         item = item.strip()
         if item.isdigit():
-            material_ids.append(int(item))
+            material_id = int(item)
+            if owner_user_id is not None:
+                with session_scope() as s:
+                    found = s.execute(select(ORMMaterial.c.id).where(
+                        ORMMaterial.c.id == material_id,
+                        ORMMaterial.c.owner_user_id == owner_user_id,
+                    )).first()
+                if found is None:
+                    raise ValueError("MATERIAL_NOT_FOUND")
+            material_ids.append(material_id)
     for upload in files or []:
         if not upload.filename:
             continue
         content = upload.file.read()
         file_hash = hashlib.sha256(content).hexdigest()
         with session_scope() as s:
-            existing = s.execute(
-                select(ORMMaterial.c.id).where(ORMMaterial.c.file_hash == file_hash)
-            ).mappings().first()
+            match = select(ORMMaterial.c.id).where(ORMMaterial.c.file_hash == file_hash)
+            if owner_user_id is not None:
+                match = match.where(ORMMaterial.c.owner_user_id == owner_user_id)
+            existing = s.execute(match).mappings().first()
             if existing is not None:
                 material_ids.append(existing["id"])
                 continue
@@ -453,14 +509,13 @@ def _collect_material_ids(task_id: str, existing_material_ids: str = "",
                         path=str(dest),
                         fingerprint=file_hash,
                         file_hash=file_hash,
+                        owner_user_id=owner_user_id,
                     )
                 )
                 material_ids.append(result.inserted_primary_key[0])
             except IntegrityError:
                 s.rollback()
-                existing = s.execute(
-                    select(ORMMaterial.c.id).where(ORMMaterial.c.file_hash == file_hash)
-                ).mappings().first()
+                existing = s.execute(match).mappings().first()
                 dest.unlink(missing_ok=True)
                 if existing is None:
                     raise ValueError(f"MATERIAL_SAVE_FAILED:{filename}")
@@ -469,15 +524,24 @@ def _collect_material_ids(task_id: str, existing_material_ids: str = "",
 
 
 @router.get("/tasks")
-def list_tasks():
+def list_tasks(request: Request):
     """历史任务列表(按创建时间倒序),含主题/状态/报告链接。"""
     with session_scope() as s:
-        rows = s.execute(
-            select(ORMShortMemory.c.task_id, ORMShortMemory.c.payload)
-        ).mappings().all()
+        query = select(ORMShortMemory.c.task_id, ORMShortMemory.c.payload)
+        if (owner := _request_owner(request)) is not None:
+            query = query.where(ORMShortMemory.c.owner_user_id == owner)
+        rows = s.execute(query).mappings().all()
     tasks = []
+    queue_position = None
+    if settings.multiuser_enabled:
+        from app.workflow.queue_store import position as queue_position
     for row in rows:
         payload = _task_view(json.loads(row["payload"]))
+        if payload.get("run_mode") in {"document_analysis", "material_discussion"}:
+            continue
+        queue_status = dict(payload.get("queue_status") or {})
+        if queue_position is not None and queue_status.get("status") in {"queued", "running"}:
+            queue_status["ahead"] = queue_position(row["task_id"])
         tasks.append({
             "task_id": row["task_id"],
             "theme": payload.get("theme", ""),
@@ -489,11 +553,16 @@ def list_tasks():
             "variant_id": payload.get("variant_id"),
             "run_revision": int(payload.get("run_revision") or 1),
             "run_mode": payload.get("run_mode") or "initial",
-            "run_history": payload.get("run_history") or [],
             "incremental_update": bool(payload.get("incremental_update")),
             "incremental_added_material_count": len(payload.get("incremental_added_material_ids") or []),
             "update_reason": payload.get("incremental_delta", {}).get("update_reason", "") if isinstance(payload.get("incremental_delta"), dict) else "",
-            "progress": _progress_summary(payload),
+            "queue_status": queue_status,
+            # Lists only need enough state to classify a task. Detailed timing,
+            # token and resource samples remain available from the task detail API.
+            "progress": {
+                "stage": payload.get("stage", ""),
+                "queue_status": queue_status,
+            },
         })
     return tasks
 
@@ -506,6 +575,8 @@ def run_task(task_id: str):
     result = enqueue_task(task_id)
     if result.get("status") == "not_found":
         return JSONResponse({"error": "TASK_NOT_FOUND"}, status_code=404)
+    if result.get("status") == "queue_limit":
+        return JSONResponse({"error": "USER_QUEUE_LIMIT_REACHED"}, status_code=409)
     return result
 
 
@@ -525,7 +596,91 @@ def get_task(task_id: str):
     task = short_term.load_task(task_id)
     if task is None:
         return JSONResponse({"error": "TASK_NOT_FOUND"}, status_code=404)
-    return _task_view(task)
+    view = _task_view(task)
+    queue_status = dict(view.get("queue_status") or {})
+    if settings.multiuser_enabled and queue_status.get("status") in {"queued", "running"}:
+        from app.workflow.queue_store import position
+        queue_status["ahead"] = position(task_id)
+    comparison = view.get("material_comparison") or {}
+    return {
+        "task_id": task_id,
+        "theme": view.get("theme", ""),
+        "user_requirements": view.get("user_requirements", ""),
+        "stage": view.get("stage", "created"),
+        "created_at": view.get("created_at", ""),
+        "updated_at": _ui_timestamp(view.get("updated_at") or view.get("last_progress_at") or view.get("created_at", "")),
+        "report_id": view.get("report_id"),
+        "material_ids": view.get("material_ids") or [],
+        "material_count": len(view.get("material_ids") or []),
+        "variant_id": view.get("variant_id"),
+        "run_revision": int(view.get("run_revision") or 1),
+        "run_mode": view.get("run_mode") or "initial",
+        "workflow_mode": view.get("workflow_mode") or "automatic",
+        "requirement_review": view.get("requirement_review") or "auto",
+        "requirement_review_pending": bool(view.get("requirement_review_pending", view.get("planning_review_pending"))),
+        "requirement_review_completed": bool(view.get("requirement_review_completed", not view.get("planning_review_pending"))),
+        "directory_review": view.get("directory_review") or "auto",
+        "directory_review_pending": bool(view.get("directory_review_pending")),
+        "directory_review_completed": bool(view.get("directory_review_completed")),
+        "queue_status": queue_status,
+        "parse_progress": view.get("parse_progress") or {},
+        "material_analysis_progress": view.get("material_analysis_progress") or {},
+        "evidence_progress": view.get("evidence_progress") or {},
+        "write_progress": view.get("write_progress") or {},
+        "graph_status": view.get("graph_status") or {},
+        "error": view.get("error") or "",
+        "failure_reason": view.get("failure_reason") or "",
+        "comparison_id": view.get("comparison_id"),
+        "comparison_report_id": view.get("comparison_report_id"),
+        "material_comparison": {"summary": comparison.get("summary") or {}},
+        "artifact_counts": {
+            "facts": len(view.get("fact_ids") or []),
+            "inferences": len(view.get("inference_ids") or []),
+            "conflicts": len(view.get("conflict_ids") or []),
+            "qa_issues": len(view.get("qa_notes") or []),
+        },
+    }
+
+
+@router.post("/tasks/{task_id}/requirements/confirm")
+def confirm_task_requirements(task_id: str, payload: dict):
+    """确认材料理解后的任务需求，并继续 AnalysisPlan。"""
+    from app.workflow.checkpoints import CheckpointError, confirm_requirements
+    try:
+        return confirm_requirements(
+            task_id,
+            theme=str(payload.get("theme") or ""),
+            requirements=str(payload.get("requirements") or ""),
+            feedback=str(payload.get("feedback") or ""),
+        )
+    except CheckpointError as exc:
+        return _checkpoint_error_response(str(exc))
+
+
+@router.post("/tasks/{task_id}/directory/confirm")
+def confirm_task_directory(task_id: str, payload: dict):
+    """确认最终目录，并继续同一任务的报告写作。"""
+    from app.workflow.checkpoints import CheckpointError, confirm_directory
+    try:
+        return confirm_directory(
+            task_id,
+            feedback=str(payload.get("feedback") or ""),
+            structure=payload.get("structure") if isinstance(payload.get("structure"), list) else None,
+        )
+    except CheckpointError as exc:
+        return _checkpoint_error_response(str(exc))
+
+
+def _checkpoint_error_response(code: str) -> JSONResponse:
+    status = {
+        "TASK_NOT_FOUND": 404,
+        "REQUIREMENT_REVIEW_NOT_PENDING": 409,
+        "DIRECTORY_REVIEW_NOT_PENDING": 409,
+        "DIRECTORY_PLAN_NOT_FOUND": 409,
+        "THEME_REQUIRED": 400,
+        "REQUIREMENTS_REQUIRED": 400,
+    }.get(code, 400)
+    return JSONResponse({"error": code}, status_code=status)
 
 
 @router.get("/tasks/{task_id}/assistant-context")
@@ -549,34 +704,28 @@ def report_assistant_context(report_id: int):
 
 def _assistant_task_context(task_id: str, task: dict) -> dict:
     """Small polling payload for the always-available collaboration assistant."""
+    from app.control_agent import build_task_agent_context
+    control_context = build_task_agent_context(task_id).model_dump(mode="json")
     return {
         "task_id": task_id,
         "report_id": task.get("report_id"),
         "theme": task.get("theme", ""),
         "user_requirements": task.get("user_requirements", ""),
         "stage": task.get("stage", "created"),
+        "workflow_mode": task.get("workflow_mode") or "automatic",
+        "requirement_review_pending": bool(task.get("requirement_review_pending", task.get("planning_review_pending"))),
+        "directory_review_pending": bool(task.get("directory_review_pending")),
         "run_revision": task.get("run_revision", 1),
         "queue_status": task.get("queue_status") or {},
         "parse_progress": task.get("parse_progress") or {},
         "material_analysis_progress": task.get("material_analysis_progress") or {},
-        "evidence_progress": task.get("evidence_progress") or {},
+        "evidence_progress": progress_for_display(task.get("evidence_progress")),
         "write_progress": task.get("write_progress") or {},
         "error": task.get("error") or task.get("failure_reason") or "",
         "updated_at": task.get("updated_at") or task.get("last_progress_at"),
+        "artifact_counts": control_context["artifact_counts"],
+        "available_artifacts": control_context["available_artifacts"],
     }
-
-
-@router.post("/tasks/{task_id}/evidence-gaps/retrieve")
-def retrieve_evidence_gaps(task_id: str):
-    """Bounded WriteHERE hook: retrieve QA-declared evidence gaps only."""
-    if short_term.load_task(task_id) is None:
-        return JSONResponse({"error": "TASK_NOT_FOUND"}, status_code=404)
-    from app.workflow.controller import WorkflowController
-    try:
-        facts = WorkflowController(task_id).reflow_evidence_gaps()
-    except Exception as exc:
-        return JSONResponse({"error": "EVIDENCE_GAP_RETRIEVAL_FAILED", "detail": str(exc)[:200]}, status_code=500)
-    return {"status": "retrieved", "fact_count": len(facts), "facts": facts}
 
 
 @router.delete("/tasks/{task_id}")
@@ -593,9 +742,17 @@ def delete_task(task_id: str):
         or task_id in set(queues.get("queued_task_ids") or [])
     ):
         return JSONResponse({"error": "TASK_BUSY"}, status_code=409)
-    short_term.delete_task(task_id)
-    with session_scope() as s:
-        s.execute(delete(ORMTaskArtifact).where(ORMTaskArtifact.c.task_id == task_id))
+    from app.workflow.execution import require_idle_task
+    try:
+        with session_scope() as s:
+            require_idle_task(s, task_id)
+            s.execute(delete(ORMGraphJob).where(ORMGraphJob.c.task_id == task_id))
+            short_term.delete_task(task_id, _session=s)
+            s.execute(delete(ORMTaskArtifact).where(ORMTaskArtifact.c.task_id == task_id))
+    except ValueError as exc:
+        if str(exc) == "TASK_BUSY":
+            return JSONResponse({"error": "TASK_BUSY"}, status_code=409)
+        raise
     return {"ok": True}
 
 
@@ -675,58 +832,135 @@ def task_materials(task_id: str):
     return result
 
 
+def _split_inference_ids(task: dict) -> tuple[list[int], list[int]]:
+    """Keep material inferences and external notes distinct at the API boundary."""
+    material = [int(item) for item in task.get("inference_ids", []) if str(item).isdigit()]
+    external = [int(item) for item in task.get("external_ids", []) if str(item).isdigit()]
+    return list(dict.fromkeys(material)), list(dict.fromkeys(external))
+
+
+@router.get("/tasks/{task_id}/analysis/page")
+def task_analysis_page(
+    task_id: str,
+    kind: str = Query(pattern="^(facts|inferences)$"),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+):
+    task = short_term.load_task(task_id)
+    if task is None:
+        return JSONResponse({"error": "TASK_NOT_FOUND"}, status_code=404)
+    if kind == "facts":
+        ids = list(dict.fromkeys(int(item) for item in task.get("fact_ids", [])))
+    else:
+        material_ids, external_ids = _split_inference_ids(task)
+        ids = list(dict.fromkeys(material_ids + external_ids))
+    visible_ids, total = page_ids(ids, page=page, page_size=page_size)
+    if not visible_ids:
+        return {"items": [], "total": total, "page": page, "page_size": page_size}
+    with session_scope() as s:
+        if kind == "facts":
+            rows = s.execute(select(ORMFact).where(ORMFact.c.id.in_(visible_ids))).mappings().all()
+            evidence_rows = s.execute(
+                select(
+                    ORMEvidence.c.fact_id, ORMEvidence.c.source_file,
+                    ORMEvidence.c.page, ORMEvidence.c.paragraph, ORMEvidence.c.quote,
+                ).where(ORMEvidence.c.fact_id.in_(visible_ids))
+            ).mappings().all()
+            evidence_by_fact: dict[int, list[dict]] = {}
+            for item in evidence_rows:
+                evidence_by_fact.setdefault(int(item["fact_id"]), []).append({
+                    "source_file": item["source_file"], "page": item["page"],
+                    "paragraph": item["paragraph"], "quote": item["quote"],
+                })
+            by_id = {int(row["id"]): row for row in rows}
+            items = [{
+                "id": row["id"], "content": row["content"], "dimension": row["dimension"],
+                "assertion_mode": row.get("assertion_mode"),
+                "assertion_mode_raw": row.get("assertion_mode_raw"),
+                "semantic_profile": normalize_semantic_profile(row.get("semantic_profile_json")),
+                "evidence": evidence_by_fact.get(fact_id, []),
+            } for fact_id in visible_ids if (row := by_id.get(fact_id)) is not None]
+        else:
+            rows = s.execute(select(ORMInference).where(ORMInference.c.id.in_(visible_ids))).mappings().all()
+            by_id = {int(row["id"]): row for row in rows}
+            items = [{
+                "id": row["id"], "content": row["content"], "source_level": row["source_level"],
+                "based_fact_ids": json.loads(row["based_fact_ids"]),
+                "reasoning_chain": row["reasoning_chain"], "dimension": row["dimension"],
+                "analysis_type": row["analysis_type"],
+                "confidence_level": row["confidence_level"],
+                "confidence_reason": row["confidence_reason"], "uncertainty": row["uncertainty"],
+                "semantic_profile": normalize_semantic_profile(row.get("semantic_profile_json")),
+                "source_semantics": _source_semantics_payload(row.get("source_semantics_json")),
+            } for inference_id in visible_ids if (row := by_id.get(inference_id)) is not None]
+    return {"items": items, "total": total, "page": page, "page_size": page_size}
+
+
 @router.get("/tasks/{task_id}/analysis")
 def task_analysis(task_id: str):
     """任务分析结果:事实(带来源)/推断/外部信息/冲突。"""
     task = short_term.load_task(task_id)
     if task is None:
         return JSONResponse({"error": "TASK_NOT_FOUND"}, status_code=404)
+    fact_ids = [int(item) for item in task.get("fact_ids", [])]
+    inference_ids, external_ids = _split_inference_ids(task)
+    all_inference_ids = list(dict.fromkeys(inference_ids + external_ids))
     with session_scope() as s:
-        facts = []
-        for fact_id in task.get("fact_ids", []):
-            row = s.execute(
-                select(ORMFact).where(ORMFact.c.id == fact_id)
-            ).mappings().first()
+        fact_rows = s.execute(
+            select(ORMFact).where(ORMFact.c.id.in_(fact_ids))
+        ).mappings().all() if fact_ids else []
+        evidence_rows = s.execute(
+            select(
+                ORMEvidence.c.fact_id, ORMEvidence.c.source_file, ORMEvidence.c.page,
+                ORMEvidence.c.paragraph, ORMEvidence.c.quote,
+            ).where(ORMEvidence.c.fact_id.in_(fact_ids))
+        ).mappings().all() if fact_ids else []
+        evidence_by_fact: dict[int, list[dict]] = {}
+        for item in evidence_rows:
+            evidence_by_fact.setdefault(int(item["fact_id"]), []).append({
+                "source_file": item["source_file"], "page": item["page"],
+                "paragraph": item["paragraph"], "quote": item["quote"],
+            })
+        fact_by_id = {int(row["id"]): row for row in fact_rows}
+        facts = [{
+            "id": row["id"], "content": row["content"], "dimension": row["dimension"],
+            "assertion_mode": row.get("assertion_mode"),
+            "assertion_mode_raw": row.get("assertion_mode_raw"),
+            "semantic_profile": normalize_semantic_profile(row.get("semantic_profile_json")),
+            "evidence": evidence_by_fact.get(fact_id, []),
+        } for fact_id in fact_ids if (row := fact_by_id.get(fact_id)) is not None]
+        inferences = []
+        external_inferences = []
+        inference_rows = s.execute(
+            select(ORMInference).where(ORMInference.c.id.in_(all_inference_ids))
+        ).mappings().all() if all_inference_ids else []
+        inference_by_id = {int(row["id"]): row for row in inference_rows}
+        for inference_id in all_inference_ids:
+            row = inference_by_id.get(inference_id)
             if row is None:
                 continue
-            evidence = s.execute(
-                select(
-                    ORMEvidence.c.source_file, ORMEvidence.c.page, ORMEvidence.c.paragraph,
-                    ORMEvidence.c.quote,
-                ).where(ORMEvidence.c.fact_id == fact_id)
-            ).mappings().all()
-            facts.append({
-                "id": row["id"], "content": row["content"], "dimension": row["dimension"],
-                "evidence": [dict(e) for e in evidence],
-            })
-        inferences = []
-        for inference_id in task.get("inference_ids", []) + task.get("external_ids", []):
-            row = s.execute(
-                select(ORMInference).where(ORMInference.c.id == inference_id)
-            ).mappings().first()
-            if row is not None:
-                inferences.append({
-                    "id": row["id"], "content": row["content"],
-                    "source_level": row["source_level"],
-                    "based_fact_ids": json.loads(row["based_fact_ids"]),
-                    "reasoning_chain": row["reasoning_chain"],
-                    "dimension": row["dimension"],
-                    "analysis_type": row["analysis_type"],
-                    "confidence_level": row["confidence_level"],
-                    "confidence_reason": row["confidence_reason"],
-                    "uncertainty": row["uncertainty"],
-                })
-        conflicts = []
-        for conflict_id in task.get("conflict_ids", []):
-            row = s.execute(
-                select(ORMConflict).where(ORMConflict.c.id == conflict_id)
-            ).mappings().first()
-            if row is not None:
-                conflicts.append({
-                    "id": row["id"], "fact_key": row["fact_key"],
-                    "entries": json.loads(row["entries"]), "status": row["status"],
-                })
-    return {"facts": facts, "inferences": inferences, "conflicts": conflicts}
+            item = {
+                "id": row["id"], "content": row["content"],
+                "source_level": row["source_level"],
+                "based_fact_ids": json.loads(row["based_fact_ids"]),
+                "reasoning_chain": row["reasoning_chain"],
+                "dimension": row["dimension"],
+                "analysis_type": row["analysis_type"],
+                "confidence_level": row["confidence_level"],
+                "confidence_reason": row["confidence_reason"],
+                "uncertainty": row["uncertainty"],
+                "semantic_profile": normalize_semantic_profile(row.get("semantic_profile_json")),
+                "source_semantics": _source_semantics_payload(row.get("source_semantics_json")),
+            }
+            (external_inferences if inference_id in external_ids else inferences).append(item)
+        from app.evidence.extractor import load_conflict_records
+        conflicts = load_conflict_records(task.get("conflict_ids", []))
+    return {
+        "facts": facts, "inferences": inferences,
+        "external_inferences": external_inferences, "conflicts": conflicts,
+        "analysis_group_audit": (task.get("coverage_audit") or {}).get("analysis_groups") or task.get("analysis_group_audit") or {},
+        "qa_notes": task.get("qa_notes") or [],
+    }
 
 
 @router.get("/tasks/{task_id}/graph")
@@ -736,10 +970,44 @@ def task_graph(task_id: str):
     The API intentionally exposes only this task's graph projection. Every
     edge carries Fact IDs, so the UI can return to the ordinary evidence panel.
     """
-    if short_term.load_task(task_id) is None:
+    task = short_term.load_task(task_id)
+    if task is None:
         return JSONResponse({"error": "TASK_NOT_FOUND"}, status_code=404)
     from app.graph import graph_service
-    return graph_service.task_graph(task_id)
+    from app.workflow.controller import WorkflowController
+    controller = WorkflowController(task_id)
+    active_fact_ids = {
+        int(fact.get("id")) for fact in controller._facts() if fact.get("id") is not None
+    }
+    result = graph_service.task_graph(
+        task_id,
+        source_task_ids=controller._graph_scope_ids(),
+        active_fact_ids=active_fact_ids,
+    )
+    result["build_status"] = task.get("graph_status") or {"status": "unknown"}
+    from app import graph_jobs
+    background_job = graph_jobs.get(task_id) or {}
+    result["background_job"] = background_job
+    result["build_active"] = background_job.get("status") in {"queued", "running"}
+    return result
+
+
+@router.post("/tasks/{task_id}/graph/rebuild", status_code=202)
+def rebuild_task_graph(task_id: str):
+    """Queue graph-only recovery for completed or degraded tasks."""
+    task = short_term.load_task(task_id)
+    if task is None:
+        return JSONResponse({"error": "TASK_NOT_FOUND"}, status_code=404)
+    from app.workflow.controller import WorkflowController
+    facts = WorkflowController(task_id)._facts()
+    if not facts:
+        return JSONResponse({"error": "TASK_HAS_NO_FACTS"}, status_code=409)
+    from app import graph_jobs
+    try:
+        job = graph_jobs.submit(task_id)
+    except KeyError:
+        return JSONResponse({"error": "TASK_NOT_FOUND"}, status_code=404)
+    return {**job, "fact_count": len(facts)}
 
 
 @router.get("/tasks/{task_id}/graph/changesets")
@@ -776,11 +1044,12 @@ def task_token_efficiency(task_id: str):
 # ---------- 材料 ----------
 
 @router.get("/materials")
-def list_materials():
+def list_materials(request: Request):
     """材料库:材料列表 + 解析状态(单元数/重复标记)。"""
-    material_tasks = _material_task_index()
+    owner = _request_owner(request)
+    material_tasks = _material_task_index(owner)
     with session_scope() as s:
-        rows = s.execute(
+        query = (
             select(
                 ORMMaterial.c.id, ORMMaterial.c.filename, ORMMaterial.c.file_type,
                 ORMMaterial.c.parsed_at,
@@ -796,7 +1065,10 @@ def list_materials():
                 ORMMaterial.c.is_duplicate, ORMMaterial.c.duplicate_of,
             )
             .order_by(ORMMaterial.c.id.desc())
-        ).mappings().all()
+        )
+        if owner is not None:
+            query = query.where(ORMMaterial.c.owner_user_id == owner)
+        rows = s.execute(query).mappings().all()
     return [{
         "id": r["id"], "filename": r["filename"], "file_type": r["file_type"],
         "unit_count": r["unit_count"], "is_duplicate": r["is_duplicate"],
@@ -807,10 +1079,11 @@ def list_materials():
     } for r in rows]
 
 
+
 @router.get("/materials/{material_id}")
-def get_material(material_id: int):
-    """材料详情:内容单元列表(文本/表格/图片文本和解析元数据)。"""
-    material_tasks = _material_task_index()
+def get_material(material_id: int, request: Request = None):
+    """Material detail with parsed units and its reusable understanding result."""
+    material_tasks = _material_task_index(_request_owner(request))
     with session_scope() as s:
         material = s.execute(
             select(ORMMaterial).where(ORMMaterial.c.id == material_id)
@@ -820,12 +1093,26 @@ def get_material(material_id: int):
         units = s.execute(
             select(ORMUnit).where(ORMUnit.c.material_id == material_id).order_by(ORMUnit.c.id)
         ).mappings().all()
+        insight = s.execute(
+            select(ORMInsight).where(ORMInsight.c.material_id == material_id)
+            .order_by(ORMInsight.c.id.desc())
+        ).mappings().first()
     return {
         "id": material["id"], "filename": material["filename"], "file_type": material["file_type"],
         "parsed_at": material["parsed_at"],
         "parse_status": "ready" if units else "pending",
         "is_duplicate": material["is_duplicate"], "duplicate_of": material["duplicate_of"],
         "tasks": material_tasks.get(material["id"], []),
+        "insight": {
+            "doc_type": insight["doc_type"] if insight else "",
+            "topic": insight["topic"] if insight else "",
+            "key_points": json.loads(insight["key_points"] or "[]") if insight else [],
+            "key_sections": json.loads(insight["key_sections"] or "[]") if insight else [],
+            "entities": json.loads(insight["entities"] or "[]") if insight else [],
+            "times": json.loads(insight["times"] or "[]") if insight else [],
+            "material_role": insight["material_role"] if insight else "",
+            "missing_information": json.loads(insight["missing_information"] or "[]") if insight else [],
+        },
         "units": [{
             "id": u["id"], "kind": u["kind"], "content": u["content"],
             "page": u["page"], "image_desc": u["image_desc"],
@@ -834,14 +1121,40 @@ def get_material(material_id: int):
     }
 
 
+@router.post("/materials/{material_id}/assistant-session")
+def create_material_assistant_session(material_id: int, request: Request = None):
+    """Create a material-scoped assistant context without entering report generation."""
+    with session_scope() as s:
+        material = s.execute(select(ORMMaterial).where(ORMMaterial.c.id == material_id)).mappings().first()
+    if material is None:
+        return JSONResponse({"error": "MATERIAL_NOT_FOUND"}, status_code=404)
+    task_id = uuid.uuid4().hex[:12]
+    owner = _request_owner(request)
+    short_term.create_task(task_id, {
+        "theme": f"材料理解：{material['filename']}",
+        "user_requirements": "解释所选材料的内容、结构、关键信息、可证明范围与缺失信息；不得引用未选材料。",
+        "material_ids": [material_id],
+        "stage": "review",
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "run_revision": 1,
+        "run_mode": "material_discussion",
+        "workflow_mode": "automatic",
+        "queue_status": {"status": "completed"},
+        "requirement_review_completed": True,
+        "directory_review_completed": True,
+    }, **({"owner_user_id": owner} if owner is not None else {}))
+    return {"task_id": task_id}
+
+
 # ---------- 报告 ----------
 
 @router.get("/reports")
-def list_reports():
+def list_reports(request: Request):
     """报告库列表(按生成时间倒序)。"""
-    report_tasks = _report_task_index()
+    owner = _request_owner(request)
+    report_tasks = _report_task_index(owner)
     with session_scope() as s:
-        rows = s.execute(
+        query = (
             select(
                 ORMReport.c.id, ORMReport.c.title, ORMReport.c.status, ORMReport.c.created_at,
                 func.count(ORMSentence.c.id).label("sentence_count"),
@@ -853,7 +1166,10 @@ def list_reports():
                 ORMReport.c.id, ORMReport.c.title, ORMReport.c.status, ORMReport.c.created_at,
             )
             .order_by(ORMReport.c.id.desc())
-        ).mappings().all()
+        )
+        if owner is not None:
+            query = query.where(ORMReport.c.owner_user_id == owner)
+        rows = s.execute(query).mappings().all()
         report_ids = [int(row["id"]) for row in rows]
         version_rows = s.execute(
             select(ORMReportVersion).where(ORMReportVersion.c.report_id.in_(report_ids))
@@ -895,16 +1211,24 @@ def get_report(report_id: int):
     task_id = _find_task_by_report(report["id"])
     task_payload = short_term.load_task(task_id) if task_id else {}
     details = _sentence_details_bulk(sentences)
+    from app.quality import attach_quality_issue_locations
+    qa_issues = attach_quality_issue_locations(
+        report_id, list((task_payload or {}).get("qa_notes") or []), rows=sentences,
+    )
     result = {
         "id": report["id"],
         "title": report["title"],
         "status": report["status"],
         "task_id": task_id,
         "versions": list_report_versions(report["id"]),
-        "qa_issues": list((task_payload or {}).get("qa_notes") or []),
+        "qa_issues": qa_issues,
         "sections": [],
     }
-    heading_strategy = _report_heading_strategy(report["style_profile_id"])
+    document_shape = _report_document_shape(report["plan_id"])
+    composition_mode = _report_composition_mode(report["plan_id"])
+    heading_strategy = _report_heading_strategy(
+        report["style_profile_id"], fallback_defaults=document_shape.get("heading_policy") == "numbered",
+    )
     current_section = None
     current_paragraph = None
     chapter_index = 0
@@ -919,6 +1243,10 @@ def get_report(report_id: int):
             section = {
                 "title": row["section"],
                 "display_title": format_heading(1, [chapter_index], row["section"], heading_strategy),
+                "show_title": (
+                    document_shape.get("section_policy") != "hidden"
+                    and composition_mode != "article_beats"
+                ),
                 "paragraphs": [],
             }
             result["sections"].append(section)
@@ -927,12 +1255,11 @@ def get_report(report_id: int):
             section["paragraphs"].append({"sentences": []})
         if row["source_level"] == "SUBHEADING":
             subsection_index += 1
-            detail["display_content"] = format_heading(
-                2,
-                [chapter_index, subsection_index],
-                detail["content"],
-                heading_strategy,
-            )
+            detail["show_subheading"] = document_shape.get("subheading_policy") != "hidden"
+            if detail["show_subheading"]:
+                detail["display_content"] = format_heading(
+                    2, [chapter_index, subsection_index], detail["content"], heading_strategy,
+                )
         section["paragraphs"][-1]["sentences"].append(detail)
     return result
 
@@ -962,55 +1289,38 @@ def update_report_meta(report_id: int, payload: dict):
 
 @router.put("/reports/{report_id}/sections")
 def update_report_section(report_id: int, payload: dict):
-    """在线编辑章节标题:同步句子 section 与 ReportPlan 结构。"""
-    old_title = str(payload.get("old_title", "")).strip()
+    """在线编辑章节标题:复用协作修改的单一写入路径。"""
+    old_title = strip_heading_prefix(str(payload.get("old_title", "")).strip())
     new_title = strip_heading_prefix(str(payload.get("new_title", "")).strip())
     if not old_title or not new_title:
         return JSONResponse({"error": "SECTION_TITLE_REQUIRED"}, status_code=400)
+    with session_scope() as s:
+        report = s.execute(
+            select(ORMReport.c.task_id).where(ORMReport.c.id == report_id)
+        ).first()
+    if report is None:
+        return JSONResponse({"error": "REPORT_NOT_FOUND"}, status_code=404)
+    task_id = str(report[0] or "")
     if old_title == new_title:
         return {
             "ok": True,
             "title": new_title,
             "display_title": _display_section_title(report_id, new_title, payload.get("section_index")),
         }
-    from app.infrastructure.orm import ORMSentence, ORMPlan, ORMReport, Base
-    from sqlalchemy import select, update
-    with session_scope() as s:
-        report = s.execute(
-            select(ORMReport.c.plan_id, ORMReport.c.style_profile_id).where(ORMReport.c.id == report_id)
-        ).first()
-        if report is None:
-            return JSONResponse({"error": "REPORT_NOT_FOUND"}, status_code=404)
-        result = s.execute(
-            update(ORMSentence).where(
-                ORMSentence.c.report_id == report_id, ORMSentence.c.section == old_title
-            ).values(section=new_title)
-        )
-        if result.rowcount == 0:
-            return JSONResponse({"error": "SECTION_NOT_FOUND"}, status_code=404)
-        plan = s.execute(
-            select(ORMPlan.c.structure, ORMPlan.c.chapter_plans).where(ORMPlan.c.id == report[0])
-        ).first()
-        if plan is not None:
-            structure = json.loads(plan[0] or "[]")
-            chapter_plans = json.loads(plan[1] or "[]")
-            structure = [new_title if str(item) == old_title else item for item in structure]
-            for chapter in chapter_plans:
-                if str(chapter.get("title", "")) == old_title:
-                    chapter["title"] = new_title
-            s.execute(
-                update(ORMPlan).where(ORMPlan.c.id == report[0]).values(
-                    structure=json.dumps(structure, ensure_ascii=False),
-                    chapter_plans=json.dumps(chapter_plans, ensure_ascii=False),
-                )
-            )
-        user_memory = Base.metadata.tables["user_memory"]
-        s.execute(user_memory.insert().values(
-            note_type="edit", summary="用户修改了章节标题",
-            content=f"{old_title} → {new_title}",
-        ))
-    display_title = _display_section_title(report_id, new_title, payload.get("section_index"))
-    return {"ok": True, "old_title": old_title, "title": new_title, "display_title": display_title}
+    if not task_id:
+        return JSONResponse({"error": "REPORT_NOT_FOUND"}, status_code=404)
+    if not rename_sections_in_task(task_id, report_id, [(old_title, new_title)]):
+        return JSONResponse({"error": "SECTION_NOT_FOUND"}, status_code=404)
+    ensure_report_version(
+        report_id, task_id=task_id, status="snapshot",
+        change_summary="在线编辑：修改章节标题", kind="minor",
+    )
+    return {
+        "ok": True,
+        "old_title": old_title,
+        "title": new_title,
+        "display_title": _display_section_title(report_id, new_title, payload.get("section_index")),
+    }
 
 
 def _display_section_title(report_id: int, title: str, section_index) -> str:
@@ -1063,6 +1373,33 @@ def update_sentence(report_id: int, sentence_id: int, payload: dict):
     return {"ok": True, "content": content if content is not None else row[1]}
 
 
+@router.patch("/reports/{report_id}/quality-issues/{issue_id}")
+def update_quality_issue(report_id: int, issue_id: str, payload: dict):
+    """Record a review decision for one quality issue without mutating report text."""
+    task_id = _find_task_by_report(report_id)
+    if task_id is None:
+        return JSONResponse({"error": "REPORT_NOT_FOUND"}, status_code=404)
+    status = str(payload.get("status") or "").strip().lower()
+    if status not in {"open", "resolved", "ignored"}:
+        return JSONResponse({"error": "INVALID_QA_STATUS"}, status_code=400)
+
+    from app.quality import attach_quality_issue_locations
+    task = short_term.load_task(task_id) or {}
+    issues = attach_quality_issue_locations(
+        report_id, list(task.get("qa_notes") or []),
+    )
+    target = next((item for item in issues if item.get("issue_id") == issue_id), None)
+    if target is None:
+        return JSONResponse({"error": "QA_ISSUE_NOT_FOUND"}, status_code=404)
+    target["status"] = status
+    target["reviewed_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+    note = str(payload.get("note") or "").strip()
+    if note:
+        target["review_note"] = note[:500]
+    short_term.update_task(task_id, qa_notes=issues)
+    return {"ok": True, "issue": target}
+
+
 @router.post("/reports/{report_id}/finalize")
 def finalize_report(report_id: int, payload: dict | None = None):
     """审核完成:报告置为 final,任务进入已完成。"""
@@ -1072,7 +1409,11 @@ def finalize_report(report_id: int, payload: dict | None = None):
     payload = payload or {}
     task = short_term.load_task(task_id) or {}
     blocking_types = {"MISSING_SECTION", "SCALE_UNDERFILL", "CITATION_MISMATCH"}
-    blocking = [issue for issue in (task.get("qa_notes") or []) if issue.get("type") in blocking_types]
+    blocking = [
+        issue for issue in (task.get("qa_notes") or [])
+        if issue.get("type") in blocking_types
+        and str(issue.get("status") or "open") not in {"resolved", "ignored"}
+    ]
     if blocking and not payload.get("force"):
         return JSONResponse({"error": "QA_BLOCKING", "issues": blocking}, status_code=409)
     WorkflowController(task_id).finalize()
@@ -1117,6 +1458,21 @@ def report_version_diff_current(version_id: int, granularity: str = "section"):
         diff = diff_report_version_sentences(version_id, task_id=task_id)
     else:
         diff = diff_report_version_to_current(version_id, task_id=task_id)
+    return diff or JSONResponse({"error": "REPORT_VERSION_NOT_FOUND"}, status_code=404)
+
+
+@router.get("/report-versions/{base_version_id}/diff/{target_version_id}")
+def report_version_diff(base_version_id: int, target_version_id: int):
+    """Compare two immutable report versions without creating review decisions."""
+    base = get_report_version(base_version_id)
+    target = get_report_version(target_version_id)
+    if base is None or target is None or int(base["report_id"]) != int(target["report_id"]):
+        return JSONResponse({"error": "REPORT_VERSION_NOT_FOUND"}, status_code=404)
+    diff = compare_report_versions(
+        base_version_id,
+        target_version_id=target_version_id,
+        task_id=str(base.get("task_id") or ""),
+    )
     return diff or JSONResponse({"error": "REPORT_VERSION_NOT_FOUND"}, status_code=404)
 
 
@@ -1173,9 +1529,18 @@ def report_version_detail(version_id: int):
 
 
 @router.post("/reports/{report_id}/incremental/preview")
-def incremental_update_preview(report_id: int, payload: dict):
+def incremental_update_preview(report_id: int, payload: dict, request: Request = None):
     """增量更新预检:只记录 Delta,不改报告正文、不重写章节。"""
     material_ids = payload.get("material_ids") or payload.get("added_material_ids") or []
+    if (owner := _request_owner(request)) is not None:
+        if not isinstance(material_ids, list):
+            return JSONResponse({"error": "INVALID_MATERIAL_IDS"}, status_code=400)
+        with session_scope() as s:
+            allowed = set(s.execute(select(ORMMaterial.c.id).where(
+                ORMMaterial.c.id.in_(material_ids), ORMMaterial.c.owner_user_id == owner,
+            )).scalars().all())
+        if any(not str(item).isdigit() or int(item) not in allowed for item in material_ids):
+            return JSONResponse({"error": "MATERIAL_NOT_FOUND"}, status_code=404)
     try:
         delta = create_incremental_delta(
             report_id,
@@ -1216,10 +1581,18 @@ def export(report_id: int):
 def create_style_learning_job(
     background_tasks: BackgroundTasks,
     files: list[UploadFile] = File(...),
+    asset_roles_json: str = Form(...),
+    request: Request = None,
 ):
     """Accept uploads quickly, then learn the template asynchronously."""
     if not files:
         return JSONResponse({"error": "NO_FILES"}, status_code=400)
+    try:
+        roles_by_file = style.validate_asset_role_assignments(
+            [upload.filename or "" for upload in files], asset_roles_json,
+        )
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc) or "INVALID_ASSET_ROLES"}, status_code=400)
     job_id = uuid.uuid4().hex[:16]
     job_dir = settings.runtime_root / "style_jobs" / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
@@ -1230,11 +1603,14 @@ def create_style_learning_job(
             target = job_dir / f"{index:03d}-{filename}"
             with target.open("wb") as handle:
                 shutil.copyfileobj(upload.file, handle)
-            stored.append({"filename": filename, "path": str(target), "size": target.stat().st_size})
+            stored.append({
+                "filename": filename, "path": str(target), "size": target.stat().st_size,
+                "asset_roles": roles_by_file[index - 1],
+            })
     except Exception as exc:
         shutil.rmtree(job_dir, ignore_errors=True)
         return JSONResponse({"error": f"UPLOAD_SAVE_FAILED:{exc}"}, status_code=500)
-    job = create_style_job(stored, job_id=job_id)
+    job = create_style_job(stored, job_id=job_id, owner_user_id=_request_owner(request))
     background_tasks.add_task(run_style_job, job["id"])
     return job
 
@@ -1246,44 +1622,11 @@ def style_learning_job(job_id: str):
         return JSONResponse({"error": "STYLE_JOB_NOT_FOUND"}, status_code=404)
     return job
 
-@router.post("/style/analyze")
-def analyze_style(files: list[UploadFile] = File(...)):
-    """上传模板或参考成品报告 → 提取文档格式与写作风格 → 生成可复核模板。
-
-    每份 docx 报告的硬排版格式(字体/字号/行距/页边距)被真实提取,
-    结构化 Schema 与原始 DOCX 双轨保存,供导出器稳定复用。
-    """
-    reports: list[dict] = []
-    tmp_files: list[Path] = []
-    settings.ensure_dirs()
-    for upload in files:
-        filename = Path(upload.filename).name
-        tmp = settings.materials_dir / f"_style_{filename}"
-        tmp_files.append(tmp)
-        with tmp.open("wb") as fh:
-            shutil.copyfileobj(upload.file, fh)
-        try:
-            units = parse_file(tmp)
-        except Exception:
-            continue
-        text = "\n".join(u.content for u in units if u.content.strip())
-        if text:
-            reports.append({"filename": filename, "text": text, "path": str(tmp)})
-    try:
-        variants = style.analyze_library(reports) if reports else []
-    finally:
-        for tmp in tmp_files:
-            tmp.unlink(missing_ok=True)
-    if not variants:
-        return JSONResponse({"error": "NO_PARSEABLE_FILES"}, status_code=400)
-    return {"variants": [variant_fields(v) for v in variants]}
-
-
 @router.get("/style/variants")
-def list_style_variants():
+def list_style_variants(request: Request):
     # The exemplar bank can contain hundreds of long paragraphs. Keep the
     # selector/list payload light and load the full profile only on inspection.
-    return [variant_summary_fields(v) for v in style.list_variants()]
+    return [variant_summary_fields(v) for v in style.list_variants(owner_user_id=_request_owner(request))]
 
 
 @router.get("/style/variants/{variant_id}/template-schema")
@@ -1293,6 +1636,10 @@ def get_template_schema(variant_id: int):
         return JSONResponse({"error": "VARIANT_NOT_FOUND"}, status_code=404)
     dominant = variant.format_spec.get("dominant") if isinstance(variant.format_spec, dict) else {}
     schema = dominant.get("template_schema") if isinstance(dominant, dict) else {}
+    if isinstance(dominant, dict) and schema.get("compiler_version") != COMPILER_VERSION:
+        source = Path(str(dominant.get("source_template_path") or ""))
+        if source.exists():
+            schema = compile_template(source)
     if not schema:
         return JSONResponse({"error": "TEMPLATE_SCHEMA_NOT_FOUND"}, status_code=404)
     return schema
@@ -1323,6 +1670,11 @@ def confirm_style_variant(variant_id: int):
 
 @router.post("/style/variants/{variant_id}/lock")
 def lock_style_variant(variant_id: int):
+    variant = style.get_variant(variant_id)
+    if variant is None:
+        return JSONResponse({"error": "VARIANT_NOT_FOUND"}, status_code=404)
+    if variant.status not in {"confirmed", "locked"}:
+        return JSONResponse({"error": "TEMPLATE_NOT_CONFIRMED", "message": "确认模板后才能设为默认。"}, status_code=409)
     style.lock_variant(variant_id)
     return {"ok": True}
 
@@ -1347,7 +1699,14 @@ def update_style_profile(variant_id: int, payload: dict):
 # ---------- 异步用户介入 ----------
 
 @router.post("/interactions")
-def start_interaction(payload: dict):
+def start_interaction(payload: dict, request: Request = None):
+    owner = _request_owner(request)
+    if owner is not None:
+        principal = request.state.principal
+        if payload.get("task_id"):
+            require_owner("task", str(payload["task_id"]), principal)
+        if payload.get("report_id") is not None:
+            require_owner("report", int(payload["report_id"]), principal)
     try:
         return create_interaction_thread(
             task_id=str(payload.get("task_id") or ""),
@@ -1356,14 +1715,26 @@ def start_interaction(payload: dict):
             artifact_version=str(payload.get("artifact_version") or ""),
             object_id=str(payload.get("object_id") or ""),
             scope=payload.get("scope") if isinstance(payload.get("scope"), dict) else {},
+            **({"owner_user_id": owner} if owner is not None else {}),
         )
     except (TypeError, ValueError) as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)
 
 
 @router.get("/interactions")
-def interactions(task_id: str = "", report_id: int | None = None, draft_id: str = ""):
-    return list_interaction_threads(task_id=task_id, report_id=report_id, draft_id=draft_id)
+def interactions(task_id: str = "", report_id: int | None = None, draft_id: str = "",
+                 request: Request = None):
+    owner = _request_owner(request)
+    if owner is not None:
+        principal = request.state.principal
+        if task_id:
+            require_owner("task", task_id, principal)
+        if report_id is not None:
+            require_owner("report", report_id, principal)
+    return list_interaction_threads(
+        task_id=task_id, report_id=report_id, draft_id=draft_id,
+        **({"owner_user_id": owner} if owner is not None else {}),
+    )
 
 
 @router.get("/tasks/{task_id}/review-workspace")
@@ -1376,7 +1747,14 @@ def task_review_workspace(task_id: str, artifact_type: str = "task_brief", q: st
 
 
 @router.get("/interaction-notifications")
-def interaction_notifications(task_id: str = "", report_id: int | None = None):
+def interaction_notifications(task_id: str = "", report_id: int | None = None,
+                              request: Request = None):
+    if _request_owner(request) is not None:
+        principal = request.state.principal
+        if task_id:
+            require_owner("task", task_id, principal)
+        if report_id is not None:
+            require_owner("report", report_id, principal)
     return list_interaction_notifications(task_id=task_id, report_id=report_id)
 
 
@@ -1412,8 +1790,14 @@ def send_interaction_message(thread_id: int, payload: dict):
                 thread_id,
                 str(payload.get("content") or ""),
                 request_id=str(payload.get("request_id") or ""),
+                context=payload.get("context") if isinstance(payload.get("context"), dict) else None,
+                draft_current=payload.get("draft_current") if isinstance(payload.get("draft_current"), dict) else None,
             )
-        return post_interaction_message(thread_id, str(payload.get("content") or ""))
+        return post_interaction_message(
+            thread_id, str(payload.get("content") or ""),
+            context=payload.get("context") if isinstance(payload.get("context"), dict) else None,
+            draft_current=payload.get("draft_current") if isinstance(payload.get("draft_current"), dict) else None,
+        )
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)
 
@@ -1428,16 +1812,70 @@ def decide_change_proposal(proposal_id: int, payload: dict):
 
 # ---------- 系统 ----------
 
+@router.get("/system/model-connection")
+def get_model_connection():
+    from app.model_connection import public_connection
+    return public_connection()
+
+
+@router.get("/system/model-connection/status")
+def model_connection_status():
+    from app.model_connection import load_connection
+    import httpx
+    try:
+        connection = load_connection()
+        response = httpx.get(f"{connection.base_url}/models", headers=connection.headers(), timeout=5, follow_redirects=False)
+        if response.status_code in {404, 405}:
+            return {"status": "unknown", "message": "服务不支持模型列表，请使用测试连接验证推理"}
+        response.raise_for_status()
+        available = any(str(item.get("id")) == connection.model_name for item in response.json().get("data", []))
+        from app.vllm_capacity import status
+        return {"status": "ready" if available else "unknown", "message": "模型已就绪" if available else "模型列表未找到配置名称，请测试连接", **status(connection)}
+    except ValueError:
+        return {"status": "unconfigured", "message": "尚未配置模型接入"}
+    except Exception:
+        return {"status": "error", "message": "模型服务连接异常"}
+
+
+@router.put("/system/model-connection")
+def update_model_connection(payload: dict):
+    from app.model_connection import connection_from_payload, public_connection, save_connection
+    lanes = model_lane_stats()
+    from app.memory.style_jobs import has_active_jobs
+    if task_queue_status().get("running_task_id") or has_active_jobs() or any(v.get("active") or v.get("submitted", 0) > v.get("completed", 0) + v.get("failed", 0) for v in lanes.values()):
+        return JSONResponse({"error": "服务正在执行任务或对话，请空闲后修改模型接入"}, status_code=409)
+    try:
+        save_connection(connection_from_payload(payload))
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    return public_connection()
+
+
+@router.post("/system/model-connection/test")
+def probe_model_connection(payload: dict):
+    from app.model_connection import connection_from_payload, test_connection
+    try:
+        return test_connection(connection_from_payload(payload))
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except Exception:
+        return JSONResponse({"error": "模型连接失败，请检查地址、凭据和服务状态"}, status_code=502)
+
 @router.get("/health")
 def health():
     """网关连通与模型在位状态(系统设置页使用)。"""
+    if settings.multiuser_enabled:
+        return {"status": "ok"}
     from app.gateway import model_gateway
+    from app.runtime_profiles import runtime_profile_manifest
+    from app.context_budget import tokenizer_method
 
-    generation_url = (
-        settings.generation_url
-        if str(settings.generation_backend).lower() == "vllm"
-        else settings.ollama_url
-    )
+    from app.model_connection import public_connection
+    generation_url = public_connection()["base_url"]
+    embedding_runtime = {
+        "backend": settings.embedding_backend,
+        "model": settings.embedding_model_path or settings.embedding_model,
+    }
 
     try:
         status = invoke("health", model_gateway.health)
@@ -1446,7 +1884,7 @@ def health():
             "version": status.get("version"),
             "models": status.get("models", {}),
             "gateway_url": generation_url,
-            "embedding_url": settings.ollama_url,
+            "embedding_runtime": embedding_runtime,
             "runtime_root": str(settings.runtime_root),
             "queues": {
                 "tasks": task_queue_status(),
@@ -1457,12 +1895,18 @@ def health():
                 "mode": graph_service.mode,
                 "neo4j_configured": graph_service.projector.available(),
             },
+            "runtime_profiles": runtime_profile_manifest(),
+            "context_tokenizer": {
+                "method": tokenizer_method(),
+                "exact": False,
+                "final_request_counter": "vllm /tokenize (with estimated fallback)",
+            },
         }
     except Exception as exc:
         return {
             "error": str(exc),
             "gateway_url": generation_url,
-            "embedding_url": settings.ollama_url,
+            "embedding_runtime": embedding_runtime,
             "runtime_root": str(settings.runtime_root),
         }
 
@@ -1615,26 +2059,14 @@ def _resource_snapshot() -> dict:
 # ---------- 辅助 ----------
 
 def _find_task_by_report(report_id: int) -> str | None:
-    """返回报告的根任务,兼容旧版曾创建的独立增量任务。"""
-    from app.infrastructure.orm import ORMShortMemory
-    from sqlalchemy import select
+    """Return the direct task owner of a report."""
+    from app.infrastructure.orm import ORMReport
     with session_scope() as s:
-        rows = s.execute(select(ORMShortMemory.c.task_id, ORMShortMemory.c.payload)).all()
-    matches: list[tuple[str, dict]] = []
-    for row in rows:
-        payload = json.loads(row[1])
-        try:
-            payload_report_id = int(payload.get("report_id"))
-        except (TypeError, ValueError):
-            continue
-        if payload_report_id == int(report_id):
-            matches.append((str(row[0]), payload))
-    if not matches:
-        return None
-    roots = [item for item in matches if not item[1].get("incremental_base_task_id")]
-    candidates = roots or matches
-    candidates.sort(key=lambda item: (str(item[1].get("created_at") or ""), item[0]))
-    return candidates[0][0]
+        row = s.execute(
+            select(ORMReport.c.task_id).where(ORMReport.c.id == int(report_id))
+        ).mappings().first()
+    task_id = str(row["task_id"] or "") if row else ""
+    return task_id or None
 
 
 def _sentence_details_bulk(rows) -> dict[int, dict]:
@@ -1685,32 +2117,55 @@ def _sentence_details_bulk(rows) -> dict[int, dict]:
     return result
 
 
-def _report_heading_strategy(style_profile_id: int | None):
+def _report_heading_strategy(style_profile_id: int | None, *, fallback_defaults: bool = False):
     variant = style.get_variant(style_profile_id) if style_profile_id else None
-    locked = style.get_locked_variant()
-    selected = variant if _api_variant_has_template_roles(variant) else None
-    if selected is None and _api_variant_has_template_roles(locked):
-        selected = locked
-    dominant = selected.format_spec.get("dominant") if selected and isinstance(selected.format_spec, dict) else {}
+    dominant = variant.format_spec.get("dominant") if variant and isinstance(variant.format_spec, dict) else {}
     schema = dominant.get("template_schema") if isinstance(dominant, dict) else {}
-    return detect_numbering_strategy(schema if isinstance(schema, dict) else {})
+    return detect_numbering_strategy(
+        schema if isinstance(schema, dict) else {}, fallback_defaults=fallback_defaults,
+    )
 
 
-def _api_variant_has_template_roles(variant) -> bool:
-    if variant is None or not isinstance(variant.format_spec, dict):
-        return False
-    dominant = variant.format_spec.get("dominant")
-    schema = dominant.get("template_schema") if isinstance(dominant, dict) else {}
-    roles = schema.get("style", {}).get("roles", {}) if isinstance(schema, dict) else {}
-    return isinstance(roles, dict) and bool(roles.get("document_title") and roles.get("body"))
+def _report_document_shape(plan_id: int | None) -> dict:
+    from app.document_shape import normalize_document_shape
+    if not plan_id:
+        return normalize_document_shape(None)
+    with session_scope() as s:
+        row = s.execute(
+            select(ORMPlan.c.final_plan_json).where(ORMPlan.c.id == int(plan_id))
+        ).mappings().first()
+    try:
+        payload = json.loads((row or {}).get("final_plan_json") or "{}")
+    except (TypeError, ValueError):
+        payload = {}
+    return normalize_document_shape(payload.get("document_shape"))
+
+
+def _report_composition_mode(plan_id: int | None) -> str:
+    from app.document_shape import normalize_composition_mode
+    if not plan_id:
+        return "chaptered"
+    with session_scope() as s:
+        row = s.execute(
+            select(ORMPlan.c.final_plan_json).where(ORMPlan.c.id == int(plan_id))
+        ).mappings().first()
+    try:
+        payload = json.loads((row or {}).get("final_plan_json") or "{}")
+    except (TypeError, ValueError):
+        payload = {}
+    return normalize_composition_mode(
+        payload.get("composition_mode"), shape=payload.get("document_shape"),
+    )
 
 
 def variant_fields(variant) -> dict:
+    structure = dict(variant.structure or {})
+    structure["asset_roles"] = _variant_asset_roles(variant)
     return {
         "id": variant.id,
         "name": variant.name,
         "description": variant.description,
-        "structure": variant.structure,
+        "structure": structure,
         "writing_style": variant.writing_style,
         "writing_patterns": variant.writing_patterns,
         "terminology": variant.terminology,
@@ -1721,10 +2176,7 @@ def variant_fields(variant) -> dict:
         "institution_rules": variant.institution_rules,
         "structure_policy": variant.structure_policy,
         "exemplar_bank": variant.exemplar_bank,
-        "profile_confidence": {
-            key: value for key, value in (variant.profile_confidence or {}).items()
-            if key != "evidence_usage"
-        },
+        "learning_evidence": structure.get("learning_evidence", {}),
         "profile_version": variant.profile_version,
         "source_reports": variant.source_reports,
         "status": variant.status,
@@ -1732,34 +2184,80 @@ def variant_fields(variant) -> dict:
 
 
 def variant_summary_fields(variant) -> dict:
+    evidence = (variant.structure or {}).get("learning_evidence", {})
+    evidence_summary = {
+        key: evidence.get(key)
+        for key in (
+            "source_count", "role_source_counts", "editorial", "structure", "layout",
+            "profile_prompt", "topic_probe",
+        )
+        if isinstance(evidence, dict) and key in evidence
+    }
     return {
         "id": variant.id,
         "name": variant.name,
         "description": variant.description,
         "status": variant.status,
         "profile_version": variant.profile_version,
-        "profile_confidence": {
-            key: value for key, value in (variant.profile_confidence or {}).items()
-            if key != "evidence_usage"
-        },
+        "learning_evidence": evidence_summary,
         "source_reports": variant.source_reports,
         "exemplar_count": len(variant.exemplar_bank or []),
+        "asset_roles": _variant_asset_roles(variant),
+        "document_shape": (variant.structure or {}).get("document_shape", {}),
     }
 
 
-def _task_rows() -> list:
+def _variant_asset_roles(variant) -> dict:
+    """Expose template capabilities consistently for both new and legacy rows."""
+    structure = variant.structure if isinstance(variant.structure, dict) else {}
+    saved = structure.get("asset_roles") if isinstance(structure.get("asset_roles"), dict) else {}
+    format_spec = variant.format_spec if isinstance(variant.format_spec, dict) else {}
+    dominant = format_spec.get("dominant") if isinstance(format_spec.get("dominant"), dict) else format_spec
+    has_layout = bool(
+        saved.get("layout_master_available")
+        or dominant.get("source_template_path")
+        or dominant.get("template_schema")
+    )
+    has_editorial = bool(
+        saved.get("editorial_reference")
+        or variant.exemplar_bank
+        or variant.style_samples
+        or variant.writing_style
+    )
+    if saved.get("role_assignment_known") is True:
+        result = dict(saved)
+        result.update({
+            "editorial_reference": has_editorial,
+            "layout_master_available": has_layout,
+            "layout_master": bool(saved.get("layout_master") and has_layout),
+        })
+        return result
+    return {
+        "role_assignment_known": False,
+        "editorial_reference": has_editorial,
+        "structural_reference": False,
+        "layout_master": has_layout,
+        "layout_master_available": has_layout,
+        "note": (
+            "该历史画像未记录逐文件用途；只能确认已有语言画像和版式文件，"
+            "不能据此认定历史目录具有结构参考权限。"
+        ),
+    }
+
+
+def _task_rows(owner_user_id: int | None = None) -> list:
     from app.infrastructure.orm import ORMShortMemory
     from sqlalchemy import select
     with session_scope() as s:
-        return s.execute(
-            select(ORMShortMemory.c.task_id, ORMShortMemory.c.payload)
-            .order_by(ORMShortMemory.c.task_id.desc())
-        ).mappings().all()
+        query = select(ORMShortMemory.c.task_id, ORMShortMemory.c.payload)
+        if owner_user_id is not None:
+            query = query.where(ORMShortMemory.c.owner_user_id == owner_user_id)
+        return s.execute(query.order_by(ORMShortMemory.c.task_id.desc())).mappings().all()
 
 
-def _material_task_index() -> dict[int, list[dict]]:
+def _material_task_index(owner_user_id: int | None = None) -> dict[int, list[dict]]:
     index: dict[int, list[dict]] = {}
-    for row in _task_rows():
+    for row in _task_rows(owner_user_id):
         payload = json.loads(row["payload"])
         for material_id in payload.get("material_ids", []) or []:
             try:
@@ -1775,9 +2273,9 @@ def _material_task_index() -> dict[int, list[dict]]:
     return index
 
 
-def _report_task_index() -> dict[int, dict]:
+def _report_task_index(owner_user_id: int | None = None) -> dict[int, dict]:
     index: dict[int, dict] = {}
-    for row in _task_rows():
+    for row in _task_rows(owner_user_id):
         payload = json.loads(row["payload"])
         report_id = payload.get("report_id")
         if report_id is None:
@@ -1798,6 +2296,7 @@ def _report_task_index() -> dict[int, dict]:
 def _task_view(payload: dict) -> dict:
     """Return UI-safe task payload without mutating historical task records."""
     view = dict(payload or {})
+    view["evidence_progress"] = progress_for_display(view.get("evidence_progress"))
     stage = str(view.get("stage") or "")
     queue_status = dict(view.get("queue_status") or {})
     queue_state = str(queue_status.get("status") or "")
@@ -1870,6 +2369,12 @@ def _progress_summary(payload: dict) -> dict:
         "critical_path_done": payload.get("critical_path_done", False),
         "background_jobs": payload.get("background_jobs") or {},
         "artifact_status": payload.get("artifact_status") or {},
+        "stage_health": {
+            "material_analysis": payload.get("material_analysis_status") or {},
+            "intelligence": payload.get("intelligence_status") or {},
+            "quality": payload.get("qa_status") or {},
+            "artifact_recording": payload.get("artifact_recording_error") or {},
+        },
         "queue_status": payload.get("queue_status") or {},
         "performance": {
             "parse_reused": payload.get("parse_reused", 0),

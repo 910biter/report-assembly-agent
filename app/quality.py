@@ -8,16 +8,161 @@ LLM 检查:逻辑跳跃、引用与内容一致性。结果统一为 qa_notes �
 确定性问题自动修;低风险问题可逆修;语义性问题仅提示人工/模型复核。
 """
 
+import hashlib
 import json
+import logging
 import re
+from decimal import Decimal, InvalidOperation
 
+from app.agents.base import BaseAgent
+from app.assertion_semantics import normalize_semantic_profile, semantic_profile_line
+from app.context_budget import ContextSection, build_prompt_from_sections
 from app.db import session_scope
-from app.gateway import model_gateway
-from app.llm_scheduler import invoke
+from app.runtime_profiles import stage_input_budget_tokens
 
-_QA_SYSTEM = """你是报告质量检查员。检查报告是否存在以下问题,严格输出 JSON:
-{"issues": [{"type": "LOGIC_GAP|CITATION_MISMATCH|REDUNDANT", "section": "章节", "quote": "问题句片段", "note": "问题说明"}]}
-没有问题时输出 {"issues": []}"""
+logger = logging.getLogger(__name__)
+
+_QA_SYSTEM = """你是报告质量检查员。按稳定句子编号核验逻辑、引用和明显重复。只输出 JSON：
+{"issues": [{
+  "type": "LOGIC_GAP|CITATION_MISMATCH|REDUNDANT",
+  "target_type": "sentence|paragraph|section|report",
+  "sentence_ids": [123],
+  "section": "章节",
+  "paragraph": 1,
+  "quote": "必须来自被指向正文的原文片段",
+  "support_status": "PARTIALLY_SUPPORTED|UNSUPPORTED|CONTRADICTED|INSUFFICIENT_EVIDENCE",
+  "note": "问题说明"
+}]}
+核验步骤:
+1. 先将句子的 FACT_IDS/INFERENCE_IDS 与 DIRECT_SENTENCES/INFERENCE_BASIS_SENTENCES/SENTENCES 映射核对；对每条推论沿 BASED_FACT_IDS 查看原始事实及来源语义。全部已绑定依据应联合判断复合句中的每个独立主张，允许语义等价改述。
+2. 对有引用的句子逐项核对每个独立主张，指出仍缺支持的最小分句及原因；对无引用而包含事实、数量、因果、效果或评价的句子同样核验。特别区分来源明示的行动与作者补入的动机、市场需求、目的或效果：仅有行动、规模和时间的依据不能单独证明这些解释。纯组织性过渡可无引用。来源观点、计划、目标、假设和预测只支持相应范围的陈述；已实现或已验证的独立结论需要相应来源证据。局部缺失说明只适用于已检查范围。
+3. 引用问题的 support_status 采用 PARTIALLY_SUPPORTED（部分主张有依据）、UNSUPPORTED（现有绑定依据不支持）、CONTRADICTED（明确反证）或 INSUFFICIENT_EVIDENCE（尚不足以判断）。逻辑跳跃与重复问题可省略该字段；普通写作偏好不作为质量问题。
+4. 句子与段落问题使用输入中的真实 sentence_ids；章节或全文问题可为空。quote 逐字截取有问题的最小正文片段。输出前逐条复核：只有 note 指出的主张确实缺支持时才保留 issue，support_status 应与最终 note 一致。无问题时返回 {"issues": []}。"""
+
+
+class _QualityAgent(BaseAgent):
+    name = "qa"
+    role = _QA_SYSTEM
+    temperature = 0.0
+
+
+def _source_ids_for_qa(rows: list[dict]) -> tuple[set[int], set[int]]:
+    fact_ids: set[int] = set()
+    inference_ids: set[int] = set()
+    for row in rows or []:
+        try:
+            refs = json.loads(row.get("source_refs") or "{}")
+        except (TypeError, ValueError):
+            refs = {}
+        if not isinstance(refs, dict):
+            continue
+        for key, target in (("fact_ids", fact_ids), ("inference_ids", inference_ids)):
+            for value in refs.get(key) or []:
+                try:
+                    parsed = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if parsed > 0:
+                    target.add(parsed)
+    return fact_ids, inference_ids
+
+
+def _build_qa_context(rows: list[dict], *, fact_by_id: dict[int, str],
+                      inference_by_id: dict[int, dict],
+                      evidence_by_fact: dict[int, list[dict]],
+                      fact_semantics_by_id: dict[int, dict] | None = None) -> dict[str, list[str]]:
+    """Build compact QA records only from evidence linked to report sentences."""
+    fact_semantics_by_id = fact_semantics_by_id or {}
+    direct_fact_sentences: dict[int, list[int]] = {}
+    inference_basis_sentences: dict[int, list[int]] = {}
+    inference_sentences: dict[int, list[int]] = {}
+    sentence_lines = []
+    for row in rows or []:
+        try:
+            refs = json.loads(row.get("source_refs") or "{}")
+        except (TypeError, ValueError):
+            refs = {}
+        if not isinstance(refs, dict):
+            refs = {}
+        fact_ids = sorted({int(value) for value in refs.get("fact_ids") or [] if str(value).isdigit()})
+        inference_ids = sorted({int(value) for value in refs.get("inference_ids") or [] if str(value).isdigit()})
+        sentence_id = int(row.get("id") or 0)
+        for fact_id in fact_ids:
+            direct_fact_sentences.setdefault(fact_id, []).append(sentence_id)
+        for inference_id in inference_ids:
+            inference_sentences.setdefault(inference_id, []).append(sentence_id)
+            inference = inference_by_id.get(inference_id) or {}
+            for fact_id in inference.get("based_fact_ids") or []:
+                inference_basis_sentences.setdefault(int(fact_id), []).append(sentence_id)
+        sentence_lines.append(
+            f"[SECTION:{row.get('section', '')}][PARAGRAPH:{int(row.get('paragraph') or 0)}]"
+            f"[SENTENCE:{sentence_id}][SOURCE:{row.get('source_level', '')}]"
+            f"[FACT_IDS:{','.join(map(str, fact_ids))}][INFERENCE_IDS:{','.join(map(str, inference_ids))}] "
+            f"{row.get('content', '')}"
+        )
+
+    linked_fact_ids = set(direct_fact_sentences) | set(inference_basis_sentences)
+    fact_lines = []
+    for fact_id in sorted(linked_fact_ids):
+        if fact_id not in fact_by_id:
+            continue
+        direct_ids = sorted(set(direct_fact_sentences.get(fact_id, [])))
+        inference_ids = sorted(set(inference_basis_sentences.get(fact_id, [])))
+        fact_semantics = fact_semantics_by_id.get(fact_id) or {}
+        profile = fact_semantics.get("semantic_profile", fact_semantics)
+        source_profile = semantic_profile_line(
+            profile,
+            fact_semantics.get("assertion_mode"),
+            fact_semantics.get("assertion_mode_raw"),
+        )
+        fact_lines.append(
+            f"[FACT:{fact_id}][DIRECT_SENTENCES:{','.join(map(str, direct_ids))}]"
+            f"[INFERENCE_BASIS_SENTENCES:{','.join(map(str, inference_ids))}] "
+            f"{fact_by_id[fact_id]} "
+            f"[SOURCE_SEMANTICS:{source_profile}]"
+        )
+    inference_lines = []
+    for inference_id, sentence_ids in sorted(inference_sentences.items()):
+        inference = inference_by_id.get(inference_id)
+        if not inference:
+            continue
+        based_fact_ids = inference.get("based_fact_ids") or []
+        inference_lines.append(
+            f"[INFERENCE:{inference_id}][SOURCE_LEVEL:{inference.get('source_level', '')}]"
+            f"[BASED_FACT_IDS:{','.join(map(str, based_fact_ids))}]"
+            f"[SENTENCES:{','.join(map(str, sorted(set(sentence_ids))))}] "
+            f"{inference.get('content', '')} "
+            f"[INFERENCE_SEMANTICS:{semantic_profile_line(inference.get('semantic_profile'))}]"
+        )
+
+    evidence_lines = []
+    seen_evidence = set()
+    for fact_id in sorted(linked_fact_ids):
+        sentence_ids = sorted(set(direct_fact_sentences.get(fact_id, []))
+                              | set(inference_basis_sentences.get(fact_id, [])))
+        for evidence in evidence_by_fact.get(fact_id, []):
+            source_file = str(evidence.get("source_file") or "来源未记录")
+            locator = []
+            if evidence.get("page") is not None:
+                locator.append(f"第{evidence['page']}页")
+            if evidence.get("paragraph") is not None:
+                locator.append(f"第{evidence['paragraph']}段")
+            quote = str(evidence.get("quote") or "").strip()
+            key = (fact_id, source_file, tuple(locator), quote)
+            if not quote or key in seen_evidence:
+                continue
+            seen_evidence.add(key)
+            location = " · ".join([source_file, *locator])
+            evidence_lines.append(
+                f"[EVIDENCE_FOR_FACT:{fact_id}][SENTENCES:{','.join(map(str, sorted(set(sentence_ids))))}] "
+                f"{location} | {quote}"
+            )
+    return {
+        "sentence_lines": sentence_lines,
+        "fact_lines": fact_lines,
+        "inference_lines": inference_lines,
+        "evidence_lines": evidence_lines,
+    }
 
 _VAGUE_TERMS = (
     "相关文件", "有关文件", "有关要求", "相关材料", "规定时间", "指定时间",
@@ -40,6 +185,23 @@ def _cosine_similarity(a: str, b: str) -> float:
     if not grams_a or not grams_b:
         return 0.0
     return len(grams_a & grams_b) / len(grams_a | grams_b)
+
+
+_NUMERIC_TOKEN_RE = re.compile(r"(?<![A-Za-z])\d+(?:\.\d+)?(?:[kK])?(?![A-Za-z])")
+
+
+def _normalized_numeric_tokens(text: str) -> set[str]:
+    """Normalize plain numbers and the common k-thousand suffix before QA comparison."""
+    normalized = set()
+    for match in _NUMERIC_TOKEN_RE.findall(str(text or "")):
+        has_k_suffix = match[-1:].lower() == "k"
+        numeric = match[:-1] if has_k_suffix else match
+        try:
+            value = Decimal(numeric) * (Decimal("1000") if has_k_suffix else Decimal("1"))
+        except InvalidOperation:
+            continue
+        normalized.add(format(value.normalize(), "f"))
+    return normalized
 
 
 def run_quality_check(report_id: int, plan_structure: list[str],
@@ -131,15 +293,65 @@ def run_quality_check(report_id: int, plan_structure: list[str],
     # 4. 数字一致性:句子中的数字应在其引用事实(含原文片段)中出现(防模型改述出错)
     # Do not treat architecture/product tokens such as x86 or SGXv1 as
     # standalone quantitative claims.
-    _digit_re = re.compile(r"(?<![A-Za-z])\d+(?:\.\d+)?(?![A-Za-z])")
-    from app.infrastructure.orm import ORMFact, ORMEvidence
+    from app.infrastructure.orm import ORMFact, ORMEvidence, ORMInference
+    linked_fact_ids, linked_inference_ids = _source_ids_for_qa(rows)
     with session_scope() as s:
-        fact_rows = s.execute(select(ORMFact.c.id, ORMFact.c.content)).mappings().all()
-        ev_rows = s.execute(select(ORMEvidence.c.fact_id, ORMEvidence.c.quote)).mappings().all()
+        inference_rows = (
+            s.execute(
+                select(ORMInference.c.id, ORMInference.c.content, ORMInference.c.source_level,
+                       ORMInference.c.based_fact_ids, ORMInference.c.confidence_level,
+                       ORMInference.c.semantic_profile_json)
+                .where(ORMInference.c.id.in_(linked_inference_ids))
+            ).mappings().all()
+            if linked_inference_ids else []
+        )
+        inference_by_id = {}
+        for row in inference_rows:
+            try:
+                based_fact_ids = json.loads(row["based_fact_ids"] or "[]")
+            except (TypeError, ValueError):
+                based_fact_ids = []
+            inference_by_id[int(row["id"])] = {
+                "content": row["content"],
+                "source_level": row["source_level"],
+                "based_fact_ids": [int(value) for value in based_fact_ids if str(value).isdigit()],
+                "confidence_level": row["confidence_level"],
+                "semantic_profile": normalize_semantic_profile(row.get("semantic_profile_json")),
+            }
+        linked_fact_ids.update({
+            fact_id for inference in inference_by_id.values()
+            for fact_id in inference.get("based_fact_ids") or []
+        })
+        fact_rows = (
+            s.execute(select(
+                ORMFact.c.id, ORMFact.c.content, ORMFact.c.semantic_profile_json,
+                ORMFact.c.assertion_mode, ORMFact.c.assertion_mode_raw,
+            ).where(ORMFact.c.id.in_(linked_fact_ids))).mappings().all()
+            if linked_fact_ids else []
+        )
+        ev_rows = (
+            s.execute(
+                select(ORMEvidence.c.fact_id, ORMEvidence.c.source_file, ORMEvidence.c.page,
+                       ORMEvidence.c.paragraph, ORMEvidence.c.quote)
+                .where(ORMEvidence.c.fact_id.in_(linked_fact_ids))
+                .order_by(ORMEvidence.c.fact_id, ORMEvidence.c.id)
+            ).mappings().all()
+            if linked_fact_ids else []
+        )
     fact_by_id = {r["id"]: r["content"] for r in fact_rows}
+    fact_semantics_by_id = {
+        int(row["id"]): {
+            "semantic_profile": normalize_semantic_profile(row.get("semantic_profile_json")),
+            "assertion_mode": row.get("assertion_mode"),
+            "assertion_mode_raw": row.get("assertion_mode_raw"),
+        }
+        for row in fact_rows
+    }
     quote_by_fact: dict[int, list[str]] = {}
+    evidence_by_fact: dict[int, list[dict]] = {}
     for ev in ev_rows:
         quote_by_fact.setdefault(ev["fact_id"], []).append(ev["quote"])
+        evidence_by_fact.setdefault(ev["fact_id"], []).append(dict(ev))
     for row in rows:
         try:
             refs = json.loads(row["source_refs"] or "{}")
@@ -148,49 +360,20 @@ def run_quality_check(report_id: int, plan_structure: list[str],
         fact_ids = refs.get("fact_ids") or []
         if not fact_ids:
             continue
-        sentence_digits = set(_digit_re.findall(row["content"]))
+        sentence_digits = _normalized_numeric_tokens(row["content"])
         if not sentence_digits:
             continue
         fact_digits: set[str] = set()
         for fid in fact_ids:
-            fact_digits |= set(_digit_re.findall(fact_by_id.get(int(fid), "")))
+            fact_digits |= _normalized_numeric_tokens(fact_by_id.get(int(fid), ""))
             for quote in quote_by_fact.get(int(fid), []):
-                fact_digits |= set(_digit_re.findall(quote))
+                fact_digits |= _normalized_numeric_tokens(quote)
         missing = {d for d in sentence_digits - fact_digits if len(d) >= 2}
         if missing:
             issues.append({
                 "type": "CITATION_MISMATCH", "section": row["section"],
                 "quote": row["content"][:60],
                 "note": f"句子数字 {sorted(missing)} 未在引用事实中出现,请核对",
-            })
-
-    # 4.4 逐句归因支持门控(AFtG"选择即引用"的运行时兜底):
-    # 句子绑定 fact_ids 却与证据文本几乎零词面重叠 → 疑似裸结论/无依据扩展。
-    # 模型语义判断为主;此处仅抓极低重叠的明显异常,避免误报。
-    for row in rows:
-        try:
-            refs = json.loads(row["source_refs"] or "{}")
-        except (TypeError, ValueError):
-            continue
-        fact_ids = refs.get("fact_ids") or []
-        if not fact_ids:
-            continue
-        content = row["content"] or ""
-        if len(content) < 20:
-            continue  # 短句/过渡句不判
-        evidence_text = ""
-        for fid in fact_ids:
-            evidence_text += fact_by_id.get(int(fid), "") + " "
-            for quote in quote_by_fact.get(int(fid), []):
-                evidence_text += quote + " "
-        if not evidence_text.strip():
-            continue
-        sim = _cosine_similarity(content, evidence_text)
-        if sim < 0.1:  # 字符二元组重叠极低(程序兜底;语义判断由模型承担)
-            issues.append({
-                "type": "ATTRIBUTION_WEAK", "section": row["section"],
-                "quote": content[:60],
-                "note": "句子与所引用证据词面重叠极低,疑似无依据扩展/裸结论,请核对或补充引用",
             })
 
     # 4.5 具体化检查:引用事实/证据已有明确日期、文件名、材料名时,正文不应泛化。
@@ -273,23 +456,75 @@ def run_quality_check(report_id: int, plan_structure: list[str],
     # 6. 逻辑与引用一致性:LLM 检查
     if rows:
         try:
-            block = "\n".join(
-                f"[{row['section']}] ({row['source_level']}) {row['content']}"
-                for row in rows[:40]
+            qa_context = _build_qa_context(
+                rows, fact_by_id=fact_by_id, inference_by_id=inference_by_id,
+                evidence_by_fact=evidence_by_fact,
+                fact_semantics_by_id=fact_semantics_by_id,
             )
-            payload = invoke(
-                "qa", model_gateway.generate_json,
-                f"报告句子清单:\n{block}", system=_QA_SYSTEM
-            )
+            sentence_lines = qa_context["sentence_lines"]
+            valid_sentence_ids = {int(row["id"]) for row in rows}
+            sentence_by_id = {int(row["id"]): str(row.get("content") or "") for row in rows}
+            prompt, _audit = build_prompt_from_sections("qa", [
+                ContextSection("instruction", [
+                    "检查报告正文和其绑定的材料事实、推断及原文依据。问题必须引用真实句子编号。",
+                    "仅按实际展示的引用依据核验；某条证据未进入上下文时，不得据此断言它不存在或引用必错。",
+                ], weight=6, required_items=2),
+                ContextSection("report_sentences", sentence_lines, weight=5, required_items=1),
+                ContextSection("cited_facts", qa_context["fact_lines"], weight=2, required_items=1),
+                ContextSection("cited_inferences", qa_context["inference_lines"], weight=2, required_items=1),
+                ContextSection("source_evidence", qa_context["evidence_lines"], weight=3, required_items=1),
+            ], stage_input_budget_tokens("qa"))
+            payload = _QualityAgent().generate_json(prompt)
             for item in payload.get("issues", []):
+                sentence_ids = []
+                for value in item.get("sentence_ids") or []:
+                    try:
+                        sentence_id = int(value)
+                    except (TypeError, ValueError):
+                        continue
+                    if sentence_id in valid_sentence_ids:
+                        sentence_ids.append(sentence_id)
+                sentence_ids = list(dict.fromkeys(sentence_ids))
+                quote = str(item.get("quote", ""))
+                if quote and sentence_ids and not any(
+                    quote in sentence_by_id.get(sentence_id, "") for sentence_id in sentence_ids
+                ):
+                    quote = ""
+                target_type = str(item.get("target_type") or "").strip().lower()
+                if target_type not in {"sentence", "paragraph", "section", "report"}:
+                    target_type = "sentence" if len(sentence_ids) == 1 else "paragraph" if sentence_ids else "section" if item.get("section") else "report"
+                support_status = str(item.get("support_status") or "").strip().upper()
+                if support_status not in {
+                    "PARTIALLY_SUPPORTED", "UNSUPPORTED", "CONTRADICTED", "INSUFFICIENT_EVIDENCE",
+                }:
+                    support_status = ""
                 issues.append({
                     "type": str(item.get("type", "LOGIC_GAP")),
+                    "target_type": target_type,
+                    "sentence_ids": sentence_ids,
+                    "sentence_id": sentence_ids[0] if len(sentence_ids) == 1 else None,
                     "section": str(item.get("section", "")),
-                    "quote": str(item.get("quote", ""))[:60],
+                    "paragraph": _safe_int(item.get("paragraph"), default=None),
+                    "quote": quote[:160],
+                    "support_status": support_status,
                     "note": str(item.get("note", "")),
+                    "location_source": "model_stable_id" if sentence_ids else "model_scope",
                 })
         except Exception:
-            pass  # LLM 检查失败不阻塞;规则检查结果保留
+            logger.exception("LLM report quality check failed for report %s", report_id)
+            issues.append({
+                "type": "QA_CHECK_INCOMPLETE",
+                "target_type": "report",
+                "sentence_ids": [],
+                "section": "",
+                "quote": "",
+                "note": "语义与引用核验未完成；本地规则检查结果仍保留，不能据此认为正文没有问题。",
+                "location_source": "system_status",
+            })
+
+    # Bind each issue to a stable report location. Rule and LLM checks use a
+    # human-readable quote, but the UI must not have to guess where it belongs.
+    issues = attach_quality_issue_locations(report_id, issues, rows=rows)
 
     # 去重
     seen = set()
@@ -300,6 +535,134 @@ def run_quality_check(report_id: int, plan_structure: list[str],
             seen.add(key)
             result.append(_classify_issue(issue))
     return result
+
+
+def attach_quality_issue_locations(report_id: int, issues: list[dict], *, rows=None,
+                                   report_version_id: int | None = None) -> list[dict]:
+    """Attach sentence/section anchors without changing QA semantics.
+
+    New QA runs receive stable sentence ids. Historical QA records are resolved
+    on read from their section and quote, so existing tasks remain navigable.
+    """
+    if rows is None:
+        from app.infrastructure.orm import ORMSentence
+        from sqlalchemy import select
+        with session_scope() as s:
+            rows = s.execute(
+                select(ORMSentence.c.id, ORMSentence.c.section, ORMSentence.c.paragraph,
+                       ORMSentence.c.content, ORMSentence.c.user_edit)
+                .where(ORMSentence.c.report_id == int(report_id), ORMSentence.c.selected == 1)
+                .order_by(ORMSentence.c.position)
+            ).mappings().all()
+    candidates = [
+        dict(row) for row in rows
+        if row.get("selected", 1) not in {0, False}
+    ]
+    by_id = {int(row["id"]): row for row in candidates}
+
+    if report_version_id is None:
+        try:
+            from app.infrastructure.orm import ORMReportVersion
+            from sqlalchemy import select
+            with session_scope() as s:
+                version = s.execute(
+                    select(ORMReportVersion.c.id)
+                    .where(ORMReportVersion.c.report_id == int(report_id))
+                    .order_by(ORMReportVersion.c.version_no.desc())
+                    .limit(1)
+                ).first()
+            report_version_id = int(version[0]) if version else None
+        except Exception:
+            report_version_id = None
+
+    result = []
+    for raw in issues or []:
+        issue = dict(raw or {})
+        original_quote = str(issue.get("quote") or "")
+        valid_ids = []
+        for value in list(issue.get("sentence_ids") or []) + [issue.get("sentence_id")]:
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError):
+                continue
+            if parsed in by_id and parsed not in valid_ids:
+                valid_ids.append(parsed)
+        if not valid_ids and original_quote:
+            section = str(issue.get("section") or "").strip()
+            paragraph = _safe_int(issue.get("paragraph"), default=None)
+            matches = []
+            for row in candidates:
+                if section and str(row.get("section") or "").strip() != section:
+                    continue
+                if paragraph is not None and int(row.get("paragraph") or 0) != paragraph:
+                    continue
+                current_text = str(row.get("user_edit") or row.get("content") or "")
+                if original_quote in current_text:
+                    matches.append(row)
+            if len(matches) == 1:
+                valid_ids = [int(matches[0]["id"])]
+                issue["location_source"] = "quote_exact"
+        if valid_ids:
+            issue["sentence_ids"] = valid_ids
+            if len(valid_ids) == 1:
+                issue["sentence_id"] = valid_ids[0]
+            issue.setdefault("target_type", "sentence" if len(valid_ids) == 1 else "paragraph")
+            issue.setdefault("location_confidence", "high")
+            issue.setdefault("location_source", "stable_id")
+        section = str(issue.get("section") or "").strip()
+        if not valid_ids and (
+            not issue.get("target_type") or issue.get("target_type") in {"sentence", "paragraph"}
+        ):
+            issue["target_type"] = "section" if section else "report"
+            issue["location_confidence"] = "section" if section else "report"
+            issue.setdefault("location_source", "scope_only")
+        if not valid_ids:
+            issue.setdefault("sentence_ids", [])
+
+        anchor_rows = [by_id[value] for value in issue.get("sentence_ids") or [] if value in by_id]
+        anchor_text = "\n".join(str(row.get("user_edit") or row.get("content") or "") for row in anchor_rows)
+        current_fingerprint = hashlib.sha256(anchor_text.encode("utf-8")).hexdigest() if anchor_text else ""
+        previous_fingerprint = str(issue.get("anchor_fingerprint") or "")
+        if previous_fingerprint and current_fingerprint and previous_fingerprint != current_fingerprint:
+            if str(issue.get("status") or "open") not in {"resolved", "ignored"}:
+                issue["status"] = "stale"
+            issue["location_confidence"] = "stale"
+        elif current_fingerprint:
+            issue.setdefault("anchor_fingerprint", current_fingerprint)
+
+        if len(anchor_rows) == 1 and original_quote:
+            current_text = str(anchor_rows[0].get("user_edit") or anchor_rows[0].get("content") or "")
+            offset = current_text.find(original_quote)
+            if offset >= 0:
+                issue["quote_start"] = offset
+                issue["quote_end"] = offset + len(original_quote)
+
+        issue.setdefault("status", "open")
+        issue.setdefault("report_version_id", report_version_id)
+        issue.setdefault("issue_id", _quality_issue_id(report_id, issue))
+        result.append(issue)
+    return result
+
+
+def _quality_issue_id(report_id: int, issue: dict) -> str:
+    """Build a stable public identifier without exposing internal row ids."""
+    parts = [
+        str(report_id), str(issue.get("type") or issue.get("issue_type") or ""),
+        str(issue.get("target_type") or ""),
+        ",".join(str(value) for value in issue.get("sentence_ids") or []),
+        str(issue.get("section") or ""), str(issue.get("paragraph") or ""),
+        str(issue.get("quote") or ""), str(issue.get("note") or ""),
+    ]
+    return "qa_" + hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()[:16]
+
+
+def _safe_int(value, default: int | None = 0) -> int | None:
+    if value is None or value == "":
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _classify_issue(issue: dict) -> dict:
@@ -315,6 +678,9 @@ def _classify_issue(issue: dict) -> dict:
     elif type_ in {"MISSING_SECTION", "SECTION_ALIGNMENT_REVIEW", "CITATION_MISMATCH", "BUSINESS_MISMATCH"}:
         item["severity"] = "high"
         item["repair_route"] = "narrative_or_planner_rebuild"
+    elif type_ == "QA_CHECK_INCOMPLETE":
+        item["severity"] = "medium"
+        item["repair_route"] = "manual_review"
     elif type_ in {"TERM_VIOLATION", "RULE_VIOLATION"}:
         item["severity"] = "high"
         item["repair_route"] = "manual_review"

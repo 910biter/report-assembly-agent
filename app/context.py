@@ -1,29 +1,49 @@
 """Context Manager: build minimal context by workflow stage with hybrid retrieval."""
 
-from app.config import settings
+from app.runtime_profiles import stage_input_budget_tokens, stage_profile
+from app.context_budget import ContextSection, build_prompt_from_sections, count_tokens, truncate_tokens
+from app.planning.evidence_context import planning_prompt, evidence_ids
 from app.models import Unit
+from app.planning.structure import normalize_text_list
 from app.retrieval.query_compiler import QueryCompiler, RetrievalQuery
 from app.retrieval import embed_texts, vector_store
 from app.retrieval.rag import hybrid_retrieve_units
+import time
 
-BUDGET_TOKENS = 6000
-_CHARS_PER_TOKEN = 4  # Conservative estimate for Chinese text.
-
-
-def _fit(text: str, budget_chars: int) -> str:
-    if len(text) <= budget_chars:
-        return text
-    return text[:budget_chars]
+def _fit(text: str, budget_tokens: int) -> str:
+    return truncate_tokens(text, budget_tokens)
 
 
-def _fit_with_meta(text: str, budget_chars: int) -> tuple[str, dict]:
-    fitted = _fit(text, budget_chars)
+def _fit_with_meta(text: str, budget_tokens: int) -> tuple[str, dict]:
+    raw_tokens = count_tokens(text)
+    fitted = _fit(text, budget_tokens)
+    context_tokens = count_tokens(fitted)
     return fitted, {
         "raw_chars": len(text or ""),
         "context_chars": len(fitted or ""),
-        "truncated": len(text or "") > len(fitted or ""),
-        "budget_chars": int(budget_chars),
+        "raw_tokens": raw_tokens,
+        "context_tokens": context_tokens,
+        "truncated": raw_tokens > context_tokens,
+        "budget_tokens": int(budget_tokens),
     }
+
+
+def _text_similarity(left: str, right: str, n: int = 2) -> float:
+    """Symmetric character n-gram overlap for deterministic near-duplicate control."""
+    import re as _re
+
+    a = _re.sub(r"\s+|[，。；：、,.!?！？:;]", "", left or "")
+    b = _re.sub(r"\s+|[，。；：、,.!?！？:;]", "", right or "")
+    if not a or not b:
+        return 0.0
+    if a == b:
+        return 1.0
+    if len(a) < n or len(b) < n:
+        return 0.0
+    grams_a = {a[index:index + n] for index in range(len(a) - n + 1)}
+    grams_b = {b[index:index + n] for index in range(len(b) - n + 1)}
+    union = grams_a | grams_b
+    return len(grams_a & grams_b) / max(len(union), 1)
 
 
 def _unit_relevance(unit, query: str, keywords: list[str],
@@ -64,24 +84,13 @@ def _ngram_similarity(left: str, right: str, n: int = 2) -> float:
 
 
 def _estimate_tokens(text: str) -> int:
-    """token 估算:中文按 1 字符≈1 token(纠正此前 2 字符/token 的严重低估——
-    那会导致装箱以为批次不大、实际却塞满窗口、把模型输出区挤没,提取出不了 JSON)。
-    保守偏安全,让装箱后实际批次留在模型窗口内。"""
-    return max(1, len(text or ""))
+    return count_tokens(text)
 
 
 def _evidence_batch_budget() -> int:
     """单批可用 tokens = 模型窗口 - 输出预留 - 固定 prompt 开销 - 安全余量。
     额外再留 20% 余量(A 辅):防 token 估算偏差与输出抖动,确保模型有空间收尾输出完整 JSON。"""
-    from app.config import settings
-
-    usable = (
-        settings.model_context_window_tokens
-        - settings.evidence_output_tokens
-        - settings.prompt_overhead_tokens
-        - settings.safety_margin_tokens
-    )
-    return max(1024, int(usable * 0.8))
+    return max(1024, int(stage_profile("evidence").input_tokens * 0.8))
 
 
 def _dynamic_cutoff(scores: list[float]) -> int:
@@ -159,14 +168,20 @@ class ContextManager:
         self.units_by_material = units_by_material or {}
         self.filenames = filenames or {}
         self._query_compiler = QueryCompiler(task_id=str(task.get("id") or ""))
+        # Reuse one task-scoped fact-vector snapshot across chapter/subsection
+        # queries. Invalidate when the fact registry changes (e.g. incremental
+        # revision), so new evidence is not hidden by an old cache.
+        self._fact_vector_cache_key: tuple | None = None
+        self._fact_vector_cache: dict = {}
+        self._fact_vector_cached_at = 0.0
         self._unit_index: dict[int, tuple[int, Unit]] = {}
         for material_id, units in self.units_by_material.items():
             for unit in units:
                 if unit.id is not None:
                     self._unit_index[unit.id] = (material_id, unit)
 
-    def budget_chars(self) -> int:
-        return BUDGET_TOKENS * _CHARS_PER_TOKEN
+    def budget_tokens(self, stage: str = "structured") -> int:
+        return stage_input_budget_tokens(stage)
 
     def retrieve_units(self, query: str, top_k: int = 8,
                        keywords: list[str] | None = None) -> list[str]:
@@ -235,37 +250,30 @@ class ContextManager:
     def for_planner(self, theme: str, user_requirements: str,
                     insights: list[dict], style_block: str, business_block: str = "",
                     policy_block: str = "") -> str:
-        lines = [f"用户主题:{theme}", f"用户要求:{user_requirements or '无'}"]
+        header = [f"用户主题:{theme}", f"用户要求:{user_requirements or '无'}"]
+        insight_lines: list[str] = []
         if insights:
-            lines.append("材料摘要(按价值排序,含候选事实要点):")
-            for insight in insights[:10]:
-                points = " / ".join(insight.get("key_points", [])[:3])
-                lines.append(
+            insight_lines.append("材料摘要(按价值排序,含候选事实要点):")
+            for insight in insights:
+                points = " / ".join(normalize_text_list(insight.get("key_points")))
+                insight_lines.append(
                     f"- [{insight.get('value_rank', '?')}级] {insight.get('doc_type', '')} "
                     f"{insight.get('topic', '')} 候选事实:{points or '无'} "
-                    f"关键实体:{'、'.join(insight.get('entities', [])[:5])} "
-                    f"时间:{'、'.join(insight.get('times', [])[:3])}"
+                    f"关键实体:{'、'.join(normalize_text_list(insight.get('entities')))} "
+                    f"时间:{'、'.join(normalize_text_list(insight.get('times')))}"
                 )
-        if business_block:
-            lines.append(business_block)
-        if policy_block:
-            lines.append(policy_block)
-        lines.append(style_block or "")
-        # Final Planner needs a larger output contract than ordinary analysis
-        # agents. Reserve that output plus the system prompt and tokenizer
-        # variance instead of filling the whole generic context budget.
-        final_budget_chars = max(
-            4000,
-            min(
-                self.budget_chars(),
-                int(settings.model_context_window_tokens)
-                - int(settings.final_planner_output_tokens)
-                - int(settings.safety_margin_tokens)
-                - 4000,
-            ),
+        prompt, _audit = build_prompt_from_sections(
+            "planner",
+            [
+                ContextSection("用户目标", header, weight=4, required_items=len(header)),
+                ContextSection("材料摘要", insight_lines, weight=4),
+                ContextSection("业务边界", business_block.splitlines(), weight=2),
+                ContextSection("报告策略", policy_block.splitlines(), weight=2),
+                ContextSection("模板风格", style_block.splitlines(), weight=1.5),
+            ],
+            self.budget_tokens("planner"),
         )
-        fitted, _meta = _fit_with_meta("\n".join(lines), final_budget_chars)
-        return fitted
+        return prompt
 
     def for_evidence(self, dimension: str, insights: list[dict],
                      required_facts: list[str] | None = None) -> str:
@@ -278,19 +286,20 @@ class ContextManager:
         is_open_discovery = "开放发现" in (dimension or "")
         insight_terms: list[str] = []
         for insight in insights or []:
-            keywords.extend(insight.get("entities", [])[:4])
-            keywords.extend(insight.get("times", [])[:3])
-            insight_terms.extend(insight.get("key_points", [])[:2])
-            insight_terms.extend([insight.get("topic", ""), insight.get("material_role", "")])
+            keywords.extend(normalize_text_list(insight.get("entities"))[:4])
+            keywords.extend(normalize_text_list(insight.get("times"))[:3])
+            insight_terms.extend(normalize_text_list(insight.get("key_points"))[:2])
+            insight_terms.extend(normalize_text_list([insight.get("topic", ""), insight.get("material_role", "")]))
+        required = normalize_text_list(required_facts)
         if is_open_discovery:
             dimension_text = " ".join(
-                [self.task.get("theme", ""), self.task.get("user_requirements", "")]
+                normalize_text_list([self.task.get("theme", ""), self.task.get("user_requirements", "")])
                 + insight_terms
-                + list(required_facts or [])
+                + required
             )
             top_k = 12
         else:
-            dimension_text = f"{dimension} {' '.join(required_facts or [])}"
+            dimension_text = f"{dimension} {' '.join(required)}"
             top_k = 8
         blocks, unit_meta = self.retrieve_units_with_meta(dimension_text, top_k=top_k, keywords=keywords)
         retrieval_strategy = {}
@@ -309,7 +318,7 @@ class ContextManager:
                 "retrieval_strategy": retrieval_strategy,
             }
         raw = "相关材料片段:\n" + "\n\n".join(blocks)
-        fitted, fit_meta = _fit_with_meta(raw, self.budget_chars() // 2)
+        fitted, fit_meta = _fit_with_meta(raw, self.budget_tokens("evidence") // 2)
         return fitted, {
             "dimension": dimension,
             "open_discovery": is_open_discovery,
@@ -354,8 +363,8 @@ class ContextManager:
         per_batch_tokens = _evidence_batch_budget()
         keywords: list[str] = []
         for insight in insights or []:
-            keywords.extend(insight.get("entities", [])[:4])
-            keywords.extend(insight.get("times", [])[:3])
+            keywords.extend(normalize_text_list(insight.get("entities"))[:4])
+            keywords.extend(normalize_text_list(insight.get("times"))[:3])
 
         # 向量混合检索:预加载单位向量 + 每查询 embed(失败自动回退纯文本)
         unit_vectors: dict = {}
@@ -369,26 +378,74 @@ class ContextManager:
         except Exception:
             unit_vectors = {}
 
+        queries = normalize_text_list(queries)
         need_text = " ".join(queries)
-        # 检索候选:Qdrant 粗召回(查询相关)→ rerank;Qdrant 不可用时回退 Python 打分
+        # Only the vector backend needs CPU embeddings. Compute each distinct
+        # query once, rather than on every material or on lexical-only runs.
+        vector_enabled = bool(getattr(vector_store, "enabled", False))
+        query_vectors = {
+            query: self._query_compiler.query_vector(RetrievalQuery(query))
+            for query in dict.fromkeys(queries)
+        } if vector_enabled else {}
+        # Search Qdrant once per distinct query, not once per query * material.
+        # Preserve material coverage with a per-material lexical fallback.
+        material_ids = list(self.units_by_material)
+        allowed_ids = {
+            int(unit.id): int(material_id)
+            for material_id, units in self.units_by_material.items()
+            for unit in units if unit.id is not None
+        }
+        vector_hit_ids: dict[str, dict[int, set[int]]] = {}
+        if vector_enabled and material_ids:
+            for query in dict.fromkeys(queries):
+                vector = query_vectors.get(query)
+                hit_by_material: dict[int, set[int]] = {}
+                if vector:
+                    try:
+                        hits = vector_store.search_units(
+                            vector,
+                            top_k=max(1, min(len(allowed_ids), _recall_budget() * len(material_ids))),
+                            filters={"material_id": material_ids[0] if len(material_ids) == 1 else material_ids},
+                        )
+                        for hit_id, _score in hits:
+                            mid = allowed_ids.get(int(hit_id))
+                            if mid is not None:
+                                hit_by_material.setdefault(mid, set()).add(int(hit_id))
+                        # Inspect actual source coverage before issuing narrow
+                        # follow-up searches. The threshold derives from the
+                        # returned pool, not a fixed quota of weak evidence.
+                        represented = sum(len(ids) for ids in hit_by_material.values())
+                        fair_share = max(1, (represented + len(material_ids) - 1) // len(material_ids))
+                        for mid, units in self.units_by_material.items():
+                            if len(material_ids) == 1:
+                                break  # The global query already has the same single-source filter.
+                            target = min(len(units), fair_share, _recall_budget())
+                            if len(hit_by_material.get(mid, set())) >= target:
+                                continue
+                            try:
+                                supplement = vector_store.search_units(
+                                    vector, top_k=target, filters={"material_id": int(mid)},
+                                )
+                            except Exception:
+                                continue  # One unavailable source must not suppress other supplements.
+                            hit_by_material.setdefault(mid, set()).update(
+                                int(uid) for uid, _score in supplement if allowed_ids.get(int(uid)) == mid
+                            )
+                    except Exception:
+                        pass
+                vector_hit_ids[query] = hit_by_material
         per_material: list[tuple[int, list[tuple[float, object]]]] = []
         for material_id, units in self.units_by_material.items():
             candidates: dict[int, object] = {}
             for query in queries:
-                query_vector = self._query_compiler.query_vector(RetrievalQuery(query))
-                hit_ids: set[int] = set()
-                try:
-                    from app.retrieval import vector_store
-                    if getattr(vector_store, "enabled", False) and query_vector:
-                        hits = vector_store.search_units(query_vector, top_k=_recall_budget(), query_text=query)
-                        hit_ids = {int(h[0]) for h in hits}
-                except Exception:
-                    hit_ids = set()
+                query_vector = query_vectors.get(query)
+                hit_ids = vector_hit_ids.get(query, {}).get(material_id, set())
+                local_hit_ids = {unit.id for unit in units if unit.id in hit_ids}
                 for unit in units:
                     if unit.id is not None and unit.id in hit_ids:
                         candidates.setdefault(id(unit), unit)
-                if not hit_ids:
-                    # 回退:全库 Python 打分(离线/无 Qdrant 场景)
+                if not local_hit_ids:
+                    # Missing or stale vector entries must not exclude a material.
                     scored = sorted(
                         [(_unit_relevance(unit, query, keywords, query_vector, unit_vectors), unit)
                          for unit in units if (unit.content or "").strip()],
@@ -398,12 +455,9 @@ class ContextManager:
                     for _score, unit in scored[:cutoff]:
                         candidates.setdefault(id(unit), unit)
             if candidates:
-                # Utility 重排:相关 + 新信息(已提取事实 feedback 降权重复)
                 ranked = rerank(
-                    [(0.5, u) for u in candidates.values()],
-                    need_text,
-                    unit_vectors=unit_vectors,
-                    known_contents=known_contents,
+                    [(0.5, u) for u in candidates.values()], need_text,
+                    unit_vectors=unit_vectors, known_contents=known_contents,
                 )
                 per_material.append((material_id, ranked))
 
@@ -477,9 +531,9 @@ class ContextManager:
         per_batch_tokens = _evidence_batch_budget()
         keywords: list[str] = []
         for insight in insights or []:
-            keywords.extend(insight.get("entities", [])[:4])
-            keywords.extend(insight.get("times", [])[:3])
-        queries = [dimension] + [rf for rf in (required_facts or []) if rf]
+            keywords.extend(normalize_text_list(insight.get("entities"))[:4])
+            keywords.extend(normalize_text_list(insight.get("times"))[:3])
+        queries = [str(dimension or "")] + normalize_text_list(required_facts)
 
         # 向量混合检索:预加载单位向量 + 每个查询 embed(失败自动回退纯文本)
         unit_vectors: dict = {}
@@ -493,16 +547,20 @@ class ContextManager:
         except Exception:
             unit_vectors = {}
 
+        query_vectors = {}
+        if unit_vectors:
+            from app.retrieval.embedder import embed_texts
+            for query in dict.fromkeys(queries):
+                try:
+                    query_vectors[query] = embed_texts([query], query=True)[0]
+                except Exception:
+                    query_vectors[query] = None
+
         per_material: list[tuple[int, list]] = []
         for material_id, units in self.units_by_material.items():
             candidates: dict[int, object] = {}
             for query in queries:
-                query_vector = None
-                try:
-                    from app.retrieval.embedder import embed_texts
-                    query_vector = embed_texts([query], query=True)[0]
-                except Exception:
-                    query_vector = None
+                query_vector = query_vectors.get(query)
                 scored = sorted(
                     [(_unit_relevance(unit, query, keywords, query_vector, unit_vectors), unit)
                      for unit in units if (unit.content or "").strip()],
@@ -567,32 +625,45 @@ class ContextManager:
             }))
         return result
 
-    def for_analysis(self, facts: list[dict], conflicts: list[dict],
-                     timeline_block: str, memory_block: str) -> str:
-        lines = ["事实清单(编号 + 来源):"]
-        lines.extend(f"{fact['id']}. [{fact['sources']}] {fact['content']}" for fact in facts)
-        lines.append("来源冲突:")
-        lines.append(json_dumps(conflicts) if conflicts else "无")
-        if timeline_block:
-            lines.append(f"事件时间线:\n{timeline_block}")
-        if memory_block:
-            lines.append(f"历史知识:\n{memory_block}")
-        raw = "\n".join(lines)
-        fitted, fit_meta = _fit_with_meta(raw, self.budget_chars())
-        if fit_meta["truncated"]:
-            fitted += (
-                "\n\n[上下文预算提示] 事实过多,本次分析上下文已按当前顺序放入预算内内容;"
-                "完整事实仍保留在数据库,后续写作与溯源不会删除原始数据。"
-            )
-        return fitted
+    def for_analysis(self, facts: list[dict], conflicts: list[dict]) -> str:
+        from app.analysis.evidence_semantics import analysis_fact_line, analysis_source_lines
+
+        fact_lines = ["事实清单(编号 + 来源陈述性质):"] + [analysis_fact_line(fact) for fact in facts]
+        source_lines = analysis_source_lines(facts)
+        prompt, _audit = build_prompt_from_sections(
+            "analysis",
+            [
+                ContextSection("事实", fact_lines, weight=6),
+                ContextSection("原文所在章节及上下文", source_lines, weight=2),
+                ContextSection("来源冲突", ["来源冲突:", json_dumps(conflicts) if conflicts else "无"], weight=3),
+            ],
+            self.budget_tokens("analysis"),
+        )
+        return prompt
 
     def for_final_planner(self, theme: str, user_requirements: str, plan: dict,
                           facts: list[dict], inferences: list[dict],
                           insights: list[dict], style_block: str,
                           policy_block: str = "") -> str:
-        lines = [
+        from app.planning.scale import parse_user_scale
+
+        explicit_scale = parse_user_scale(user_requirements)
+        scale_guidance = (
+            "用户已明确篇幅约束；按该目标/范围规划，证据不足应说明边界，不得静默改写用户目标。"
+            if explicit_scale else
+            "下方初步字数预算仅为材料理解阶段的暂定估计；请基于本次实际 Facts/Inferences、覆盖广度、"
+            "信息丰富度、证据支撑深度和最终章节任务重新估算，不要机械继承初步数字或套固定档位。"
+        )
+        header_lines = [
             f"用户主题:{theme}",
             f"用户要求:{user_requirements or '无'}",
+            f"篇幅决策:{scale_guidance}",
+            "证据处理状态（处理失败不等于材料没有证据）:" + json_dumps({
+                "status": (self.task.get("evidence_status") or {}).get("status", "unknown"),
+                "unprocessed_segment_count": len((self.task.get("evidence_status") or {}).get("unprocessed_segments") or []),
+                "failure_reasons": sorted({item.get("failure_reason") for item in
+                    (self.task.get("evidence_status") or {}).get("batches", []) if item.get("failure_reason")}),
+            }),
             "初步分析规划(仅为分析假设与检索重点,可被后续事实推翻,不是最终目录):",
             json_dumps({
                 "title": plan.get("title"),
@@ -606,38 +677,22 @@ class ContextManager:
             }),
         ]
         if insights:
-            lines.append("材料理解摘要:")
-            for item in insights[:10]:
-                lines.append(
+            header_lines.append("材料理解摘要:")
+            for item in insights:
+                header_lines.append(
                     f"- {item.get('filename','')}: {item.get('doc_type','')} / {item.get('topic','')} / "
                     f"角色:{item.get('material_role','')} / 边界:{item.get('claim_support','unknown')}"
                 )
         analysis_meta = plan.get("analysis_global_meta") or {}
         if analysis_meta:
-            lines.append("综合分析摘要:")
-            lines.append(json_dumps({
+            header_lines.append("综合分析摘要:")
+            header_lines.append(json_dumps({
                 "critical_fact_ids": analysis_meta.get("critical_fact_ids") or [],
                 "coverage_status": analysis_meta.get("coverage_status") or {},
                 "unresolved_conflicts": analysis_meta.get("unresolved_conflicts") or [],
                 "uncertainty": analysis_meta.get("uncertainty") or [],
             }))
 
-        # Final structure must see a coverage-driven sample rather than the
-        # first rows in database order. Critical facts are mandatory; the rest
-        # are retrieved across user intent, analysis dimensions and evidence needs.
-        fact_by_id = {int(f.get("id")): f for f in facts if f.get("id") is not None}
-        selected_facts: list[dict] = []
-        selected_ids: set[int] = set()
-
-        def add_fact(fact: dict) -> None:
-            fact_id = int(fact.get("id") or 0)
-            if fact_id and fact_id not in selected_ids:
-                selected_ids.add(fact_id)
-                selected_facts.append(fact)
-
-        for fact_id in analysis_meta.get("critical_fact_ids") or []:
-            if str(fact_id).isdigit() and int(fact_id) in fact_by_id:
-                add_fact(fact_by_id[int(fact_id)])
         queries = [theme, user_requirements, plan.get("core_question", ""), plan.get("core_judgment", "")]
         queries.extend(str(key) for key in (analysis_meta.get("coverage_status") or {}).keys())
         queries.extend(
@@ -646,44 +701,139 @@ class ContextManager:
             if isinstance(item, dict)
         )
         queries = list(dict.fromkeys(str(query).strip() for query in queries if str(query).strip()))
-        average_fact_chars = max(1, sum(len(str(f.get("content") or "")) for f in facts) // max(len(facts), 1))
-        fact_char_budget = max(1000, int(self.budget_chars() * 0.55))
-        estimated_capacity = max(1, fact_char_budget // average_fact_chars)
-        per_query = max(1, estimated_capacity // max(len(queries), 1))
-        for query in queries:
-            for fact in self._retrieve_facts(query, facts, per_query, used_fact_ids=set()):
-                add_fact(fact)
-        if not selected_facts:
-            selected_facts = list(facts)
+        total_budget = self.budget_tokens("final_planner")
+        critical_ids = {
+            int(value) for value in (analysis_meta.get("critical_fact_ids") or [])
+            if str(value).isdigit()
+        }
+        selected_facts = self._select_final_planner_facts(facts, queries, critical_ids, total_budget)
+        selected_fact_ids = {int(item.get("id") or 0) for item in selected_facts}
+        selected_inferences = self._select_final_planner_inferences(
+            inferences, selected_fact_ids, critical_ids, queries, total_budget
+        )
 
-        lines.append("已抽取事实(关键事实 + 多查询覆盖召回):")
-        used_fact_chars = 0
-        included_fact_count = 0
-        for fact in selected_facts:
-            fact_line = f"- fact_id={fact.get('id')}: {fact.get('content')}"
-            if used_fact_chars + len(fact_line) > fact_char_budget and included_fact_count:
-                break
-            lines.append(fact_line)
-            used_fact_chars += len(fact_line)
-            included_fact_count += 1
-        if len(facts) > included_fact_count:
-            lines.append(
-                f"[覆盖说明] Facts 共 {len(facts)} 条,本次按关键事实和多查询覆盖召回 {included_fact_count} 条用于结构规划;"
-                "完整事实由后续章节检索继续使用。"
-            )
-        lines.append("已形成分析判断:")
-        for inf in inferences[:40]:
-            lines.append(
-                f"- inference_id={inf.get('id')}: {inf.get('content')} "
-                f"(based_fact_ids={inf.get('based_fact_ids')})"
-            )
-        if style_block:
-            lines.append("模板/风格信息(格式优先,结构按策略处理):")
-            lines.append(style_block)
-        if policy_block:
-            lines.append(policy_block)
-        fitted, _meta = _fit_with_meta("\n".join(lines), self.budget_chars())
-        return fitted
+        based_ids = {fid for item in selected_inferences for fid in evidence_ids(item.get("based_fact_ids"))}
+        selected_facts.extend(item for item in facts if int(item.get("id") or 0) in based_ids - selected_fact_ids)
+        prompt, _audit = planning_prompt(
+            "final_planner",
+            [
+                ContextSection("任务与分析摘要", header_lines, weight=3, required_items=2),
+                ContextSection(
+                    "模板风格",
+                    ["模板/风格信息(格式优先,结构按策略处理):", *(style_block.splitlines() if style_block else ["无"])],
+                    weight=1.5,
+                ),
+                ContextSection(
+                    "报告策略", ["报告策略:", *(policy_block.splitlines() if policy_block else ["无"])],
+                    weight=2,
+                ),
+            ],
+            selected_facts, selected_inferences, total_budget, required_facts=sorted(critical_ids), tagged=True,
+        )
+        return prompt
+
+    def _select_final_planner_facts(self, facts: list[dict], queries: list[str],
+                                    critical_ids: set[int], budget_tokens: int) -> list[dict]:
+        """Select mandatory, source-diverse and topic-diverse facts under one budget."""
+        if not facts:
+            return []
+        by_id = {int(item.get("id")): item for item in facts if item.get("id") is not None}
+        average_size = max(1, sum(count_tokens(str(item.get("content") or "")) + 24 for item in facts) // len(facts))
+        capacity = max(1, int(budget_tokens) // average_size)
+        per_query = max(2, (capacity + max(len(queries), 1) - 1) // max(len(queries), 1) + 1)
+        ranked_groups = [self._retrieve_facts(query, facts, per_query) for query in queries]
+        selected: list[dict] = []
+        selected_ids: set[int] = set()
+        selected_sources: set[str] = set()
+        used_tokens = 0
+
+        def add(item: dict, mandatory: bool = False) -> bool:
+            nonlocal used_tokens
+            item_id = int(item.get("id") or 0)
+            content = str(item.get("content") or "")
+            if not item_id or not content or item_id in selected_ids:
+                return False
+            size = count_tokens(content) + 24
+            if not mandatory and used_tokens + size > budget_tokens:
+                return False
+            if not mandatory and any(_text_similarity(content, str(old.get("content") or "")) >= 0.82 for old in selected):
+                return False
+            selected.append(item)
+            selected_ids.add(item_id)
+            selected_sources.update(str(value) for value in item.get("source_files") or [] if str(value))
+            used_tokens += size
+            return True
+
+        for item_id in sorted(critical_ids):
+            if item_id in by_id:
+                add(by_id[item_id], mandatory=True)
+        max_rank = max((len(group) for group in ranked_groups), default=0)
+        for rank in range(max_rank):
+            for group in ranked_groups:
+                if rank >= len(group):
+                    continue
+                item = group[rank]
+                sources = {str(value) for value in item.get("source_files") or [] if str(value)}
+                if sources - selected_sources:
+                    add(item)
+        for rank in range(max_rank):
+            for group in ranked_groups:
+                if rank < len(group):
+                    add(group[rank])
+        if not selected:
+            for item in facts:
+                add(item)
+        return selected
+
+    def _select_final_planner_inferences(self, inferences: list[dict], selected_fact_ids: set[int],
+                                         critical_fact_ids: set[int], queries: list[str],
+                                         budget_tokens: int) -> list[dict]:
+        """Select judgments with visible evidence links and runtime dimension coverage."""
+        if not inferences:
+            return []
+        query_chars = set("".join(queries))
+        confidence_score = {"high": 3, "medium": 2, "low": 1}
+
+        def based_ids(item: dict) -> set[int]:
+            return {int(value) for value in item.get("based_fact_ids") or [] if str(value).isdigit()}
+
+        def score(item: dict) -> tuple[float, int]:
+            based = based_ids(item)
+            overlap = based & selected_fact_ids
+            critical = based & critical_fact_ids
+            lexical = len(set(str(item.get("content") or "")) & query_chars)
+            confidence = confidence_score.get(str(item.get("confidence_level") or "").lower(), 0)
+            return (len(critical) * 20 + len(overlap) * 5 + confidence + lexical / 100, len(based))
+
+        ranked = sorted(inferences, key=score, reverse=True)
+        linked = [item for item in ranked if based_ids(item) & selected_fact_ids]
+        candidates = linked or ranked
+        selected: list[dict] = []
+        selected_ids: set[int] = set()
+        used_tokens = 0
+
+        def add(item: dict) -> bool:
+            nonlocal used_tokens
+            item_id = int(item.get("id") or 0)
+            content = str(item.get("content") or "")
+            size = count_tokens(content) + count_tokens(str(item.get("based_fact_ids") or [])) + 32
+            if not item_id or not content or item_id in selected_ids or used_tokens + size > budget_tokens:
+                return False
+            if any(_text_similarity(content, str(old.get("content") or "")) >= 0.82 for old in selected):
+                return False
+            selected.append(item)
+            selected_ids.add(item_id)
+            used_tokens += size
+            return True
+
+        seen_dimensions: set[str] = set()
+        for item in candidates:
+            dimension = str(item.get("dimension") or "未分类")
+            if dimension not in seen_dimensions and add(item):
+                seen_dimensions.add(dimension)
+        for item in candidates:
+            add(item)
+        return selected
 
     def for_writer_section(self, chapter: str, facts: list[dict],
                            inferences: list[dict], style_block: str,
@@ -699,10 +849,10 @@ class ContextManager:
             for value in [chapter, *(coverage_queries or [])]
             if str(value or "").strip()
         ))
-        fact_budget = max(1000, int(self.budget_chars() * 0.65))
+        fact_budget = max(1000, int(self.budget_tokens("writer") * 0.65))
         average_fact_size = max(
             1,
-            sum(len(str(fact.get("content") or "")) + 24 for fact in facts) // max(len(facts), 1),
+            sum(count_tokens(str(fact.get("content") or "")) + 8 for fact in facts) // max(len(facts), 1),
         )
         capacity = max(len(required_fact_ids), fact_budget // average_fact_size)
         if top_facts is not None:
@@ -719,22 +869,24 @@ class ContextManager:
             ))
         related_facts = []
         seen: set[int] = set()
-        used_chars = 0
+        used_tokens = 0
         for fact in candidates:
             fact_id = int(fact.get("id") or 0)
             if not fact_id or fact_id in seen:
                 continue
-            size = len(str(fact.get("content") or "")) + 24
-            if fact_id not in required_fact_ids and related_facts and used_chars + size > fact_budget:
+            size = count_tokens(str(fact.get("content") or "")) + 8
+            if fact_id not in required_fact_ids and related_facts and used_tokens + size > fact_budget:
                 continue
             related_facts.append(fact)
             seen.add(fact_id)
-            used_chars += size
+            used_tokens += size
         related_ids = {fact["id"] for fact in related_facts}
         related_inferences = [
             inference for inference in inferences
             if any(bid in related_ids for bid in (inference.get("based_fact_ids") or []))
-        ] or inferences[:3]
+        ]
+        bases = {fid for item in related_inferences for fid in evidence_ids(item.get("based_fact_ids"))}
+        related_facts.extend(by_id[fid] for fid in sorted(bases - seen) if fid in by_id)
         return related_facts, related_inferences, style_block
 
     def _retrieve_facts(self, query: str, facts: list[dict], top_k: int,
@@ -743,11 +895,23 @@ class ContextManager:
             return []
         used_fact_ids = used_fact_ids or set()
         try:
-            query_vector = embed_texts([query], query=True)[0]
-            vec_by_id = {
-                int(fact_id): vector
-                for fact_id, vector in vector_store.fact_vectors(str(self.task.get("id") or self.task.get("task_id") or ""))
-            }
+            if not getattr(vector_store, "enabled", False):
+                raise ValueError("vector backend off")
+            scope = str(self.task.get("id") or self.task.get("task_id") or "")
+            signature = (scope, tuple(sorted((int(fact["id"]), str(fact.get("content") or "")) for fact in facts if fact.get("id") is not None)))
+            if self._fact_vector_cache_key != signature or time.monotonic() - self._fact_vector_cached_at >= 5:
+                self._fact_vector_cache = {
+                    int(fact_id): vector
+                    for fact_id, vector in vector_store.fact_vectors(scope)
+                }
+                self._fact_vector_cache_key = signature
+                self._fact_vector_cached_at = time.monotonic()
+            vec_by_id = self._fact_vector_cache
+            if not vec_by_id:
+                raise ValueError("no cached vectors")
+            query_vector = self._query_compiler.query_vector(RetrievalQuery(query))
+            if query_vector is None:
+                raise ValueError("query embedding unavailable")
             scored = []
             for fact in facts:
                 vector = vec_by_id.get(fact["id"])

@@ -32,11 +32,6 @@ DOCX 模板 ----------------------> Template Schema ------> DOCX Renderer
   -> 可解释统计特征
   -> LLM 归纳表达规律与段落用途
   -> Style Profile + Exemplar Bank
-
-带事实溯源的审核报告版本
-  -> 句子/段落与 Fact、Inference 对齐
-  -> 正例 + 用户改写前反例
-  -> Evidence Usage Profile
 ```
 
 学习器版本参与缓存身份。学习算法升级后，同一源文件会重新生成画像，不会静默复用旧结果。
@@ -50,7 +45,7 @@ Style Profile 固定结构、动态取值，主要包含：
 - `observed_metrics`：段落长度、每段句数、句长和标点分布；
 - `chapter_styles`：不同章节功能对应的表达目的；
 - `terminology`：惯用和避免表达；
-- `evidence_usage_profile`：选材、合并、具体信息保留和事实到推论的稳定习惯；
+- `material_realization`：主次事实选择、具体信息保留、多来源综合、事实到判断和证据边界表达；
 - `exemplar_bank`：带来源、章节、位置、用途和审核状态的段落级样例；
 - `profile_confidence`：各层画像独立置信度；
 - `structure_policy`：`FORMAT_ONLY / SOFT_STRUCTURE / HARD_STRUCTURE`。
@@ -71,14 +66,15 @@ Final Report Plan
 
 样例检索不会把历史样例中的事实加入当前报告，只允许借鉴组织和表达方式。匹配度不足时宁可少给样例，不用无关范例凑数量。
 
-## 6. 反馈学习
+## 6. 原模板执行协议
 
-只有用户明确审核通过的报告版本才进入材料使用学习：
+编译器从 OOXML 直接读取页面、样式继承、多级编号、标题层级、段落格式和角色锚点。Schema 中的 `render_contract` 记录标题替换位置和正文插入位置，导出器在原始 DOCX 内执行，而不是另建空白 Word 模仿模板。
 
-- 当前保留文本作为正例；
-- 用户改写前文本作为反例；
-- 每个范例保留版本、章节、段落、Fact/Inference 和来源信息；
-- 未审核 AI 草稿不自动沉淀为客户标准。
+- 报告始终优先使用创建时绑定的模板，默认模板不能静默替换它；
+- 编号读取 `numbering.xml` 的 `numFmt/lvlText/start/suff/ilvl`，可见文字只作兜底；
+- 未明确识别的书名、文件名不会被误当成占位符；
+- 模板示例目录默认不进入内容规划，当前任务仍由 Fact、Inference 和用户目标决定结构；
+- 旧格式兼容字段只作读取兜底，不再覆盖新版 Template Schema。
 
 ## 7. QA 与修复边界
 

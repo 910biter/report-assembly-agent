@@ -7,7 +7,9 @@ updates should compare against a version snapshot instead of mutating history.
 from __future__ import annotations
 
 import json
+import re
 from collections import defaultdict
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
 
@@ -41,27 +43,39 @@ class VersionSnapshot:
 
 
 def ensure_report_version(report_id: int, task_id: str = "", status: str = "snapshot",
-                          change_summary: str = "", kind: str = "major") -> VersionSnapshot:
+                          change_summary: str = "", kind: str = "major", _session=None) -> VersionSnapshot:
     """Create a new immutable version unless the latest snapshot is identical.
 
     ``version_no`` is a monotonic database sequence. Human-facing major/minor
     components are stored separately, so v2.10 never collapses into v2.1.
     """
-    snapshot = build_report_snapshot(report_id, task_id=task_id)
-    with session_scope() as s:
+    manager = session_scope() if _session is None else nullcontext(_session)
+    with manager as s:
+        report = s.execute(
+            select(ORMReport.c.id, ORMReport.c.task_id)
+            .where(ORMReport.c.id == report_id)
+            .with_for_update()
+        ).mappings().first()
+        if report is None:
+            raise ValueError("REPORT_NOT_FOUND")
+        owner = str(report.get("task_id") or "")
+        if owner and task_id and owner != task_id:
+            raise ValueError("REPORT_TASK_MISMATCH")
+        if task_id and not owner:
+            s.execute(
+                update(ORMReport)
+                .where(ORMReport.c.id == report_id)
+                .values(task_id=task_id)
+            )
+            owner = task_id
+        snapshot = build_report_snapshot(report_id, task_id=owner or task_id, _session=s)
         latest = s.execute(
             select(ORMReportVersion)
             .where(ORMReportVersion.c.report_id == report_id)
             .order_by(ORMReportVersion.c.version_no.desc())
         ).mappings().first()
-        latest_hash = ""
-        if latest is not None:
-            try:
-                latest_hash = json.loads(latest["metadata_json"] or "{}").get("snapshot_hash", "")
-            except (TypeError, ValueError):
-                latest_hash = ""
-        if (latest is not None and latest_hash == snapshot["metadata"]["snapshot_hash"]
-                and str(latest.get("status") or "") == status):
+        latest_hash = _stored_version_hash(latest) if latest is not None else ""
+        if latest is not None and latest_hash == snapshot["metadata"]["snapshot_hash"]:
             major, minor = _version_components(latest)
             return VersionSnapshot(int(latest["id"]), int(latest["version_no"]), _version_label(major, minor))
         if latest is None:
@@ -117,14 +131,18 @@ def latest_report_version(report_id: int) -> dict[str, Any] | None:
     return _version_detail(row) if row is not None else None
 
 
-def build_report_snapshot(report_id: int, task_id: str = "") -> dict[str, Any]:
+def build_report_snapshot(report_id: int, task_id: str = "", *, _session=None) -> dict[str, Any]:
     """Read the current mutable report state and convert it into a snapshot."""
-    with session_scope() as s:
+    manager = session_scope() if _session is None else nullcontext(_session)
+    with manager as s:
         report = s.execute(select(ORMReport).where(ORMReport.c.id == report_id)).mappings().first()
         if report is None:
             raise ValueError("REPORT_NOT_FOUND")
         plan = s.execute(select(ORMPlan).where(ORMPlan.c.id == report["plan_id"])).mappings().first()
-        task_id = task_id or _find_task_by_report_in_session(s, report_id) or ""
+        owner = str(report.get("task_id") or "")
+        if owner and task_id and owner != task_id:
+            raise ValueError("REPORT_TASK_MISMATCH")
+        task_id = owner or task_id or ""
         task_payload = _task_payload_in_session(s, task_id)
         material_ids = [int(mid) for mid in (task_payload.get("material_ids") or []) if str(mid).isdigit()]
         fact_ids = [int(fid) for fid in (task_payload.get("fact_ids") or []) if str(fid).isdigit()]
@@ -154,16 +172,18 @@ def build_report_snapshot(report_id: int, task_id: str = "") -> dict[str, Any]:
         "inference_count": len(inferences),
         "conflict_count": len(conflicts),
     }
-    payload_for_hash = {
+    metadata["snapshot_hash"] = _content_snapshot_hash({
         "title": report["title"],
-        "materials": materials,
-        "facts": facts,
-        "inferences": inferences,
-        "conflicts": conflicts,
-        "sentences": sentences,
-        "plan": plan_snapshot,
-    }
-    metadata["snapshot_hash"] = _stable_json_hash(payload_for_hash)
+        "material_fingerprints": materials,
+        "report_plan_snapshot": plan_snapshot,
+        "narrative_plan_snapshot": narrative,
+        "scale_plan_snapshot": _json_load(plan["budget"] if plan is not None else "{}", {}),
+        "fact_snapshot": facts,
+        "inference_snapshot": inferences,
+        "conflict_snapshot": conflicts,
+        "sentence_snapshot": sentences,
+    })
+    metadata["snapshot_hash_version"] = _SNAPSHOT_HASH_VERSION
     return {
         "task_id": task_id,
         "title": report["title"],
@@ -191,8 +211,9 @@ def list_report_versions(report_id: int) -> list[dict[str, Any]]:
     return [_version_summary(row) for row in rows]
 
 
-def get_report_version(version_id: int) -> dict[str, Any] | None:
-    with session_scope() as s:
+def get_report_version(version_id: int, *, _session=None) -> dict[str, Any] | None:
+    manager = session_scope() if _session is None else nullcontext(_session)
+    with manager as s:
         row = s.execute(
             select(ORMReportVersion).where(ORMReportVersion.c.id == version_id)
         ).mappings().first()
@@ -202,7 +223,8 @@ def get_report_version(version_id: int) -> dict[str, Any] | None:
 
 
 def create_incremental_delta(report_id: int, added_material_ids: list[int],
-                             update_reason: str = "", run_id: str = "") -> dict[str, Any]:
+                             update_reason: str = "", run_id: str = "",
+                             _session=None) -> dict[str, Any]:
     """Create a conservative delta preview for future incremental update runs.
 
     This does not rewrite the report. It records deterministic material changes
@@ -210,7 +232,8 @@ def create_incremental_delta(report_id: int, added_material_ids: list[int],
     the planner a safe handoff object for the next implementation step.
     """
     added_material_ids = [int(mid) for mid in added_material_ids if str(mid).isdigit()]
-    with session_scope() as s:
+    manager = session_scope() if _session is None else nullcontext(_session)
+    with manager as s:
         latest = s.execute(
             select(ORMReportVersion)
             .where(ORMReportVersion.c.report_id == report_id)
@@ -218,7 +241,7 @@ def create_incremental_delta(report_id: int, added_material_ids: list[int],
         ).mappings().first()
         if latest is None:
             raise ValueError("REPORT_VERSION_REQUIRED")
-        current = build_report_snapshot(report_id, task_id=latest["task_id"])
+        current = build_report_snapshot(report_id, task_id=latest["task_id"], _session=s)
         old_materials = _json_load(latest["material_fingerprints"], [])
         old_facts = _json_load(latest["fact_snapshot"], [])
         old_inferences = _json_load(latest["inference_snapshot"], [])
@@ -227,9 +250,9 @@ def create_incremental_delta(report_id: int, added_material_ids: list[int],
         old_hashes = {m.get("file_hash") or m.get("fingerprint") for m in old_materials}
         added_materials = [m for m in new_materials if (m.get("file_hash") or m.get("fingerprint")) not in old_hashes]
         duplicate_materials = [m for m in new_materials if (m.get("file_hash") or m.get("fingerprint")) in old_hashes]
-        fact_delta = _object_delta(old_facts, current["fact_snapshot"], key="content")
-        inference_delta = _object_delta(old_inferences, current["inference_snapshot"], key="content")
-        conflict_delta = _object_delta(old_conflicts, current["conflict_snapshot"], key="fact_key")
+        fact_delta = _object_delta(old_facts, current["fact_snapshot"])
+        inference_delta = _object_delta(old_inferences, current["inference_snapshot"])
+        conflict_delta = _object_delta(old_conflicts, current["conflict_snapshot"])
         affected = _affected_chapters(current["sentence_snapshot"], fact_delta["added"], inference_delta["added"])
         cur = s.execute(
             insert(ORMReportVersionDelta).values(
@@ -259,7 +282,12 @@ def create_incremental_delta(report_id: int, added_material_ids: list[int],
             )
         )
         delta_id = int(cur.inserted_primary_key[0])
-    return get_report_delta(delta_id) or {"id": delta_id}
+    if _session is None:
+        return get_report_delta(delta_id) or {"id": delta_id}
+    row = s.execute(
+        select(ORMReportVersionDelta).where(ORMReportVersionDelta.c.id == delta_id)
+    ).mappings().first()
+    return _delta_detail(row) if row is not None else {"id": delta_id}
 
 
 def attach_delta_version(delta_id: int, version_id: int, status: str = "applied") -> None:
@@ -543,12 +571,44 @@ def _plan_snapshot(plan) -> dict[str, Any]:
     }
 
 
-def _object_delta(old_items: list[dict[str, Any]], new_items: list[dict[str, Any]], key: str) -> dict[str, list[dict[str, Any]]]:
-    # Database identity is stable across content edits. Text is only a fallback
-    # for imported legacy snapshots without ids.
+def _restore_plan_values(
+    plan_snapshot: dict[str, Any],
+    scale_snapshot: dict[str, Any] | None = None,
+    fallback_title: str = "",
+    fallback_requirements: str = "",
+) -> dict[str, Any]:
+    """Build one consistent set of mutable plan fields for version restore."""
+    snapshot = dict(plan_snapshot or {})
+    final_plan = snapshot.get("final_plan_json")
+    return {
+        "title": snapshot.get("title") or fallback_title,
+        "structure": _dump(snapshot.get("structure") or []),
+        "dimensions": _dump(snapshot.get("dimensions") or []),
+        "objective": snapshot.get("objective") or "",
+        "audience": snapshot.get("audience") or "",
+        "report_type": snapshot.get("report_type") or "",
+        "core_question": snapshot.get("core_question") or "",
+        "core_judgment": snapshot.get("core_judgment") or "",
+        "narrative_logic": snapshot.get("narrative_logic") or "",
+        "chapter_plans": _dump(snapshot.get("chapter_plans") or []),
+        "budget": _dump(snapshot.get("budget") or scale_snapshot or {}),
+        "required_facts": _dump(snapshot.get("required_facts") or []),
+        "evidence_needs": _dump(snapshot.get("evidence_needs") or []),
+        "user_requirements": snapshot.get("user_requirements") or fallback_requirements,
+        "plan_stage": snapshot.get("plan_stage") or "final",
+        "plan_version": int(snapshot.get("plan_version") or 1),
+        "analysis_plan_json": _dump(snapshot.get("analysis_plan_json") or {}),
+        "final_plan_json": _dump(final_plan or {}),
+        "finalized_at": snapshot.get("finalized_at"),
+    }
+
+
+def _object_delta(old_items: list[dict[str, Any]], new_items: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
     def identity(item: dict[str, Any]) -> str:
         item_id = item.get("id")
-        return f"id:{item_id}" if item_id is not None else f"value:{item.get(key, '')}"
+        if item_id is None:
+            raise ValueError("VERSION_ARTIFACT_ID_REQUIRED")
+        return f"id:{item_id}"
 
     old_by_key = {identity(item): item for item in old_items}
     new_by_key = {identity(item): item for item in new_items}
@@ -587,50 +647,6 @@ def _affected_chapters(sentences: list[dict[str, Any]], added_facts: list[dict[s
     return result
 
 
-
-
-def diff_report_version_to_current(version_id: int, task_id: str = "") -> dict[str, Any] | None:
-    """Compare an immutable version snapshot with the current mutable report."""
-    base = get_report_version(version_id)
-    if base is None:
-        return None
-    current = build_report_snapshot(int(base["report_id"]), task_id=task_id or base.get("task_id") or "")
-    old_sections = _sections_from_sentences(base.get("sentence_snapshot") or [])
-    new_sections = _sections_from_sentences(current.get("sentence_snapshot") or [])
-    old_titles = list(old_sections.keys())
-    new_titles = list(new_sections.keys())
-    section_diffs = []
-    for title in new_titles:
-        if title not in old_sections:
-            section_diffs.append({"section": title, "change_type": "added", "old_text": "", "new_text": new_sections[title]})
-        else:
-            old_text = old_sections[title]
-            new_text = new_sections[title]
-            if _stable_json_hash(old_text) != _stable_json_hash(new_text):
-                section_diffs.append({
-                    "section": title,
-                    "change_type": "modified",
-                    "old_text": old_text,
-                    "new_text": new_text,
-                    "old_chars": len(old_text),
-                    "new_chars": len(new_text),
-                })
-    for title in old_titles:
-        if title not in new_sections:
-            section_diffs.append({"section": title, "change_type": "removed", "old_text": old_sections[title], "new_text": ""})
-    return {
-        "base_version_id": version_id,
-        "report_id": base["report_id"],
-        "old_title": base.get("title", ""),
-        "new_title": current.get("title", ""),
-        "structure_changes": _structure_changes(old_titles, new_titles),
-        "section_diffs": section_diffs,
-        "summary": {
-            "added_sections": sum(1 for d in section_diffs if d["change_type"] == "added"),
-            "modified_sections": sum(1 for d in section_diffs if d["change_type"] == "modified"),
-            "removed_sections": sum(1 for d in section_diffs if d["change_type"] == "removed"),
-        },
-    }
 
 
 def restore_report_version(version_id: int) -> dict[str, Any] | None:
@@ -693,104 +709,128 @@ def restore_report_version(version_id: int) -> dict[str, Any] | None:
         ))
         plan_snapshot = version.get("report_plan_snapshot") or {}
         if report_row is not None and plan_snapshot:
+            plan_values = _restore_plan_values(
+                plan_snapshot,
+                version.get("scale_plan_snapshot") or {},
+                version.get("title", ""),
+                version.get("user_requirements", ""),
+            )
             s.execute(update(ORMPlan).where(ORMPlan.c.id == report_row["plan_id"]).values(
-                title=plan_snapshot.get("title") or version.get("title", ""),
-                structure=_dump(plan_snapshot.get("structure") or []),
-                chapter_plans=_dump(plan_snapshot.get("chapter_plans") or []),
-                budget=_dump(plan_snapshot.get("budget") or version.get("scale_plan_snapshot") or {}),
-                core_question=plan_snapshot.get("core_question", ""),
-                core_judgment=plan_snapshot.get("core_judgment", ""),
-                narrative_logic=plan_snapshot.get("narrative_logic", ""),
-                user_requirements=version.get("user_requirements", ""),
+                **plan_values,
             ))
     return {"report_id": report_id, "restored_version_id": version_id, "sentence_count": len(sentences)}
 
+def _section_text(paragraphs: dict[int, list[dict[str, Any]]]) -> str:
+    return "".join(str(item.get("text") or "") for items in paragraphs.values() for item in items)
 
-def _sections_from_sentences(sentences: list[dict[str, Any]]) -> dict[str, str]:
-    sections: dict[str, list[str]] = {}
-    for sentence in sentences:
-        if not sentence.get("selected", 1):
+def _normalize_section_title(title: str) -> str:
+    value = re.sub(r"^\s*(?:第\s*)?[\d０-９]+(?:\.[\d０-９]+)*\s*[章节篇]?\s*", "", str(title or ""))
+    value = re.sub(r"^\s*[一二三四五六七八九十百千万]+\s*[、.．:：]\s*", "", value)
+    return re.sub(r"[\s\-—_·,，。；;:：()（）\[\]【】]", "", value).casefold()
+
+def _pair_sections(old_sections: dict[str, dict[int, list[dict[str, Any]]]],
+                   new_sections: dict[str, dict[int, list[dict[str, Any]]]]) -> list[dict[str, Any]]:
+    """Pair logical sections without using display titles as identity."""
+    old_titles, new_titles = list(old_sections), list(new_sections)
+    old_pos = {title: index for index, title in enumerate(old_titles)}
+    new_pos = {title: index for index, title in enumerate(new_titles)}
+    unused_old = set(old_titles)
+    matches: dict[str, str] = {}
+    match_methods: dict[str, str] = {}
+    for new_title in new_titles:
+        candidates = [title for title in unused_old
+                      if _normalize_section_title(title) == _normalize_section_title(new_title)]
+        if candidates:
+            old_title = min(candidates, key=lambda title: abs(old_pos[title] - new_pos[new_title]))
+            matches[new_title] = old_title
+            match_methods[new_title] = "title"
+            unused_old.remove(old_title)
+    for new_title in new_titles:
+        if new_title in matches:
             continue
-        section = str(sentence.get("section") or "")
-        if not section:
-            continue
-        text = str(sentence.get("rendered_text") or sentence.get("user_edit") or sentence.get("content") or "")
-        sections.setdefault(section, []).append(text)
-    return {section: "".join(texts) for section, texts in sections.items()}
-
-
-def diff_report_version_sentences(version_id: int, task_id: str = "") -> dict[str, Any] | None:
-    """Sentence/paragraph-level diff between a version commit and current draft."""
-    base = get_report_version(version_id)
-    if base is None:
-        return None
-    current = build_report_snapshot(int(base["report_id"]), task_id=task_id or base.get("task_id") or "")
-    old_sections = _sentence_groups(base.get("sentence_snapshot") or [])
-    new_sections = _sentence_groups(current.get("sentence_snapshot") or [])
-    section_titles = list(dict.fromkeys(list(old_sections.keys()) + list(new_sections.keys())))
-    sections = []
-    for title in section_titles:
-        old_paras = old_sections.get(title, {})
-        new_paras = new_sections.get(title, {})
-        paragraphs = []
-        for old_para_no, new_para_no in _align_paragraphs(old_paras, new_paras):
-            old_items = old_paras.get(old_para_no, []) if old_para_no is not None else []
-            new_items = new_paras.get(new_para_no, []) if new_para_no is not None else []
-            sentence_diffs = _sequence_diff(old_items, new_items)
+        candidates = []
+        for old_title in unused_old:
+            score = _sentence_similarity(_section_text(old_sections[old_title]), _section_text(new_sections[new_title]))
+            if score >= 0.18:
+                candidates.append((score, abs(old_pos[old_title] - new_pos[new_title]), old_title))
+        if candidates:
+            _score, _distance, old_title = max(candidates, key=lambda item: (item[0], -item[1]))
+            matches[new_title] = old_title
+            match_methods[new_title] = "content"
+            unused_old.remove(old_title)
+    remaining_new = [title for title in new_titles if title not in matches]
+    remaining_old = [title for title in old_titles if title in unused_old]
+    if len(remaining_new) == len(remaining_old):
+        for new_title, old_title in zip(remaining_new, remaining_old):
+            matches[new_title] = old_title
+            match_methods[new_title] = "position"
+            unused_old.remove(old_title)
+    result = []
+    for new_index, new_title in enumerate(new_titles):
+        old_title = matches.get(new_title)
+        old_paragraphs = old_sections.get(old_title, {}) if old_title else {}
+        new_paragraphs = new_sections[new_title]
+        old_text, new_text = _section_text(old_paragraphs), _section_text(new_paragraphs)
+        title_changed = bool(old_title and old_title != new_title)
+        content_changed = old_text != new_text
+        old_index = old_pos.get(old_title) if old_title else None
+        order_changed = old_index is not None and old_index != new_index
+        if old_title is None:
+            change_type = "added"
+        elif title_changed and not content_changed:
+            change_type = "renamed"
+        elif content_changed:
+            change_type = "rewritten" if title_changed else "modified"
+        elif order_changed:
+            change_type = "reordered"
+        else:
             change_type = "unchanged"
-            if any(item["change_type"] != "unchanged" for item in sentence_diffs):
-                change_type = "modified"
-            if old_items and not new_items:
-                change_type = "removed"
-            elif new_items and not old_items:
-                change_type = "added"
-            paragraphs.append({
-                "paragraph": new_para_no if new_para_no is not None else old_para_no,
-                "old_paragraph": old_para_no,
-                "new_paragraph": new_para_no,
-                "change_key": "paragraph:" + _stable_json_hash({
-                    "section": title, "old": old_para_no, "new": new_para_no,
-                }),
-                "change_type": change_type,
-                "old_text": "".join(item["text"] for item in old_items),
-                "new_text": "".join(item["text"] for item in new_items),
-                "sentences": sentence_diffs,
-            })
-        section_change = "unchanged"
-        if title not in old_sections:
-            section_change = "added"
-        elif title not in new_sections:
-            section_change = "removed"
-        elif any(p["change_type"] != "unchanged" for p in paragraphs):
-            section_change = "modified"
-        sections.append({
-            "section": title,
-            "change_key": "section:" + _stable_json_hash({"section": title}),
-            "change_type": section_change,
-            "paragraphs": paragraphs,
+        result.append({
+            "section": old_title or new_title, "old_title": old_title or "", "new_title": new_title,
+            "old_index": old_index, "new_index": new_index, "title_changed": title_changed,
+            "content_changed": content_changed, "order_changed": order_changed,
+            "match_method": match_methods.get(new_title, "unmatched"),
+            "match_confidence": (
+                "high" if match_methods.get(new_title) == "title"
+                else "medium" if match_methods.get(new_title) == "content"
+                else "low" if match_methods.get(new_title) == "position"
+                else "none"
+            ),
+            "change_type": change_type,
+            "change_kinds": [kind for kind, active in (("rename", title_changed), ("rewrite", content_changed), ("reorder", order_changed)) if active],
+            "old_paragraphs": old_paragraphs, "new_paragraphs": new_paragraphs,
         })
-    return {
-        "base_version_id": version_id,
-        "report_id": base["report_id"],
-        "candidate_hash": current.get("metadata", {}).get("snapshot_hash", ""),
-        "sections": sections,
-        "summary": _fine_diff_summary(sections),
-    }
+    for old_title in unused_old:
+        result.append({
+            "section": old_title, "old_title": old_title, "new_title": "",
+            "old_index": old_pos[old_title], "new_index": None, "title_changed": False,
+            "content_changed": True, "order_changed": False, "match_method": "unmatched",
+            "match_confidence": "none",
+            "change_type": "removed", "change_kinds": ["remove"],
+            "old_paragraphs": old_sections[old_title], "new_paragraphs": {},
+        })
+    return sorted(
+        result,
+        key=lambda item: (
+            item.get("new_index") is None,
+            item.get("new_index") if item.get("new_index") is not None else item.get("old_index") or 0,
+        ),
+    )
 
 
-def restore_report_version_scope(version_id: int, scope: dict[str, Any]) -> dict[str, Any] | None:
+def restore_report_version_scope(version_id: int, scope: dict[str, Any], *, _session=None) -> dict[str, Any] | None:
     """Restore selected sentence/paragraph/section content from a version commit."""
     version = get_report_version(version_id)
     if version is None:
         return None
     report_id = int(version["report_id"])
-    section = str(scope.get("section") or "")
+    section = str(scope.get("base_section") or scope.get("section") or "")
+    current_section = str(scope.get("current_section") or scope.get("section") or section)
     paragraph = scope.get("old_paragraph", scope.get("paragraph"))
     current_paragraph = scope.get("new_paragraph", scope.get("paragraph"))
     level = str(scope.get("level") or ("sentence" if scope.get("old_sentence_id") is not None else "paragraph" if paragraph is not None else "section"))
     old_sentence_id = scope.get("old_sentence_id")
     current_sentence_id = scope.get("current_sentence_id")
-    sentence_index = scope.get("sentence_index")  # backward compatible fallback
     if not section:
         return {"report_id": report_id, "restored": 0, "reason": "section_required"}
     old_groups = _sentence_groups(version.get("sentence_snapshot") or [])
@@ -803,22 +843,18 @@ def restore_report_version_scope(version_id: int, scope: dict[str, Any]) -> dict
     elif level == "section":
         for items in old_groups[section].values():
             targets.extend(items)
-    elif level == "paragraph" or sentence_index is None:
+    elif level == "paragraph":
         targets.extend(old_groups[section].get(int(paragraph), []))
-    else:
-        items = old_groups[section].get(int(paragraph), [])
-        idx = int(sentence_index)
-        if 0 <= idx < len(items):
-            targets.append(items[idx])
     if not targets:
         return {"report_id": report_id, "restored": 0, "reason": "no_target"}
-    with session_scope() as s:
+    manager = session_scope() if _session is None else nullcontext(_session)
+    with manager as s:
         sentence_ids: list[int] = []
         if current_sentence_id is not None:
             sentence_ids = [int(current_sentence_id)] if str(current_sentence_id).isdigit() else []
         elif level == "section":
             rows = s.execute(
-                select(ORMSentence.c.id).where(ORMSentence.c.report_id == report_id, ORMSentence.c.section == section)
+                select(ORMSentence.c.id).where(ORMSentence.c.report_id == report_id, ORMSentence.c.section == current_section)
             ).mappings().all()
             sentence_ids = [int(r["id"]) for r in rows]
         elif level == "paragraph":
@@ -826,7 +862,7 @@ def restore_report_version_scope(version_id: int, scope: dict[str, Any]) -> dict
                 rows = s.execute(
                     select(ORMSentence.c.id).where(
                         ORMSentence.c.report_id == report_id,
-                        ORMSentence.c.section == section,
+                        ORMSentence.c.section == current_section,
                         ORMSentence.c.paragraph == int(current_paragraph),
                     ).order_by(ORMSentence.c.position, ORMSentence.c.id)
                 ).mappings().all()
@@ -847,7 +883,7 @@ def restore_report_version_scope(version_id: int, scope: dict[str, Any]) -> dict
                     report_id=report_id,
                     lineage_id=item.get("lineage_id") or f"restored-{version_id}-{item.get('id')}",
                     parent_sentence_id=item.get("parent_sentence_id"),
-                    section=section,
+                    section=current_section if level != "section" else section,
                     paragraph=int(current_paragraph or item.get("paragraph") or paragraph or 1),
                     position=position,
                     content=item.get("content", ""),
@@ -869,6 +905,8 @@ def restore_report_version_scope(version_id: int, scope: dict[str, Any]) -> dict
         "report_id": report_id,
         "restored": len(targets),
         "section": section,
+        "base_section": section,
+        "current_section": current_section,
         "paragraph": paragraph,
         "current_paragraph": current_paragraph,
         "old_sentence_id": old_sentence_id,
@@ -959,29 +997,31 @@ def apply_report_change_decisions(version_id: int, candidate_hash: str) -> dict[
         change_summary="应用差异决策前自动快照", kind="minor",
     )
     applied_ids: list[int] = []
-    for decision in decisions:
-        if decision["decision"] == "use_base":
-            scope = dict(decision.get("scope") or {})
-            if scope.get("change_type") == "added":
-                _delete_current_scope(report_id, scope)
-            else:
-                restore_report_version_scope(version_id, scope)
-        applied_ids.append(int(decision["id"]))
+    # Keep report mutations and review state in one transaction.
     with session_scope() as s:
+        for decision in decisions:
+            if decision["decision"] == "use_base":
+                scope = dict(decision.get("scope") or {})
+                if scope.get("change_type") == "added":
+                    _delete_current_scope(report_id, scope, _session=s)
+                else:
+                    restore_report_version_scope(version_id, scope, _session=s)
+            applied_ids.append(int(decision["id"]))
         if applied_ids:
             s.execute(update(ORMReportChangeDecision).where(
                 ORMReportChangeDecision.c.id.in_(applied_ids)
             ).values(status="applied", applied_at=func.current_timestamp()))
-    _normalize_sentence_positions(report_id)
-    result_version = ensure_report_version(
-        report_id, task_id=str(version.get("task_id") or ""), status="draft",
-        change_summary="应用逐句版本审阅决策", kind="minor",
-    )
+        _normalize_sentence_positions(report_id, _session=s)
+        result_version = ensure_report_version(
+            report_id, task_id=str(version.get("task_id") or ""), status="draft",
+            change_summary="应用逐句版本审阅决策", kind="minor", _session=s,
+        )
     return {"report_id": report_id, "applied": len(applied_ids), "version_id": result_version.version_id}
 
 
-def _delete_current_sentence(report_id: int, sentence_id: int) -> None:
-    with session_scope() as s:
+def _delete_current_sentence(report_id: int, sentence_id: int, *, _session=None) -> None:
+    manager = session_scope() if _session is None else nullcontext(_session)
+    with manager as s:
         exists = s.execute(select(ORMSentence.c.id).where(
             ORMSentence.c.id == sentence_id, ORMSentence.c.report_id == report_id,
         )).scalar()
@@ -992,11 +1032,12 @@ def _delete_current_sentence(report_id: int, sentence_id: int) -> None:
         s.execute(ORMSentence.delete().where(ORMSentence.c.id == sentence_id))
 
 
-def _delete_current_scope(report_id: int, scope: dict[str, Any]) -> None:
+def _delete_current_scope(report_id: int, scope: dict[str, Any], *, _session=None) -> None:
     """Delete a candidate-only sentence, paragraph, or section with lineage rows."""
-    section = str(scope.get("section") or "")
+    section = str(scope.get("current_section") or scope.get("section") or "")
     level = str(scope.get("level") or "sentence")
-    with session_scope() as s:
+    manager = session_scope() if _session is None else nullcontext(_session)
+    with manager as s:
         query = select(ORMSentence.c.id).where(ORMSentence.c.report_id == report_id)
         if level == "section":
             query = query.where(ORMSentence.c.section == section)
@@ -1032,7 +1073,15 @@ def _review_scope_level(scope: dict[str, Any]) -> str:
 
 def _review_scopes_overlap(left: dict[str, Any], right: dict[str, Any]) -> bool:
     """A granularity switch replaces parent/child choices in the same scope."""
-    if str(left.get("section") or "") != str(right.get("section") or ""):
+    left_sections = {
+        str(left.get("base_section") or left.get("section") or ""),
+        str(left.get("current_section") or left.get("section") or ""),
+    }
+    right_sections = {
+        str(right.get("base_section") or right.get("section") or ""),
+        str(right.get("current_section") or right.get("section") or ""),
+    }
+    if not (left_sections & right_sections):
         return False
     left_level, right_level = _review_scope_level(left), _review_scope_level(right)
     if "section" in {left_level, right_level}:
@@ -1050,8 +1099,9 @@ def _review_scopes_overlap(left: dict[str, Any], right: dict[str, Any]) -> bool:
     return "paragraph" in {left_level, right_level}
 
 
-def _normalize_sentence_positions(report_id: int) -> None:
-    with session_scope() as s:
+def _normalize_sentence_positions(report_id: int, *, _session=None) -> None:
+    manager = session_scope() if _session is None else nullcontext(_session)
+    with manager as s:
         rows = s.execute(select(ORMSentence.c.id).where(
             ORMSentence.c.report_id == report_id
         ).order_by(ORMSentence.c.position, ORMSentence.c.id)).mappings().all()
@@ -1137,7 +1187,7 @@ def _sequence_diff(old_items: list[dict[str, Any]], new_items: list[dict[str, An
         new = new_items[new_idx]
         old_text = old.get("text", "")
         new_text = new.get("text", "")
-        change = "unchanged" if old_text == new_text else "modified"
+        change = "unchanged" if old_text == new_text and _source_signature(old) == _source_signature(new) else "provenance_changed" if old_text == new_text else "modified"
         result.append(_diff_item(old_idx, new_idx, old, new, change, score))
         old_cursor = old_idx + 1
         new_cursor = new_idx + 1
@@ -1236,6 +1286,18 @@ def _sentence_similarity(left: str, right: str) -> float:
     return max(overlap * 0.75 + len_ratio * 0.25, seq * 0.85 + len_ratio * 0.15)
 
 
+def _source_signature(item: dict[str, Any]) -> tuple:
+    refs = item.get("source_refs") or {}
+    if isinstance(refs, str):
+        refs = _json_load(refs, {})
+    if not isinstance(refs, dict):
+        refs = {}
+    return (
+        tuple(sorted(str(value) for value in refs.get("fact_ids") or [])),
+        tuple(sorted(str(value) for value in refs.get("inference_ids") or [])),
+        str(item.get("source_level") or ""),
+    )
+
 def _match_threshold(left: str, right: str) -> float:
     shortest = min(len(left or ""), len(right or ""))
     if shortest <= 10:
@@ -1248,7 +1310,8 @@ def _match_threshold(left: str, right: str) -> float:
 
 
 def _fine_diff_summary(sections: list[dict[str, Any]]) -> dict[str, int]:
-    counts = {"sections_changed": 0, "paragraphs_changed": 0, "sentences_added": 0, "sentences_modified": 0, "sentences_removed": 0}
+    counts = {"sections_changed": 0, "paragraphs_changed": 0, "sentences_added": 0, "sentences_modified": 0, "sentences_removed": 0,
+              "sentences_provenance_changed": 0}
     for section in sections:
         if section.get("change_type") != "unchanged":
             counts["sections_changed"] += 1
@@ -1283,8 +1346,8 @@ def build_incremental_impact(report_id: int, delta_id: int, task_id: str = "") -
     old_facts = _json_load(base["fact_snapshot"], [])
     old_inferences = _json_load(base["inference_snapshot"], [])
     old_conflicts = _json_load(base["conflict_snapshot"], [])
-    fact_delta = _object_delta(old_facts, current["fact_snapshot"], key="content")
-    inference_delta = _object_delta(old_inferences, current["inference_snapshot"], key="content")
+    fact_delta = _object_delta(old_facts, current["fact_snapshot"])
+    inference_delta = _object_delta(old_inferences, current["inference_snapshot"])
     superseded_fact_ids = {
         int(item["id"]) for item in current["fact_snapshot"]
         if item.get("id") is not None and item.get("lifecycle_status") == "superseded"
@@ -1298,7 +1361,7 @@ def build_incremental_impact(report_id: int, delta_id: int, task_id: str = "") -
             item for item in fact_delta["modified"]
             if int((item.get("current") or {}).get("id") or -1) not in superseded_fact_ids
         ]
-    conflict_delta = _object_delta(old_conflicts, current["conflict_snapshot"], key="fact_key")
+    conflict_delta = _object_delta(old_conflicts, current["conflict_snapshot"])
     base_plan = _json_load(base["report_plan_snapshot"], {})
     current_plan = current.get("report_plan_snapshot") or {}
     structure_changes = _structure_changes(base_plan.get("structure") or [], current_plan.get("structure") or [])
@@ -1454,15 +1517,6 @@ def _text_overlap(left: str, right: str) -> float:
     grams_b = {b[i:i + 2] for i in range(len(b) - 1)}
     return len(grams_a & grams_b) / max(len(grams_a), 1)
 
-def _find_task_by_report_in_session(s, report_id: int) -> str | None:
-    rows = s.execute(select(ORMShortMemory.c.task_id, ORMShortMemory.c.payload)).all()
-    for task_id, payload_text in rows:
-        payload = _json_load(payload_text, {})
-        if payload.get("report_id") == report_id:
-            return task_id
-    return None
-
-
 def _task_payload_in_session(s, task_id: str) -> dict[str, Any]:
     if not task_id:
         return {}
@@ -1565,6 +1619,342 @@ def _stable_json_hash(value: Any) -> str:
     return sha256(_dump(value).encode("utf-8")).hexdigest()
 
 
+_SNAPSHOT_HASH_VERSION = 2
+_VOLATILE_HASH_KEYS = {
+    "id",
+    "material_id",
+    "unit_id",
+    "fact_id",
+    "inference_id",
+    "evidence_id",
+    "conflict_id",
+    "sentence_id",
+    "task_id",
+    "run_id",
+    "origin_call_id",
+    "lineage_id",
+    "parent_sentence_id",
+    "introduced_run_id",
+    "superseded_by_fact_id",
+    "superseded_by_inference_id",
+    "created_at",
+    "updated_at",
+    "finalized_at",
+}
+
+
+def _hash_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _canonical_hash_value(value: Any, key: str = "") -> Any:
+    """Remove storage/runtime identity from nested snapshot values."""
+    if isinstance(value, dict):
+        return {
+            str(name): _canonical_hash_value(child, str(name))
+            for name, child in sorted(value.items(), key=lambda item: str(item[0]))
+            if str(name) not in _VOLATILE_HASH_KEYS
+        }
+    if isinstance(value, list):
+        return [_canonical_hash_value(item, key) for item in value]
+    if isinstance(value, str):
+        return _hash_text(value)
+    return value
+
+
+def _artifact_key(item: dict[str, Any], prefix: str) -> str:
+    stable = _hash_text(item.get("stable_key"))
+    if stable:
+        return stable
+    content = _hash_text(item.get("content"))
+    dimension = _hash_text(item.get("dimension"))
+    if content or dimension:
+        return f"{dimension}:{content}"
+    return f"{prefix}:{item.get('id', '')}"
+
+
+def _content_hash_payload(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Build a content-only projection for snapshot de-duplication.
+
+    Version identity belongs to the report-version table. It must not be
+    derived from database row ids, model call ids, or sentence lineage ids;
+    those values may change when an unchanged draft is rebuilt.
+    """
+    facts = list(snapshot.get("fact_snapshot") or snapshot.get("facts") or [])
+    inferences = list(snapshot.get("inference_snapshot") or snapshot.get("inferences") or [])
+    fact_keys = {str(item.get("id")): _artifact_key(item, "fact") for item in facts}
+    inference_keys = {str(item.get("id")): _artifact_key(item, "inference") for item in inferences}
+
+    stable_facts = []
+    for item in facts:
+        evidence = []
+        for entry in item.get("evidence") or []:
+            evidence.append({
+                "source_file": _hash_text(entry.get("source_file")),
+                "page": entry.get("page"),
+                "paragraph": entry.get("paragraph"),
+                "quote": _hash_text(entry.get("quote")),
+            })
+        stable_facts.append({
+            "key": fact_keys.get(str(item.get("id")), _artifact_key(item, "fact")),
+            "content": _hash_text(item.get("content")),
+            "dimension": _hash_text(item.get("dimension")),
+            "need_id": item.get("need_id"),
+            "source_level": _hash_text(item.get("source_level")),
+            "evidence": sorted(evidence, key=lambda value: _dump(value)),
+            "lifecycle_status": _hash_text(item.get("lifecycle_status")),
+        })
+
+    stable_inferences = []
+    for item in inferences:
+        stable_inferences.append({
+            "key": inference_keys.get(str(item.get("id")), _artifact_key(item, "inference")),
+            "content": _hash_text(item.get("content")),
+            "source_level": _hash_text(item.get("source_level")),
+            "based_fact_keys": sorted(
+                fact_keys.get(str(fact_id), f"fact:{fact_id}")
+                for fact_id in (item.get("based_fact_ids") or [])
+            ),
+            "reasoning_chain": _hash_text(item.get("reasoning_chain")),
+            "dimension": _hash_text(item.get("dimension")),
+            "analysis_type": _hash_text(item.get("analysis_type")),
+            "confidence_level": _hash_text(item.get("confidence_level")),
+            "confidence_reason": _hash_text(item.get("confidence_reason")),
+            "uncertainty": _hash_text(item.get("uncertainty")),
+            "lifecycle_status": _hash_text(item.get("lifecycle_status")),
+        })
+
+    stable_sentences = []
+    for item in snapshot.get("sentence_snapshot") or snapshot.get("sentences") or []:
+        refs = item.get("source_refs") or {}
+        stable_sentences.append({
+            "section": _hash_text(item.get("section")),
+            "paragraph": item.get("paragraph"),
+            "position": item.get("position"),
+            "content": _hash_text(item.get("user_edit") or item.get("content")),
+            "source_level": _hash_text(item.get("source_level")),
+            "fact_keys": sorted(
+                fact_keys.get(str(fact_id), f"fact:{fact_id}")
+                for fact_id in (refs.get("fact_ids") or [])
+            ),
+            "inference_keys": sorted(
+                inference_keys.get(str(inference_id), f"inference:{inference_id}")
+                for inference_id in (refs.get("inference_ids") or [])
+            ),
+            "selected": item.get("selected", 1),
+        })
+
+    materials = [
+        _canonical_hash_value(item)
+        for item in (snapshot.get("material_fingerprints") or snapshot.get("materials") or [])
+    ]
+    return {
+        "title": _hash_text(snapshot.get("title")),
+        "materials": sorted(materials, key=lambda value: _dump(value)),
+        "facts": sorted(stable_facts, key=lambda value: value["key"]),
+        "inferences": sorted(stable_inferences, key=lambda value: value["key"]),
+        "conflicts": _canonical_hash_value(snapshot.get("conflict_snapshot") or snapshot.get("conflicts") or []),
+        "sentences": stable_sentences,
+        "plan": _canonical_hash_value(snapshot.get("report_plan_snapshot") or snapshot.get("plan") or {}),
+        "narrative_plan": _canonical_hash_value(snapshot.get("narrative_plan_snapshot") or snapshot.get("narrative_plan") or {}),
+        "scale_plan": _canonical_hash_value(snapshot.get("scale_plan_snapshot") or snapshot.get("scale_plan") or {}),
+    }
+
+
+def _content_snapshot_hash(snapshot: dict[str, Any]) -> str:
+    return _stable_json_hash(_content_hash_payload(snapshot))
+
+
+def _stored_version_hash(row) -> str:
+    """Recompute a stable hash for both new and legacy version rows."""
+    snapshot = {
+        "title": row.get("title", ""),
+        "material_fingerprints": _json_load(row.get("material_fingerprints"), []),
+        "report_plan_snapshot": _json_load(row.get("report_plan_snapshot"), {}),
+        "narrative_plan_snapshot": _json_load(row.get("narrative_plan_snapshot"), {}),
+        "scale_plan_snapshot": _json_load(row.get("scale_plan_snapshot"), {}),
+        "fact_snapshot": _json_load(row.get("fact_snapshot"), []),
+        "inference_snapshot": _json_load(row.get("inference_snapshot"), []),
+        "conflict_snapshot": _json_load(row.get("conflict_snapshot"), []),
+        "sentence_snapshot": _json_load(row.get("sentence_snapshot"), []),
+    }
+    return _content_snapshot_hash(snapshot)
+
+
+def _build_sentence_diff(base: dict[str, Any], target: dict[str, Any], *,
+                         base_version_id: int, target_version_id: int | None,
+                         comparison_mode: str, can_apply: bool) -> dict[str, Any]:
+    old_sections = _sentence_groups(base.get("sentence_snapshot") or [])
+    new_sections = _sentence_groups(target.get("sentence_snapshot") or [])
+    sections: list[dict[str, Any]] = []
+    for pair in _pair_sections(old_sections, new_sections):
+        old_title = pair.get("old_title") or ""
+        new_title = pair.get("new_title") or ""
+        old_paras = pair.get("old_paragraphs") or {}
+        new_paras = pair.get("new_paragraphs") or {}
+        paragraphs: list[dict[str, Any]] = []
+        for old_para_no, new_para_no in _align_paragraphs(old_paras, new_paras):
+            old_items = old_paras.get(old_para_no, []) if old_para_no is not None else []
+            new_items = new_paras.get(new_para_no, []) if new_para_no is not None else []
+            sentence_diffs = _sequence_diff(old_items, new_items)
+            if old_items and not new_items:
+                paragraph_type = "removed"
+            elif new_items and not old_items:
+                paragraph_type = "added"
+            else:
+                changed = [item["change_type"] for item in sentence_diffs if item["change_type"] != "unchanged"]
+                if not changed:
+                    paragraph_type = "unchanged"
+                elif set(changed) == {"provenance_changed"}:
+                    paragraph_type = "provenance_changed"
+                else:
+                    paragraph_type = "modified"
+            paragraphs.append({
+                "paragraph": new_para_no if new_para_no is not None else old_para_no,
+                "old_paragraph": old_para_no,
+                "new_paragraph": new_para_no,
+                "change_key": "paragraph:" + _stable_json_hash({
+                    "base_section": old_title,
+                    "current_section": new_title,
+                    "old": old_para_no,
+                    "new": new_para_no,
+                }),
+                "change_type": paragraph_type,
+                "old_text": "".join(item["text"] for item in old_items),
+                "new_text": "".join(item["text"] for item in new_items),
+                "sentences": sentence_diffs,
+            })
+        paragraph_changes = [item["change_type"] for item in paragraphs if item["change_type"] != "unchanged"]
+        section_type = pair.get("change_type") or "unchanged"
+        if section_type == "unchanged" and paragraph_changes:
+            section_type = "provenance_changed" if set(paragraph_changes) == {"provenance_changed"} else "modified"
+        sections.append({
+            "section": old_title or new_title,
+            "base_section": old_title,
+            "current_section": new_title,
+            "old_title": old_title,
+            "new_title": new_title,
+            "old_index": pair.get("old_index"),
+            "new_index": pair.get("new_index"),
+            "title_changed": bool(pair.get("title_changed")),
+            "content_changed": bool(pair.get("content_changed")),
+            "order_changed": bool(pair.get("order_changed")),
+            "match_method": pair.get("match_method"),
+            "match_confidence": pair.get("match_confidence", "none"),
+            "change_type": section_type,
+            "change_kinds": pair.get("change_kinds") or [],
+            "change_key": "section:" + _stable_json_hash({
+                "base_section": old_title,
+                "current_section": new_title,
+                "old_index": pair.get("old_index"),
+                "new_index": pair.get("new_index"),
+            }),
+            "paragraphs": paragraphs,
+        })
+    return {
+        "base_version_id": base_version_id,
+        "target_version_id": target_version_id,
+        "comparison_mode": comparison_mode,
+        "can_apply": can_apply,
+        "report_id": base["report_id"],
+        "old_title": base.get("title", ""),
+        "new_title": target.get("title", ""),
+        "candidate_hash": target.get("metadata", {}).get("snapshot_hash", ""),
+        "sections": sections,
+        "summary": _fine_diff_summary(sections),
+    }
+
+
+def compare_report_versions(base_version_id: int, target_version_id: int | None = None,
+                            task_id: str = "") -> dict[str, Any] | None:
+    """Compare two immutable versions, or a version with the current draft."""
+    base = get_report_version(base_version_id)
+    if base is None:
+        return None
+    report_id = int(base["report_id"])
+    if target_version_id is None:
+        target = build_report_snapshot(report_id, task_id=task_id or base.get("task_id") or "")
+        return _build_sentence_diff(
+            base, target, base_version_id=base_version_id, target_version_id=None,
+            comparison_mode="current_draft", can_apply=True,
+        )
+    target = get_report_version(target_version_id)
+    if target is None or int(target["report_id"]) != report_id:
+        return None
+    return _build_sentence_diff(
+        base, target, base_version_id=base_version_id, target_version_id=target_version_id,
+        comparison_mode="version", can_apply=False,
+    )
+
+
+def _paired_structure_changes(sections: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Expose structural changes without splitting a logical rename into add/remove."""
+    changes: list[dict[str, Any]] = []
+    for section in sections:
+        change_type = section.get("change_type")
+        old_title = str(section.get("old_title") or "")
+        new_title = str(section.get("new_title") or "")
+        display_title = new_title or old_title
+        if change_type == "added":
+            changes.append({"type": "added_section", "section": display_title, "severity": "major"})
+        elif change_type == "removed":
+            changes.append({"type": "removed_section", "section": old_title, "severity": "major"})
+        elif change_type == "renamed":
+            changes.append({
+                "type": "renamed_section",
+                "from": old_title,
+                "to": new_title,
+                "section": display_title,
+                "severity": "minor",
+            })
+        elif change_type == "rewritten":
+            changes.append({
+                "type": "rewritten_section",
+                "from": old_title,
+                "to": new_title,
+                "section": display_title,
+                "severity": "minor",
+            })
+        elif change_type == "reordered":
+            changes.append({
+                "type": "reordered_section",
+                "section": display_title,
+                "from_index": section.get("old_index"),
+                "to_index": section.get("new_index"),
+                "severity": "minor",
+            })
+    return changes
+
+
+def diff_report_version_to_current(version_id: int, task_id: str = "") -> dict[str, Any] | None:
+    """Compatibility view of the unified version-to-current comparator."""
+    detailed = compare_report_versions(version_id, task_id=task_id)
+    if detailed is None:
+        return None
+    section_diffs = [{
+        "section": section["section"],
+        "old_title": section["old_title"],
+        "new_title": section["new_title"],
+        "change_type": section["change_type"],
+        "old_text": "".join(p["old_text"] for p in section["paragraphs"]),
+        "new_text": "".join(p["new_text"] for p in section["paragraphs"]),
+        "old_chars": sum(len(p["old_text"]) for p in section["paragraphs"]),
+        "new_chars": sum(len(p["new_text"]) for p in section["paragraphs"]),
+    } for section in detailed["sections"]]
+    detailed["structure_changes"] = _paired_structure_changes(detailed["sections"])
+    detailed["section_diffs"] = section_diffs
+    detailed["summary"].update({
+        "added_sections": sum(1 for s in detailed["sections"] if s["change_type"] == "added"),
+        "modified_sections": sum(1 for s in detailed["sections"] if s["change_type"] in {"modified", "rewritten", "provenance_changed"}),
+        "removed_sections": sum(1 for s in detailed["sections"] if s["change_type"] == "removed"),
+    })
+    return detailed
+
+
+def diff_report_version_sentences(version_id: int, task_id: str = "") -> dict[str, Any] | None:
+    """Sentence/paragraph diff backed by the unified section pairing model."""
+    return compare_report_versions(version_id, task_id=task_id)
+
 __all__ = [
     "VersionSnapshot",
     "ensure_report_version",
@@ -1576,6 +1966,7 @@ __all__ = [
     "build_incremental_impact",
     "diff_report_version_to_current",
     "diff_report_version_sentences",
+    "compare_report_versions",
     "restore_report_version",
     "restore_report_version_scope",
     "get_report_delta",

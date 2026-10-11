@@ -5,10 +5,11 @@ from unittest.mock import patch
 
 from app.agents.base import BaseAgent
 from app.config import settings
+from app.model_connection import Connection
 from app.gateway import (
     OpenAICompatibleGateway,
     _completion_was_truncated,
-    _context_safe_max_tokens,
+    _context_exceeded,
     last_generation_stats,
 )
 from app.evidence.extractor import EvidenceAgent
@@ -79,6 +80,15 @@ class _HealthResponse:
 
 
 class VllmGatewayTests(unittest.TestCase):
+    def setUp(self):
+        from app.vllm_capacity import reset
+        reset()
+        self.addCleanup(reset)
+        connection = Connection("http://vllm.test/v1", "qwen3.6-27b", service_kind="vllm", vllm_priority=True)
+        for target in ("app.model_connection.load_connection", "app.gateway.load_connection"):
+            mock = patch(target, return_value=connection)
+            mock.start()
+            self.addCleanup(mock.stop)
     def test_length_finish_reason_is_never_accepted_as_complete_json(self):
         self.assertTrue(_completion_was_truncated({
             "choices": [{"finish_reason": "length", "message": {"content": "{}"}}],
@@ -91,18 +101,24 @@ class VllmGatewayTests(unittest.TestCase):
         facts = ["1. " + "f" * 30, "2. " + "f" * 30, "3. " + "f" * 30]
         inferences = ["10. " + "i" * 20, "11. " + "i" * 20]
         selected_facts, selected_inferences = _pack_writer_evidence(
-            facts, inferences, available_chars=100,
+            facts, inferences, available_tokens=100,
         )
         self.assertTrue(selected_facts)
         self.assertTrue(selected_inferences)
         self.assertTrue(all(line in facts for line in selected_facts))
         self.assertTrue(all(line in inferences for line in selected_inferences))
 
-    def test_context_overflow_reduces_only_generation_ceiling(self):
+    def test_writer_packing_skips_oversized_line_and_keeps_later_fitting_evidence(self):
+        selected_facts, selected_inferences = _pack_writer_evidence(
+            ["1. A", "2. " + "x" * 30, "3. C"], [], available_tokens=4,
+        )
+
+        self.assertEqual(selected_facts, ["1. A", "3. C"])
+        self.assertEqual(selected_inferences, [])
+
+    def test_context_overflow_is_classified_without_shrinking_output(self):
         response = _ContextOverflowResponse()
-        with patch.object(settings, "model_context_window_tokens", 15360):
-            adjusted = _context_safe_max_tokens(response, requested_max_tokens=3072)
-        self.assertEqual(adjusted, 2560)
+        self.assertTrue(_context_exceeded(response))
 
     def test_evidence_stage_budget_preserves_source_coverage_without_selecting_all(self):
         candidates = []
@@ -110,7 +126,7 @@ class VllmGatewayTests(unittest.TestCase):
         for material_id in range(1, 4):
             ranked = []
             for score in (0.9, 0.8, 0.7):
-                ranked.append((score, SimpleNamespace(id=unit_id, content="x" * 100)))
+                ranked.append((score, SimpleNamespace(id=unit_id, content="证" * 100)))
                 unit_id += 1
             candidates.append((material_id, ranked))
         selected = _select_evidence_candidates(candidates, token_budget=400)
@@ -150,21 +166,25 @@ class VllmGatewayTests(unittest.TestCase):
 
     def test_json_generation_propagates_priority_and_thinking_control(self):
         gateway = OpenAICompatibleGateway("http://vllm.test/v1")
-        with patch("app.gateway.httpx.Client", _Client), patch.object(
-            settings, "generation_model", "qwen3.6-27b"
-        ):
+        with patch("app.gateway.httpx.Client", _Client):
             with llm_priority(PRIORITY_INTERACTIVE):
                 result = gateway.generate_json("return json", think=False)
         self.assertEqual(result, {"ok": True})
         self.assertEqual(_Client.last_payload["priority"], PRIORITY_INTERACTIVE)
         self.assertFalse(_Client.last_payload["chat_template_kwargs"]["enable_thinking"])
         self.assertEqual(last_generation_stats()["output_tokens"], 5)
+        self.assertNotIn("temperature", _Client.last_payload)
+
+    def test_json_generation_accepts_stage_specific_temperature(self):
+        gateway = OpenAICompatibleGateway("http://vllm.test/v1")
+        with patch("app.gateway.httpx.Client", _Client):
+            result = gateway.generate_json("return json", think=False, temperature=0.0)
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(_Client.last_payload["temperature"], 0.0)
 
     def test_queue_returns_worker_usage_to_calling_context(self):
         gateway = OpenAICompatibleGateway("http://vllm.test/v1")
-        with patch("app.gateway.httpx.Client", _Client), patch.object(
-            settings, "generation_model", "qwen3.6-27b"
-        ):
+        with patch("app.gateway.httpx.Client", _Client):
             result = submit_llm_call(
                 lambda: gateway.generate_json("return json", think=False)
             )
@@ -174,9 +194,7 @@ class VllmGatewayTests(unittest.TestCase):
 
     def test_queue_returns_worker_usage_when_json_parsing_fails(self):
         gateway = OpenAICompatibleGateway("http://vllm.test/v1")
-        with patch("app.gateway.httpx.Client", _InvalidJsonClient), patch.object(
-            settings, "generation_model", "qwen3.6-27b"
-        ):
+        with patch("app.gateway.httpx.Client", _InvalidJsonClient):
             with self.assertRaisesRegex(ValueError, "MODEL_JSON_NOT_FOUND"):
                 submit_llm_call(
                     lambda: gateway.generate_json("return json", think=False)
@@ -192,9 +210,7 @@ class VllmGatewayTests(unittest.TestCase):
                 return _HealthResponse({"data": [{"id": "qwen3.6-27b"}]})
             return _HealthResponse({"models": [{"name": "qwen-embed:latest"}]})
 
-        with patch("app.gateway.httpx.get", side_effect=fake_get), patch.object(
-            settings, "generation_model", "qwen3.6-27b"
-        ), patch.object(settings, "embedding_model", "Qwen3-Embedding-0.6B"), patch(
+        with patch("app.gateway.httpx.get", side_effect=fake_get), patch.object(settings, "embedding_model", "Qwen3-Embedding-0.6B"), patch(
             "app.local_embedding.local_embedding_runtime.health",
             return_value={"backend": "transformers-cpu", "model": "/models/qwen", "available": True, "loaded": False},
         ):
@@ -209,9 +225,9 @@ class VllmGatewayTests(unittest.TestCase):
         def fake_process(self, needs, text, meta, units, filenames, task_id, index, count, round_tag=0):
             return [text]
 
-        with patch.object(settings, "generation_backend", "vllm"), patch.object(
-            settings, "evidence_batch_concurrency", 2
-        ), patch.object(EvidenceAgent, "_process_batch", fake_process):
+        with patch.object(settings, "evidence_batch_concurrency", 2), patch.object(
+            EvidenceAgent, "_process_batch", fake_process
+        ):
             result = agent._process_batches(
                 [("first", {}), ("second", {})], [], {}, {}, "task",
             )

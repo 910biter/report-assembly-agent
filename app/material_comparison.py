@@ -11,26 +11,35 @@ import re
 import time
 import uuid
 from collections import Counter
+from contextlib import nullcontext
 from typing import Any
 
 from sqlalchemy import delete, insert, select, update
 
+from app.agents.base import BaseAgent
+from app.config import settings
+from app.context_budget import ContextSection, build_prompt_from_sections
 from app.db import session_scope
-from app.gateway import model_gateway
 from app.infrastructure.orm import (
+    ORMEvidence,
     ORMFact,
     ORMInference,
     ORMMaterialComparisonItem,
     ORMMaterialComparisonRun,
     ORMShortMemory,
 )
-from app.llm_scheduler import invoke
+from app.runtime_profiles import stage_input_budget_tokens
 from app.report_versions import get_report_version
 
 CHANGE_TYPES = {
     "addition", "corroboration", "refinement", "update", "conflict",
-    "weakening", "irrelevant", "uncertain",
+    "weakening", "related", "irrelevant", "uncertain",
 }
+
+
+class _ComparisonAgent(BaseAgent):
+    name = "comparison"
+    role = "你只负责证据变化分类，不改写报告。"
 
 _CLASSIFY_PROMPT = """你是新增材料变化核验员。请比较“新增事实”和候选基线事实，判断它对基线报告的真实影响。
 只输出 JSON：
@@ -38,7 +47,7 @@ _CLASSIFY_PROMPT = """你是新增材料变化核验员。请比较“新增事�
   "items": [{
     "new_fact_id": 1,
     "baseline_fact_id": 2或null,
-    "change_type": "addition/corroboration/refinement/update/conflict/weakening/irrelevant/uncertain",
+    "change_type": "addition/corroboration/refinement/update/conflict/weakening/related/irrelevant/uncertain",
     "confidence": "high/medium/low",
     "title": "简洁变化标题",
     "rationale": "一句话说明判断依据"
@@ -52,9 +61,10 @@ _CLASSIFY_PROMPT = """你是新增材料变化核验员。请比较“新增事�
 - update：同一事项出现更晚版本、状态或替代值；
 - conflict：相同主体、事项、时间/适用范围下不能同时成立；
 - weakening：不直接构成相反事实，但削弱既有判断；
+- related：与既有事实或报告主题相关，但尚不足以构成新增断言、补强、细化、更新或冲突；
 - irrelevant：真实但不影响当前报告目标；
 - uncertain：证据不足以稳定分类。
-不得仅因措辞不同判为冲突，不得猜测材料中没有的信息。
+先核对主体、时间、条件和口径，再用两侧原文支持 change_type；措辞不同但命题相同可归为 corroboration，证据尚不足时用 uncertain。
 
 任务目标：{focus}
 待比较数据：
@@ -63,9 +73,11 @@ _CLASSIFY_PROMPT = """你是新增材料变化核验员。请比较“新增事�
 
 
 def create_comparison_run(task_id: str, report_id: int, base_version_id: int,
-                          material_ids: list[int], focus: str = "") -> dict[str, Any]:
+                          material_ids: list[int], focus: str = "", *,
+                          _session=None) -> dict[str, Any]:
     key = uuid.uuid4().hex
-    with session_scope() as s:
+    manager = session_scope() if _session is None else nullcontext(_session)
+    with manager as s:
         result = s.execute(insert(ORMMaterialComparisonRun).values(
             comparison_key=key,
             task_id=task_id,
@@ -77,6 +89,8 @@ def create_comparison_run(task_id: str, report_id: int, base_version_id: int,
             summary_json="{}",
         ))
         comparison_id = int(result.inserted_primary_key[0])
+    if _session is not None:
+        return {"id": comparison_id, "comparison_key": key}
     return get_comparison(comparison_id) or {"id": comparison_id}
 
 
@@ -90,7 +104,7 @@ def list_comparisons(report_id: int) -> list[dict[str, Any]]:
     return [_run_detail(row, include_items=False) for row in rows]
 
 
-def get_comparison(comparison_id: int) -> dict[str, Any] | None:
+def get_comparison(comparison_id: int, *, compact: bool = False) -> dict[str, Any] | None:
     with session_scope() as s:
         row = s.execute(select(ORMMaterialComparisonRun).where(
             ORMMaterialComparisonRun.c.id == int(comparison_id)
@@ -101,8 +115,36 @@ def get_comparison(comparison_id: int) -> dict[str, Any] | None:
             ORMMaterialComparisonItem.c.comparison_id == int(comparison_id)
         ).order_by(ORMMaterialComparisonItem.c.id)).mappings().all()
     result = _run_detail(row, include_items=False)
-    result["items"] = [_item_detail(item) for item in items]
+    result_items = [_item_detail(item) for item in items]
+    if not compact:
+        _attach_new_fact_evidence(result_items)
+    baseline = get_report_version(int(row["base_version_id"]))
+    result["baseline"] = {
+        "id": int(row["base_version_id"]),
+        "title": str((baseline or {}).get("title") or ""),
+        "version_label": str((baseline or {}).get("version_label") or (baseline or {}).get("version_no") or ""),
+    }
+    result["document"] = _comparison_document(baseline or {}, result_items)
+    if compact:
+        result_items = [_compact_comparison_item(item) for item in result_items]
+        for sentence in result["document"].get("sentences", []):
+            sentence.pop("source_refs", None)
+    result["items"] = result_items
     return result
+
+
+def get_comparison_item(comparison_id: int, item_id: int) -> dict[str, Any] | None:
+    """Load the full provenance for one selected review item."""
+    with session_scope() as s:
+        row = s.execute(select(ORMMaterialComparisonItem).where(
+            ORMMaterialComparisonItem.c.id == int(item_id),
+            ORMMaterialComparisonItem.c.comparison_id == int(comparison_id),
+        )).mappings().first()
+    if row is None:
+        return None
+    item = _item_detail(row)
+    _attach_new_fact_evidence([item])
+    return item
 
 
 def update_comparison_item(comparison_id: int, item_id: int, *, status: str,
@@ -120,8 +162,7 @@ def update_comparison_item(comparison_id: int, item_id: int, *, status: str,
             ORMMaterialComparisonItem.c.id == int(item_id),
             ORMMaterialComparisonItem.c.comparison_id == int(comparison_id),
         ).values(**values))
-    comparison = get_comparison(comparison_id)
-    return next((item for item in (comparison or {}).get("items", []) if item["id"] == item_id), None)
+    return get_comparison_item(comparison_id, item_id)
 
 
 def complete_comparison_task(task_id: str) -> dict[str, Any]:
@@ -154,7 +195,10 @@ def complete_comparison_task(task_id: str) -> dict[str, Any]:
     candidates = _candidate_sets(new_facts, baseline_facts)
     candidates = _merge_candidate_sets(
         candidates,
-        _semantic_candidate_sets(new_facts, baseline_facts, str(baseline.get("task_id") or "")),
+        _semantic_candidate_sets(
+            new_facts, baseline_facts,
+            str(baseline.get("task_id") or ""), str(run.get("task_id") or ""),
+        ),
     )
     classified = _classify_batches(candidates, str(run["focus"] or baseline.get("user_requirements") or ""))
     baseline_by_id = {int(item["id"]): item for item in baseline_facts if item.get("id") is not None}
@@ -171,7 +215,7 @@ def complete_comparison_task(task_id: str) -> dict[str, Any]:
         if not impacts:
             impacts = _section_overlap_impacts(str(fact.get("content") or ""), sections)
         evidence = {
-            "new_fact": _compact_fact(fact),
+            "new_fact": _compact_fact(fact, include_evidence=True),
             "baseline_fact": baseline_fact,
         }
         item_key = hashlib.sha256(
@@ -195,11 +239,13 @@ def complete_comparison_task(task_id: str) -> dict[str, Any]:
     # a fabricated one-to-one fact relation.
     inference_summary = _inference_impact_summary(new_inferences, baseline.get("inference_snapshot") or [])
     counts = Counter(record["change_type"] for record in records)
+    comparison_metrics = _comparison_metrics(records)
     summary = {
         "new_material_count": len(_load(run["material_ids_json"], [])),
         "new_fact_count": len(new_facts),
         "new_inference_count": len(new_inferences),
         "change_counts": dict(counts),
+        **comparison_metrics,
         "affected_sections": sorted({
             impact.get("section", "")
             for record in records
@@ -273,7 +319,8 @@ def _candidate_sets(new_facts: list[dict], baseline_facts: list[dict], limit: in
 
 
 def _semantic_candidate_sets(new_facts: list[dict], baseline_facts: list[dict],
-                             baseline_task_id: str, limit: int = 4) -> dict[int, list[dict]]:
+                             baseline_task_id: str, new_task_id: str = "",
+                             limit: int = 4) -> dict[int, list[dict]]:
     """Use Qdrant fact vectors when available; lexical retrieval remains fallback."""
     if not new_facts or not baseline_facts or not baseline_task_id:
         return {}
@@ -286,11 +333,20 @@ def _semantic_candidate_sets(new_facts: list[dict], baseline_facts: list[dict],
         old_vectors = [(fact_id, vector) for fact_id, vector in vector_store.fact_vectors(baseline_task_id) if fact_id in allowed]
         if not old_vectors:
             return {}
-        query_vectors = embed_texts(
-            [str(item.get("content") or "") for item in new_facts], query=True,
-        )
+        indexed_new_vectors = dict(vector_store.fact_vectors(new_task_id)) if new_task_id else {}
+        missing = [item for item in new_facts if int(item["id"]) not in indexed_new_vectors]
+        if missing:
+            generated = embed_texts(
+                [str(item.get("content") or "") for item in missing], query=True,
+            )
+            indexed_new_vectors.update(
+                (int(item["id"]), vector) for item, vector in zip(missing, generated)
+            )
         result: dict[int, list[dict]] = {}
-        for fact, vector in zip(new_facts, query_vectors):
+        for fact in new_facts:
+            vector = indexed_new_vectors.get(int(fact["id"]))
+            if vector is None:
+                continue
             scored = sorted(
                 ((cosine(np.asarray(vector, dtype=np.float32), old_vector), fact_id) for fact_id, old_vector in old_vectors),
                 reverse=True,
@@ -334,11 +390,13 @@ def _classify_batches(candidates: dict[int, list[dict]], focus: str) -> dict[int
     for start in range(0, len(entries), 16):
         batch = entries[start:start + 16]
         try:
-            payload = invoke(
-                "material_comparison",
-                model_gateway.generate_json,
-                _CLASSIFY_PROMPT.replace("{focus}", focus[:1200]).replace("{payload}", _dump(batch)),
-                system="你只负责证据变化分类，不改写报告。",
+            instruction = _CLASSIFY_PROMPT.replace("{focus}", focus).replace("{payload}", "")
+            prompt, _audit = build_prompt_from_sections("comparison", [
+                ContextSection("instruction", [instruction], weight=5, required_items=1),
+                ContextSection("candidate_changes", [_dump(item) for item in batch], weight=4, required_items=1),
+            ], stage_input_budget_tokens("comparison"))
+            payload = _ComparisonAgent().generate_json(
+                prompt, max_tokens=settings.comparison_output_tokens,
             )
         except Exception:
             payload = {}
@@ -419,8 +477,107 @@ def _inference_impact_summary(new_items: list[dict], baseline_items: list[dict])
     return {"generated": len(new_items), "related_to_baseline": affected, "requires_review": bool(new_items)}
 
 
-def _compact_fact(fact: dict) -> dict:
-    return {key: fact.get(key) for key in ("id", "content", "dimension", "source_level", "stable_key")}
+def _compact_fact(fact: dict, *, include_evidence: bool = False) -> dict:
+    result = {key: fact.get(key) for key in ("id", "content", "dimension", "source_level", "stable_key")}
+    if include_evidence:
+        result["evidence"] = list(fact.get("evidence") or [])
+    return result
+
+
+def _attach_new_fact_evidence(items: list[dict[str, Any]]) -> None:
+    """Backfill provenance for comparisons created before evidence was embedded."""
+    fact_ids = sorted({
+        int(item["new_fact_id"]) for item in items if item.get("new_fact_id") is not None
+    })
+    if not fact_ids:
+        return
+    with session_scope() as s:
+        rows = s.execute(
+            select(ORMEvidence).where(ORMEvidence.c.fact_id.in_(fact_ids)).order_by(ORMEvidence.c.id)
+        ).mappings().all()
+    evidence_by_fact: dict[int, list[dict[str, Any]]] = {}
+    for row in rows:
+        evidence_by_fact.setdefault(int(row["fact_id"]), []).append({
+            "evidence_id": int(row["id"]),
+            "material_id": int(row["material_id"]),
+            "unit_id": int(row["unit_id"]),
+            "source_file": row["source_file"],
+            "page": row["page"],
+            "paragraph": row["paragraph"],
+            "quote": row["quote"],
+        })
+    for item in items:
+        fact = (item.get("evidence") or {}).get("new_fact")
+        if not isinstance(fact, dict):
+            continue
+        fact["evidence"] = evidence_by_fact.get(int(item["new_fact_id"]), [])
+
+
+def _comparison_document(baseline: dict, items: list[dict[str, Any]]) -> dict[str, Any]:
+    """Build a stable sentence-oriented view without changing the baseline report."""
+    changes_by_sentence: dict[int, list[dict[str, Any]]] = {}
+    mapped_item_ids: set[int] = set()
+    for item in items:
+        for location in (item.get("impact") or {}).get("report_locations", []):
+            sentence_id = location.get("sentence_id")
+            if sentence_id is None:
+                continue
+            try:
+                sentence_key = int(sentence_id)
+            except (TypeError, ValueError):
+                continue
+            mapped_item_ids.add(int(item["id"]))
+            changes_by_sentence.setdefault(sentence_key, []).append({
+                "item_id": int(item["id"]),
+                "change_type": item["change_type"],
+                "status": item["status"],
+                "confidence": item["confidence"],
+            })
+
+    sentences = []
+    for row in baseline.get("sentence_snapshot") or []:
+        sentence_id = row.get("id")
+        try:
+            sentence_key = int(sentence_id)
+        except (TypeError, ValueError):
+            sentence_key = -1
+        sentences.append({
+            "id": sentence_id,
+            "section": row.get("section") or "正文",
+            "paragraph": row.get("paragraph") or 0,
+            "position": row.get("position") or 0,
+            "text": row.get("rendered_text") or row.get("content") or "",
+            "source_refs": row.get("source_refs") or {},
+            "changes": changes_by_sentence.get(sentence_key, []),
+        })
+    return {
+        "sentences": sentences,
+        "unmapped_item_ids": [int(item["id"]) for item in items if int(item["id"]) not in mapped_item_ids],
+    }
+
+
+def _comparison_metrics(records: list[dict[str, Any]]) -> dict[str, int]:
+    reviewable = [record for record in records if record.get("change_type") != "irrelevant"]
+    mapped_records = []
+    sentence_ids: set[int] = set()
+    for record in reviewable:
+        locations = _load(record.get("impact_json"), {}).get("report_locations", [])
+        exact_ids = []
+        for location in locations:
+            try:
+                if location.get("sentence_id") is not None:
+                    exact_ids.append(int(location["sentence_id"]))
+            except (TypeError, ValueError):
+                continue
+        if exact_ids:
+            mapped_records.append(record)
+            sentence_ids.update(exact_ids)
+    return {
+        "reviewable_change_count": len(reviewable),
+        "mapped_change_count": len(mapped_records),
+        "affected_sentence_count": len(sentence_ids),
+        "independent_finding_count": len(reviewable) - len(mapped_records),
+    }
 
 
 def _text_overlap(left: str, right: str) -> float:
@@ -452,6 +609,27 @@ def _item_detail(row) -> dict[str, Any]:
         "rationale": row["rationale"], "evidence": _load(row["evidence_json"], {}),
         "impact": _load(row["impact_json"], {}), "user_note": row["user_note"],
     }
+
+
+def _compact_comparison_item(item: dict[str, Any]) -> dict[str, Any]:
+    """Keep the workspace index small; provenance is fetched on selection."""
+    result = {
+        key: item.get(key) for key in (
+            "id", "change_type", "status", "confidence", "new_fact_id",
+            "baseline_fact_id", "baseline_inference_id", "title",
+        )
+    }
+    compact_evidence: dict[str, Any] = {}
+    for key in ("new_fact", "baseline_fact"):
+        fact = (item.get("evidence") or {}).get(key)
+        if isinstance(fact, dict):
+            compact_evidence[key] = {
+                "id": fact.get("id"),
+                "content": fact.get("content"),
+                "evidence_count": len(fact.get("evidence") or []),
+            }
+    result["evidence"] = compact_evidence
+    return result
 
 
 def _load(value: Any, default: Any) -> Any:

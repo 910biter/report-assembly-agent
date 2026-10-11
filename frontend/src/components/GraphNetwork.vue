@@ -7,13 +7,26 @@ const emit = defineEmits<{ select: [edge: any] }>();
 const host = ref<HTMLElement | null>(null);
 let graph: cytoscape.Core | null = null;
 
+function token(name: string) {
+  return getComputedStyle(document.documentElement)
+    .getPropertyValue(name)
+    .trim();
+}
+
 function render() {
   graph?.destroy();
   if (!host.value) return;
+  const nodeKeys = new Set(
+    (props.nodes || []).map((node) => String(node.key || "")),
+  );
   const visible = new Set<string>();
   const edges = (props.edges || [])
     .filter((edge) => {
       if (!edge.subject_key || !edge.target_key) return false;
+      // The API contract should provide both endpoints. Keep visualization
+      // resilient while a task is being rebuilt or against older projections.
+      if (!nodeKeys.has(edge.subject_key) || !nodeKeys.has(edge.target_key))
+        return false;
       visible.add(edge.subject_key);
       visible.add(edge.target_key);
       return true;
@@ -46,49 +59,62 @@ function render() {
       name: "cose",
       animate: false,
       padding: 24,
-      nodeRepulsion: () => 5200,
-      idealEdgeLength: () => 115,
+      nodeRepulsion: () => 12000,
+      idealEdgeLength: () => 180,
+      componentSpacing: 100,
+      nodeOverlap: 30,
     },
     style: [
       {
         selector: "node",
         style: {
-          "background-color": "#eff5fb",
-          "border-color": "#245b9e",
+          "background-color": token("--graph-node-fill"),
+          "border-color": token("--graph-node-border"),
           "border-width": "1px",
           label: "data(label)",
-          color: "#1f2329",
-          "font-size": "11px",
+          color: token("--graph-node-text"),
+          "font-size": "12px",
+          "font-weight": 600,
           "text-wrap": "wrap",
-          "text-max-width": "88px",
+          "text-max-width": "150px",
           "text-valign": "center",
           "text-halign": "center",
-          width: "58px",
-          height: "58px",
+          "text-background-color": token("--graph-node-fill"),
+          "text-background-opacity": 1,
+          "text-background-padding": "5px",
+          shape: "roundrectangle",
+          width: "label",
+          height: "label",
+          padding: "12px",
         },
       },
       {
         selector: "edge",
         style: {
           width: "1.2px",
-          "line-color": "#9db5cf",
-          "target-arrow-color": "#9db5cf",
+          "line-color": token("--graph-edge"),
+          "target-arrow-color": token("--graph-edge"),
+          "arrow-scale": 0.8,
           "target-arrow-shape": "triangle",
           "curve-style": "bezier",
           label: "data(label)",
-          color: "#646a73",
-          "font-size": "10px",
-          "text-background-color": "#fff",
-          "text-background-opacity": 0.9,
-          "text-background-padding": "2px",
+          color: token("--graph-edge-text"),
+          "font-size": "11px",
+          "font-weight": 600,
+          "text-background-color": token("--graph-label-bg"),
+          "text-background-opacity": 1,
+          "text-background-padding": "4px",
+          "text-border-color": token("--graph-label-border"),
+          "text-border-width": 1,
+          "text-border-opacity": 1,
         },
       },
       {
         selector: ":selected",
         style: {
-          "background-color": "#245b9e",
-          "line-color": "#245b9e",
-          "target-arrow-color": "#245b9e",
+          "background-color": token("--primary"),
+          "line-color": token("--primary"),
+          "target-arrow-color": token("--primary"),
         },
       },
     ],
@@ -105,10 +131,11 @@ onBeforeUnmount(() => graph?.destroy());
 
 <style scoped>
 .graph-network {
-  height: 360px;
+  height: 500px;
   margin: 16px 0;
-  border: 1px solid var(--color-border);
-  border-radius: 6px;
-  background: var(--color-surface-soft);
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  background: var(--graph-canvas);
 }
 </style>

@@ -8,13 +8,22 @@ from __future__ import annotations
 from collections import Counter
 import math
 import re
-from statistics import median
 
 
 _SENTENCE_SPLIT = re.compile(r"(?<=[。！？!?；;])")
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_]{2,}|[\u4e00-\u9fff]{2,}")
 _PLACEHOLDER_RE = re.compile(
     r"(?:[×Xx]{2,}|_{3,}|\{\{.+?\}\}|<[^>]{1,40}>|【(?:填写|说明|占位)[^】]*】)"
+)
+_CONCRETE_RE = re.compile(
+    r"(?:\d+(?:\.\d+)?(?:%|亿元|万元|人|项|个|年|月|日|小时|分钟|公里|米)?|"
+    r"《[^》]{2,60}》|(?:委员会|办公室|公司|部门|机构|平台|系统))"
+)
+_ATTRIBUTION_RE = re.compile(r"(?:根据|依据|材料显示|数据显示|报告指出|文件明确|统计表明)")
+_JUDGMENT_RE = re.compile(r"(?:表明|说明|意味着|反映出|由此可见|预计|可能|风险|建议|需要|应当)")
+_BOILERPLATE_RE = re.compile(
+    r"(?:原文链接|点击阅读原文|扫码|关注我们|责任编辑|图片来源|文中图片|免责声明|转载|版权归)",
+    re.IGNORECASE,
 )
 
 
@@ -85,11 +94,20 @@ def annotate_exemplars(exemplars: list[dict], annotations: list[dict]) -> list[d
         purpose = str(annotation.get("purpose") or "").strip()
         sample_type = str(annotation.get("sample_type") or "").strip().lower()
         tags = annotation.get("tags") if isinstance(annotation.get("tags"), list) else []
+        realization_mode = str(annotation.get("realization_mode") or "").strip()
+        rhetorical_role = str(annotation.get("rhetorical_role") or sample_type).strip().lower()
+        discourse_moves = annotation.get("discourse_moves") if isinstance(annotation.get("discourse_moves"), list) else []
         if purpose:
             exemplar["purpose"] = purpose[:160]
-        if sample_type in {"opening", "fact", "analysis", "risk", "conclusion", "transition"}:
-            exemplar["sample_type"] = sample_type
+        if sample_type:
+            exemplar["sample_type"] = sample_type[:64]
         exemplar["tags"] = [str(tag)[:40] for tag in tags[:8] if str(tag).strip()]
+        if realization_mode:
+            exemplar["realization_mode"] = realization_mode[:80]
+        if rhetorical_role:
+            exemplar["rhetorical_role"] = rhetorical_role[:64]
+        if discourse_moves:
+            exemplar["discourse_moves"] = [str(move)[:32] for move in discourse_moves[:6] if str(move).strip()]
     return exemplars
 
 
@@ -109,6 +127,13 @@ def aggregate_style_metrics(exemplars: list[dict]) -> dict:
         sentence_lengths.extend(len(sentence) for sentence in sentences)
         punctuation.update(char for char in text if char in "，。；：！？、（）")
     total_chars = max(1, sum(paragraph_lengths))
+    concrete_count = sum(bool(_CONCRETE_RE.search(str(item["content"]))) for item in usable)
+    attribution_count = sum(bool(_ATTRIBUTION_RE.search(str(item["content"]))) for item in usable)
+    judgment_count = sum(bool(_JUDGMENT_RE.search(str(item["content"]))) for item in usable)
+    fact_judgment_count = sum(
+        bool(_CONCRETE_RE.search(str(item["content"]))) and bool(_JUDGMENT_RE.search(str(item["content"])))
+        for item in usable
+    )
     return {
         "sample_count": len(usable),
         "paragraph_chars": _distribution(paragraph_lengths),
@@ -119,6 +144,36 @@ def aggregate_style_metrics(exemplars: list[dict]) -> dict:
         },
         "structural_roles": dict(Counter(str(item.get("structural_role") or "body") for item in usable)),
         "source_report_count": len({str(item.get("source_report") or "") for item in usable}),
+        "material_realization": {
+            "concrete_detail_ratio": round(concrete_count / len(usable), 3),
+            "explicit_attribution_ratio": round(attribution_count / len(usable), 3),
+            "judgment_paragraph_ratio": round(judgment_count / len(usable), 3),
+            "fact_judgment_combination_ratio": round(fact_judgment_count / len(usable), 3),
+        },
+        # Observed editorial behavior guides prose organization only. It never
+        # turns incidental headings in historical articles into a new directory.
+        "editorial_contract": editorial_contract(usable),
+    }
+
+
+def editorial_contract(exemplars: list[dict]) -> dict:
+    """Extract domain-neutral discourse cues from approved prose samples."""
+    usable = [item for item in exemplars if str(item.get("content") or "").strip()]
+    if not usable:
+        return {}
+    roles = Counter(
+        str(item.get("rhetorical_role") or item.get("sample_type") or item.get("structural_role") or "body")
+        for item in usable
+    )
+    lengths = [len(str(item.get("content") or "")) for item in usable]
+    labels = sum(bool(re.match(r"^[^。！？!?]{2,28}[。]\s*", str(item.get("content") or ""))) for item in usable)
+    return {
+        "opening_mode": "event_or_data_lead" if roles.get("opening") else "natural_lead",
+        "body_progression": "facts_to_interpretation" if any(item.get("realization_mode") for item in usable) else "fact_context_analysis",
+        "paragraph_rhythm": "extended" if _percentile(lengths, 0.5) >= 360 else "compact",
+        "inline_label_policy": "optional" if labels / max(1, len(usable)) >= 0.15 else "avoid",
+        "closing_mode": "natural_assessment" if roles.get("conclusion") else "natural",
+        "source_voice": "explicit_when_materially_needed",
     }
 
 
@@ -139,7 +194,16 @@ def select_exemplars(bank: list[dict], context: dict, limit: int = 3) -> list[di
     report_type = str(context.get("report_type") or "")
     desired_role = str(context.get("sample_type") or context.get("rhetorical_role") or "").lower()
     keywords = [str(item) for item in context.get("keywords") or []]
-    query = " ".join([title, purpose, report_type, *keywords]).strip()
+    expression_reference = context.get("match_dimension") == "expression"
+    if expression_reference:
+        # A link is a source locator, not a prose example. Retain the bank;
+        # exclude link-only records from this runtime reference selection.
+        candidates = [item for item in candidates if _usable_exemplar(
+            re.sub(r"https?://\S+", "", str(item.get("content") or ""))
+        )]
+        if not candidates:
+            return []
+    query = " ".join([purpose, desired_role] if expression_reference else [title, purpose, report_type, *keywords]).strip()
     query_terms = _terms(query)
     target_words = int(context.get("target_words") or 0)
     scored: list[tuple[float, int, dict]] = []
@@ -147,14 +211,17 @@ def select_exemplars(bank: list[dict], context: dict, limit: int = 3) -> list[di
         metadata = " ".join(str(item.get(key) or "") for key in (
             "chapter_type", "purpose", "sample_type", "structural_role", "tags"
         ))
-        candidate_terms = _terms(metadata + " " + str(item.get("content") or "")[:400])
+        candidate_terms = _terms(metadata if expression_reference else metadata + " " + str(item.get("content") or "")[:400])
         overlap = _jaccard(query_terms, candidate_terms)
         score = overlap * 5.0
-        if desired_role and desired_role == str(item.get("sample_type") or "").lower():
-            score += 3.0
+        item_role = str(item.get("rhetorical_role") or item.get("sample_type") or "").lower()
+        if desired_role and desired_role == item_role:
+            # Same rhetorical role matters more than historical topic overlap.
+            score += 6.0
         if purpose and purpose in metadata:
             score += 2.0
-        if title and (title in metadata or str(item.get("section") or "") in title):
+        section = str(item.get("section") or "").strip()
+        if not expression_reference and title and (title in metadata or (section and section in title)):
             score += 1.5
         if target_words:
             paragraph_words = max(1, len(str(item.get("content") or "")))
@@ -162,11 +229,13 @@ def select_exemplars(bank: list[dict], context: dict, limit: int = 3) -> list[di
             score += max(0.0, 1.0 - abs(paragraph_words - expected_paragraph) / expected_paragraph)
         scored.append((score, -index, item))
     scored.sort(key=lambda row: (row[0], row[1]), reverse=True)
-    best_score = scored[0][0] if scored else 0.0
     selected: list[dict] = []
     seen_sections: set[tuple[str, str]] = set()
+    # A user-selected template may teach expression across unrelated subjects.
+    # This mode selects stylistic references, never task evidence.
+    minimum_score = 0.0 if expression_reference else (1.0 if (query_terms or desired_role) else float("inf"))
     for _score, _index, item in scored:
-        if selected and best_score >= 2.0 and _score < 1.0:
+        if _score < minimum_score:
             break
         section_key = (str(item.get("source_report") or ""), str(item.get("section") or ""))
         if section_key in seen_sections and len(selected) + 1 < limit:
@@ -175,12 +244,6 @@ def select_exemplars(bank: list[dict], context: dict, limit: int = 3) -> list[di
         seen_sections.add(section_key)
         if len(selected) >= max(1, limit):
             break
-    if len(selected) < min(limit, len(scored)) and (not selected or best_score < 2.0):
-        for _score, _index, item in scored:
-            if item not in selected:
-                selected.append(item)
-            if len(selected) >= limit:
-                break
     return selected
 
 
@@ -266,6 +329,8 @@ def _structural_role(section_index: int, section_count: int, paragraph_index: in
 
 def _usable_exemplar(text: str) -> bool:
     if len(text) < 24 or _PLACEHOLDER_RE.search(text):
+        return False
+    if _BOILERPLATE_RE.search(text) and len(text) < 220:
         return False
     visible = sum(1 for char in text if char.isalnum() or "\u4e00" <= char <= "\u9fff")
     return visible / max(1, len(text)) >= 0.45

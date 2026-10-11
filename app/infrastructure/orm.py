@@ -1,4 +1,4 @@
-"""ORM 数据模型(SQLAlchemy 2.0)——38 张表集中定义。
+"""ORM 数据模型(SQLAlchemy 2.0)集中定义。
 
 - 表结构唯一真源:_SCHEMA(CREATE TABLE)解析生成 Table 对象
 - PostgreSQL 方言由 SQLAlchemy 自动映射(SQLite 已完全退出)
@@ -11,12 +11,76 @@ from sqlalchemy.orm import DeclarativeBase
 # 表结构唯一真源(CREATE TABLE 语句;业务 schema 的历史基线,
 # SQLAlchemy create_all 在 PG 下按类型映射生成兼容 DDL)
 _SCHEMA = """
+CREATE TABLE IF NOT EXISTS model_connection (
+    id INTEGER PRIMARY KEY,
+    base_url TEXT NOT NULL,
+    model_name TEXT NOT NULL,
+    encrypted_api_key TEXT NOT NULL DEFAULT '',
+    options_json TEXT NOT NULL DEFAULT '{}',
+    updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+);
+
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'user',
+    disabled INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+);
+
+CREATE TABLE IF NOT EXISTS user_sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    token_hash TEXT NOT NULL UNIQUE,
+    expires_at REAL NOT NULL,
+    revoked INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+);
+
+CREATE TABLE IF NOT EXISTS user_preferences (
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    preference_key TEXT NOT NULL,
+    value_json TEXT NOT NULL,
+    PRIMARY KEY (user_id, preference_key)
+);
+
+CREATE TABLE IF NOT EXISTS account_audit_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    actor_user_id INTEGER NOT NULL REFERENCES users(id),
+    target_user_id INTEGER NOT NULL REFERENCES users(id),
+    action TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+);
+
+CREATE TABLE IF NOT EXISTS auth_login_attempts (
+    attempt_key TEXT PRIMARY KEY,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    window_started REAL NOT NULL,
+    blocked_until REAL NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS task_queue_entries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    owner_user_id INTEGER REFERENCES users(id),
+    priority INTEGER NOT NULL DEFAULT 50,
+    status TEXT NOT NULL DEFAULT 'queued',
+    queued_at REAL NOT NULL,
+    started_at REAL,
+    finished_at REAL,
+    heartbeat_at REAL,
+    error TEXT NOT NULL DEFAULT ''
+);
+
 CREATE TABLE IF NOT EXISTS materials (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_user_id INTEGER REFERENCES users(id),
     filename TEXT NOT NULL,
     file_type TEXT NOT NULL,
     path TEXT NOT NULL,
-    fingerprint TEXT NOT NULL UNIQUE DEFAULT '',
+    fingerprint TEXT NOT NULL DEFAULT '',
     file_hash TEXT NOT NULL DEFAULT '',
     parser_version TEXT NOT NULL DEFAULT '',
     parsed_at TEXT,
@@ -24,26 +88,9 @@ CREATE TABLE IF NOT EXISTS materials (
     duplicate_of INTEGER
 );
 
-CREATE TABLE IF NOT EXISTS file_nodes (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    parent_id INTEGER REFERENCES file_nodes(id),
-    node_type TEXT NOT NULL DEFAULT 'file',
-    name TEXT NOT NULL,
-    path TEXT NOT NULL UNIQUE,
-    relative_path TEXT NOT NULL DEFAULT '',
-    file_type TEXT NOT NULL DEFAULT '',
-    file_size INTEGER NOT NULL DEFAULT 0,
-    file_hash TEXT NOT NULL DEFAULT '',
-    material_id INTEGER REFERENCES materials(id),
-    status TEXT NOT NULL DEFAULT 'indexed',
-    created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
-    updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
-);
-
 CREATE TABLE IF NOT EXISTS file_parse_profiles (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    node_id INTEGER NOT NULL REFERENCES file_nodes(id),
-    material_id INTEGER REFERENCES materials(id),
+    material_id INTEGER NOT NULL REFERENCES materials(id),
     parser TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'pending',
     page_count INTEGER NOT NULL DEFAULT 0,
@@ -53,28 +100,7 @@ CREATE TABLE IF NOT EXISTS file_parse_profiles (
     markdown_chars INTEGER NOT NULL DEFAULT 0,
     structure_json TEXT NOT NULL DEFAULT '{}',
     error TEXT NOT NULL DEFAULT '',
-    parsed_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
-    UNIQUE(node_id, parser)
-);
-
-CREATE TABLE IF NOT EXISTS node_summaries (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    node_id INTEGER NOT NULL REFERENCES file_nodes(id),
-    summary_type TEXT NOT NULL DEFAULT 'folder',
-    status TEXT NOT NULL DEFAULT 'ready',
-    summary TEXT NOT NULL DEFAULT '',
-    detail_json TEXT NOT NULL DEFAULT '{}',
-    generated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
-    UNIQUE(node_id, summary_type)
-);
-
-CREATE TABLE IF NOT EXISTS export_packages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    node_id INTEGER NOT NULL REFERENCES file_nodes(id),
-    package_path TEXT NOT NULL,
-    file_count INTEGER NOT NULL DEFAULT 0,
-    total_size INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+    parsed_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
 );
 
 CREATE TABLE IF NOT EXISTS units (
@@ -111,6 +137,10 @@ CREATE TABLE IF NOT EXISTS facts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     content TEXT NOT NULL,
     dimension TEXT NOT NULL DEFAULT '',
+    fact_type TEXT NOT NULL DEFAULT 'unknown',
+    assertion_mode TEXT NOT NULL DEFAULT 'unknown',
+    assertion_mode_raw TEXT NOT NULL DEFAULT 'unknown',
+    semantic_profile_json TEXT NOT NULL DEFAULT '{}',
     need_id INTEGER NOT NULL DEFAULT 0,
     source_level TEXT NOT NULL DEFAULT 'MATERIAL_FACT',
     evidence_ids TEXT NOT NULL DEFAULT '[]',
@@ -133,6 +163,7 @@ CREATE TABLE IF NOT EXISTS evidence (
     page INTEGER,
     paragraph INTEGER,
     quote TEXT NOT NULL,
+    visibility_json TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
 );
 
@@ -141,6 +172,10 @@ CREATE TABLE IF NOT EXISTS conflicts (
     fact_key TEXT NOT NULL,
     entries TEXT NOT NULL DEFAULT '[]',
     status TEXT NOT NULL DEFAULT 'unresolved',
+    conflict_type TEXT NOT NULL DEFAULT 'needs_verification',
+    reason TEXT NOT NULL DEFAULT '',
+    confidence TEXT NOT NULL DEFAULT 'medium',
+    claim_ids TEXT NOT NULL DEFAULT '[]',
     task_id TEXT NOT NULL DEFAULT '',
     origin_call_id TEXT NOT NULL DEFAULT ''
 );
@@ -152,9 +187,12 @@ CREATE TABLE IF NOT EXISTS inferences (
     based_fact_ids TEXT NOT NULL DEFAULT '[]',
     reasoning_chain TEXT NOT NULL DEFAULT '',
     dimension TEXT NOT NULL DEFAULT '',
+    analysis_type TEXT NOT NULL DEFAULT '',
     confidence_level TEXT NOT NULL DEFAULT 'medium',
     confidence_reason TEXT NOT NULL DEFAULT '',
     uncertainty TEXT NOT NULL DEFAULT '',
+    semantic_profile_json TEXT NOT NULL DEFAULT '{}',
+    source_semantics_json TEXT NOT NULL DEFAULT '[]',
     origin_call_id TEXT NOT NULL DEFAULT '',
     stable_key TEXT NOT NULL DEFAULT '',
     lifecycle_status TEXT NOT NULL DEFAULT 'active',
@@ -170,6 +208,7 @@ CREATE TABLE IF NOT EXISTS style_library (
 
 CREATE TABLE IF NOT EXISTS style_variants (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_user_id INTEGER REFERENCES users(id),
     library_id INTEGER NOT NULL REFERENCES style_library(id),
     name TEXT NOT NULL,
     description TEXT NOT NULL DEFAULT '',
@@ -179,12 +218,14 @@ CREATE TABLE IF NOT EXISTS style_variants (
     format_spec_json TEXT NOT NULL DEFAULT '{}',
     writing_patterns_json TEXT NOT NULL DEFAULT '{}',
     style_samples_json TEXT NOT NULL DEFAULT '[]',
+    chapter_styles_json TEXT NOT NULL DEFAULT '[]',
+    reasoning_profile_json TEXT NOT NULL DEFAULT '{}',
+    institution_rules_json TEXT NOT NULL DEFAULT '{}',
     source_reports TEXT NOT NULL DEFAULT '[]',
     confidence REAL NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'draft',
     source_hash TEXT NOT NULL DEFAULT '',
     structure_policy_json TEXT NOT NULL DEFAULT '{}',
-    evidence_usage_profile_json TEXT NOT NULL DEFAULT '{}',
     exemplar_bank_json TEXT NOT NULL DEFAULT '[]',
     learning_cases_json TEXT NOT NULL DEFAULT '[]',
     profile_confidence_json TEXT NOT NULL DEFAULT '{}',
@@ -228,6 +269,7 @@ CREATE TABLE IF NOT EXISTS material_comparison_items (
 
 CREATE TABLE IF NOT EXISTS interaction_threads (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_user_id INTEGER REFERENCES users(id),
     thread_key TEXT NOT NULL UNIQUE,
     task_id TEXT NOT NULL DEFAULT '',
     report_id INTEGER REFERENCES reports(id),
@@ -292,10 +334,14 @@ CREATE TABLE IF NOT EXISTS claims (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     fact_id INTEGER REFERENCES facts(id),
     material_id INTEGER NOT NULL,
+    unit_id INTEGER,
     content TEXT NOT NULL,
     quote TEXT NOT NULL DEFAULT '',
     source TEXT NOT NULL DEFAULT '',
-    fact_type TEXT NOT NULL DEFAULT 'STATEMENT',
+    fact_type TEXT NOT NULL DEFAULT 'unknown',
+    assertion_mode TEXT NOT NULL DEFAULT 'unknown',
+    assertion_mode_raw TEXT NOT NULL DEFAULT 'unknown',
+    semantic_profile_json TEXT NOT NULL DEFAULT '{}',
     dimension TEXT NOT NULL DEFAULT '',
     need_id INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'pending',
@@ -444,7 +490,9 @@ CREATE TABLE IF NOT EXISTS report_plans (
 
 CREATE TABLE IF NOT EXISTS reports (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_user_id INTEGER REFERENCES users(id),
     plan_id INTEGER NOT NULL REFERENCES report_plans(id),
+    task_id TEXT NOT NULL DEFAULT '',
     title TEXT NOT NULL,
     style_profile_id INTEGER,
     status TEXT NOT NULL DEFAULT 'draft',
@@ -476,6 +524,16 @@ CREATE TABLE IF NOT EXISTS report_versions (
     change_summary TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
     UNIQUE(report_id, version_no)
+);
+
+CREATE TABLE IF NOT EXISTS report_ownership_audits (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    report_id INTEGER NOT NULL REFERENCES reports(id),
+    status TEXT NOT NULL DEFAULT 'orphaned',
+    reason TEXT NOT NULL DEFAULT '',
+    candidate_task_ids TEXT NOT NULL DEFAULT '[]',
+    checked_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+    UNIQUE(report_id)
 );
 
 CREATE TABLE IF NOT EXISTS report_version_deltas (
@@ -536,12 +594,29 @@ CREATE TABLE IF NOT EXISTS report_sentences (
 
 CREATE TABLE IF NOT EXISTS short_memory (
     task_id TEXT PRIMARY KEY,
+    owner_user_id INTEGER REFERENCES users(id),
     payload TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS graph_jobs (
+    task_id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL UNIQUE,
+    source_run_id TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'queued',
+    requested_at REAL NOT NULL DEFAULT 0,
+    started_at REAL NOT NULL DEFAULT 0,
+    finished_at REAL NOT NULL DEFAULT 0,
+    heartbeat_at REAL NOT NULL DEFAULT 0,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    progress_json TEXT NOT NULL DEFAULT '{}',
+    result_json TEXT NOT NULL DEFAULT '{}',
+    error TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS long_memory (
     key TEXT PRIMARY KEY,
-    value TEXT NOT NULL
+    value TEXT NOT NULL,
+    scope TEXT NOT NULL DEFAULT 'institution'
 );
 
 CREATE TABLE IF NOT EXISTS entities (
@@ -577,7 +652,7 @@ CREATE TABLE IF NOT EXISTS kg_entities (
     entity_key TEXT NOT NULL UNIQUE,
     workspace_id TEXT NOT NULL DEFAULT 'default',
     canonical_name TEXT NOT NULL,
-    entity_type TEXT NOT NULL DEFAULT 'other',
+    entity_type TEXT NOT NULL DEFAULT 'unknown',
     aliases_json TEXT NOT NULL DEFAULT '[]',
     status TEXT NOT NULL DEFAULT 'active',
     created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
@@ -619,6 +694,21 @@ CREATE TABLE IF NOT EXISTS kg_assertion_facts (
     assertion_id INTEGER NOT NULL REFERENCES kg_assertions(id),
     fact_id INTEGER NOT NULL REFERENCES facts(id),
     PRIMARY KEY (assertion_id, fact_id)
+);
+
+-- Canonical per-fact graph extraction coverage. A fact with no extracted
+-- relation is still recorded as processed so incremental runs do not retry it.
+CREATE TABLE IF NOT EXISTS kg_fact_coverage (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace_id TEXT NOT NULL DEFAULT 'default',
+    fact_id INTEGER NOT NULL REFERENCES facts(id),
+    status TEXT NOT NULL DEFAULT 'pending',
+    source_task_id TEXT NOT NULL DEFAULT '',
+    assertion_count INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+    updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+    UNIQUE(workspace_id, fact_id)
 );
 
 CREATE TABLE IF NOT EXISTS kg_task_membership (
@@ -692,12 +782,26 @@ CREATE INDEX IF NOT EXISTS idx_interaction_notifications_task ON interaction_not
 """
 # 迁移/演进补充列(历史 ALTER 汇总;新库 create_all 直接含,旧库靠 _migrate 补齐)
 _MIGRATED_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ('evidence', 'visibility_json', "TEXT NOT NULL DEFAULT '{}'"),
+    ('materials', 'owner_user_id', 'INTEGER REFERENCES users(id)'),
+    ('style_variants', 'owner_user_id', 'INTEGER REFERENCES users(id)'),
+    ('interaction_threads', 'owner_user_id', 'INTEGER REFERENCES users(id)'),
+    ('reports', 'owner_user_id', 'INTEGER REFERENCES users(id)'),
+    ('short_memory', 'owner_user_id', 'INTEGER REFERENCES users(id)'),
     ('claims', 'need_id', 'INTEGER NOT NULL DEFAULT 0'),
     ('facts', 'need_id', 'INTEGER NOT NULL DEFAULT 0'),
+    ('claims', 'assertion_mode', "TEXT NOT NULL DEFAULT 'unknown'"),
+    ('facts', 'assertion_mode', "TEXT NOT NULL DEFAULT 'unknown'"),
+    ('claims', 'assertion_mode_raw', "TEXT NOT NULL DEFAULT 'unknown'"),
+    ('facts', 'assertion_mode_raw', "TEXT NOT NULL DEFAULT 'unknown'"),
+    ('claims', 'semantic_profile_json', "TEXT NOT NULL DEFAULT '{}'"),
+    ('facts', 'semantic_profile_json', "TEXT NOT NULL DEFAULT '{}'"),
+    ('inferences', 'semantic_profile_json', "TEXT NOT NULL DEFAULT '{}'"),
+    ('inferences', 'source_semantics_json', "TEXT NOT NULL DEFAULT '[]'"),
     ('style_variants', 'source_hash', "TEXT NOT NULL DEFAULT ''"),
     ('report_sentences', 'paragraph', 'INTEGER NOT NULL DEFAULT 1'),
     ('report_sentences', 'edit_history', "TEXT NOT NULL DEFAULT '[]'"),
-    ('facts', 'fact_type', "TEXT NOT NULL DEFAULT 'STATEMENT'"),
+    ('facts', 'fact_type', "TEXT NOT NULL DEFAULT 'unknown'"),
     ('facts', 'task_id', "TEXT NOT NULL DEFAULT ''"),
     ('facts', 'origin_call_id', "TEXT NOT NULL DEFAULT ''"),
     ('facts', 'disposition', "TEXT NOT NULL DEFAULT 'UNASSIGNED'"),
@@ -711,6 +815,7 @@ _MIGRATED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ('inferences', 'superseded_by_inference_id', 'INTEGER'),
     ('claims', 'origin_call_id', "TEXT NOT NULL DEFAULT ''"),
     ('claims', 'task_id', "TEXT NOT NULL DEFAULT ''"),
+    ('claims', 'unit_id', 'INTEGER'),
     ('conflicts', 'origin_call_id', "TEXT NOT NULL DEFAULT ''"),
     ('conflicts', 'task_id', "TEXT NOT NULL DEFAULT ''"),
     ('inferences', 'origin_call_id', "TEXT NOT NULL DEFAULT ''"),
@@ -720,9 +825,6 @@ _MIGRATED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ('materials', 'file_hash', "TEXT NOT NULL DEFAULT ''"),
     ('materials', 'parser_version', "TEXT NOT NULL DEFAULT ''"),
     ('materials', 'parsed_at', 'TEXT'),
-    ('file_nodes', 'parent_id', 'INTEGER REFERENCES file_nodes(id)'),
-    ('file_nodes', 'material_id', 'INTEGER REFERENCES materials(id)'),
-    ('file_nodes', 'status', "TEXT NOT NULL DEFAULT 'indexed'"),
     ('file_parse_profiles', 'markdown_chars', 'INTEGER NOT NULL DEFAULT 0'),
     ('units', 'metadata_json', "TEXT NOT NULL DEFAULT '{}'"),
     ('material_insights', 'key_points', "TEXT NOT NULL DEFAULT '[]'"),
@@ -734,6 +836,9 @@ _MIGRATED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ('material_insights', 'missing_information', "TEXT NOT NULL DEFAULT '[]'"),
     ('material_insights', 'analysis_version', "TEXT NOT NULL DEFAULT ''"),
     ('conflicts', 'claim_ids', "TEXT NOT NULL DEFAULT '[]'"),
+    ('conflicts', 'conflict_type', "TEXT NOT NULL DEFAULT 'needs_verification'"),
+    ('conflicts', 'reason', "TEXT NOT NULL DEFAULT ''"),
+    ('conflicts', 'confidence', "TEXT NOT NULL DEFAULT 'medium'"),
     ('evidence', 'created_at', "TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)"),
     ('inferences', 'analysis_type', "TEXT NOT NULL DEFAULT ''"),
     ('inferences', 'confidence_level', "TEXT NOT NULL DEFAULT 'medium'"),
@@ -743,7 +848,6 @@ _MIGRATED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ('style_variants', 'reasoning_profile_json', "TEXT NOT NULL DEFAULT '{}'"),
     ('style_variants', 'institution_rules_json', "TEXT NOT NULL DEFAULT '{}'"),
     ('style_variants', 'structure_policy_json', "TEXT NOT NULL DEFAULT '{}'"),
-    ('style_variants', 'evidence_usage_profile_json', "TEXT NOT NULL DEFAULT '{}'"),
     ('style_variants', 'exemplar_bank_json', "TEXT NOT NULL DEFAULT '[]'"),
     ('style_variants', 'learning_cases_json', "TEXT NOT NULL DEFAULT '[]'"),
     ('style_variants', 'profile_confidence_json', "TEXT NOT NULL DEFAULT '{}'"),
@@ -769,6 +873,8 @@ _MIGRATED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ('report_plans', 'analysis_plan_json', "TEXT NOT NULL DEFAULT '{}'"),
     ('report_plans', 'final_plan_json', "TEXT NOT NULL DEFAULT '{}'"),
     ('report_plans', 'finalized_at', 'TEXT'),
+    ('reports', 'task_id', "TEXT NOT NULL DEFAULT ''"),
+    ('report_versions', 'task_id', "TEXT NOT NULL DEFAULT ''"),
     ('llm_call_logs', 'returned_chars', 'INTEGER NOT NULL DEFAULT 0'),
     ('llm_call_logs', 'valid_json_chars', 'INTEGER NOT NULL DEFAULT 0'),
     ('llm_call_logs', 'stored_chars', 'INTEGER NOT NULL DEFAULT 0'),
@@ -868,11 +974,21 @@ def _build_tables_from_schema() -> None:
             else:
                 Table(name, Base.metadata, *cols, *table_constraints)
             created.add(name)
-        # 合并迁移补充列(内置清单;新库 create_all 直接含,结构 100% 对齐)
+        # Keep additive migrations equivalent to the canonical schema. This
+        # path is only for a column absent from an older schema; fresh tables
+        # are defined above and therefore never take this branch.
         for _table, _col, _ddl in _MIGRATED_COLUMNS:
             if _table in Base.metadata.tables and _col not in Base.metadata.tables[_table].c:
                 _ctype = _type_map.get(_ddl.split()[0], String)
-                Base.metadata.tables[_table].append_column(Column(_col, _ctype))
+                _nullable = "NOT NULL" not in _ddl.upper()
+                Base.metadata.tables[_table].append_column(
+                    Column(
+                        _col,
+                        _ctype,
+                        nullable=_nullable,
+                        server_default=_server_default(_ddl),
+                    )
+                )
 
 
 _build_tables_from_schema()
@@ -902,6 +1018,7 @@ ORMRelation = Base.metadata.tables["fact_relations"]
 ORMTaskArtifact = Base.metadata.tables["task_artifacts"]
 ORMTaskRun = Base.metadata.tables["task_runs"]
 ORMShortMemory = Base.metadata.tables["short_memory"]
+ORMGraphJob = Base.metadata.tables["graph_jobs"]
 ORMLLMCall = Base.metadata.tables["llm_call_logs"]
 ORMInsight = Base.metadata.tables["material_insights"]
 ORMMaterialScan = Base.metadata.tables["material_scan"]
@@ -909,6 +1026,7 @@ ORMKGEntity = Base.metadata.tables["kg_entities"]
 ORMKGEntityAlias = Base.metadata.tables["kg_entity_aliases"]
 ORMKGAssertion = Base.metadata.tables["kg_assertions"]
 ORMKGAssertionFact = Base.metadata.tables["kg_assertion_facts"]
+ORMKGFactCoverage = Base.metadata.tables["kg_fact_coverage"]
 ORMKGTaskMembership = Base.metadata.tables["kg_task_membership"]
 ORMKGChangeSet = Base.metadata.tables["kg_changesets"]
 ORMGraphOutbox = Base.metadata.tables["graph_outbox"]

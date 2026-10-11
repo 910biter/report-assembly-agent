@@ -22,8 +22,11 @@ from app.db import session_scope
 from app.infrastructure.orm import ORMReport, ORMSentence
 from sqlalchemy import select
 from app.memory.style import get_locked_variant, get_variant
+from app.document_shape import normalize_composition_mode, normalize_document_shape, visible_sections, visible_subheadings, wants_numbering
+from app.infrastructure.orm import ORMPlan
 from app.rendering.headings import detect_numbering_strategy, format_heading
-from app.template_engine import check_docx_conformance
+from app.template_engine import check_docx_conformance, compile_template
+from app.template_engine.compiler import COMPILER_VERSION
 
 
 ROLE_STYLE_NAMES = {
@@ -48,17 +51,29 @@ def export_report(report_id: int) -> Path:
                 ORMSentence.c.report_id == report_id, ORMSentence.c.selected == 1
             ).order_by(ORMSentence.c.position)
         ).mappings().all()
-    variant = _select_export_variant(report["style_profile_id"])
+        plan = s.execute(select(ORMPlan.c.final_plan_json).where(ORMPlan.c.id == report["plan_id"])).mappings().first()
+    final_plan = json.loads((plan or {}).get("final_plan_json") or "{}")
+    document_shape = normalize_document_shape(final_plan.get("document_shape"))
+    composition_mode = normalize_composition_mode(
+        final_plan.get("composition_mode"), shape=document_shape,
+    )
+    variant = _select_export_variant(report["style_profile_id"], document_shape,
+                                     owner_user_id=report.get("owner_user_id"))
     format_spec = _dominant_format(variant)
     schema = format_spec.get("template_schema") if isinstance(format_spec.get("template_schema"), dict) else {}
 
     doc = _open_render_base(format_spec, schema)
-    _clear_body_keep_sections(doc)
+    title_anchor = _prepare_render_body(doc, schema)
     _apply_format(doc, format_spec, schema)
     _install_semantic_styles(doc, schema, format_spec)
-    heading_strategy = detect_numbering_strategy(schema)
+    heading_strategy = detect_numbering_strategy(
+        schema, fallback_defaults=wants_numbering(document_shape, 1),
+    )
 
-    _add_role_paragraph(doc, report["title"], "document_title")
+    if title_anchor is not None:
+        _replace_role_paragraph(doc, title_anchor, report["title"], "document_title")
+    else:
+        _add_role_paragraph(doc, report["title"], "document_title")
     current_section = None
     current_paragraph = None
     chapter_index = 0
@@ -73,11 +88,12 @@ def export_report(report_id: int) -> Path:
             current_section = sentence["section"]
             chapter_index += 1
             subsection_index = 0
-            _add_role_paragraph(
-                doc,
-                format_heading(1, [chapter_index], current_section, heading_strategy),
-                "heading_1",
-            )
+            if visible_sections(document_shape) and composition_mode != "article_beats":
+                _add_role_paragraph(
+                    doc,
+                    format_heading(1, [chapter_index], current_section, heading_strategy),
+                    "heading_1",
+                )
         elif paragraph_changed:
             _flush_paragraph(doc, paragraph_buffer)
             paragraph_buffer = []
@@ -86,16 +102,17 @@ def export_report(report_id: int) -> Path:
             _flush_paragraph(doc, paragraph_buffer)
             paragraph_buffer = []
             subsection_index += 1
-            _add_role_paragraph(
-                doc,
-                format_heading(
-                    2,
-                    [chapter_index, subsection_index],
-                    sentence["user_edit"] or sentence["content"],
-                    heading_strategy,
-                ),
-                "heading_2",
-            )
+            if visible_subheadings(document_shape):
+                _add_role_paragraph(
+                    doc,
+                    format_heading(
+                        2,
+                        [chapter_index, subsection_index],
+                        sentence["user_edit"] or sentence["content"],
+                        heading_strategy,
+                    ),
+                    "heading_2",
+                )
             continue
         paragraph_buffer.append(sentence["user_edit"] or sentence["content"])
     _flush_paragraph(doc, paragraph_buffer)
@@ -111,36 +128,37 @@ def _dominant_format(variant) -> dict:
     if variant is None or not isinstance(variant.format_spec, dict):
         return {}
     dominant = variant.format_spec.get("dominant")
-    return dominant if isinstance(dominant, dict) else {}
-
-
-def _select_export_variant(style_profile_id: int | None):
-    """Use the active locked template when older reports point at stale variants."""
-    variant = get_variant(style_profile_id) if style_profile_id else None
-    locked = get_locked_variant()
-    if (
-        _variant_has_template_roles(locked)
-        and variant is not None
-        and getattr(variant, "status", "") != "locked"
-        and getattr(variant, "library_id", None) == getattr(locked, "library_id", None)
-    ):
-        return locked
-    if _variant_has_template_roles(variant):
-        return variant
-    if _variant_has_template_roles(locked):
-        return locked
-    return variant or locked
-
-
-def _variant_has_template_roles(variant) -> bool:
-    if variant is None or not isinstance(variant.format_spec, dict):
-        return False
-    dominant = variant.format_spec.get("dominant")
     if not isinstance(dominant, dict):
-        return False
-    schema = dominant.get("template_schema")
+        return {}
+    result = dict(dominant)
+    schema = result.get("template_schema") if isinstance(result.get("template_schema"), dict) else {}
+    if schema.get("compiler_version") != COMPILER_VERSION:
+        source = _source_template_path(result, schema)
+        if source is not None:
+            refreshed = compile_template(source)
+            if refreshed:
+                result["template_schema"] = refreshed
+    return result
+
+
+def _select_export_variant(style_profile_id: int | None, document_shape: dict,
+                           owner_user_id: int | None = None):
+    """Keep editorial style separate from the OOXML base chosen for output."""
+    selected = get_variant(style_profile_id, owner_user_id=owner_user_id) if style_profile_id else None
+    if document_shape.get("render_base") != "default_structured":
+        return selected
+    fallback = get_locked_variant(owner_user_id=owner_user_id)
+    # A style-only reference must not be reused as a fake formal template.
+    # With no compatible structured base, the semantic renderer starts a clean
+    # document and applies its deterministic fallback styles.
+    return fallback if _has_heading_hierarchy(fallback) else None
+
+
+def _has_heading_hierarchy(variant) -> bool:
+    spec = _dominant_format(variant)
+    schema = spec.get("template_schema") if isinstance(spec, dict) else {}
     roles = schema.get("style", {}).get("roles", {}) if isinstance(schema, dict) else {}
-    return isinstance(roles, dict) and bool(roles.get("body") and roles.get("document_title"))
+    return bool(isinstance(roles, dict) and (roles.get("heading_1") or roles.get("heading_2")))
 
 
 def _open_render_base(format_spec: dict, schema: dict):
@@ -163,25 +181,56 @@ def _source_template_path(format_spec: dict, schema: dict) -> Path | None:
     return None
 
 
+def _prepare_render_body(doc, schema: dict):
+    """Keep the template cover/prefix and replace content at learned anchors."""
+    contract = schema.get("structure", {}).get("render_contract", {}) if isinstance(schema, dict) else {}
+    title_index = ((contract.get("title_anchor") or {}).get("paragraph_index"))
+    body_index = ((contract.get("body_anchor") or {}).get("paragraph_index"))
+    paragraphs = list(doc.paragraphs)
+    if not isinstance(body_index, int) or not (0 <= body_index < len(paragraphs)):
+        _clear_body_keep_sections(doc)
+        return None
+    title_para = paragraphs[title_index] if isinstance(title_index, int) and 0 <= title_index < body_index else None
+    body = doc._body._element
+    sect_pr = body.sectPr
+    anchor = paragraphs[body_index]._p
+    instruction_elements = {
+        paragraphs[index]._p
+        for item in schema.get("structure", {}).get("template_instructions", [])
+        for index in [item.get("paragraph_index")]
+        if item.get("render") is False and isinstance(index, int) and 0 <= index < body_index
+        and paragraphs[index] is not title_para
+    }
+    for element in instruction_elements:
+        if element.getparent() is body:
+            body.remove(element)
+    remove = False
+    for child in list(body):
+        if child is anchor:
+            remove = True
+        if remove and child is not sect_pr:
+            body.remove(child)
+    if sect_pr is not None and sect_pr.getparent() is None:
+        body.append(sect_pr)
+    return title_para
+
+
 def _clear_body_keep_sections(doc) -> None:
-    """Remove template sample content while retaining section properties."""
     body = doc._body._element
     sect_pr = body.sectPr
     for child in list(body):
-        if child is sect_pr:
-            continue
-        body.remove(child)
+        if child is not sect_pr:
+            body.remove(child)
     if sect_pr is not None and sect_pr.getparent() is None:
         body.append(sect_pr)
 
 
 def _install_semantic_styles(doc, schema: dict, format_spec: dict) -> None:
     roles = _schema_roles(schema)
-    fallback = _legacy_roles(format_spec)
     for role, style_name in ROLE_STYLE_NAMES.items():
-        role_style = _enrich_role_style(doc, roles.get(role) or fallback.get(role) or {})
+        role_style = _enrich_role_style(doc, roles.get(role) or {})
         _ensure_paragraph_style(doc, style_name, role_style)
-    if not roles and not fallback:
+    if not roles:
         _ensure_paragraph_style(doc, ROLE_STYLE_NAMES["body"], _enrich_role_style(doc, {}))
 
 
@@ -236,6 +285,24 @@ def _add_role_paragraph(doc, text: str, role: str):
     return paragraph
 
 
+def _replace_role_paragraph(doc, paragraph, text: str, role: str):
+    """Replace a learned placeholder in place while keeping its OOXML container."""
+    for run in list(paragraph.runs):
+        paragraph._p.remove(run._r)
+    style_name = ROLE_STYLE_NAMES.get(role, ROLE_STYLE_NAMES["body"])
+    try:
+        paragraph.style = doc.styles[style_name]
+    except Exception:
+        pass
+    role_style = getattr(doc, "_ira_role_styles", {}).get(role, {})
+    _apply_paragraph_format(paragraph.paragraph_format, _role_paragraph(role_style))
+    _set_paragraph_borders(paragraph, _role_paragraph(role_style).get("borders"))
+    run = paragraph.add_run(text)
+    _apply_font(run.font, _role_run(role_style))
+    _set_run_east_asia(run, _role_run(role_style).get("font_east_asia") or _role_run(role_style).get("font_name"))
+    return paragraph
+
+
 def _flush_paragraph(doc, buffer: list[str]) -> None:
     normal_buffer: list[str] = []
     for text in buffer:
@@ -255,56 +322,14 @@ def _is_list_item(text: str) -> bool:
 
 
 def _add_list_paragraph(doc, text: str):
-    paragraph = _add_role_paragraph(doc, re.sub(r"^(?:[•\-*])\s*", "", text.strip()), "body")
+    paragraph = _add_role_paragraph(doc, text.strip(), "body")
     paragraph.paragraph_format.first_line_indent = None
-    paragraph.paragraph_format.left_indent = Cm(0.74)
     return paragraph
 
 
 def _schema_roles(schema: dict) -> dict:
     roles = schema.get("style", {}).get("roles", {}) if isinstance(schema, dict) else {}
     return roles if isinstance(roles, dict) else {}
-
-
-def _legacy_roles(format_spec: dict) -> dict:
-    doc_format = format_spec.get("document_format") if isinstance(format_spec.get("document_format"), dict) else {}
-    typography = doc_format.get("typography") if isinstance(doc_format.get("typography"), dict) else {}
-    return {
-        "document_title": _legacy_role(typography.get("title") or format_spec.get("title")),
-        "heading_1": _legacy_role(typography.get("heading1") or format_spec.get("heading1")),
-        "heading_2": _legacy_role(typography.get("heading2") or format_spec.get("heading2")),
-        "heading_3": _legacy_role(typography.get("heading3") or format_spec.get("heading3")),
-        "body": _legacy_role(typography.get("body") or format_spec.get("body_paragraph") or format_spec.get("normal") or format_spec),
-    }
-
-
-def _legacy_role(spec) -> dict:
-    spec = spec if isinstance(spec, dict) else {}
-    line_spacing = {}
-    if spec.get("line_spacing_pt") is not None:
-        line_spacing = {"type": "exact_pt", "value": spec.get("line_spacing_pt")}
-    elif spec.get("line_spacing") is not None:
-        line_spacing = {"type": "multiple", "value": spec.get("line_spacing")}
-    return {
-        "paragraph": {
-            "alignment": spec.get("alignment"),
-            "first_line_indent_cm": spec.get("first_line_indent_cm"),
-            "left_indent_cm": spec.get("left_indent_cm"),
-            "right_indent_cm": spec.get("right_indent_cm"),
-            "space_before_pt": spec.get("space_before_pt"),
-            "space_after_pt": spec.get("space_after_pt"),
-            "line_spacing": line_spacing or "unknown",
-            "borders": spec.get("borders") or {"top": None, "bottom": None, "left": None, "right": None},
-        },
-        "run": {
-            "font_east_asia": spec.get("font_name"),
-            "font_ascii": spec.get("font_name"),
-            "font_size_pt": spec.get("font_size_pt"),
-            "font_color": spec.get("font_color_rgb") or "000000",
-            "bold": spec.get("bold"),
-            "italic": spec.get("italic"),
-        },
-    }
 
 
 def _role_paragraph(role_style: dict) -> dict:
@@ -465,7 +490,7 @@ def _replace_pbdr(ppr, borders) -> None:
 
 def _apply_format(doc, spec: dict, schema: dict) -> None:
     """Apply page/header/footer and expose role styles for paragraph creation."""
-    raw_roles = _schema_roles(schema) or _legacy_roles(spec)
+    raw_roles = _schema_roles(schema)
     doc._ira_role_styles = {
         role: _enrich_role_style(doc, style)
         for role, style in raw_roles.items()
@@ -473,10 +498,6 @@ def _apply_format(doc, spec: dict, schema: dict) -> None:
     try:
         page = schema.get("document", {}).get("page", {}) if schema else {}
         margins = schema.get("document", {}).get("margins", {}) if schema else {}
-        if not page:
-            page = spec.get("page_cm", {})
-        if not margins:
-            margins = spec.get("margins_cm", {})
         section = doc.sections[0]
         if page.get("width_cm") and page.get("height_cm"):
             section.page_width = Cm(float(page["width_cm"]))

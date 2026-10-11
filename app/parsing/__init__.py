@@ -22,9 +22,8 @@ def parse_file(path: str | Path) -> list[Unit]:
 def parse_file_with_profile(path: str | Path) -> tuple[list[Unit], dict]:
     """Return Units plus Docling parse metadata.
 
-    Failures are explicit: unsupported formats, Docling failures, and provider
-    configuration errors are surfaced to the workflow instead of hidden behind
-    legacy fallback.
+    Unsupported formats and Docling failures are surfaced explicitly to the
+    workflow; no alternate parser path exists.
     """
     source = Path(path)
     if not can_parse_with_docling(source):

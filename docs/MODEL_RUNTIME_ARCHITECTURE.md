@@ -1,35 +1,41 @@
 # 模型运行与上下文约定
 
-## 运行基线
+本文说明运行机制，不复制易漂移的阶段 token 参数表。默认值见 **app/config.py**，各类工作负载的输入预算和批次策略见 **app/runtime_profiles.py**；部署环境变量可覆盖代码默认值。
 
-系统使用一个常驻 vLLM 模型实例，不为交互助手复制第二份权重。当前生产基线为 24,576 token 物理上下文、2 个服务端序列槽位和 FP16 KV Cache。模型常驻后，Web 服务重启不触发权重重新加载。
+## 模型与调度
 
-## 两条逻辑通道
+- 文本生成经一个 OpenAI-compatible vLLM 服务；交互助手与工作流共用模型实例，不各自加载权重。
+- 应用侧为工作流和协作助手分别设置有界并发入口。协作助手通过 review_copilot 通道；其他生成调用进入工作流通道。二者仍竞争同一模型的 GPU 资源。
+- 应用侧调用队列、信号量与 vLLM 服务端 batching 是不同层次；增加应用并发不等于增加模型吞吐，需结合目标硬件压测。
+- Embedding 由应用内本地 Transformers CPU runtime 执行；文档解析统一走 Docling，默认设备配置见 app/config.py。
 
-| 通道 | 任务 | 本地并发 | 输入预算 | 输出预算 | 调度优先级 |
-|---|---|---:|---:|---:|---:|
-| 交互控制 | 需求讨论、产物解释、修改提案 | 1 | 6,144 token | 1,024 token | 10 |
-| 工作流执行 | Evidence、Analysis、Planner、Writer、QA | 由 `IRA_LLM_CONCURRENCY` 控制 | 按 Stage 动态装箱，物理上限 24,576 token | 按 Stage 预留 | 50/90 |
+## 上下文预算
 
-交互请求不进入长工作流的本地队列，而是通过独立并发闸门直接提交给 vLLM。vLLM 在同一模型实例内根据 priority 调度；这改善交互等待时间，但不会虚增模型的物理吞吐。
+各阶段共享一个物理上下文窗口，但不是共享同一种输入/输出比例。应用配置的默认物理窗口为 18,432 tokens；生产运行值以部署环境的 IRA_MODEL_CONTEXT_WINDOW_TOKENS 为准。
 
-## 上下文契约
-
-工作流上下文由各 Stage 按“输入证据 + 固定提示 + 输出预留 + 安全余量”计算，不允许用完整报告历史无限累积。Writer 只接收当前章节或小节所需的覆盖证据、章节关系、已使用事实标识和压缩后的 Report Memory。
-
-交互上下文只包含当前任务边界、当前产物、直接绑定的 Fact/Inference/Evidence、少量相关内容、最近完整对话和已确认变更。Fact、Inference 和 Evidence 必须通过当前任务的 ID 白名单读取。交互消息不得成为正式事实来源；只有用户接受 ChangeProposal 后，系统才按影响范围生成可审阅候选版本。
-
-## 缓存与并发边界
-
-vLLM prefix cache 复用稳定 system prompt 和重复前缀；业务 Artifact Cache 继续负责工作流断点复用。交互记录保存在 PostgreSQL，不缓存为跨任务知识。单卡只允许一个交互生成并发，工作流并发保持有界，避免大量短对话挤占正式报告生成。
-
-推荐环境变量：
-
-```dotenv
-IRA_MODEL_CONTEXT_WINDOW_TOKENS=24576
-IRA_LLM_CONCURRENCY=2
-IRA_INTERACTIVE_CONCURRENCY=1
-IRA_INTERACTIVE_INPUT_TOKENS=6144
-IRA_INTERACTIVE_HISTORY_TOKENS=1536
-IRA_INTERACTIVE_OUTPUT_TOKENS=1024
+```text
+阶段可用输入
+  = 物理上下文窗口
+  - 当前阶段输出预留
+  - prompt 开销预留
+  - 安全余量
 ```
+
+Runtime Profile 可进一步限制输入预算，并指定批次策略和延迟类别。Evidence、Analysis、Narrative、Writer、Graph、交互助手等工作负载使用不同 profile；不得从某一阶段的预算推断另一阶段的输入/输出比例。Writer 的规模和生成单元由报告计划及 subsection 预算控制，不等价于单次模型输出上限。
+
+app/config.py 中的值是默认配置，不代表某次远端服务的有效配置。复测或迁移硬件时同时记录：服务端 max-model-len、应用实际窗口、各 Stage 的输入/输出预留、模型/量化版本、并发、TTFT、Prefill/Decode、端到端耗时与资源占用。
+
+## 截断、拆批与观测
+
+- 单次输出上限与物理上下文是两个不同边界；提高其一不会自动解决另一边的预算不足。
+- 拆批由具体阶段实现的 batch policy 决定。不能假定任意 JSON 截断都会自动重试或安全拆分；结构化阶段应核对该阶段的失败与恢复路径。
+- 报告规模同时记录目标、有效最低字数、章节预算和实际篇幅；规模不足应作为可见偏差处理，不能靠无依据补写消除。
+- LLM 调用记录见 app/token_monitor.py；任务 workload/token-efficiency 接口见 app/api/routes.py。性能字段是否可得取决于推理服务采集能力，不能仅凭应用调用统计推断 Prefill/Decode。
+
+## 调参原则
+
+1. 先读取部署环境的有效配置和 vLLM 启动参数，不凭文档默认值推断远端正在使用的数值。
+2. 固定模型版本、精度、窗口、并发和 baseline 输入，再逐项改变参数。
+3. 长输入阶段重点看输入 tokens、Prefill/TTFT、吞吐与内存；长输出阶段重点看输出 tokens、Decode/TPOT、超时和输出截断。
+4. 每次调大输出预留，都同步核对可用输入预算；每次增加并发，都核对 KV Cache 峰值和排队时延。
+5. 性能收益必须与 JSON 完整率、证据溯源、报告篇幅和人工质量评估一起比较。

@@ -1,8 +1,4 @@
-"""模型网关:业务代码访问生成/向量模型的唯一入口。
-
-当前实现为 Ollama 兼容协议客户端,指向远端模型服务
-(settings.ollama_url)。远端接口文件如有变化,只改本文件。
-"""
+"""OpenAI-compatible generation and local embedding gateway."""
 import json
 import re
 import threading
@@ -13,6 +9,7 @@ from typing import Protocol
 import httpx
 
 from app.config import settings
+from app.model_connection import load_connection
 
 _GENERATION_STATS_LOCK = threading.Lock()
 _GENERATION_STATS = {
@@ -33,103 +30,42 @@ _LAST_GENERATION_STATS = contextvars.ContextVar("last_generation_stats", default
 
 class ModelGateway(Protocol):
     def generate(self, prompt: str, system: str | None = None,
-                 max_tokens: int | None = None) -> str: ...
+                 max_tokens: int | None = None,
+                 temperature: float | None = None) -> str: ...
     def generate_json(self, prompt: str, system: str | None = None,
                       think: bool | None = None,
-                      max_tokens: int | None = None) -> dict: ...
+                      max_tokens: int | None = None,
+                      temperature: float | None = None) -> dict: ...
     def embed(self, texts: list[str], query: bool = False, **kwargs) -> list[list[float]]: ...
     def health(self) -> dict: ...
-    def unload_model(self, model: str = "") -> bool: ...
-    def warmup_model(self, model: str = "") -> bool: ...
 
 
-class OllamaGateway:
-    def __init__(self, base_url: str = settings.ollama_url) -> None:
-        self.base_url = base_url.rstrip("/")
+class OpenAICompatibleGateway:
+    """vLLM generation client with an independent CPU embedding runtime."""
+
+    def __init__(self, base_url: str = "") -> None:
+        self._base_url = base_url.rstrip("/")
+
+    @property
+    def generation_url(self) -> str:
+        from app.model_connection import load_connection
+        return self._base_url or load_connection().base_url
 
     def generate(self, prompt: str, system: str | None = None,
-                 max_tokens: int | None = None) -> str:
-        return self._chat(prompt, system=system, json_mode=False, max_tokens=max_tokens)
-
-    def unload_model(self, model: str = "") -> bool:
-        """卸载 Ollama 模型(keep_alive=0)。由 LLM Scheduler 按资源策略调用。"""
-        try:
-            resp = httpx.post(
-                f"{self.base_url}/api/generate",
-                json={"model": model or settings.generation_model, "keep_alive": 0},
-                timeout=30,
-            )
-            return resp.status_code == 200
-        except Exception:
-            return False
-
-    def warmup_model(self, model: str = "") -> bool:
-        """预热模型(重新加载到显存)。由 LLM Scheduler 按资源策略调用。"""
-        try:
-            resp = httpx.post(
-                f"{self.base_url}/api/generate",
-                json={"model": model or settings.generation_model, "prompt": "hi", "stream": False,
-                      "keep_alive": "5m", "options": {"num_predict": 1}},
-                timeout=settings.gateway_timeout_seconds,
-            )
-            return resp.status_code == 200
-        except Exception:
-            return False
-
-    def _chat(self, prompt: str, system: str | None = None, json_mode: bool = False,
-              think: bool | None = None, max_tokens: int | None = None) -> str:
-        messages = []
-        if system:
-            messages.append({"role": "system", "content": system})
-        messages.append({"role": "user", "content": prompt})
-        payload = {
-            "model": settings.generation_model,
-            "messages": messages,
-            "stream": False,
-            "options": {
-                "num_gpu": settings.gpu_layers,
-                "num_ctx": settings.model_context_window_tokens,
-                "num_predict": int(max_tokens or settings.generation_reserve_tokens),
-            },
-        }
-        if json_mode:
-            payload["format"] = "json"
-        if think is not None:
-            payload["think"] = bool(think)
-        from app import task_control
-        task_id = task_control.active_task_id()
-        client = httpx.Client(timeout=settings.gateway_timeout_seconds)
-        if task_id:
-            task_control.register_client(task_id, client)
-        try:
-            response = client.post(f"{self.base_url}/api/chat", json=payload)
-        except Exception:
-            if task_id and task_control.is_paused(task_id):
-                raise RuntimeError("TASK_PAUSED")
-            raise
-        finally:
-            if task_id:
-                task_control.unregister_client(task_id, client)
-            try:
-                client.close()
-            except Exception:
-                pass
-        response.raise_for_status()
-        payload = response.json()
-        _record_generation_stats(payload)
-        content = payload["message"]["content"].strip()
-        _record_generation_meta(returned_chars=len(content), valid_json_chars=0)
-        return content
+                 max_tokens: int | None = None,
+                 temperature: float | None = None) -> str:
+        return self._chat(
+            prompt, system=system, json_mode=False,
+            max_tokens=max_tokens, temperature=temperature,
+        )
 
     def generate_json(self, prompt: str, system: str | None = None,
                       think: bool | None = None,
-                      max_tokens: int | None = None) -> dict:
-        # Do not enable Ollama's global JSON format by default. In real runs it
-        # reduced output tokens but made structured stages much slower; this
-        # project already gets high JSON compliance from prompts, and we repair
-        # common truncation glitches below.
+                      max_tokens: int | None = None,
+                      temperature: float | None = None) -> dict:
         content = self._chat(
-            prompt, system, json_mode=False, think=think, max_tokens=max_tokens,
+            prompt, system, json_mode=load_connection().send_json_response_format, think=think, max_tokens=max_tokens,
+            temperature=temperature,
         )
         fenced = re.search(r"```(?:json)?\s*(.*?)\s*```", content, re.DOTALL)
         if fenced:
@@ -141,9 +77,8 @@ class OllamaGateway:
         try:
             value = json.loads(json_text)
         except json.JSONDecodeError:
-            repaired = _repair_json_text(json_text)
-            value = json.loads(repaired)
-            json_text = repaired
+            json_text = _repair_json_text(json_text)
+            value = json.loads(json_text)
         if not isinstance(value, dict):
             raise TypeError("MODEL_JSON_OBJECT_REQUIRED")
         meta = last_generation_meta()
@@ -153,71 +88,10 @@ class OllamaGateway:
         )
         return value
 
-    def embed(self, texts: list[str], timeout: int | None = None, num_gpu: int | None = None) -> list[list[float]]:
-        if not texts:
-            return []
-        response = httpx.post(
-            f"{self.base_url}/api/embed",
-            json={
-                "model": settings.embedding_model,
-                "input": texts,
-                "options": {"num_gpu": settings.gpu_layers if num_gpu is None else num_gpu},  # 统一放置策略
-            },
-            timeout=timeout or 90,  # 由自适应分批按 workload 动态传入
-        )
-        response.raise_for_status()
-        embeddings = response.json()["embeddings"]
-        if len(embeddings) != len(texts):
-            raise RuntimeError("EMBEDDING_COUNT_MISMATCH")
-        return embeddings
-
-    def health(self) -> dict:
-        version_response = httpx.get(f"{self.base_url}/api/version", timeout=2)
-        tags_response = httpx.get(f"{self.base_url}/api/tags", timeout=5)
-        version_response.raise_for_status()
-        tags_response.raise_for_status()
-        available = {item["name"] for item in tags_response.json().get("models", [])}
-        required = [settings.generation_model, settings.embedding_model]
-        return {
-            "version": version_response.json().get("version"),
-            "models": {name: name in available for name in required},
-        }
-
-
-class OpenAICompatibleGateway(OllamaGateway):
-    """vLLM generation client with an independent CPU embedding runtime."""
-
-    def __init__(self, base_url: str = "") -> None:
-        super().__init__(settings.ollama_url)
-        self.generation_url = (
-            base_url or settings.generation_url or "http://127.0.0.1:8100/v1"
-        ).rstrip("/")
-
-    def unload_model(self, model: str = "") -> bool:
-        # vLLM model lifecycle belongs to the resident serving process.
-        return True
-
-    def warmup_model(self, model: str = "") -> bool:
-        try:
-            response = httpx.post(
-                f"{self.generation_url}/chat/completions",
-                headers=self._headers(),
-                json={
-                    "model": model or settings.generation_model,
-                    "messages": [{"role": "user", "content": "hi"}],
-                    "stream": False,
-                    "max_tokens": 1,
-                },
-                timeout=settings.gateway_timeout_seconds,
-            )
-            return response.status_code == 200
-        except Exception:
-            return False
-
     def _headers(self) -> dict[str, str]:
+        from app.model_connection import load_connection
         headers = {"Content-Type": "application/json"}
-        if settings.generation_api_key:
-            headers["Authorization"] = f"Bearer {settings.generation_api_key}"
+        headers.update(load_connection().headers())
         return headers
 
     def embed(self, texts: list[str], query: bool = False, **kwargs) -> list[list[float]]:
@@ -226,27 +100,32 @@ class OpenAICompatibleGateway(OllamaGateway):
         return local_embedding_runtime.embed(texts, query=query)
 
     def _chat(self, prompt: str, system: str | None = None, json_mode: bool = False,
-              think: bool | None = None, max_tokens: int | None = None) -> str:
+              think: bool | None = None, max_tokens: int | None = None,
+              temperature: float | None = None) -> str:
+        connection = load_connection()
+        base_url = self._base_url or connection.base_url
+        headers = {"Content-Type": "application/json", **connection.headers()}
         messages = []
         if system:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
         payload = {
-            "model": settings.generation_model,
+            "model": connection.model_name,
             "messages": messages,
             "stream": False,
-            "max_tokens": int(max_tokens or settings.generation_reserve_tokens),
+            connection.output_parameter: int(max_tokens or settings.generation_reserve_tokens),
         }
-        # Lower values are more urgent in vLLM's priority scheduler.
-        from app.llm_queue import current_llm_priority
-        payload["priority"] = current_llm_priority()
-        if think is not None:
-            payload["chat_template_kwargs"] = {
-                "enable_thinking": bool(think),
-                "preserve_thinking": False,
-            }
+        if payload[connection.output_parameter] > connection.output_tokens:
+            raise ValueError("MODEL_INPUT_OVER_BUDGET")
+        if temperature is not None and connection.send_temperature:
+            payload["temperature"] = float(temperature)
+        payload.update(connection.extra_body(think))
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
+        from app.vllm_capacity import verify_request
+        from dataclasses import replace
+        request_capacity = verify_request(replace(connection, base_url=base_url), payload,
+                                          safety_tokens=int(settings.safety_margin_tokens))
         from app import task_control
         task_id = task_control.active_task_id()
         client = httpx.Client(timeout=settings.gateway_timeout_seconds)
@@ -255,21 +134,10 @@ class OpenAICompatibleGateway(OllamaGateway):
         started = time.perf_counter()
         try:
             response = client.post(
-                f"{self.generation_url}/chat/completions",
-                headers=self._headers(),
+                f"{base_url}/chat/completions",
+                headers=headers,
                 json=payload,
             )
-            adjusted_max_tokens = _context_safe_max_tokens(
-                response,
-                requested_max_tokens=int(payload["max_tokens"]),
-            )
-            if adjusted_max_tokens is not None:
-                payload["max_tokens"] = adjusted_max_tokens
-                response = client.post(
-                    f"{self.generation_url}/chat/completions",
-                    headers=self._headers(),
-                    json=payload,
-                )
         except Exception:
             if task_id and task_control.is_paused(task_id):
                 raise RuntimeError("TASK_PAUSED")
@@ -278,25 +146,32 @@ class OpenAICompatibleGateway(OllamaGateway):
             if task_id:
                 task_control.unregister_client(task_id, client)
             client.close()
+        if task_id:
+            task_control.raise_if_paused(task_id)
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
-            detail = response.text.strip().replace("\n", " ")[:500]
+            if _context_exceeded(response):
+                raise RuntimeError("MODEL_CONTEXT_EXCEEDED") from exc
             raise RuntimeError(
-                f"MODEL_HTTP_{response.status_code}:{detail or 'empty response'}"
+                f"MODEL_HTTP_{response.status_code}"
             ) from exc
         result = response.json()
+        from app.vllm_capacity import observe_usage
+        observe_usage(replace(connection, base_url=base_url), payload, result.get("usage") or {})
         _record_openai_generation_stats(result, time.perf_counter() - started)
         if _completion_was_truncated(result):
             raise RuntimeError("MODEL_OUTPUT_TRUNCATED")
         content = str(result["choices"][0]["message"].get("content") or "").strip()
         _record_generation_meta(returned_chars=len(content), valid_json_chars=0)
+        _LAST_GENERATION_META_CONTEXT.set({**last_generation_meta(), "request_capacity": request_capacity})
         return content
 
     def health(self) -> dict:
+        connection = load_connection()
         response = httpx.get(
-            f"{self.generation_url}/models",
-            headers=self._headers(),
+            f"{connection.base_url}/models",
+            headers=connection.headers(),
             timeout=5,
         )
         response.raise_for_status()
@@ -306,37 +181,21 @@ class OpenAICompatibleGateway(OllamaGateway):
         embedding_health = local_embedding_runtime.health()
         return {
             "version": "openai-compatible",
-            "backend": "vllm",
+            "backend": connection.service_kind,
             "models": {
-                settings.generation_model: settings.generation_model in available,
+                connection.model_name: connection.model_name in available,
                 settings.embedding_model: bool(embedding_health["available"]),
             },
             "embedding": embedding_health,
         }
 
 
-def _context_safe_max_tokens(response, requested_max_tokens: int) -> int | None:
-    """Recover once when chat-template tokens barely cross the model window.
-
-    Prompt builders reserve context conservatively, but the serving tokenizer
-    is the final authority. vLLM reports the exact prompt length in its 400
-    response; reducing only the unused generation ceiling avoids three
-    identical retries without dropping evidence from the request.
-    """
+def _context_exceeded(response) -> bool:
+    """Classify capacity errors; the calling stage must repack, not shrink output."""
     if int(getattr(response, "status_code", 0) or 0) != 400:
-        return None
+        return False
     detail = str(getattr(response, "text", "") or "")
-    match = re.search(r"prompt contains at least\s+(\d+)\s+input tokens", detail, re.I)
-    if not match:
-        return None
-    # The reported prompt count is only a lower bound: vLLM stops tokenizing as
-    # soon as it can prove the request is too large. It therefore cannot be used
-    # to calculate an exact remainder. A bounded decrement is deterministic and
-    # leaves prompt selection to the stage-specific context builder.
-    available = int(requested_max_tokens) - 512
-    if available < 512:
-        return None
-    return available
+    return bool(re.search(r"prompt contains at least\s+\d+\s+input tokens|maximum context length|maximum model length|context[_ ]length[_ ]exceeded", detail, re.I))
 
 
 def _completion_was_truncated(payload: dict) -> bool:
@@ -344,13 +203,7 @@ def _completion_was_truncated(payload: dict) -> bool:
     return bool(choices and str(choices[0].get("finish_reason") or "").lower() == "length")
 
 
-def _build_gateway() -> ModelGateway:
-    if str(settings.generation_backend or "ollama").strip().lower() == "vllm":
-        return OpenAICompatibleGateway()
-    return OllamaGateway()
-
-
-model_gateway: ModelGateway = _build_gateway()
+model_gateway: ModelGateway = OpenAICompatibleGateway()
 
 
 def _repair_json_text(text: str) -> str:
@@ -439,39 +292,9 @@ def _record_generation_meta(returned_chars: int, valid_json_chars: int = 0) -> N
         "returned_chars": int(returned_chars or 0),
         "valid_json_chars": int(valid_json_chars or 0),
     }
-    _LAST_GENERATION_META_CONTEXT.set(meta)
+    _LAST_GENERATION_META_CONTEXT.set({**last_generation_meta(), **meta})
     with _GENERATION_STATS_LOCK:
         _LAST_GENERATION_META.update(meta)
-
-
-def _record_generation_stats(payload: dict) -> None:
-    """Collect Ollama token counters when available."""
-    prompt_tokens = int(payload.get("prompt_eval_count") or 0)
-    output_tokens = int(payload.get("eval_count") or 0)
-    prompt_seconds = float(payload.get("prompt_eval_duration") or 0) / 1_000_000_000
-    output_seconds = float(payload.get("eval_duration") or 0) / 1_000_000_000
-    total_seconds = float(payload.get("total_duration") or 0) / 1_000_000_000
-    _LAST_GENERATION_STATS.set({
-        "chat_calls": 1,
-        "prompt_tokens": prompt_tokens,
-        "output_tokens": output_tokens,
-        "prompt_eval_seconds": prompt_seconds,
-        "output_eval_seconds": output_seconds,
-        "total_seconds": total_seconds,
-    })
-    with _GENERATION_STATS_LOCK:
-        _GENERATION_STATS["chat_calls"] += 1
-        _GENERATION_STATS["prompt_tokens"] += prompt_tokens
-        _GENERATION_STATS["output_tokens"] += output_tokens
-        _GENERATION_STATS["prompt_eval_seconds"] = round(
-            float(_GENERATION_STATS["prompt_eval_seconds"]) + prompt_seconds, 3
-        )
-        _GENERATION_STATS["output_eval_seconds"] = round(
-            float(_GENERATION_STATS["output_eval_seconds"]) + output_seconds, 3
-        )
-        _GENERATION_STATS["total_seconds"] = round(
-            float(_GENERATION_STATS["total_seconds"]) + total_seconds, 3
-        )
 
 
 def _record_openai_generation_stats(payload: dict, elapsed_seconds: float) -> None:

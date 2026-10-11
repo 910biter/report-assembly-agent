@@ -1,22 +1,231 @@
 import threading
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from app import llm_scheduler
-from app.interaction import _build_interaction_prompt, _estimate_tokens, _merge_draft_change, _thread_summary
+from app.interaction import (
+    _bounded_history,
+    _friendly_interaction_error,
+    _friendly_revision_error,
+    _merge_draft_change,
+    _apply_supported_proposal,
+    _apply_pre_report_checkpoint_proposal,
+    decide_proposal,
+    _prepare_revision_run,
+    _synchronize_plan_title_payloads,
+    _latest_failed_proposal,
+    _task_decision_memory,
+    _thread_summary,
+    _interrupted_turn_retry_content,
+    close_thread,
+)
+
+from app.interaction_policy import propagation_policy
+from app.control_agent import AgentToolName
+from app.workflow.controller import _apply_section_title_changes_to_plan
 
 
 class InteractionRuntimeTests(unittest.TestCase):
-    def test_draft_change_normalizes_requirements_and_content(self):
+    def test_requirement_checkpoint_proposal_is_consumed_by_initial_run(self):
+        row = {
+            "id": 8, "task_id": "task-a", "report_id": None,
+            "artifact_type": "task_brief",
+            "after_json": '{"theme":"新主题","requirements":"完整要求"}',
+            "proposal_key": "proposal-a", "thread_id": 1, "artifact_version": "1",
+            "object_id": "", "operation": "update", "before_json": "{}",
+            "impact_json": "{}", "rationale": "更新需求", "risk_level": "low",
+            "created_at": "now", "decided_at": "now",
+        }
+        query_result = unittest.mock.MagicMock()
+        query_result.mappings.return_value.first.side_effect = [
+            {**row, "status": "proposed", "execution_status": "not_required"},
+            {**row, "status": "applied", "execution_status": "completed"},
+        ]
+        session = unittest.mock.MagicMock()
+        session.execute.return_value = query_result
+        context = unittest.mock.MagicMock()
+        context.__enter__.return_value = session
+
+        with (
+            patch("app.interaction.session_scope", return_value=context),
+            patch("app.interaction._apply_pre_report_checkpoint_proposal", return_value=True) as apply,
+            patch("app.interaction._apply_supported_proposal") as apply_report,
+            patch("app.interaction._schedule_semantic_proposal") as schedule,
+        ):
+            result = decide_proposal(8, "accepted")
+
+        apply.assert_called_once()
+        apply_report.assert_not_called()
+        schedule.assert_not_called()
+        self.assertEqual("applied", result["status"])
+        self.assertEqual("completed", result["execution_status"])
+
+    def test_pre_report_task_brief_fills_pending_requirements_checkpoint(self):
+        row = {
+            "task_id": "task-a", "report_id": None,
+            "artifact_type": "task_brief",
+            "after_json": '{"theme":"新主题","requirements":"完整要求"}',
+        }
+        with (
+            patch("app.interaction.short_term.load_task", return_value={
+                "requirement_review_pending": True, "report_id": None,
+            }),
+            patch("app.interaction.short_term.update_task") as update_task,
+        ):
+            self.assertTrue(_apply_pre_report_checkpoint_proposal(row))
+
+        update_task.assert_called_once_with(
+            "task-a", theme="新主题", user_requirements="完整要求",
+        )
+
+    def test_pre_report_directory_proposal_updates_authoritative_plan(self):
+        row = {
+            "task_id": "task-a", "report_id": None,
+            "artifact_type": "final_plan",
+            "after_json": '{"instruction":"合并章节","required_structure":["甲","乙"]}',
+        }
+        revised_plan = SimpleNamespace(title="新目录")
+        with (
+            patch("app.interaction.short_term.load_task", return_value={
+                "directory_review_pending": True, "report_id": None, "plan_id": 7,
+            }),
+            patch("app.workflow.controller.planner.revise_final_plan_structure",
+                  return_value=revised_plan) as revise,
+            patch("app.interaction.short_term.update_task") as update_task,
+        ):
+            self.assertTrue(_apply_pre_report_checkpoint_proposal(row))
+
+        revise.assert_called_once_with(7, ["甲", "乙"], instruction="合并章节", refine=False)
+        update_task.assert_called_once_with(
+            "task-a", plan_id=7, plan_title="新目录", final_plan_frozen=True,
+        )
+
+    def test_section_title_proposals_are_deferred_to_revision_run(self):
+        row = {
+            "artifact_type": "section_title",
+            "task_id": "task-a",
+            "report_id": 7,
+            "object_id": "旧章",
+            "after_json": '{"title":"新章"}',
+            "before_json": '{"title":"旧章"}',
+            "impact_json": '{"scope":{"tool_call":{"tool_name":"update_section_title","arguments":{"old_title":"旧章","new_title":"新章"}}}}',
+        }
+        with patch("app.interaction._rename_sections_in_task") as rename:
+            self.assertFalse(_apply_supported_proposal(row))
+        rename.assert_not_called()
+
+        policy = propagation_policy(AgentToolName.UPDATE_SECTION_TITLE.value, "section_title")
+        self.assertEqual(policy.recompute_from, "writing")
+        self.assertIn("writing", policy.invalidates)
+
+    def test_controller_applies_title_changes_to_the_writing_plan(self):
+        plan = {
+            "structure": ["旧章"],
+            "chapter_plans": [{"title": "旧章", "questions": ["围绕旧章的问题"]}],
+            "final_plan_json": {"structure": ["旧章"], "chapter_plans": [{"title": "旧章"}]},
+        }
+        result = _apply_section_title_changes_to_plan(
+            plan, [{"old_title": "旧章", "new_title": "新章"}],
+        )
+        self.assertEqual(result["structure"], ["新章"])
+        self.assertEqual(result["chapter_plans"][0]["title"], "新章")
+        self.assertEqual(result["final_plan_json"]["structure"], ["新章"])
+    def test_final_plan_proposal_is_scheduled_instead_of_applied_in_place(self):
+        with patch("app.interaction.short_term.load_task") as load_task:
+            self.assertFalse(_apply_supported_proposal({
+                "artifact_type": "final_plan",
+                "task_id": "task-a",
+                "report_id": 7,
+                "after_json": '{"required_structure":["第一章"]}',
+                "impact_json": "{}",
+            }))
+        load_task.assert_not_called()
+
+    def test_title_sync_updates_both_plan_snapshots_and_version(self):
+        result = _synchronize_plan_title_payloads({
+            "structure": ["旧章"],
+            "chapter_plans": [{"title": "旧章", "questions": ["旧章问题"]}],
+            "analysis_plan_json": {"stage": "analysis", "structure": ["旧章"], "plan_version": 2},
+            "final_plan_json": {"stage": "final", "chapter_plans": [{"title": "旧章"}], "plan_version": 2},
+            "plan_version": 2,
+        }, {"旧章": "新章"})
+
+        self.assertEqual(result["plan_version"], 3)
+        self.assertEqual(result["structure"], ["新章"])
+        self.assertEqual(result["chapter_plans"][0]["title"], "新章")
+        self.assertEqual(result["analysis_plan_json"]["structure"], ["新章"])
+        self.assertEqual(result["analysis_plan_json"]["plan_version"], 3)
+        self.assertEqual(result["final_plan_json"]["chapter_plans"][0]["title"], "新章")
+        self.assertEqual(result["final_plan_json"]["plan_version"], 3)
+
+    def test_revision_preparation_failure_leaves_payload_transition_uncommitted(self):
+        task = {
+            "report_id": 7, "run_revision": 1, "stage": "review",
+            "run_mode": "initial", "run_history": [], "queue_status": {},
+        }
+        proposal = {
+            "id": 4, "task_id": "task-a", "report_id": 7,
+            "artifact_type": "narrative_plan", "object_id": "第一章",
+            "before_json": "{}", "after_json": '{"instruction":"重写"}',
+            "impact_json": '{"scope":{"tool_call":{"tool_name":"regenerate_chapter","arguments":{"chapter_title":"第一章"}}}}',
+        }
+        session = unittest.mock.MagicMock()
+        context = unittest.mock.MagicMock()
+        context.__enter__.return_value = session
+        committed_payloads = []
+
+        def transition_in_transaction(task_id, callback, *, _session):
+            payload = callback(dict(task), _session)
+            committed_payloads.append(payload)
+            return payload
+
+        with (
+            patch("app.interaction.short_term.load_task", return_value=task),
+            patch("app.interaction.short_term.transition_task", side_effect=transition_in_transaction) as transition,
+            patch("app.report_versions.ensure_report_version", return_value=SimpleNamespace(version_id=9)),
+            patch("app.report_versions.get_report_version", return_value={
+                "id": 9, "report_plan_snapshot": {}, "fact_snapshot": [],
+                "inference_snapshot": [], "conflict_snapshot": [],
+            }),
+            patch("app.task_runs.create_task_run", return_value="run-a"),
+            patch("app.report_versions.create_incremental_delta", side_effect=ValueError("DELTA_FAIL")),
+            patch("app.interaction.session_scope", return_value=context),
+            patch("app.workflow.queue.task_queue_status", return_value={}),
+        ):
+            with self.assertRaisesRegex(ValueError, "DELTA_FAIL"):
+                _prepare_revision_run("task-a", [proposal])
+
+        transition.assert_called_once()
+        self.assertEqual(committed_payloads, [])
+
+    def test_retry_selects_latest_accepted_failed_proposal(self):
+        selected = _latest_failed_proposal([
+            {"id": 4, "status": "accepted", "execution_status": "failed"},
+            {"id": 6, "status": "accepted", "execution_status": "completed"},
+            {"id": 9, "status": "accepted", "execution_status": "failed"},
+        ])
+        self.assertEqual(selected["id"], 9)
+        self.assertIsNone(_latest_failed_proposal([
+            {"id": 9, "status": "accepted", "execution_status": "failed"},
+            {"id": 12, "status": "accepted", "execution_status": "completed"},
+        ]))
+        self.assertIsNone(_latest_failed_proposal([
+            {"id": 9, "status": "accepted", "execution_status": "failed"},
+            {"id": 12, "status": "proposed", "execution_status": "not_required"},
+        ]))
+
+    def test_internal_model_errors_are_not_exposed_to_users(self):
+        self.assertNotIn("MODEL_OUTPUT_TRUNCATED", _friendly_interaction_error(Exception("MODEL_OUTPUT_TRUNCATED")))
+        self.assertIn("原报告保持不变", _friendly_revision_error("FINAL_PLAN_CHAPTER_COUNT_MISMATCH"))
+
+    def test_draft_change_uses_canonical_requirements_field(self):
         current = {"theme": "原主题", "requirements": "原要求"}
         self.assertEqual(
             _merge_draft_change(current, {"requirements": "新要求"}),
             {"theme": "原主题", "requirements": "新要求"},
         )
-        self.assertEqual(
-            _merge_draft_change(current, {"content": "兼容要求"})["requirements"],
-            "兼容要求",
-        )
+        self.assertEqual(_merge_draft_change(current, {"content": "非协议字段"}), current)
 
     def test_thread_summary_exposes_history_and_proposal_state(self):
         summary = _thread_summary({
@@ -38,25 +247,75 @@ class InteractionRuntimeTests(unittest.TestCase):
         self.assertEqual(summary["pending_proposal_count"], 1)
         self.assertEqual(summary["last_message"]["content"], "建议调整章节顺序")
 
-    def test_interaction_prompt_keeps_current_turn_within_budget(self):
-        thread = {
-            "id": 1,
-            "task_id": "task-a",
-            "scope": {"current": {"content": "旧内容"}},
-            "messages": [
-                {"role": "user", "content": "较早问题" * 4000},
-                {"role": "assistant", "content": "较早答复" * 4000},
-            ],
-        }
+    def test_task_decision_memory_survives_conversation_boundaries(self):
+        session = unittest.mock.MagicMock()
+        session.execute.return_value.mappings.return_value.all.return_value = [{
+            "id": 9, "artifact_type": "final_plan", "object_id": "task-a",
+            "operation": "reorganize", "rationale": "按确认目录重组",
+            "status": "accepted", "execution_status": "completed",
+            "impact_json": '{"scope":{"tool_call":{"tool_name":"rerun_final_plan","arguments":{"instruction":"调整为六章","required_chapter_count":6}}}}',
+            "after_json": "{}", "decided_at": "2026-08-31", "candidate_version_id": 12,
+            "execution_run_id": "run-1",
+        }]
+        context = unittest.mock.MagicMock()
+        context.__enter__.return_value = session
         with (
-            patch("app.interaction._interaction_task_context", return_value={"theme": "测试任务"}),
-            patch("app.interaction._interaction_grounding", return_value={"facts": [{"id": 2, "content": "依据"}]}),
-            patch("app.interaction._accepted_interaction_decisions", return_value=[]),
+            patch("app.interaction.session_scope", return_value=context),
+            patch("app.memory.short_term.load_task", return_value={
+                "theme": "测试报告", "user_requirements": "形成六章报告",
+            }),
         ):
-            prompt = _build_interaction_prompt(thread, {"content": "当前句子"}, "请解释当前句子的依据")
-        self.assertLessEqual(_estimate_tokens(prompt), 6144)
-        self.assertIn("当前句子", prompt)
-        self.assertIn("请解释当前句子的依据", prompt)
+            memory = _task_decision_memory("task-a", {"artifact_type": "final_plan"})
+        self.assertEqual(memory["task_goal"]["theme"], "测试报告")
+        self.assertEqual(memory["confirmed_decisions"][0]["required_chapter_count"], 6)
+        self.assertEqual(memory["latest_candidate"]["version_id"], 12)
+
+    def test_background_proposal_does_not_block_closing_conversation(self):
+        thread = {
+            "id": 7,
+            "pending": False,
+            "proposals": [{"execution_status": "running"}],
+        }
+        session = unittest.mock.MagicMock()
+        context = unittest.mock.MagicMock()
+        context.__enter__.return_value = session
+        with (
+            patch("app.interaction.get_thread", return_value=thread),
+            patch("app.interaction.session_scope", return_value=context),
+        ):
+            result = close_thread(7)
+        self.assertEqual(result["status"], "closed")
+        session.execute.assert_called_once()
+
+    def test_pending_assistant_turn_still_blocks_closing_conversation(self):
+        with patch("app.interaction.get_thread", return_value={"id": 8, "pending": True}):
+            with self.assertRaisesRegex(ValueError, "INTERACTION_THREAD_BUSY"):
+                close_thread(8)
+
+    def test_agent_history_is_bounded_without_losing_latest_turn(self):
+        messages = [
+            {"role": "user", "content": "较早问题" * 4000},
+            {"role": "assistant", "content": "最近答复"},
+        ]
+        history = _bounded_history(messages, 128)
+        self.assertEqual(history[-1]["content"], "最近答复")
+
+    def test_agent_history_caps_an_oversized_latest_turn(self):
+        history = _bounded_history([
+            {"role": "user", "content": "很长的粘贴内容" * 4000},
+        ], 128)
+        self.assertEqual(len(history), 1)
+        self.assertLessEqual(sum(len(item["content"]) for item in history), 512)
+        self.assertIn("已截断", history[0]["content"])
+
+    def test_interrupted_turn_can_be_retried_without_reconstructing_context(self):
+        thread = {"messages": [
+            {"id": 4, "role": "user", "content": "请说明材料的主体", "metadata": {"status": "interrupted"}},
+        ]}
+        with patch("app.interaction._update_message_metadata") as update:
+            content = _interrupted_turn_retry_content(thread, "重试上一轮")
+        self.assertEqual(content, "请说明材料的主体")
+        update.assert_called_once_with(4, {"status": "retried", "retryable": False})
 
     def test_interaction_lane_is_not_blocked_by_workflow_lane(self):
         original_generation = llm_scheduler._generation_slots

@@ -1,21 +1,44 @@
 <script setup lang="ts">
-import { computed, defineAsyncComponent, ref } from "vue";
+import { computed, defineAsyncComponent, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/vue-query";
-import { useRoute, RouterLink } from "vue-router";
-import { api } from "@/api/http";
+import { useRoute, useRouter, RouterLink } from "vue-router";
+import { api, jsonInit } from "@/api/http";
 import type { TaskSummary } from "@/api/types";
 import StatusBadge from "@/components/StatusBadge.vue";
-import ArtifactReviewWorkspace from "@/components/ArtifactReviewWorkspace.vue";
+import MaterialComparisonWorkspace from "@/components/MaterialComparisonWorkspace.vue";
+import UiPageHeader from "@/components/ui/UiPageHeader.vue";
+import UiPagination from "@/components/ui/UiPagination.vue";
+import { usePersistentPageSize } from "@/lib/pagination";
+import { stageGroups, stageMeta } from "@/domain/workflowStages";
+import { useUiStore } from "@/stores/ui";
 const GraphNetwork = defineAsyncComponent(
   () => import("@/components/GraphNetwork.vue"),
 );
 const route = useRoute();
+const router = useRouter();
+const ui = useUiStore();
 const qc = useQueryClient();
 const taskId = String(route.params.taskId);
-const active = ref(String(route.query.tab || "overview"));
+function refreshAfterAssistantUpdate(event: Event) {
+  const detail = (event as CustomEvent).detail || {};
+  if (detail.taskId && String(detail.taskId) !== taskId) return;
+  qc.invalidateQueries({ queryKey: ["task", taskId] });
+  qc.invalidateQueries({ queryKey: ["task-analysis", taskId] });
+  qc.invalidateQueries({ queryKey: ["task-materials", taskId] });
+  qc.invalidateQueries({ queryKey: ["task-graph", taskId] });
+  qc.invalidateQueries({ queryKey: ["report-versions"] });
+}
+onMounted(() => window.addEventListener("ira:task-artifact-updated", refreshAfterAssistantUpdate));
+onBeforeUnmount(() => window.removeEventListener("ira:task-artifact-updated", refreshAfterAssistantUpdate));
+const requestedTab = String(route.query.tab || "overview");
+const active = ref(requestedTab === "runtime" ? "materials" : requestedTab);
+const workspacePane = ref(requestedTab === "runtime" ? "process" : "materials");
 const analysisType = ref("facts");
-const detailsOpen = ref(false);
+const analysisPage = ref(1);
+const analysisPageSize = usePersistentPageSize("analysis");
+watch([analysisType, analysisPageSize], () => { analysisPage.value = 1; });
 const selectedGraphEdge = ref<any>(null);
+const graphBuildError = ref("");
 const task = useQuery({
   queryKey: ["task", taskId],
   queryFn: () => api<TaskSummary>(`/api/tasks/${taskId}`),
@@ -24,6 +47,17 @@ const task = useQuery({
       ? 15000
       : 4000,
 });
+const isComparison = computed(
+  () => task.data.value?.run_mode === "material_comparison",
+);
+watch(
+  () => task.data.value?.run_mode,
+  (mode) => {
+    if (mode === "material_comparison" && !route.query.tab)
+      active.value = "comparison";
+  },
+  { immediate: true },
+);
 const materials = useQuery({
   queryKey: ["task-materials", taskId],
   queryFn: () => api<any[]>(`/api/tasks/${taskId}/materials`),
@@ -31,10 +65,14 @@ const materials = useQuery({
   staleTime: 30000,
 });
 const analysis = useQuery({
-  queryKey: ["task-analysis", taskId],
-  queryFn: () => api<any>(`/api/tasks/${taskId}/analysis`),
-  enabled: computed(() => ["analysis", "overview"].includes(active.value)),
+  queryKey: ["task-analysis", taskId, analysisType, analysisPage, analysisPageSize],
+  queryFn: () => api<{ items: any[]; total: number }>(`/api/tasks/${taskId}/analysis/page?kind=${analysisType.value}&page=${analysisPage.value}&page_size=${analysisPageSize.value}`),
+  enabled: computed(() => active.value === "analysis" && ["facts", "inferences"].includes(analysisType.value)),
   staleTime: 30000,
+});
+watch(() => analysis.data.value?.total, (total) => {
+  if (total === undefined) return;
+  analysisPage.value = Math.min(analysisPage.value, Math.max(1, Math.ceil(total / analysisPageSize.value)));
 });
 const graph = useQuery({
   queryKey: ["task-graph", taskId],
@@ -43,6 +81,7 @@ const graph = useQuery({
     () => active.value === "analysis" && analysisType.value === "graph",
   ),
   staleTime: 30000,
+  refetchInterval: (q) => (q.state.data?.build_active ? 4000 : false),
 });
 const graphChanges = useQuery({
   queryKey: ["task-graph-changes", taskId],
@@ -60,66 +99,282 @@ const versions = useQuery({
     () => active.value === "versions" && Boolean(task.data.value?.report_id),
   ),
 });
+const checkpointPlan = useQuery({
+  queryKey: ["checkpoint-plan", taskId],
+  queryFn: () =>
+    api<any>(
+      `/api/tasks/${taskId}/review-workspace?artifact_type=final_plan&limit=1`,
+    ),
+  enabled: computed(() => Boolean(task.data.value?.directory_review_pending)),
+  staleTime: 5000,
+});
+const checkpointTheme = ref("");
+const checkpointRequirements = ref("");
+const checkpointStructure = ref<string[]>([]);
+let requirementsDraftKey = "";
+let directoryDraftKey = "";
+watch(
+  () => [
+    task.data.value?.requirement_review_pending,
+    task.data.value?.theme,
+    task.data.value?.user_requirements,
+  ],
+  ([pending, theme, requirements]) => {
+    const key = `${Boolean(pending)}:${theme || ""}:${requirements || ""}`;
+    if (!pending || key === requirementsDraftKey) return;
+    requirementsDraftKey = key;
+    checkpointTheme.value = String(theme || "");
+    checkpointRequirements.value = String(requirements || "");
+  },
+  { immediate: true },
+);
+watch(
+  () => [
+    task.data.value?.directory_review_pending,
+    checkpointPlan.data.value?.items?.[0]?.current?.chapter_plans,
+  ],
+  ([pending, chapters]) => {
+    if (!pending) return;
+    const titles = (chapters || [])
+      .map((chapter: any) => String(chapter?.title || "").trim())
+      .filter(Boolean);
+    const key = titles.join("\u001f");
+    if (!titles.length || key === directoryDraftKey) return;
+    directoryDraftKey = key;
+    checkpointStructure.value = titles;
+  },
+  { immediate: true, deep: true },
+);
+const checkpointStructureTitles = computed(() =>
+  checkpointStructure.value.map((title) => title.trim()).filter(Boolean),
+);
+const checkpointStructureEdited = computed(
+  () => checkpointStructureTitles.value.join("\u001f") !== directoryDraftKey,
+);
 const command = useMutation({
   mutationFn: ({ path }: { path: string }) => api(path, { method: "POST" }),
   onSuccess: () => qc.invalidateQueries({ queryKey: ["task", taskId] }),
 });
+const confirmPlanning = useMutation({
+  mutationFn: () =>
+    api(
+      `/api/tasks/${taskId}/requirements/confirm`,
+      jsonInit("POST", {
+        theme: checkpointTheme.value.trim(),
+        requirements: checkpointRequirements.value.trim(),
+        feedback: "",
+      }),
+    ),
+  onSuccess: () => {
+    qc.invalidateQueries({ queryKey: ["task", taskId] });
+  },
+});
+const confirmDirectory = useMutation({
+  mutationFn: () =>
+    api(
+      `/api/tasks/${taskId}/directory/confirm`,
+      jsonInit("POST", {
+        feedback: "",
+        structure: checkpointStructureEdited.value
+          ? checkpointStructureTitles.value
+          : undefined,
+      }),
+    ),
+  onSuccess: () => {
+    qc.invalidateQueries({ queryKey: ["task", taskId] });
+  },
+});
+const rebuildGraph = useMutation({
+  mutationFn: () =>
+    api(`/api/tasks/${taskId}/graph/rebuild`, { method: "POST" }),
+  onMutate: () => { graphBuildError.value = ""; },
+  onError: (error: any) => { graphBuildError.value = String(error?.message || error || "构建请求失败"); },
+  onSuccess: async () => {
+    graphBuildError.value = "";
+    await Promise.all([
+      qc.invalidateQueries({ queryKey: ["task", taskId] }),
+      qc.invalidateQueries({ queryKey: ["task-graph", taskId] }),
+      qc.invalidateQueries({ queryKey: ["task-graph-changes", taskId] }),
+    ]);
+  },
+});
+const graphBuildStatus = computed(() =>
+  String(graph.data.value?.build_status?.status || "unknown"),
+);
+const graphBuildActive = computed(() =>
+  Boolean(graph.data.value?.build_active),
+);
+const graphAssertionCount = computed(() =>
+  Number(
+    graph.data.value?.stats?.assertion_count ??
+      task.data.value?.graph_status?.assertion_count ??
+      0,
+  ),
+);
+  const graphBuildMessage = computed(() => {
+    const status = graph.data.value?.build_status || {};
+    const job = graph.data.value?.background_job || {};
+    if (job.status === "queued" && job.waiting_for_main) {
+      return "主报告任务完成后将自动开始构建关系网络。";
+    }
+    if (job.status === "queued") {
+      return "关系网络已排队，等待可用的模型执行资源。";
+    }
+    if (job.status === "running") {
+      const progress = job.progress || {};
+      if (progress.total_batches) {
+        return `正在抽取关系：${progress.completed_batches || 0}/${progress.total_batches} 批，已覆盖 ${progress.completed_facts || 0}/${progress.total_facts || 0} 条事实。`;
+      }
+      return "关系网络正在构建，完成后会自动刷新。";
+    }
+  if (status.status === "partial_ready") {
+    const failedFacts = Number(status.failed_fact_ids?.length || 0);
+    return failedFacts
+      ? `已有关系可用，另有 ${failedFacts} 条事实尚未完成关系抽取。`
+      : "已有部分关系可用，仍有批次需要重新构建。";
+  }
+  if (
+    status.error === "MODEL_OUTPUT_TRUNCATED" ||
+    String(status.error || "").includes("terminal batch")
+  ) {
+    return "关系抽取输出超过当前模型容量，可使用自适应拆批重新构建。";
+  }
+  return status.error || "构图只保留可回查事实的关系。";
+});
 const stages = computed(() =>
   task.data.value?.run_mode === "material_comparison"
+    ? stageGroups.comparison
+    : stageGroups.standard,
+);
+const taskTabs = computed(() =>
+  isComparison.value
     ? [
-        {
-          name: "新增材料准备",
-          keys: [
-            "created",
-            "parsing",
-            "dedup",
-            "material_analysis",
-            "planning",
-          ],
-        },
-        { name: "证据与变化分析", keys: ["evidence", "conflict", "analysis"] },
-        { name: "变化审阅", keys: ["review", "done"] },
+        ["comparison", "对比结果"],
+        ["materials", "材料与过程"],
       ]
     : [
-        { name: "材料准备", keys: ["created", "parsing", "dedup"] },
-        {
-          name: "分析规划",
-          keys: [
-            "material_analysis",
-            "planning",
-            "evidence",
-            "conflict",
-            "analysis",
-          ],
-        },
-        { name: "报告生成", keys: ["writing", "knowledge"] },
-        { name: "审核完成", keys: ["review", "done"] },
+        ["overview", "概览"],
+        ["materials", "材料与过程"],
+        ["analysis", "分析"],
+        ["report", "报告"],
+        ["versions", "版本"],
       ],
 );
-const stageIndex = computed(() =>
-  Math.max(
-    0,
-    stages.value.findIndex((x) =>
-      x.keys.includes(task.data.value?.stage || ""),
-    ),
-  ),
-);
+const stageIndex = computed(() => {
+  const stage = String(task.data.value?.stage || "created");
+  const index = stages.value.findIndex((item) => item.keys.includes(stage));
+  return index >= 0 ? index : ["failed", "paused"].includes(stage) ? -1 : 0;
+});
+const processCurrentLabel = computed(() => {
+  if (task.data.value?.queue_status?.status === "queued") {
+    const ahead = task.data.value?.queue_status?.ahead;
+    return ahead == null ? "待运行" : `待运行 · 前方 ${ahead} 个任务`;
+  }
+  if (stageIndex.value >= 0) return stages.value[stageIndex.value]?.name || "处理中";
+  return stageMeta[String(task.data.value?.stage || "")]?.label || "处理中";
+});
 const running = computed(
   () =>
-    !["created", "review", "done", "failed", "paused"].includes(
-      task.data.value?.stage || "created",
-    ),
+    task.data.value?.queue_status?.status === "queued" ||
+    ![
+      "created",
+      "requirement_review",
+      "directory_review",
+      "review",
+      "done",
+      "failed",
+      "paused",
+    ].includes(task.data.value?.stage || "created"),
 );
-const facts = computed(() => analysis.data.value?.facts || []);
-const inferences = computed(() =>
-  (analysis.data.value?.inferences || []).filter(
-    (x: any) => x.source_level === "MATERIAL_INFERENCE",
-  ),
+const stageProgress = computed(() => {
+  const stage = String(task.data.value?.stage || "created");
+  const progressByStage: Record<string, { label: string; key: string }> = {
+    parsing: { label: "材料解析", key: "parse_progress" },
+    material_analysis: { label: "材料理解", key: "material_analysis_progress" },
+    evidence: { label: "事实与证据", key: "evidence_progress" },
+    writing: { label: "报告生成", key: "write_progress" },
+  };
+  const config = progressByStage[stage];
+  if (!config) return null;
+  const progress = task.data.value?.[config.key] || {};
+  const total = Number(progress.total);
+  if (!Number.isFinite(total) || total <= 0) return null;
+  return {
+    label: config.label,
+    done: progress.done ?? 0,
+    total,
+  };
+});
+const pauseRequested = computed(
+  () => task.data.value?.queue_status?.status === "pause_requested",
 );
-const conflicts = computed(() => analysis.data.value?.conflicts || []);
+const facts = computed(() => analysisType.value === "facts" ? analysis.data.value?.items || [] : []);
+const inferences = computed(() => analysisType.value === "inferences" ? analysis.data.value?.items || [] : []);
+const artifactCounts = computed(() => task.data.value?.artifact_counts || {});
+const factCount = computed(() =>
+  analysisType.value === "facts" && analysis.data.value
+    ? analysis.data.value.total
+    : Number(artifactCounts.value.facts || 0),
+);
+const inferenceCount = computed(() =>
+  analysisType.value === "inferences" && analysis.data.value
+    ? analysis.data.value.total
+    : Number(artifactCounts.value.inferences || 0),
+);
 function run() {
   command.mutate({ path: `/api/tasks/${taskId}/run` });
 }
+function confirmPlan() {
+  confirmPlanning.mutate();
+}
+function confirmDirectoryPlan() {
+  confirmDirectory.mutate();
+}
+function addCheckpointChapter() {
+  checkpointStructure.value.push("");
+}
+function removeCheckpointChapter(index: number) {
+  if (checkpointStructure.value.length <= 1) return;
+  checkpointStructure.value.splice(index, 1);
+}
+function openCheckpointAssistant(kind: "requirements" | "directory") {
+  const isRequirements = kind === "requirements";
+  const plan = checkpointPlan.data.value?.items?.[0] || null;
+  ui.openAssistant({
+    taskId,
+    artifact: isRequirements
+      ? {
+          artifact_type: "task_brief",
+          object_id: taskId,
+          artifact_version: String(task.data.value?.run_revision || 1),
+          current: {
+            theme: task.data.value?.theme || "",
+            requirements: task.data.value?.user_requirements || "",
+          },
+          title: "报告需求",
+        }
+      : plan || {
+          artifact_type: "final_plan",
+          object_id: String(task.data.value?.plan_id || ""),
+          artifact_version: String(task.data.value?.run_revision || 1),
+          current: {},
+          title: "最终目录",
+        },
+  });
+}
+watch(
+  () => [route.query.tab, route.query.assistant],
+  async ([tab, assistant]) => {
+    if (tab !== "collaboration" && assistant !== "1") return;
+    active.value = "overview";
+    const query = { ...route.query };
+    delete query.tab;
+    delete query.assistant;
+    await router.replace({ query });
+    ui.openAssistant({ taskId });
+  },
+  { immediate: true },
+);
 function control(op: string) {
   command.mutate({ path: `/api/tasks/${taskId}/control/${op}` });
 }
@@ -130,6 +385,23 @@ function confidence(x: any) {
     ] || "需人工复核"
   );
 }
+function semanticFacets(profile: any, legacyMode = "", legacyDetail = "") {
+  const facets = Array.isArray(profile?.facets)
+    ? profile.facets.filter((item: any) => item?.axis && item?.label)
+    : [];
+  const attribution = profile?.additional?.attribution;
+  if (typeof attribution === "string" && attribution.trim()) {
+    facets.push({ axis: "来源归属", label: attribution.trim(), detail: "" });
+  }
+  if (!facets.length && (legacyDetail || (legacyMode && legacyMode !== "unknown"))) {
+    facets.push({ axis: "陈述性质", label: legacyDetail || legacyMode, detail: "" });
+  }
+  return facets;
+}
+function hasInferenceSemantics(item: any) {
+  return semanticFacets(item?.semantic_profile).length > 0 ||
+    (Array.isArray(item?.source_semantics) && item.source_semantics.length > 0);
+}
 function versionsList() {
   const data = versions.data.value;
   return Array.isArray(data) ? data : data?.versions || [];
@@ -137,11 +409,12 @@ function versionsList() {
 </script>
 <template>
   <div v-if="task.data.value" class="page-stack task-workspace">
-    <header class="task-head">
-      <div>
-        <RouterLink to="/tasks" class="back-link">任务 /</RouterLink>
-        <h1>{{ task.data.value.theme }}</h1>
-        <p class="muted">
+    <UiPageHeader class="task-head" :title="task.data.value.theme">
+      <template #eyebrow>
+        <RouterLink to="/tasks" class="back-link">任务</RouterLink>
+      </template>
+      <template #meta>
+        <p class="muted task-meta">
           创建于 {{ task.data.value.created_at || "—" }} ·
           {{
             task.data.value.material_count ||
@@ -150,19 +423,55 @@ function versionsList() {
           }}
           份材料 · 第 {{ task.data.value.run_revision || 1 }} 轮
         </p>
-      </div>
-      <div class="button-row">
-        <StatusBadge :stage="task.data.value.stage" /><button
-          v-if="['created', 'failed'].includes(task.data.value.stage)"
+      </template>
+      <template #actions>
+        <div class="button-row">
+        <span
+          v-if="isComparison"
+          class="badge"
+          :class="
+            task.data.value.stage === 'failed'
+              ? 'danger'
+              : task.data.value.stage === 'review'
+                ? 'warning'
+                : task.data.value.stage === 'done'
+                  ? 'success'
+                  : ''
+          "
+          >{{
+            task.data.value.stage === "failed"
+              ? "对比异常"
+              : task.data.value.stage === "review"
+                ? "等待审阅"
+                : task.data.value.stage === "done"
+                  ? "审阅完成"
+                  : "对比中"
+          }}</span
+        ><StatusBadge v-else :stage="task.data.value.stage" /><button
+          v-if="
+            ['created', 'failed'].includes(task.data.value.stage) ||
+            task.data.value.requirement_review_pending
+          "
           class="btn primary"
           :disabled="command.isPending.value"
-          @click="run"
+          @click="
+            task.data.value.requirement_review_pending ? confirmPlan() : run()
+          "
         >
           {{
-            task.data.value.stage === "failed" ? "重新运行" : "开始运行"
+            task.data.value.requirement_review_pending
+              ? "确认需求并开始规划"
+              : task.data.value.stage === "failed"
+                ? "重新运行"
+                : "开始运行"
           }}</button
-        ><button v-if="running" class="btn" @click="control('pause')">
-          暂停</button
+        ><button
+          v-if="running"
+          class="btn"
+          :disabled="command.isPending.value || pauseRequested"
+          @click="control('pause')"
+        >
+          {{ pauseRequested ? "正在暂停…" : "暂停" }}</button
         ><button
           v-if="task.data.value.stage === 'paused'"
           class="btn primary"
@@ -174,11 +483,17 @@ function versionsList() {
           class="btn"
           :to="`/reports/${task.data.value.report_id}`"
           >打开报告</RouterLink
+        ><RouterLink
+          v-else-if="isComparison && task.data.value.comparison_report_id"
+          class="btn"
+          :to="`/reports/${task.data.value.comparison_report_id}`"
+          >查看基线报告</RouterLink
         >
-      </div>
-    </header>
+        </div>
+      </template>
+    </UiPageHeader>
     <section class="surface progress-block">
-      <div class="progress-rail">
+      <div v-if="stageIndex >= 0" class="progress-rail" :class="{ compact: isComparison }">
         <div
           v-for="(item, index) in stages"
           :key="item.name"
@@ -193,50 +508,26 @@ function versionsList() {
                 ? "已完成"
                 : index === stageIndex
                   ? task.data.value.stage === "review"
-                    ? "待审核"
+                    ? isComparison
+                      ? "待审阅"
+                      : "待审核"
                     : "正在进行"
                   : "等待中"
             }}</small>
           </div>
         </div>
       </div>
-      <button class="details-toggle" @click="detailsOpen = !detailsOpen">
-        {{ detailsOpen ? "收起运行详情" : "查看运行详情" }}
-      </button>
-      <div v-if="detailsOpen" class="run-details">
+      <div v-else class="progress-interruption">
+        <span class="progress-interruption-mark" aria-hidden="true"></span>
         <div>
-          <span>内部阶段</span><b>{{ task.data.value.stage }}</b>
-        </div>
-        <div>
-          <span>队列状态</span
-          ><b>{{ task.data.value.queue_status?.status || "—" }}</b>
-        </div>
-        <div>
-          <span>解析进度</span
-          ><b
-            >{{ task.data.value.parse_progress?.done || 0 }} /
-            {{ task.data.value.parse_progress?.total || "—" }}</b
-          >
-        </div>
-        <div>
-          <span>写作进度</span
-          ><b
-            >{{ task.data.value.write_progress?.done || 0 }} /
-            {{ task.data.value.write_progress?.total || "—" }}</b
-          >
+          <b>{{ processCurrentLabel }}</b>
+          <small>{{ task.data.value.stage === "paused" ? "任务已暂停；暂停前的具体环节未记录" : "任务异常；失败环节未记录" }}</small>
         </div>
       </div>
     </section>
     <nav class="tabs workspace-tabs">
       <button
-        v-for="tab in [
-          ['overview', '概览'],
-          ['materials', '材料'],
-          ['analysis', '分析'],
-          ['report', '报告'],
-          ['versions', '版本'],
-          ['collaboration', '协作审阅'],
-        ]"
+        v-for="tab in taskTabs"
         :key="tab[0]"
         class="tab"
         :class="{ active: active === tab[0] }"
@@ -245,7 +536,13 @@ function versionsList() {
         {{ tab[1] }}
       </button>
     </nav>
-    <section v-if="active === 'overview'" class="workspace-grid">
+    <MaterialComparisonWorkspace
+      v-if="active === 'comparison' && isComparison"
+      embedded
+      :report-id="Number(task.data.value.comparison_report_id)"
+      :comparison-id="Number(task.data.value.comparison_id)"
+    />
+    <section v-else-if="active === 'overview'" class="workspace-grid">
       <div class="main-column">
         <div v-if="task.data.value.stage === 'failed'" class="notice warning">
           <b>任务运行异常</b><br />{{
@@ -254,40 +551,83 @@ function versionsList() {
             "请查看运行详情后重新运行。"
           }}
         </div>
-        <div class="surface section-block">
-          <div class="section-head">
-            <div>
-              <h2>当前状态</h2>
-              <p class="muted">只展示此刻需要关注的结果和下一步操作</p>
-            </div>
+        <div
+          v-if="task.data.value.requirement_review_pending"
+          class="notice planning-review"
+        >
+          <b>请确认报告需求</b>
+          <p>
+            可与助手讨论主题、受众、重点和篇幅；确认后进入规划。
+          </p>
+          <div class="checkpoint-form">
+            <label>
+              <span>报告主题</span>
+              <input v-model="checkpointTheme" placeholder="填写或在助手中讨论后补充" />
+            </label>
+            <label>
+              <span>报告要求</span>
+              <textarea v-model="checkpointRequirements" rows="4" placeholder="填写目标读者、重点、篇幅或约束" />
+            </label>
           </div>
-          <div class="status-summary">
-            <div>
-              <span>当前阶段</span><b>{{ stages[stageIndex]?.name }}</b>
-            </div>
-            <div>
-              <span>已经产生</span
-              ><b>{{ task.data.value.report_id ? "报告草稿" : "分析产物" }}</b>
-            </div>
-            <div>
-              <span>下一步</span
-              ><b>{{
-                task.data.value.stage === "review"
-                  ? "完成审核"
-                  : task.data.value.stage === "done"
-                    ? "导出或增量更新"
-                    : running
-                      ? "等待当前阶段完成"
-                      : "开始运行"
-              }}</b>
-            </div>
+          <div class="button-row">
+            <button
+              class="btn"
+              @click="openCheckpointAssistant('requirements')"
+            >
+              查看并讨论
+            </button>
+            <button
+              class="btn primary"
+              :disabled="confirmPlanning.isPending.value"
+              @click="confirmPlan"
+            >
+              {{
+                confirmPlanning.isPending.value
+                  ? "正在继续…"
+                  : "确认需求并开始规划"
+              }}
+            </button>
+          </div>
+        </div>
+        <div
+          v-if="task.data.value.directory_review_pending"
+          class="notice planning-review"
+        >
+          <b>请确认最终目录</b>
+          <p>
+            可调整章节标题、顺序和重点；确认后开始写作。
+          </p>
+          <ol v-if="checkpointStructure.length" class="checkpoint-outline checkpoint-outline-editable">
+            <li
+              v-for="(_title, index) in checkpointStructure"
+              :key="index"
+            >
+              <input v-model="checkpointStructure[index]" :aria-label="`第 ${index + 1} 章标题`" />
+              <button type="button" class="text-button" :disabled="checkpointStructure.length <= 1" @click="removeCheckpointChapter(index)">删除</button>
+            </li>
+          </ol>
+          <button type="button" class="text-button checkpoint-add" @click="addCheckpointChapter">添加章节</button>
+          <div class="button-row">
+            <button class="btn" @click="openCheckpointAssistant('directory')">
+              查看并讨论
+            </button>
+            <button
+              class="btn primary"
+              :disabled="confirmDirectory.isPending.value || (checkpointStructureEdited && !checkpointStructureTitles.length)"
+              @click="confirmDirectoryPlan"
+            >
+              {{
+                confirmDirectory.isPending.value
+                  ? "正在继续…"
+                  : "确认目录并开始写作"
+              }}
+            </button>
           </div>
         </div>
         <div class="surface section-block">
           <div class="section-head">
             <div>
-              <h2>质量概览</h2>
-              <p class="muted">业务结果与技术诊断分开呈现</p>
+              <h2>提取结果</h2>
             </div>
           </div>
           <div class="metric-strip flat">
@@ -300,18 +640,12 @@ function versionsList() {
               ><span>材料</span>
             </div>
             <div class="metric">
-              <strong>{{ facts.length }}</strong
+              <strong>{{ factCount }}</strong
               ><span>事实</span>
             </div>
             <div class="metric">
-              <strong>{{ inferences.length }}</strong
+              <strong>{{ inferenceCount }}</strong
               ><span>分析判断</span>
-            </div>
-            <div class="metric">
-              <strong>{{
-                conflicts.length + (task.data.value.qa_notes?.length || 0)
-              }}</strong
-              ><span>待核验</span>
             </div>
           </div>
         </div>
@@ -359,7 +693,7 @@ function versionsList() {
               }}</span>
             </div>
             <strong>打开</strong></RouterLink
-          ><button class="artifact-link" @click="active = 'materials'">
+          ><button class="artifact-link" @click="active = 'materials'; workspacePane = 'materials'">
             <div>
               <b>材料解析</b
               ><span
@@ -374,73 +708,96 @@ function versionsList() {
           ><button class="artifact-link" @click="active = 'analysis'">
             <div>
               <b>分析结果</b
-              ><span
-                >{{ facts.length }} 条事实 ·
-                {{ inferences.length }} 条判断</span
-              >
+              ><span>{{ factCount }} 条事实 · {{ inferenceCount }} 条判断</span>
             </div>
             <strong>查看</strong>
           </button>
         </div>
       </aside>
     </section>
-    <section v-else-if="active === 'materials'" class="surface section-block">
-      <div class="section-head">
-        <div>
-          <h2>任务材料</h2>
-          <p class="muted">本任务实际使用的材料及解析状态</p>
-        </div>
-      </div>
-      <div class="data-list">
-        <div
-          v-for="item in materials.data.value || []"
-          :key="item.filename"
-          class="data-row material-row"
-        >
+    <section v-else-if="active === 'materials'" class="workspace-browser">
+      <nav class="tabs workspace-subtabs" aria-label="材料与运行过程">
+        <button
+          class="tab"
+          :class="{ active: workspacePane === 'materials' }"
+          @click="workspacePane = 'materials'"
+        >材料</button>
+        <button
+          class="tab"
+          :class="{ active: workspacePane === 'process' }"
+          @click="workspacePane = 'process'"
+        >运行过程</button>
+      </nav>
+      <section v-if="workspacePane === 'materials'" class="surface section-block">
+        <div class="section-head">
           <div>
-            <b>{{ item.filename }}</b
-            ><span
-              >{{ item.file_type }} · {{ item.units_count }} 个内容单元<span
-                v-if="item.pages?.length"
+            <h2>{{ isComparison ? "新增材料" : "任务材料" }}</h2>
+          </div>
+        </div>
+        <div class="data-list">
+          <div
+            v-for="item in materials.data.value || []"
+            :key="item.filename"
+            class="data-row material-row"
+          >
+            <div>
+              <b>{{ item.filename }}</b
+              ><span
+                >{{ item.file_type }} · {{ item.units_count }} 个内容单元<span
+                  v-if="item.pages?.length"
+                >
+                  · {{ item.pages.length }} 页</span
+                ></span
               >
-                · {{ item.pages.length }} 页</span
-              ></span
+            </div>
+            <span
+              class="badge"
+              :class="
+                item.parse_status === 'error'
+                  ? 'danger'
+                  : item.parse_status === 'ok'
+                    ? 'success'
+                    : 'warning'
+              "
+              >{{
+                item.parse_status === "ok"
+                  ? "已解析"
+                  : item.parse_status === "partial"
+                    ? "正文可用"
+                    : item.parse_status === "error"
+                      ? "解析失败"
+                      : "处理中"
+              }}</span
             >
           </div>
-          <span
-            class="badge"
-            :class="
-              item.parse_status === 'error'
-                ? 'danger'
-                : item.parse_status === 'ok'
-                  ? 'success'
-                  : 'warning'
-            "
-            >{{
-              item.parse_status === "ok"
-                ? "已解析"
-                : item.parse_status === "partial"
-                  ? "正文可用"
-                  : item.parse_status === "error"
-                    ? "解析失败"
-                    : "处理中"
-            }}</span
-          >
         </div>
-      </div>
+      </section>
+      <section v-else class="surface section-block process-panel">
+        <div class="section-head">
+          <div>
+            <h2>运行过程</h2>
+            <p v-if="isComparison" class="muted">
+              仅处理新增材料并核验变化，不生成或改写基线报告。
+            </p>
+          </div>
+        </div>
+        <dl class="process-records">
+          <div><dt>创建时间</dt><dd>{{ task.data.value.created_at || '—' }}</dd></div>
+          <div><dt>执行轮次</dt><dd>第 {{ task.data.value.run_revision || 1 }} 轮</dd></div>
+          <div v-if="task.data.value.queue_status?.queue_wait_seconds != null"><dt>排队耗时</dt><dd>{{ Number(task.data.value.queue_status.queue_wait_seconds).toFixed(1) }} 秒</dd></div>
+        </dl>
+        <p v-if="task.data.value.stage === 'failed'" class="notice warning process-error">
+          {{ task.data.value.error || task.data.value.failure_reason || "当前环节未完成，请查看任务状态。" }}
+        </p>
+      </section>
     </section>
     <section v-else-if="active === 'analysis'" class="analysis-layout">
       <aside class="analysis-nav surface">
         <button
           v-for="item in [
-            ['facts', `事实 ${facts.length}`],
-            ['inferences', `分析判断 ${inferences.length}`],
-            [
-              'graph',
-              `关系网络 ${graph.data.value?.stats?.assertion_count || 0}`,
-            ],
-            ['conflicts', `冲突与待核验 ${conflicts.length}`],
-            ['qa', `质量检查 ${task.data.value.qa_notes?.length || 0}`],
+            ['facts', `事实 ${factCount}`],
+            ['inferences', `分析判断 ${inferenceCount}`],
+            ['graph', `关系网络 ${graphAssertionCount}`],
           ]"
           :key="item[0]"
           :class="{ active: analysisType === item[0] }"
@@ -450,6 +807,8 @@ function versionsList() {
         </button>
       </aside>
       <div class="surface analysis-content">
+        <p v-if="analysis.isPending.value && analysisType !== 'graph'" class="muted">正在读取分析结果…</p>
+        <p v-if="analysis.isError.value && analysisType !== 'graph'" class="notice warning">分析结果读取失败，请稍后重试。</p>
         <template v-if="analysisType === 'facts'"
           ><details v-for="fact in facts" :key="fact.id" class="knowledge-item">
             <summary>
@@ -461,16 +820,35 @@ function versionsList() {
                 ev.quote
               }}
             </blockquote>
-          </details></template
-        ><template v-else-if="analysisType === 'inferences'"
+            <div
+              v-if="semanticFacets(fact.semantic_profile, fact.assertion_mode, fact.assertion_mode_raw).length"
+              class="semantic-profile"
+            >
+              <small>陈述语义</small>
+              <span
+                v-for="facet in semanticFacets(fact.semantic_profile, fact.assertion_mode, fact.assertion_mode_raw)"
+                :key="`${facet.axis}:${facet.label}`"
+                class="semantic-facet"
+                :title="facet.detail || `${facet.axis}：${facet.label}`"
+              >{{ facet.axis }} · {{ facet.label }}</span>
+            </div>
+          </details></template>
+        <template v-else-if="analysisType === 'inferences'"
           ><article
             v-for="item in inferences"
             :key="item.id"
             class="knowledge-item inference"
           >
             <div>
-              <span class="badge success">置信度 {{ confidence(item) }}</span
-              ><small
+              <span
+                v-if="item.source_level === 'EXTERNAL_INFORMATION'"
+                class="inference-source"
+                >外部补充</span
+              ><span v-else class="badge success"
+                >置信度 {{ confidence(item) }}</span
+              ><small v-if="item.source_level === 'EXTERNAL_INFORMATION'"
+                >非本任务材料依据</small
+              ><small v-else
                 >依据事实
                 {{ item.based_fact_ids?.join("、") || "待核验" }}</small
               >
@@ -479,8 +857,37 @@ function versionsList() {
             <blockquote v-if="item.reasoning_chain">
               {{ item.reasoning_chain }}
             </blockquote>
-          </article></template
-        ><template v-else-if="analysisType === 'graph'"
+            <details v-if="hasInferenceSemantics(item)" class="semantic-details">
+              <summary>语义边界与来源</summary>
+              <div
+                v-if="semanticFacets(item.semantic_profile).length"
+                class="semantic-profile"
+              >
+                <small>推论语义</small>
+                <span
+                  v-for="facet in semanticFacets(item.semantic_profile)"
+                  :key="`inference:${facet.axis}:${facet.label}`"
+                  class="semantic-facet"
+                  :title="facet.detail || `${facet.axis}：${facet.label}`"
+                >{{ facet.axis }} · {{ facet.label }}</span>
+              </div>
+              <div
+                v-for="source in item.source_semantics || []"
+                :key="`source:${source.fact_id}`"
+                class="semantic-profile semantic-source"
+              >
+                <small>来源事实 {{ source.fact_id }}</small>
+                <span
+                  v-for="facet in semanticFacets(source.profile, source.legacy_assertion_mode, source.legacy_assertion_detail)"
+                  :key="`${source.fact_id}:${facet.axis}:${facet.label}`"
+                  class="semantic-facet"
+                  :title="facet.detail || `${facet.axis}：${facet.label}`"
+                >{{ facet.axis }} · {{ facet.label }}</span>
+              </div>
+            </details>
+          </article></template>
+        <UiPagination v-if="['facts', 'inferences'].includes(analysisType) && (analysis.data.value?.total || 0)" v-model:page="analysisPage" v-model:page-size="analysisPageSize" :total="analysis.data.value?.total || 0" />
+        <template v-if="analysisType === 'graph'"
           ><div class="graph-summary">
             <span
               class="badge"
@@ -492,7 +899,17 @@ function versionsList() {
                   ? "Graph RAG 已启用"
                   : "图谱观测模式"
               }}</span
-            ><small>关系只保存有事实依据的实体联系。</small>
+            ><span v-if="graphBuildError" class="graph-build-error">{{ graphBuildError }}</span
+              ><button class="btn graph-build-button" :disabled="rebuildGraph.isPending.value || graphBuildActive" @click="rebuildGraph.mutate()">{{ graphBuildActive ? (graph.data.value?.background_job?.status === "queued" ? "已排队" : "正在构建") : "构建知识图谱" }}</button
+            ><span
+              v-if="!graphBuildActive && graphBuildStatus === 'partial_ready'"
+              class="badge warning"
+              >部分完成</span
+            ><span
+              v-else-if="!graphBuildActive && graphBuildStatus === 'degraded'"
+              class="badge danger"
+              >构建失败</span
+            >
           </div>
           <GraphNetwork
             v-if="graph.data.value?.edges?.length"
@@ -536,49 +953,16 @@ function versionsList() {
           <div v-if="!graph.data.value?.edges?.length" class="empty">
             <div>
               <strong>尚未形成可展示的关系网络</strong
-              >构图只保留可回查事实的关系。
+              ><span>{{ graphBuildMessage }}</span>
             </div>
-          </div></template
-        ><template v-else-if="analysisType === 'conflicts'"
-          ><article
-            v-for="item in conflicts"
-            :key="item.id"
-            class="knowledge-item conflict"
-          >
-            <b>{{ item.fact_key }}</b>
-            <p v-for="entry in item.entries || []" :key="entry.statement">
-              {{ entry.file }}：{{ entry.statement }}
-            </p>
-          </article>
-          <div v-if="!conflicts.length" class="empty">
-            <div>
-              <strong>未发现明确冲突</strong>冲突核验不会因为结果为空而删除。
-            </div>
-          </div></template
-        ><template v-else
-          ><article
-            v-for="(item, index) in task.data.value.qa_notes || []"
-            :key="index"
-            class="knowledge-item conflict"
-          >
-            <b>{{ item.type || "质量问题" }}</b>
-            <p>{{ item.note || item.quote }}</p>
-          </article>
-          <div v-if="!task.data.value.qa_notes?.length" class="empty">
-            <div><strong>暂无质量问题</strong>深度检查结果会在这里出现。</div>
-          </div></template
-        >
+          </div></template>
+
       </div>
     </section>
-    <ArtifactReviewWorkspace
-      v-else-if="active === 'collaboration'"
-      :task-id="taskId"
-      :report-id="task.data.value.report_id"
-      :run-revision="task.data.value.run_revision || 1"
-    />
     <section
       v-else-if="active === 'report'"
       class="surface section-block report-entry"
+      :class="{ 'tab-entry--empty': !task.data.value.report_id }"
     >
       <template v-if="task.data.value.report_id"
         ><div>
@@ -604,20 +988,22 @@ function versionsList() {
             :href="`/api/reports/${task.data.value.report_id}/export`"
             >导出 Word</a
           >
-        </div></template
-      >
-      <div v-else class="empty">
+        </div></template>
+      <div v-else class="empty tab-empty-state">
         <div>
-          <strong>尚未生成报告</strong
-          >完成分析后，系统将按照最终报告计划开始写作。
+          <strong>尚未生成报告</strong>
+          <span>完成分析后，系统将按照最终报告计划开始写作。</span>
         </div>
       </div>
     </section>
-    <section v-else class="surface section-block">
-      <div class="section-head">
+    <section
+      v-else
+      class="surface section-block version-entry"
+      :class="{ 'tab-entry--empty': !versionsList().length }"
+    >
+      <div v-if="versionsList().length" class="section-head">
         <div>
           <h2>版本记录</h2>
-          <p class="muted">每次快照和增量更新都形成可审阅的历史基线</p>
         </div>
       </div>
       <div v-if="versionsList().length" class="data-list">
@@ -638,9 +1024,10 @@ function versionsList() {
           >
         </div>
       </div>
-      <div v-else class="empty">
+      <div v-else class="empty tab-empty-state">
         <div>
-          <strong>暂无版本快照</strong>报告编辑器中可生成快照或启动增量更新。
+          <strong>暂无版本快照</strong>
+          <span>报告编辑器中可生成快照或启动增量更新。</span>
         </div>
       </div>
     </section>
@@ -652,39 +1039,81 @@ function versionsList() {
 </template>
 <style scoped>
 .task-head {
-  display: flex;
-  justify-content: space-between;
   align-items: flex-start;
-  gap: 24px;
 }
 .task-head h1 {
-  margin: 3px 0;
+  max-width: 920px;
+  margin: 6px 0 8px;
+  color: var(--foreground);
+  font-size: clamp(24px, 2vw, 32px);
+  letter-spacing: -0.035em;
+  line-height: 1.18;
 }
 .back-link {
+  display: inline-flex;
+  margin-bottom: 4px;
   color: var(--color-primary);
-  font-size: 12px;
+  font-size: 13px;
+  font-weight: 650;
+}
+.task-meta {
+  margin: 6px 0 0;
 }
 .progress-block {
-  padding: 20px 24px;
+  overflow: hidden;
+  padding: 18px 22px 16px;
+  border-color: var(--border);
+  background: var(--card);
+}
+.progress-interruption {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 36px;
+}
+.progress-interruption-mark {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--warning);
+}
+.progress-interruption b,
+.progress-interruption small {
+  display: block;
+}
+.progress-interruption b {
+  font-size: 13px;
+  font-weight: 600;
+}
+.progress-interruption small {
+  margin-top: 3px;
+  color: var(--muted-foreground);
+  font-size: 12px;
 }
 .progress-rail {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
+  gap: 4px;
+}
+.progress-rail.compact {
+  grid-template-columns: repeat(3, 1fr);
 }
 .progress-step {
   position: relative;
   display: flex;
-  gap: 12px;
+  min-width: 0;
+  gap: 11px;
   align-items: center;
 }
 .progress-step::after {
   content: "";
   position: absolute;
-  left: 42px;
-  right: 12px;
+  left: 38px;
+  right: 0;
   top: 14px;
   height: 1px;
-  background: var(--color-border-strong);
+  background: color-mix(in srgb, var(--border-strong) 82%, transparent);
 }
 .progress-step:last-child::after {
   display: none;
@@ -697,18 +1126,25 @@ function versionsList() {
   width: 29px;
   height: 29px;
   border: 1px solid var(--color-border-strong);
-  border-radius: 50%;
-  background: #fff;
+  border-radius: 8px;
+  background: var(--card);
   color: var(--color-faint);
   font-size: 12px;
 }
+.progress-step > div {
+  position: relative;
+  z-index: 1;
+  min-width: 0;
+  padding: 2px 8px 2px 1px;
+  background: var(--card);
+}
 .progress-step.done > span {
-  color: #fff;
-  border-color: var(--color-success);
-  background: var(--color-success);
+  color: var(--foreground);
+  border-color: var(--border-strong);
+  background: var(--surface-hover);
 }
 .progress-step.current > span {
-  color: #fff;
+  color: var(--foreground);
   border-color: var(--color-primary);
   background: var(--color-primary);
 }
@@ -716,59 +1152,87 @@ function versionsList() {
 .progress-step small {
   display: block;
 }
+.progress-step b {
+  overflow: hidden;
+  color: var(--foreground);
+  font-size: 13px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .progress-step small {
   color: var(--color-faint);
   font-size: 11px;
 }
-.details-toggle {
-  margin: 16px 0 0;
-  border: 0;
-  background: transparent;
-  color: var(--color-primary);
-  padding: 0;
+.workspace-tabs {
+  position: sticky;
+  z-index: 5;
+  top: var(--header-height);
+  padding: 7px 4px 9px;
+  background: var(--background);
 }
-.run-details {
+.workspace-browser {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  min-width: 0;
+  gap: 12px;
+}
+.workspace-subtabs {
+  position: static;
+  z-index: auto;
+  display: flex;
+  width: fit-content;
+  max-width: 100%;
+  padding: 0 4px;
+  background: transparent;
+  backdrop-filter: none;
+  flex-wrap: wrap;
+  overflow: visible;
+}
+.workspace-browser > .section-block {
+  min-width: 0;
+  padding: 16px 20px;
+}
+.material-row {
+  grid-template-columns: minmax(0, 1fr) auto;
   gap: 16px;
-  margin-top: 16px;
-  padding-top: 16px;
-  border-top: 1px solid var(--color-border);
 }
-.run-details span,
-.run-details b {
-  display: block;
+.material-row > div {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
-.run-details span {
-  color: var(--color-muted);
+.material-row > .badge {
+  white-space: nowrap;
+}
+.process-records {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px 32px;
+  margin: 0;
+}
+.process-records dt {
+  color: var(--muted-foreground);
   font-size: 12px;
 }
-.workspace-tabs {
-  padding: 0 4px;
+.process-records dd {
+  margin: 4px 0 0;
+  font-size: 13px;
+}
+.process-panel .section-head {
+  margin-bottom: 4px;
+}
+.process-error {
+  margin-top: 4px;
 }
 .workspace-grid {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 340px;
-  gap: 24px;
+  gap: 28px;
 }
 .main-column,
 .side-column {
   display: grid;
   align-content: start;
   gap: 24px;
-}
-.status-summary {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 20px;
-}
-.status-summary span,
-.status-summary b {
-  display: block;
-}
-.status-summary span {
-  color: var(--color-muted);
-  font-size: 12px;
 }
 .flat {
   border: 0;
@@ -779,11 +1243,14 @@ function versionsList() {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding: 13px 0;
+  padding: 15px 3px;
   border: 0;
   border-top: 1px solid var(--color-border);
   background: transparent;
   text-align: left;
+}
+.artifact-link:hover {
+  background: var(--muted);
 }
 .artifact-link div b,
 .artifact-link div span {
@@ -820,15 +1287,24 @@ function versionsList() {
 .analysis-nav button {
   width: 100%;
   padding: 11px 12px;
-  border: 0;
-  background: transparent;
+  border: 1px solid transparent;
+  background: var(--surface-raised);
+  color: var(--foreground);
   text-align: left;
-  border-radius: 4px;
+  font-size: 13px;
+  font-weight: 550;
+  border-radius: var(--radius-sm);
+  transition: background-color var(--motion-fast), border-color var(--motion-fast);
+}
+.analysis-nav button:hover {
+  background: var(--surface-hover);
+  border-color: var(--border-strong);
 }
 .analysis-nav button.active {
-  color: var(--color-primary);
-  background: var(--color-primary-soft);
-  font-weight: 650;
+  color: var(--foreground);
+  background: var(--primary-soft);
+  border-color: color-mix(in srgb, var(--primary) 58%, var(--border));
+  font-weight: 600;
 }
 .analysis-content {
   padding: 8px 24px;
@@ -854,24 +1330,220 @@ function versionsList() {
 .knowledge-item blockquote {
   margin: 12px 0 0;
   padding: 10px 14px;
-  border-left: 2px solid #aebbc9;
+  border-left: 2px solid var(--border-strong);
   background: var(--color-surface-soft);
   color: var(--color-muted);
 }
+.semantic-profile {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+}
+.semantic-profile > small {
+  color: var(--color-muted);
+  margin-right: 2px;
+}
+.semantic-facet {
+  max-width: 100%;
+  padding: 3px 7px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface-soft);
+  color: var(--foreground);
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.semantic-details {
+  margin-top: 12px;
+  padding-top: 9px;
+  border-top: 1px solid var(--color-border);
+}
+.semantic-details > summary {
+  color: var(--color-muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+.semantic-source {
+  padding-top: 6px;
+}
 .knowledge-item.inference {
-  border-left: 2px solid #73a983;
+  border-left: 2px solid var(--success);
   padding-left: 14px;
 }
 .knowledge-item.inference > div {
   display: flex;
-  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
 }
 .knowledge-item.inference p {
   margin: 12px 0 0;
 }
+.inference-source {
+  color: var(--color-muted);
+  border: 1px solid var(--color-border);
+  background: var(--color-surface-soft);
+  border-radius: var(--radius-sm);
+  padding: 2px 7px;
+  font-size: 12px;
+}
 .knowledge-item.conflict {
-  border-left: 2px solid #d39a48;
+  border-left: 2px solid var(--warning);
   padding-left: 14px;
+}
+.conflict-review {
+  margin-bottom: 18px;
+  border: 1px solid var(--color-border);
+  background: var(--color-surface);
+}
+.conflict-review > header {
+  padding: 16px 18px;
+  border-bottom: 1px solid var(--color-border);
+}
+.conflict-review > header > div,
+.conflict-side {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.conflict-review > header b {
+  display: block;
+  margin-top: 10px;
+  font-size: 16px;
+}
+.conflict-review > header p {
+  margin: 7px 0 0;
+  color: var(--color-muted);
+}
+.conflict-type {
+  padding: 3px 7px;
+  border-radius: 3px;
+  background: var(--surface-hover);
+  color: var(--muted-foreground);
+  font-size: 12px;
+  font-weight: 650;
+}
+.conflict-type.direct_contradiction {
+  background: var(--destructive-soft);
+  color: var(--destructive);
+}
+.conflict-type.qualification,
+.conflict-type.temporal_difference {
+  background: var(--warning-soft);
+  color: var(--warning);
+}
+.conflict-pair {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 190px minmax(0, 1fr);
+  align-items: stretch;
+}
+.conflict-pair > section {
+  min-width: 0;
+  padding: 16px 18px;
+}
+.conflict-pair > section:first-child {
+  grid-column: 1;
+}
+.conflict-pair > section:nth-child(2) {
+  grid-column: 3;
+}
+.conflict-relation {
+  grid-column: 2;
+  grid-row: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 16px;
+  border-inline: 1px solid var(--color-border);
+  background: var(--color-surface-soft);
+  text-align: center;
+}
+.conflict-relation span {
+  color: var(--color-primary);
+  font-size: 12px;
+  font-weight: 650;
+}
+.conflict-relation b {
+  font-size: 13px;
+  line-height: 1.6;
+}
+.conflict-side span {
+  color: var(--color-primary);
+  font-weight: 650;
+}
+.conflict-side small,
+.conflict-review footer {
+  color: var(--color-muted);
+  font-size: 12px;
+}
+.conflict-pair section > strong {
+  display: block;
+  margin-top: 12px;
+  line-height: 1.65;
+}
+.conflict-pair blockquote {
+  margin: 12px 0;
+  padding: 10px 12px;
+  border-left: 2px solid var(--color-border-strong);
+  background: var(--color-surface-soft);
+  color: var(--color-muted);
+  line-height: 1.6;
+}
+.conflict-ambiguous {
+  padding: 18px;
+  background: var(--warning-soft);
+}
+.conflict-ambiguous > strong {
+  color: var(--warning);
+}
+.conflict-ambiguous > p {
+  color: var(--color-muted);
+  line-height: 1.65;
+}
+.conflict-candidates {
+  display: grid;
+  gap: 8px;
+}
+.conflict-candidates section {
+  padding: 10px 12px;
+  border-left: 2px solid var(--warning);
+  background: var(--surface-raised);
+}
+.conflict-candidates section small,
+.conflict-candidates section b,
+.conflict-candidates section footer {
+  display: block;
+}
+.conflict-candidates section b {
+  margin: 5px 0;
+  line-height: 1.55;
+}
+@media (max-width: 900px) {
+  .conflict-pair {
+    grid-template-columns: 1fr;
+  }
+  .conflict-pair > section:first-child,
+  .conflict-pair > section:nth-child(2),
+  .conflict-relation {
+    grid-column: 1;
+  }
+  .conflict-pair > section:first-child {
+    grid-row: 1;
+  }
+  .conflict-relation {
+    grid-row: 2;
+    border: 1px solid var(--color-border);
+    border-inline: 0;
+  }
+  .conflict-pair > section:nth-child(2) {
+    grid-row: 3;
+  }
 }
 .graph-summary,
 .graph-changes,
@@ -885,7 +1557,6 @@ function versionsList() {
   padding: 12px 0;
   border-bottom: 1px solid var(--color-border);
 }
-.graph-summary small,
 .graph-edge small,
 .graph-changes small {
   color: var(--color-muted);
@@ -906,6 +1577,40 @@ function versionsList() {
   justify-content: space-between;
   gap: 24px;
 }
+.tab-entry--empty {
+  display: grid;
+  min-height: 260px;
+}
+.report-entry.tab-entry--empty,
+.version-entry.tab-entry--empty {
+  min-height: 260px;
+  grid-template-columns: minmax(0, 1fr);
+}
+.tab-empty-state {
+  width: 100%;
+  min-width: 0;
+  min-height: 0;
+  padding: 24px;
+  display: grid;
+  place-items: center;
+  text-align: center;
+}
+.tab-empty-state > div {
+  width: min(100%, 460px);
+  margin-inline: auto;
+  justify-self: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+}
+.tab-empty-state > div > span {
+  display: block;
+  margin-top: 4px;
+}
+.version-entry {
+  min-height: 0;
+}
 .report-entry h2,
 .report-entry p {
   margin-bottom: 3px;
@@ -919,6 +1624,88 @@ function versionsList() {
 }
 .version-row div span {
   color: var(--color-muted);
+}
+.checkpoint-form {
+  display: grid;
+  gap: 8px;
+  margin: 14px 0;
+}
+.checkpoint-form label {
+  display: grid;
+  gap: 7px;
+  padding: 11px 13px;
+  border-left: 2px solid var(--primary);
+  border-radius: 0 8px 8px 0;
+  background: color-mix(in srgb, var(--primary) 5%, var(--card));
+}
+.checkpoint-form label > span {
+  color: var(--color-muted);
+  font-size: 12px;
+}
+.checkpoint-form input,
+.checkpoint-form textarea,
+.checkpoint-outline input {
+  width: 100%;
+  min-width: 0;
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  background: var(--surface-raised);
+  color: var(--color-text);
+  font: inherit;
+  line-height: 1.55;
+}
+.checkpoint-form input,
+.checkpoint-outline input {
+  height: 34px;
+  padding: 0 10px;
+}
+.checkpoint-form textarea {
+  min-height: 92px;
+  padding: 8px 10px;
+  resize: vertical;
+}
+.checkpoint-form input:focus,
+.checkpoint-form textarea:focus,
+.checkpoint-outline input:focus {
+  outline: none;
+  border-color: var(--primary);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--primary) 20%, transparent);
+}
+.checkpoint-outline {
+  margin: 12px 0;
+  padding-left: 22px;
+  line-height: 1.8;
+}
+.checkpoint-outline-editable {
+  display: grid;
+  gap: 8px;
+  padding-left: 30px;
+}
+.checkpoint-outline-editable li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-left: 4px;
+}
+.text-button {
+  flex: 0 0 auto;
+  border: 0;
+  background: transparent;
+  color: var(--color-muted);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.text-button:hover:not(:disabled) {
+  color: var(--color-text);
+}
+.text-button:disabled {
+  cursor: not-allowed;
+  opacity: .45;
+}
+.checkpoint-add {
+  margin: -2px 0 12px;
+  text-align: left;
 }
 @media (max-width: 900px) {
   .task-head,
@@ -935,16 +1722,12 @@ function versionsList() {
   .progress-step::after {
     display: none;
   }
-  .run-details,
-  .status-summary {
-    grid-template-columns: repeat(2, 1fr);
-  }
   .analysis-layout {
     grid-template-columns: 1fr;
   }
   .analysis-nav {
     display: flex;
-    overflow: auto;
+    flex-wrap: wrap;
   }
   .analysis-nav button {
     width: auto;
@@ -952,10 +1735,6 @@ function versionsList() {
   }
 }
 @media (max-width: 600px) {
-  .run-details,
-  .status-summary {
-    grid-template-columns: 1fr;
-  }
   .version-row {
     grid-template-columns: 1fr auto;
   }
