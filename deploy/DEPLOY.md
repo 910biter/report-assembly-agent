@@ -42,6 +42,7 @@ curl -fsS http://127.0.0.1:6333/healthz
 推荐安装并启用常驻服务：
 
 ```bash
+.venv/bin/pip install 'vllm==0.27.1'
 sudo deploy/install-vllm-service.sh "$PWD"
 sudo systemctl enable --now ira-vllm
 curl -fsS http://127.0.0.1:8100/v1/models

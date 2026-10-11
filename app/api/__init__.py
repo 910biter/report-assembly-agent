@@ -64,9 +64,6 @@ def create_app() -> FastAPI:
         application.mount(
             "/ui-assets/assets", ImmutableStaticFiles(directory=str(spa_assets)), name="ui-assets"
         )
-    application.mount(
-        "/static", StaticFiles(directory=str(_WEB_DIR / "static")), name="static"
-    )
     return application
 
 
