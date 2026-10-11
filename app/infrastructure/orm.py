@@ -163,6 +163,7 @@ CREATE TABLE IF NOT EXISTS evidence (
     page INTEGER,
     paragraph INTEGER,
     quote TEXT NOT NULL,
+    visibility_json TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
 );
 
@@ -781,6 +782,7 @@ CREATE INDEX IF NOT EXISTS idx_interaction_notifications_task ON interaction_not
 """
 # 迁移/演进补充列(历史 ALTER 汇总;新库 create_all 直接含,旧库靠 _migrate 补齐)
 _MIGRATED_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ('evidence', 'visibility_json', "TEXT NOT NULL DEFAULT '{}'"),
     ('materials', 'owner_user_id', 'INTEGER REFERENCES users(id)'),
     ('style_variants', 'owner_user_id', 'INTEGER REFERENCES users(id)'),
     ('interaction_threads', 'owner_user_id', 'INTEGER REFERENCES users(id)'),

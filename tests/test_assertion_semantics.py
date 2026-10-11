@@ -173,16 +173,16 @@ def test_evidence_and_analysis_prompts_preserve_source_modality(monkeypatch):
 
     assert '"assertion_mode"' in evidence_system
     assert '"assertion_mode_raw"' in evidence_system
-    assert "不得改写成机制已经存在或已落地" in evidence_system
-    assert "不得用领域关键词、文件名、章节标题或固定词表规则" in evidence_system
-    for axis in ("主体/范围/量词", "条件/因果/关系", "极性/否定/例外"):
-        assert axis in evidence_system
-        assert axis in analyzer._SYSTEM
-        assert axis in analyzer._GLOBAL_SYSTEM
-    assert "示例不是必填清单" in evidence_system
-    assert "不构成穷举或必填清单" in analyzer._SYSTEM
-    assert "不能单独证明已经实施" in analyzer._SYSTEM
-    assert "材料级摘要标签不能替代单条事实证据" in analyzer._SYSTEM
+    assert "保留原文时态、条件和语气" in evidence_system
+    assert "材料标题、文件名和领域词仅供定位" in evidence_system
+    for prompt in (evidence_system, analyzer._SYSTEM, analyzer._GLOBAL_SYSTEM):
+        for boundary in ("时间", "条件", "归属", "实现状态"):
+            assert boundary in prompt
+        assert '"semantic_profile": {"facets": []' in prompt
+    assert "相关字段缺失时省略" in evidence_system
+    assert "按需补充" in analyzer._SYSTEM
+    assert "现状/目标/计划/预测" in analyzer._SYSTEM
+    assert "直接支撑判断的 based_fact_ids" in analyzer._SYSTEM
 
     agent = AnalysisAgent()
     captured = {}

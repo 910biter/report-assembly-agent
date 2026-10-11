@@ -104,7 +104,7 @@
     0 8px 24px rgba(0, 0, 0, 0.28), 0 28px 64px rgba(0, 0, 0, 0.38);
   --focus-ring: 0 0 0 3px var(--ring);
   --nav-width: 176px;
-  --header-height: 56px;
+  --header-height: 0px;
   --content-max: 1360px;
   --motion-fast: 160ms cubic-bezier(0.2, 0.8, 0.2, 1);
   --motion-normal: 220ms cubic-bezier(0.2, 0.8, 0.2, 1);
@@ -222,4 +222,8 @@
   --accent: #b0bdc7;
   --accent-soft: rgba(176, 189, 199, 0.1);
   --ring: rgba(176, 189, 199, 0.38);
+}
+
+@media (max-width: 1024px) {
+  :root { --header-height: 48px; }
 }

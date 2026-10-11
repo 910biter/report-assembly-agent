@@ -64,7 +64,7 @@ class OpenAICompatibleGateway:
                       max_tokens: int | None = None,
                       temperature: float | None = None) -> dict:
         content = self._chat(
-            prompt, system, json_mode=False, think=think, max_tokens=max_tokens,
+            prompt, system, json_mode=load_connection().send_json_response_format, think=think, max_tokens=max_tokens,
             temperature=temperature,
         )
         fenced = re.search(r"```(?:json)?\s*(.*?)\s*```", content, re.DOTALL)
@@ -113,13 +113,19 @@ class OpenAICompatibleGateway:
             "model": connection.model_name,
             "messages": messages,
             "stream": False,
-            connection.output_parameter: min(int(max_tokens or settings.generation_reserve_tokens), connection.output_tokens),
+            connection.output_parameter: int(max_tokens or settings.generation_reserve_tokens),
         }
+        if payload[connection.output_parameter] > connection.output_tokens:
+            raise ValueError("MODEL_INPUT_OVER_BUDGET")
         if temperature is not None and connection.send_temperature:
             payload["temperature"] = float(temperature)
         payload.update(connection.extra_body(think))
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
+        from app.vllm_capacity import verify_request
+        from dataclasses import replace
+        request_capacity = verify_request(replace(connection, base_url=base_url), payload,
+                                          safety_tokens=int(settings.safety_margin_tokens))
         from app import task_control
         task_id = task_control.active_task_id()
         client = httpx.Client(timeout=settings.gateway_timeout_seconds)
@@ -132,17 +138,6 @@ class OpenAICompatibleGateway:
                 headers=headers,
                 json=payload,
             )
-            adjusted_max_tokens = _context_safe_max_tokens(
-                response,
-                requested_max_tokens=int(payload[connection.output_parameter]),
-            )
-            if adjusted_max_tokens is not None:
-                payload[connection.output_parameter] = adjusted_max_tokens
-                response = client.post(
-                    f"{base_url}/chat/completions",
-                    headers=headers,
-                    json=payload,
-                )
         except Exception:
             if task_id and task_control.is_paused(task_id):
                 raise RuntimeError("TASK_PAUSED")
@@ -156,15 +151,20 @@ class OpenAICompatibleGateway:
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
+            if _context_exceeded(response):
+                raise RuntimeError("MODEL_CONTEXT_EXCEEDED") from exc
             raise RuntimeError(
                 f"MODEL_HTTP_{response.status_code}"
             ) from exc
         result = response.json()
+        from app.vllm_capacity import observe_usage
+        observe_usage(replace(connection, base_url=base_url), payload, result.get("usage") or {})
         _record_openai_generation_stats(result, time.perf_counter() - started)
         if _completion_was_truncated(result):
             raise RuntimeError("MODEL_OUTPUT_TRUNCATED")
         content = str(result["choices"][0]["message"].get("content") or "").strip()
         _record_generation_meta(returned_chars=len(content), valid_json_chars=0)
+        _LAST_GENERATION_META_CONTEXT.set({**last_generation_meta(), "request_capacity": request_capacity})
         return content
 
     def health(self) -> dict:
@@ -190,28 +190,12 @@ class OpenAICompatibleGateway:
         }
 
 
-def _context_safe_max_tokens(response, requested_max_tokens: int) -> int | None:
-    """Recover once when chat-template tokens barely cross the model window.
-
-    Prompt builders reserve context conservatively, but the serving tokenizer
-    is the final authority. vLLM reports the exact prompt length in its 400
-    response; reducing only the unused generation ceiling avoids three
-    identical retries without dropping evidence from the request.
-    """
+def _context_exceeded(response) -> bool:
+    """Classify capacity errors; the calling stage must repack, not shrink output."""
     if int(getattr(response, "status_code", 0) or 0) != 400:
-        return None
+        return False
     detail = str(getattr(response, "text", "") or "")
-    match = re.search(r"prompt contains at least\s+(\d+)\s+input tokens", detail, re.I)
-    if not match:
-        return None
-    # The reported prompt count is only a lower bound: vLLM stops tokenizing as
-    # soon as it can prove the request is too large. It therefore cannot be used
-    # to calculate an exact remainder. A bounded decrement is deterministic and
-    # leaves prompt selection to the stage-specific context builder.
-    available = int(requested_max_tokens) - 512
-    if available < 512:
-        return None
-    return available
+    return bool(re.search(r"prompt contains at least\s+\d+\s+input tokens|maximum context length|maximum model length|context[_ ]length[_ ]exceeded", detail, re.I))
 
 
 def _completion_was_truncated(payload: dict) -> bool:
@@ -308,7 +292,7 @@ def _record_generation_meta(returned_chars: int, valid_json_chars: int = 0) -> N
         "returned_chars": int(returned_chars or 0),
         "valid_json_chars": int(valid_json_chars or 0),
     }
-    _LAST_GENERATION_META_CONTEXT.set(meta)
+    _LAST_GENERATION_META_CONTEXT.set({**last_generation_meta(), **meta})
     with _GENERATION_STATS_LOCK:
         _LAST_GENERATION_META.update(meta)
 

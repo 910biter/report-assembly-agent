@@ -484,9 +484,7 @@ function previewSection(section: any) {
   <section class="review-workspace">
     <header class="review-header">
       <div>
-        <span class="eyebrow">VERSION REVIEW</span>
         <h2>版本审阅</h2>
-        <p>先理解段落变化，需要时再逐句调整。</p>
       </div>
       <div v-if="diff" class="header-stats">
         <span
@@ -524,12 +522,11 @@ function previewSection(section: any) {
       <section>
         <div class="navigation-heading">
           <div>
-            <h3>版本查看与对比</h3>
+            <h3>版本</h3>
             <small>{{ formalVersions.length }} 个正式版本</small>
           </div>
         </div>
-        <label class="version-select-label" for="version-anchor">当前查看版本</label>
-        <select id="version-anchor" v-model.number="activeVersion" class="version-select">
+        <select id="version-anchor" v-model.number="activeVersion" class="version-select" aria-label="选择版本">
           <option
             v-for="version in formalVersions"
             :key="version.id"
@@ -1014,7 +1011,7 @@ function previewSection(section: any) {
   inset: var(--header-height) 0 0 var(--nav-width);
   z-index: 80;
   display: grid;
-  grid-template: 88px minmax(0, 1fr) / 250px minmax(560px, 1fr) 292px;
+  grid-template: 64px minmax(0, 1fr) / 250px minmax(560px, 1fr) 292px;
   background: var(--background);
   color: var(--foreground);
   min-width: 0;
@@ -1032,7 +1029,7 @@ button {
   grid-template-columns: 250px 1fr auto;
   align-items: center;
   gap: 20px;
-  min-height: 88px;
+  min-height: 64px;
   padding: 10px 22px;
   background: color-mix(in srgb, var(--card) 94%, var(--primary-soft));
   border-bottom: 1px solid var(--color-border);
@@ -1045,24 +1042,9 @@ button {
   margin: 1px 0;
   font-family: var(--font-ui);
   font-size: 23px;
-  font-weight: 720;
+  font-weight: 600;
   letter-spacing: -0.03em;
   line-height: 1.25;
-}
-.review-header p {
-  margin: 2px 0 0;
-  color: var(--color-muted);
-  font-size: 12px;
-  line-height: 1.35;
-  white-space: nowrap;
-}
-.eyebrow {
-  display: block;
-  color: var(--color-primary);
-  font-size: 9px;
-  font-weight: 700;
-  line-height: 1.2;
-  letter-spacing: 0.14em;
 }
 .header-stats {
   display: flex;
@@ -1143,14 +1125,9 @@ button {
 .navigation-heading h3 {
   margin: 0;
 }
-.navigation-heading small,
-.version-select-label {
+.navigation-heading small {
   color: var(--color-muted);
   font-size: 10px;
-}
-.version-select-label {
-  display: block;
-  margin-bottom: 5px;
 }
 .version-select {
   width: 100%;
@@ -1815,7 +1792,6 @@ button {
     grid-column: 1;
     grid-template-columns: 1fr auto;
   }
-  .review-header p,
   .header-actions button:not(:last-child) {
     display: none;
   }

@@ -1829,7 +1829,8 @@ def model_connection_status():
             return {"status": "unknown", "message": "服务不支持模型列表，请使用测试连接验证推理"}
         response.raise_for_status()
         available = any(str(item.get("id")) == connection.model_name for item in response.json().get("data", []))
-        return {"status": "ready" if available else "unknown", "message": "模型已就绪" if available else "模型列表未找到配置名称，请测试连接"}
+        from app.vllm_capacity import status
+        return {"status": "ready" if available else "unknown", "message": "模型已就绪" if available else "模型列表未找到配置名称，请测试连接", **status(connection)}
     except ValueError:
         return {"status": "unconfigured", "message": "尚未配置模型接入"}
     except Exception:
@@ -1897,8 +1898,8 @@ def health():
             "runtime_profiles": runtime_profile_manifest(),
             "context_tokenizer": {
                 "method": tokenizer_method(),
-                "configured_path": public_connection().get("tokenizer_path", ""),
-                "exact": tokenizer_method().startswith("tokenizer:"),
+                "exact": False,
+                "final_request_counter": "vllm /tokenize (with estimated fallback)",
             },
         }
     except Exception as exc:

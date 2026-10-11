@@ -46,7 +46,6 @@ class Settings(BaseSettings):
     runtime_root: Path = _PROJECT_ROOT / "runtime"
     host: str = "127.0.0.1"  # 服务监听地址(IRA_HOST,支持 .env;容器/远端部署设 0.0.0.0)
     port: int = 8000  # 服务监听端口(IRA_PORT)
-    context_tokenizer_local_only: bool = True  # 禁止上下文计量在运行时访问外网
     embedding_backend: str = "transformers-cpu"
     embedding_model: str = "Qwen3-Embedding-0.6B"
     embedding_model_path: str = "/home/nas511/zhangruqi/models/Qwen3-Embedding-0.6B"
@@ -56,6 +55,8 @@ class Settings(BaseSettings):
     embedding_query_instruction: str = "Retrieve relevant evidence passages for the current report analysis question"
     llm_concurrency: int = 1  # OpenAI-compatible serving continuous batching入口并发
     evidence_batch_concurrency: int = 1  # 独立 Evidence 批次并发；仅 vLLM 部署建议设为2
+    evidence_max_adaptive_split_depth: int = 4
+    evidence_max_adaptive_split_calls: int = 12
     # 同一物理模型上的交互控制通道。交互请求不进入长工作流的本地队列，
     # 但仍通过独立信号量限制并发，并由 vLLM priority scheduler 统一调度。
     interactive_concurrency: int = 1
@@ -72,7 +73,8 @@ class Settings(BaseSettings):
     material_analysis_input_tokens: int = 4000
     material_analysis_output_tokens: int = 2048
     planner_output_tokens: int = 3072
-    analysis_output_tokens: int = 3072
+    analysis_output_tokens: int = 5120
+    analysis_target_inferences_per_batch: int = 8  # Suggested count; increasing output room must not increase generation demand.
     analysis_inference_token_budget: int = 384  # Analysis 单条推断的资源估算，不是领域规则
     analysis_facts_per_batch: int = 45  # 资源边界；语义分组仍由运行时维度与事实关系决定
     narrative_output_tokens: int = 4096
@@ -101,7 +103,7 @@ class Settings(BaseSettings):
     evidence_output_tokens: int = 5120  # Evidence 高密度批次需要比普通结构化阶段更大的输出空间
     evidence_first_pass_input_tokens: int = 160000  # 首轮 Evidence 总输入资源边界
     evidence_gap_input_tokens: int = 60000  # 单轮缺口检索输入资源边界
-    # Exact model tokenization is available in production. Keep a measured
+    # Final request tokenization is provided by vLLM. Keep a measured
     # guard band instead of reserving several thousand tokens twice: prompt
     # sections are already counted by the context packer.
     prompt_overhead_tokens: int = 1024  # chat template/system prompt allowance

@@ -47,8 +47,7 @@ def workspace_for_task(task_id: str) -> str:
     return f"{settings.graph_workspace_id}:user:{owner}"
 
 
-_GRAPH_SYSTEM = """你是证据约束的关系抽取员。只根据给定事实抽取实体和关系，不推断、不补全。
-严格输出 JSON：
+_GRAPH_SYSTEM = """你是关系抽取员。将本次给定 Fact 明确表达、且有分析价值的主体—关系—客体整理为图谱。只输出 JSON：
 {
   "entities": [{"name":"实体原文","type":"模型判断的开放实体类型标签或 unknown","fact_ids":[1]}],
   "assertions": [{
@@ -57,12 +56,9 @@ _GRAPH_SYSTEM = """你是证据约束的关系抽取员。只根据给定事实�
     "valid_to":"可选时间", "fact_ids":[1], "confidence":"high/medium/low"
   }]
 }
-约束：
-1. fact_ids 必须来自输入且直接支撑该实体或关系。
-2. 不要把抽象判断、预测、建议、标题当成实体关系。
-3. 关系必须是输入事实明确表达的主体-谓词-客体，不要把同段文字强行串联。
-4. object_kind 只能为 entity 或 value；不确定时使用 value。
-5. 同一事实可有多个关系，但只保留有分析价值且可解释的关系。"""
+工作方法：
+1. 每个实体和关系绑定直接支持它的本次 fact_ids；同一事实可形成多个可解释关系。主体、谓词、客体应在同一事实中有明确联系，抽象判断、建议和标题保留在原始事实层。
+2. object_kind 使用 entity 或 value；客体尚未稳定识别为实体时使用 value。时间和事件只填写事实明确给出的内容。"""
 
 
 def _normalized(value: str) -> str:

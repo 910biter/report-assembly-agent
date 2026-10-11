@@ -13,10 +13,10 @@ from app.workflow.execution import require_idle_task
 from app.workflow.queue import task_queue_status
 
 
-def _snapshot_ids(rows: list[dict], *, exclude_external: bool = False) -> list[int]:
+def _snapshot_ids(rows: list[dict], *, key: str = "id", exclude_external: bool = False) -> list[int]:
     result = []
     for item in rows:
-        raw_id = item.get("id")
+        raw_id = item.get(key)
         if not str(raw_id or "").isdigit():
             continue
         if exclude_external and str(item.get("source_level") or "") == "EXTERNAL_INFORMATION":
@@ -73,7 +73,7 @@ def activate_incremental_task(task_id: str, report: dict[str, Any], submitted_ma
         if base_version is None:
             raise ValueError("BASE_VERSION_NOT_FOUND")
 
-        old_material_ids = _snapshot_ids(base_version.get("material_fingerprints") or [])
+        old_material_ids = _snapshot_ids(base_version.get("material_fingerprints") or [], key="material_id")
         old_fact_ids = _snapshot_ids(base_version.get("fact_snapshot") or [])
         inference_rows = base_version.get("inference_snapshot") or []
         old_inference_ids = _snapshot_ids(inference_rows, exclude_external=True)

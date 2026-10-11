@@ -25,13 +25,13 @@ defineProps<{ eyebrow?: string; title: string; description?: string }>();
   gap: var(--space-4);
 }
 .ui-section-header h2 {
-  margin: 2px 0 4px;
+  margin: 0;
   color: var(--foreground);
   font-size: 17px;
   letter-spacing: -0.015em;
 }
 .ui-section-header p {
-  margin: 0;
+  margin: 6px 0 0;
   color: var(--muted-foreground);
   font-size: 13px;
 }

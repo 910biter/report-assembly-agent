@@ -57,7 +57,7 @@ class NarrativeScaleTests(unittest.TestCase):
 
     def test_writer_prompt_requires_minimal_sentence_specific_citations(self):
         self.assertIn("最小且逐句绑定", WriterAgent.role)
-        self.assertIn("不得把整段证据列表复制到每一句", WriterAgent.role)
+        self.assertIn("每个 ID 直接支持当前句", WriterAgent.role)
         self.assertIn('source_level="TRANSITION"', WriterAgent.role)
 
     def test_local_rewrite_cannot_cite_inference_omitted_from_its_context(self):
@@ -520,10 +520,10 @@ class NarrativeScaleTests(unittest.TestCase):
     def test_writer_system_prompt_matches_subsection_generation_granularity(self):
         self.assertIn("当前交付单元", WriterAgent.role)
         self.assertNotIn("每次只撰写一个章节", WriterAgent.role)
-        self.assertIn("不得为保留计划段数制造单句段", WriterAgent.role)
-        self.assertIn("paragraph.target_words 是段落篇幅的分配参考", WriterAgent.role)
-        self.assertIn("相邻论证连续且前段仅承担引出或过渡时", NarrativeAgent.role)
-        self.assertIn("paragraph.target_words 只是篇幅分配参考", NarrativeAgent.role)
+        self.assertIn("自然段按论证关系形成", WriterAgent.role)
+        self.assertIn("paragraph.target_words 只分配篇幅", WriterAgent.role)
+        self.assertIn("连续的引出和解释可同段", NarrativeAgent.role)
+        self.assertIn("paragraph.target_words 是篇幅分配参考", NarrativeAgent.role)
 
     def test_chapter_writer_receives_nested_report_chapter_and_unit_budgets(self):
         writer = WriterAgent.__new__(WriterAgent)

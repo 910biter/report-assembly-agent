@@ -108,18 +108,28 @@ const shellStyle = computed(
         </div>
       </nav>
       <div class="nav-foot">
-        <div v-if="currentUser" class="account-area">
-          <button class="account-trigger" type="button" :aria-expanded="accountOpen" aria-label="账户菜单" @click="accountOpen = !accountOpen">
-            <span class="account-avatar">{{ currentUser.username.slice(0, 1).toUpperCase() }}</span>
-            <span class="account-name">{{ currentUser.username }}</span>
-            <span class="account-caret">⌄</span>
-          </button>
-          <div v-if="accountOpen" class="account-menu">
-            <button type="button" @click="passwordOpen = true; accountOpen = false">修改密码</button>
-            <button type="button" @click="signOut">退出登录</button>
+        <div class="nav-utilities">
+          <div v-if="currentUser" class="account-area">
+            <button class="account-trigger" type="button" :aria-expanded="accountOpen" aria-label="账户菜单" @click="accountOpen = !accountOpen">
+              <span class="account-avatar">{{ currentUser.username.slice(0, 1).toUpperCase() }}</span>
+              <span class="account-name">{{ currentUser.username }}</span>
+              <span class="account-caret">⌄</span>
+            </button>
+            <div v-if="accountOpen" class="account-menu">
+              <button type="button" @click="passwordOpen = true; accountOpen = false">修改密码</button>
+              <button type="button" @click="signOut">退出登录</button>
+            </div>
           </div>
+          <button
+            class="theme-toggle sidebar-theme-toggle"
+            type="button"
+            :aria-label="ui.theme === 'dark' ? '切换亮色主题' : '切换暗色主题'"
+            :title="ui.theme === 'dark' ? '切换亮色主题' : '切换暗色主题'"
+            @click="ui.toggleTheme()"
+          >
+            <AppIcon :name="ui.theme === 'dark' ? 'sun' : 'moon'" :size="16" />
+          </button>
         </div>
-        <div class="health-line"><span class="health-dot"></span><span>服务运行正常</span></div>
       </div>
     </aside>
     <div class="shell-main">
@@ -131,7 +141,6 @@ const shellStyle = computed(
         >
           <AppIcon name="menu" />
         </button>
-        <div class="topbar-title"><span>工作区</span><span aria-hidden="true">›</span><strong>{{ route.meta.title || '报告整编' }}</strong></div>
         <button
           class="theme-toggle"
           type="button"
@@ -166,8 +175,9 @@ const shellStyle = computed(
   </div>
 </template>
 <style scoped>
-.health-line { display: flex; align-items: center; gap: 7px; }
-.account-area { position: relative; width: 100%; min-width: 0; margin-bottom: 8px; }
+.nav-utilities { display: flex; align-items: center; gap: 4px; min-width: 0; }
+.account-area { position: relative; flex: 1; min-width: 0; }
+.sidebar-theme-toggle { flex: 0 0 34px; margin-left: 0; }
 .account-trigger { width: 100%; display: flex; align-items: center; gap: 10px; padding: 6px; border: 1px solid transparent; border-radius: 8px; color: var(--foreground); background: transparent; cursor: pointer; text-align: left; }
 .account-trigger:hover { border-color: var(--border-strong); background: var(--surface-hover); }
 .account-avatar { display: grid; place-items: center; flex: 0 0 28px; height: 28px; border-radius: 6px; background: var(--primary-soft); color: var(--foreground); font-weight: 600; }
@@ -203,7 +213,7 @@ const shellStyle = computed(
 }
 .brand {
   position: relative;
-  height: var(--header-height);
+  height: 56px;
   display: flex;
   align-items: center;
   gap: 9px;
@@ -308,14 +318,6 @@ nav.primary-nav {
   color: var(--nav-muted);
   font-size: 11px;
 }
-.health-dot {
-  display: inline-block;
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: var(--health);
-  box-shadow: 0 0 0 3px var(--health-soft);
-}
 .shell-main {
   min-height: 100vh;
   min-width: 0;
@@ -365,6 +367,8 @@ nav.primary-nav {
   height: 30px;
   flex: 0 0 30px;
 }
+.is-nav-collapsed .nav-utilities { flex-direction: column; }
+.is-nav-collapsed .account-area { flex: none; }
 .is-nav-collapsed nav.primary-nav {
   gap: 8px;
   padding-inline: 8px;
@@ -397,7 +401,7 @@ nav.primary-nav {
   top: 0;
   z-index: 20;
   height: var(--header-height);
-  display: flex;
+  display: none;
   align-items: center;
   gap: 12px;
   padding: 0 32px;
@@ -405,20 +409,6 @@ nav.primary-nav {
   border-bottom: 1px solid var(--border);
   box-shadow: none;
   backdrop-filter: blur(10px);
-}
-.topbar-title {
-  display: flex;
-  align-items: baseline;
-  gap: 10px;
-}
-.topbar strong {
-  color: var(--foreground);
-  font-size: 14px;
-  letter-spacing: -0.01em;
-}
-.topbar-title span {
-  color: var(--subtle-foreground);
-  font-size: 12px;
 }
 .theme-toggle {
   display: grid;
@@ -458,6 +448,7 @@ nav.primary-nav {
   display: none;
 }
 @media (max-width: 1024px) {
+  .topbar { display: flex; }
   .sidebar {
     transform: translateX(-100%);
     transition: transform var(--motion-fast);
@@ -490,10 +481,12 @@ nav.primary-nav {
     padding: 0 12px;
   }
   .is-nav-collapsed .nav-foot {
-  left: 18px;
-    right: auto;
+    left: 18px;
+    right: 18px;
     justify-content: flex-start;
   }
+  .is-nav-collapsed .nav-utilities { flex-direction: row; }
+  .is-nav-collapsed .account-area { flex: 1; }
   .nav-toggle {
     display: grid;
     place-items: center;

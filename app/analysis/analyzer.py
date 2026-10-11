@@ -25,43 +25,32 @@ from app.models import Inference
 from app.token_monitor import current_context, update_call_funnel, update_call_metrics, update_call_products
 from app.runtime_profiles import stage_input_budget_tokens, stage_profile
 
-_SYSTEM = """你是情报分析员。基于事实清单、来源冲突与历史知识做综合分析,禁止无依据结论。
-严格输出 JSON,不要任何解释:
+_SYSTEM = """你是情报分析员。根据本次给定的事实及其来源语义，形成可解释的局部判断。
+只输出 JSON:
 {
   "inferences": [
     {"content": "综合判断", "based_fact_ids": [1, 2], "short_rationale": "60字以内依据说明",
      "dimension": "所属维度", "analysis_type": "开放类型标签",
-     "semantic_profile": {"facets": [{"axis": "命题类型", "label": "开放类别", "detail": "判定依据"}, {"axis": "情态/言语行为", "label": "开放类别", "detail": ""}, {"axis": "时间范围", "label": "开放类别", "detail": "时间锚点"}, {"axis": "实现状态", "label": "开放类别", "detail": ""}, {"axis": "知识依据", "label": "开放类别", "detail": ""}, {"axis": "主体/范围/量词", "label": "开放类别", "detail": ""}, {"axis": "条件/因果/关系", "label": "开放类别", "detail": "仅相关时填写"}, {"axis": "极性/否定/例外", "label": "开放类别", "detail": "仅相关时填写"}], "attribution": "来源归属", "conditions": [], "scope_qualifiers": [], "additional": {}}}
+     "semantic_profile": {"facets": [], "attribution": "原文明确的归属（仅相关时）", "conditions": [], "scope_qualifiers": []}}
   ],
   "external_notes": [
     {"content": "模型常识/外部知识补充,与材料无关"}
   ]
 }
-要求:
-1. 每条推断必须基于给定事实,based_fact_ids 必须真实存在
-2. 无事实依据的判断不得输出
-3. 推断层要覆盖该维度的关键观察、原因、影响、风险、趋势、约束或不确定性;不要只输出一条总括结论
-4. 材料存在冲突时,推断须避开矛盾口径或明确标注基于哪一方
-5. external_notes 用于材料无法得出、但有助于理解的常识补充,必须与材料事实区分
-6. 不要判断或输出置信度与不确定性字段;系统将根据有效 based_fact_ids 确定性计算
-7. 不要输出长篇推理过程;short_rationale 只写必要依据链
-8. 不得扩大事实适用范围;保留依据中的主体、对象、版本、时间和条件限定,综合结论范围不得超出依据共同支持的范围
-9. assertion_mode/assertion_mode_raw 仅是粗粒度旧协议投影；完整分类和细类以每条事实的开放 semantic_profile 及其来源原文为准
-10. 目标、要求、计划或假设等语义不能单独证明已经实施、发生或达到效果；不得把来源报告等同系统独立核实；观点、转述和估计须保留归属，状态/来源不同须分别表述
-11. 来源陈述性质不同时,必须区分现状与目标,没有明确完成证据不得推断发生了状态转变
-12. 必须结合单条事实、原文引文及章节上下文判断,不得按领域关键词、文件名、标题词或材料整体角色作硬编码推断;材料级摘要标签不能替代单条事实证据
-13. 当推论依赖材料的陈述性质或状态边界时,short_rationale 必须简要说明该边界,content 使用与依据匹配的语气
-14. semantic_profile 是开放的多维分类，不使用封闭标签表。逐条检查所有影响推论真值、适用性或可比性的面向，按内容标注命题类型、情态、时间、实现状态、认识依据、归属、主体/范围/量词、条件/前提、因果/关系、极性/否定、例外/限制及其他相关细类；示例不构成穷举或必填清单，不相关不填，不得因类别未列出而归并或遗漏。source_semantics 是程序从引用事实继承的逐条语义画像，不得省略、合并成更强的状态或把计划/目标转成已实现。
-"""
+工作方法:
+1. 每条 inferences 使用本次给定、且直接支撑判断的 based_fact_ids；在 short_rationale 中简述事实之间的关系。具体数值、日期和对象来自所引事实；由多个数值计算的新结果应列出全部操作数的事实 ID 和计算方式。缺少依据的想法可暂不输出。
+2. 围绕关键观察、原因、影响、风险、趋势及约束形成彼此有区别的判断，并写明事实之间的关系或材料可支持的解释。纯粹换说法重述单条事实的内容留在事实层；相近判断整合，互相矛盾的口径分别注明来源和范围。机构行动的动机、市场需求与实际效果，须有材料明示或可追溯的事实关系支撑；依据尚弱时将含义表述为待验证的解释。content 保留事实的主体、时间、条件、来源归属及现状/目标/计划/预测等陈述性质；来源观点仍写为来源观点。
+3. 本次是局部事实批次。关于信息缺口，只能描述明确检查过的文件或批次范围；对未提供的全局信息保持开放。依据应逐条查看事实、原文片段及必要上下文，材料级摘要、标题和领域词只作定位线索。
+4. semantic_profile 按需补充 content 未表达的时间、条件、归属、实现状态与范围，类别开放，字段简短；source_semantics 由程序继承。单条置信度由系统依据有效引用计算，无需在 JSON 中输出。外部常识只放 external_notes，与材料推断分开。"""
 
 
-_GLOBAL_SYSTEM = """你是情报报告综合研判师。基于各维度局部推断与关键事实,形成跨维度综合判断。
-严格输出 JSON,不要任何解释:
+_GLOBAL_SYSTEM = """你是情报报告综合研判师。根据局部推论和关键事实，形成跨维度判断。
+只输出 JSON:
 {
   "inferences": [
     {"content": "跨维度综合判断", "based_fact_ids": [1, 2], "short_rationale": "60字以内依据说明",
      "dimension": "全局综合", "analysis_type": "开放类型标签",
-     "semantic_profile": {"facets": [{"axis": "命题类型", "label": "开放类别", "detail": "判定依据"}, {"axis": "情态/言语行为", "label": "开放类别", "detail": ""}, {"axis": "时间范围", "label": "开放类别", "detail": "时间锚点"}, {"axis": "实现状态", "label": "开放类别", "detail": ""}, {"axis": "知识依据", "label": "开放类别", "detail": ""}, {"axis": "主体/范围/量词", "label": "开放类别", "detail": ""}, {"axis": "条件/因果/关系", "label": "开放类别", "detail": "仅相关时填写"}, {"axis": "极性/否定/例外", "label": "开放类别", "detail": "仅相关时填写"}], "attribution": "来源归属", "conditions": [], "scope_qualifiers": [], "additional": {}}}
+     "semantic_profile": {"facets": [], "attribution": "原文明确的归属（仅相关时）", "conditions": [], "scope_qualifiers": []}}
   ],
   "external_notes": [{"content": "模型常识/外部知识补充,与材料无关"}],
   "critical_fact_ids": [1],
@@ -69,19 +58,11 @@ _GLOBAL_SYSTEM = """你是情报报告综合研判师。基于各维度局部推
   "unresolved_conflicts": ["未解决的矛盾口径"],
   "uncertainty": ["不确定性说明"]
 }
-要求:
-1. 综合判断必须基于局部推断与给定事实,based_fact_ids 必须真实存在
-2. 不得重复局部推断的原文,综合是跨维度的新判断
-3. coverage_status 逐维度给出证据覆盖状态,证据不足的维度必须如实标注
-4. critical_fact_ids 列出支撑核心结论的关键事实
-5. 材料存在冲突时,unresolved_conflicts 必须列出,不得假装一致
-6. 全局判断应形成主线、关键风险和证据边界,不要简单重复局部推断
-7. 不要为单条推论输出置信度与不确定性字段;系统将按有效依据事实数量计算置信度
-8. 不得扩大局部推断或事实的适用范围;保留依据中的主体、对象、版本、时间和条件限定
-9. 继承局部推论及所引事实的完整开放语义画像；不得把不同来源、不同时间、条件或范围的状态合并为更强结论，材料报告也不等于系统独立核实
-10. 只能依据逐条事实、对应原文和局部推论判断状态;不得依赖领域关键词、文件名、标题词或材料级汇总标签做硬编码分类
-11. semantic_profile 使用开放、多标签分类，不限于示例；逐条保留所有影响结论真值和适用性的维度，包括时间、条件、归属、范围、量化口径、极性、例外、因果关系及领域特有细类，不相关时不强行填写。不得将不同来源的语义状态合并为更强结论。
-"""
+工作方法:
+1. 每条 inferences 提出跨维度的新判断，使用直接支撑它的 based_fact_ids，并在 short_rationale 中说明综合关系。具体数值、日期和对象由所引事实支持；计算结果应交代所用事实及算法。
+2. 结合不同维度形成主线、风险和证据边界，解释事实间的关系、变化或影响。仅重述单条事实的内容留在事实层；相近判断整合。行动动机、外部需求与效果须能从来源或给定事实关系中定位，依据有限时保持为待验证解释。保留来源归属、时间、条件、版本及现状/计划/预测等性质；不同来源与不同范围分别陈述。局部推论中的“未提供”只适用于它实际检查过的范围，再对照本次给定事实判断全局覆盖。
+3. coverage_status 逐维度标注证据充分程度，critical_fact_ids 列核心事实，unresolved_conflicts 列尚未消解的不同口径。材料级摘要、标题和领域词用来定位，不代替逐条事实和原文核验。
+4. semantic_profile 仅按需补充影响真实性的时间、条件、归属、实现状态及范围，类别开放；source_semantics 由程序继承。单条置信度由系统按有效引用计算，外部常识另列 external_notes。"""
 
 
 def _int_ids(values) -> list[int]:
@@ -158,10 +139,12 @@ def _target_local_inference_count(fact_count: int, group_count: int = 0) -> int:
         base = 4
     if group_count <= 0:
         return base
-    # This is an output-capacity estimate, not a domain rule. A semantic
-    # batch may need more than the historical four-result suggestion, but the
-    # target remains bounded by the configured Analysis output budget.
-    output_capacity = max(4, stage_profile("analysis").output_tokens // max(1, int(settings.analysis_inference_token_budget)))
+    # Extra output room covers the same conclusions and their semantic metadata.
+    # This suggestion does not limit the number of valid returned inferences.
+    output_capacity = max(4, min(
+        int(settings.analysis_target_inferences_per_batch),
+        stage_profile("analysis").output_tokens // max(1, int(settings.analysis_inference_token_budget)),
+    ))
     return max(base, min(int(group_count), int(fact_count), output_capacity))
 
 

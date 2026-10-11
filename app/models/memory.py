@@ -53,27 +53,22 @@ class StyleVariant:
         )
 
     def writer_prompt_block(self, context: dict | None = None) -> str:
-        """Editorial profile plus a few context-relevant, approved exemplars."""
+        """Expose transferable expression, not the source article's worldview."""
         block = (
             f"机构风格变体「{self.name or '未命名'}」表达参考:\n"
-            "只借鉴组织、句式、节奏和材料表达方式。样本的主题、立场、分析对象和结论不是本任务要求；"
-            "不能据此补充业务事实、动机或因果。用户要求和当前材料的证据边界优先；不适用的表达可不采用。\n"
+            "以用户本次要求和当前证据确定语气与判断；模板提供可迁移的句式、节奏、段落推进和材料表达方法。\n"
         )
-        writing = self.writing_style or {}
-        if writing:
-            block += (
-                f"- 语言正式程度: {writing.get('tone', '未指定')}\n"
-                f"- 句式习惯: {writing.get('sentence_pattern', '未指定')}\n"
-                f"- 样本的分析表达(非本任务论证要求): {writing.get('analysis_style', '未指定')}\n"
-            )
         patterns = self.writing_patterns or {}
+        transferable = patterns.get("transferable_style")
+        if isinstance(transferable, dict) and transferable:
+            block += f"- 可迁移表达契约: {json_dumps(transferable, limit=950)}\n"
+        else:
+            # Historical profiles predate the portable contract. Their prose
+            # fields and exemplars can contain source-specific claims or stance.
+            sentence_pattern = str((self.writing_style or {}).get("sentence_pattern") or "").strip()
+            if sentence_pattern:
+                block += f"- 已观察到的句式节奏: {sentence_pattern[:160]}\n"
         if patterns:
-            qualitative = {
-                key: value for key, value in patterns.items()
-                if key != "observed_metrics" and value not in (None, "", [], {})
-            }
-            if qualitative:
-                block += f"- 可复核的行文模式: {json_dumps(qualitative, limit=900)}\n"
             observed = patterns.get("observed_metrics") or {}
             if not observed.get("editorial_contract") and self.exemplar_bank:
                 # Existing templates predate the editorial-contract field. Build
@@ -97,35 +92,6 @@ class StyleVariant:
                         "- 编辑组织契约(仅指导段落推进，不是固定目录): "
                         f"{json_dumps(editorial, limit=420)}\n"
                     )
-        terminology = self.terminology or {}
-        if terminology.get("preferred"):
-            block += "- 样本惯用表达(仅语境合适且依据充分时借鉴): " + "、".join(terminology["preferred"]) + "\n"
-        if terminology.get("forbidden"):
-            block += "- 避免表达: " + "、".join(terminology["forbidden"]) + "\n"
-        samples = self.select_exemplars({**context, "match_dimension": "expression"}, limit=2) if context else self.style_samples[:2]
-        if samples:
-            block += "- 所选模板的表达范例(优先相近论证用途；主题不同仍可参考文体，不代表当前论证或事实):\n"
-            for sample in samples:
-                label = _SAMPLE_TYPES_label(sample.get("sample_type", ""))
-                purpose = str(sample.get("purpose") or sample.get("section") or "").strip()
-                purpose_text = f" / 用途:{purpose[:70]}" if purpose else ""
-                realization = str(sample.get("realization_mode") or "").strip()
-                realization_text = f" / 材料运用:{realization[:60]}" if realization else ""
-                block += f"  [{label}{purpose_text}{realization_text}] {str(sample.get('content', ''))[:420]}\n"
-                negative = str(sample.get("negative_content") or "").strip()
-                if negative:
-                    block += f"  [避免这种旧表达] {negative[:220]}\n"
-        chapter_styles = self.chapter_styles or []
-        if chapter_styles:
-            block += "- 章节写作规范(不同类型章节写法不同):\n"
-            for cs in chapter_styles[:6]:
-                block += (
-                    f"  {cs.get('chapter_type', '')}: 目的={cs.get('purpose', '')}"
-                    f" 规则={str(cs.get('rules', ''))[:80]}\n"
-                )
-        reasoning = self.reasoning_profile or {}
-        if reasoning:
-            block += f"- 样本分析方式(仅当前证据支持时参考，不得继承样本结论): {json_dumps(reasoning, limit=600)}\n"
         return block.strip()
 
     def select_exemplars(self, context: dict, limit: int = 3) -> list[dict]:

@@ -50,9 +50,7 @@ const waiting = computed(() =>
   (tasks.data.value || []).filter((t) => t.stage === "review"),
 );
 const finished = computed(() =>
-  (tasks.data.value || []).filter(
-    (t) => t.stage === "done" || t.stage === "review",
-  ),
+  (tasks.data.value || []).filter((t) => t.stage === "done"),
 );
 const configuredMaterialCount = computed(
   () => selectedFiles.value.length + selectedLibraryIds.value.length,
@@ -176,7 +174,7 @@ const createTask = useMutation({
 </script>
 <template>
   <div class="page-stack dashboard">
-    <UiPageHeader title="工作台" description="从材料准备到报告生成，在一个工作区完成整编任务。" featured>
+    <UiPageHeader title="工作台" featured>
       <template #actions
         ><UiButton
           :variant="createOpen ? 'outline' : 'default'"
@@ -199,14 +197,13 @@ const createTask = useMutation({
         @submit.prevent="createTask.mutate()"
       >
         <div class="form-heading">
-          <div><h2>新建任务</h2><p>选择材料、模板与工作方式，系统会自动完成后续整编。</p></div>
-          <span class="workspace-state">{{ workflowMode === "automatic" ? "直接生成" : "协作规划" }}</span>
+          <div><h2>新建任务</h2></div>
         </div>
         <input type="hidden" name="interaction_draft_id" :value="ui.draftId" />
         <section class="setup-section material-section">
           <div class="step-heading">
             <span class="step-number">1</span>
-            <div><h3>材料来源</h3><p>上传新文件，或从材料库选择已有材料。</p></div>
+            <div><h3>材料来源</h3></div>
           </div>
           <div class="source-actions">
             <UiButton type="button" @click="openFilePicker"><AppIcon name="upload" :size="16" />上传新材料</UiButton>
@@ -226,7 +223,7 @@ const createTask = useMutation({
         <section class="setup-section template-section">
           <div class="step-heading">
             <span class="step-number">2</span>
-            <div><h3>文档模板</h3><p>选择导出报告使用的版式与样式。</p></div>
+            <div><h3>文档模板</h3></div>
           </div>
           <label class="field template-select"
             ><span>使用模板</span
@@ -239,10 +236,9 @@ const createTask = useMutation({
         <section class="setup-section flow-section">
           <div class="step-heading">
             <span class="step-number">3</span>
-            <div><h3>写作流程</h3><p>选择任务如何从材料理解进入报告写作。</p></div>
+            <div><h3>写作流程</h3></div>
           </div>
           <div class="workflow-mode">
-          <span class="field-label">工作方式</span>
           <div class="mode-switch" role="radiogroup" aria-label="工作方式">
             <button
               type="button"
@@ -274,7 +270,6 @@ const createTask = useMutation({
         <section class="brief-section">
           <div class="brief-section-heading">
             <strong>任务目标</strong>
-            <span>协作规划模式下，主题和要求也可以在材料理解后补充。</span>
           </div>
           <div class="brief-fields">
         <label v-if="workflowMode === 'automatic'" class="field task-brief-field theme-field"
@@ -304,7 +299,7 @@ const createTask = useMutation({
             v-model="ui.taskDraft.requirements"
             name="requirements"
             rows="4"
-            placeholder="描述用途、重点、篇幅或必须回答的问题。无需配置系统参数。"
+            placeholder="描述用途、重点、篇幅或必须回答的问题。"
           ></textarea>
         </label>
         <details v-else class="optional-field task-brief-field requirements-field">
@@ -379,7 +374,6 @@ const createTask = useMutation({
         <UiEmptyState
           v-else
           title="尚无任务"
-          description="创建第一个报告任务后，进度和审阅项会出现在这里。"
       /></section>
       <aside class="side-stack">
         <section class="side-section">
@@ -605,23 +599,9 @@ const createTask = useMutation({
   border-bottom: 1px solid var(--border);
 }
 .form-heading h2 {
-  margin: 0 0 3px;
+  margin: 0;
   font-size: 19px;
   letter-spacing: -0.025em;
-}
-.form-heading p {
-  margin: 0;
-  color: var(--subtle-foreground);
-  font-size: 12px;
-}
-.workspace-state {
-  flex: 0 0 auto;
-  padding: 5px 8px;
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  color: var(--muted-foreground);
-  background: var(--muted);
-  font-size: 11px;
 }
 .task-brief-field {
   min-width: 0;
@@ -642,20 +622,10 @@ const createTask = useMutation({
   font-size: 13px;
   font-weight: 600;
 }
-.brief-section-heading span {
-  color: var(--muted-foreground);
-  font-size: 12px;
-}
 .brief-fields {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 18px;
-}
-.field-label {
-  display: block;
-  margin-bottom: 8px;
-  font-size: 13px;
-  font-weight: 650;
 }
 .mode-switch {
   display: grid;
@@ -902,11 +872,6 @@ const createTask = useMutation({
   .brief-fields {
     grid-template-columns: 1fr;
     gap: 14px;
-  }
-  .brief-section-heading {
-    align-items: flex-start;
-    flex-direction: column;
-    gap: 3px;
   }
   .dashboard-grid {
     gap: 20px;

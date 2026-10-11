@@ -201,12 +201,13 @@ def test_quality_check_does_not_treat_low_lexical_overlap_as_unsupported_claim()
 
     assert call_index == 4
     assert result == []
-    assert "不能仅因措辞不同或词面相似度低" in _QA_SYSTEM
-    assert "无引用的实质性句子" in _QA_SYSTEM
-    assert "复合句中的每个可独立核验主张" in _QA_SYSTEM
-    assert "全部 FACT 与 INFERENCE 联合判断" in _QA_SYSTEM
-    assert "材料关于自身或某系统现状的描述" in _QA_SYSTEM
-    assert "support_status 与 note 必须一致" in _QA_SYSTEM
+    assert "允许语义等价改述" in _QA_SYSTEM
+    assert "对无引用而包含事实" in _QA_SYSTEM
+    assert "每个独立主张" in _QA_SYSTEM
+    assert "全部已绑定依据应联合判断" in _QA_SYSTEM
+    assert "已实现或已验证的独立结论需要相应来源证据" in _QA_SYSTEM
+    assert "作者补入的动机、市场需求、目的或效果" in _QA_SYSTEM
+    assert "support_status 应与最终 note 一致" in _QA_SYSTEM
 
 
 def test_qa_failure_is_reported_as_incomplete_instead_of_silent_zero(monkeypatch):

@@ -80,7 +80,9 @@ def test_gateway_uses_snapshot_and_generic_wire_parameter(monkeypatch):
             captured.update(json)
             return httpx.Response(200, request=httpx.Request("POST", url), json={"choices": [{"message": {"content": "OK"}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
     with patch("app.gateway.httpx.Client", Client):
-        assert OpenAICompatibleGateway().generate("hello", max_tokens=1000, temperature=0.2) == "OK"
+        assert OpenAICompatibleGateway().generate("hello", max_tokens=512, temperature=0.2) == "OK"
+        with pytest.raises(ValueError, match="MODEL_INPUT_OVER_BUDGET"):
+            OpenAICompatibleGateway().generate("hello", max_tokens=1000, temperature=0.2)
     assert captured["max_completion_tokens"] == 512
     assert not {"priority", "temperature", "chat_template_kwargs", "max_tokens"} & captured.keys()
 
@@ -92,6 +94,7 @@ def test_collaboration_wire_parameter_adapter():
     content = b"".join(request.stream)
     assert json.loads(content)["max_tokens"] == 20
     assert "max_completion_tokens" not in json.loads(content)
+    assert request.content == content
     assert int(request.headers["Content-Length"]) == len(content)
 
 

@@ -387,23 +387,59 @@ class ContextManager:
             query: self._query_compiler.query_vector(RetrievalQuery(query))
             for query in dict.fromkeys(queries)
         } if vector_enabled else {}
-        # 检索候选:Qdrant 粗召回(查询相关)→ rerank;Qdrant 不可用时回退 Python 打分
+        # Search Qdrant once per distinct query, not once per query * material.
+        # Preserve material coverage with a per-material lexical fallback.
+        material_ids = list(self.units_by_material)
+        allowed_ids = {
+            int(unit.id): int(material_id)
+            for material_id, units in self.units_by_material.items()
+            for unit in units if unit.id is not None
+        }
+        vector_hit_ids: dict[str, dict[int, set[int]]] = {}
+        if vector_enabled and material_ids:
+            for query in dict.fromkeys(queries):
+                vector = query_vectors.get(query)
+                hit_by_material: dict[int, set[int]] = {}
+                if vector:
+                    try:
+                        hits = vector_store.search_units(
+                            vector,
+                            top_k=max(1, min(len(allowed_ids), _recall_budget() * len(material_ids))),
+                            filters={"material_id": material_ids[0] if len(material_ids) == 1 else material_ids},
+                        )
+                        for hit_id, _score in hits:
+                            mid = allowed_ids.get(int(hit_id))
+                            if mid is not None:
+                                hit_by_material.setdefault(mid, set()).add(int(hit_id))
+                        # Inspect actual source coverage before issuing narrow
+                        # follow-up searches. The threshold derives from the
+                        # returned pool, not a fixed quota of weak evidence.
+                        represented = sum(len(ids) for ids in hit_by_material.values())
+                        fair_share = max(1, (represented + len(material_ids) - 1) // len(material_ids))
+                        for mid, units in self.units_by_material.items():
+                            if len(material_ids) == 1:
+                                break  # The global query already has the same single-source filter.
+                            target = min(len(units), fair_share, _recall_budget())
+                            if len(hit_by_material.get(mid, set())) >= target:
+                                continue
+                            try:
+                                supplement = vector_store.search_units(
+                                    vector, top_k=target, filters={"material_id": int(mid)},
+                                )
+                            except Exception:
+                                continue  # One unavailable source must not suppress other supplements.
+                            hit_by_material.setdefault(mid, set()).update(
+                                int(uid) for uid, _score in supplement if allowed_ids.get(int(uid)) == mid
+                            )
+                    except Exception:
+                        pass
+                vector_hit_ids[query] = hit_by_material
         per_material: list[tuple[int, list[tuple[float, object]]]] = []
         for material_id, units in self.units_by_material.items():
             candidates: dict[int, object] = {}
             for query in queries:
                 query_vector = query_vectors.get(query)
-                hit_ids: set[int] = set()
-                try:
-                    from app.retrieval import vector_store
-                    if getattr(vector_store, "enabled", False) and query_vector:
-                        hits = vector_store.search_units(
-                            query_vector, top_k=_recall_budget(),
-                            filters={"material_id": int(material_id)},
-                        )
-                        hit_ids = {int(h[0]) for h in hits}
-                except Exception:
-                    hit_ids = set()
+                hit_ids = vector_hit_ids.get(query, {}).get(material_id, set())
                 local_hit_ids = {unit.id for unit in units if unit.id in hit_ids}
                 for unit in units:
                     if unit.id is not None and unit.id in hit_ids:
@@ -419,12 +455,9 @@ class ContextManager:
                     for _score, unit in scored[:cutoff]:
                         candidates.setdefault(id(unit), unit)
             if candidates:
-                # Utility 重排:相关 + 新信息(已提取事实 feedback 降权重复)
                 ranked = rerank(
-                    [(0.5, u) for u in candidates.values()],
-                    need_text,
-                    unit_vectors=unit_vectors,
-                    known_contents=known_contents,
+                    [(0.5, u) for u in candidates.values()], need_text,
+                    unit_vectors=unit_vectors, known_contents=known_contents,
                 )
                 per_material.append((material_id, ranked))
 
@@ -625,6 +658,12 @@ class ContextManager:
             f"用户主题:{theme}",
             f"用户要求:{user_requirements or '无'}",
             f"篇幅决策:{scale_guidance}",
+            "证据处理状态（处理失败不等于材料没有证据）:" + json_dumps({
+                "status": (self.task.get("evidence_status") or {}).get("status", "unknown"),
+                "unprocessed_segment_count": len((self.task.get("evidence_status") or {}).get("unprocessed_segments") or []),
+                "failure_reasons": sorted({item.get("failure_reason") for item in
+                    (self.task.get("evidence_status") or {}).get("batches", []) if item.get("failure_reason")}),
+            }),
             "初步分析规划(仅为分析假设与检索重点,可被后续事实推翻,不是最终目录):",
             json_dumps({
                 "title": plan.get("title"),

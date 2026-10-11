@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from pydantic_ai.models.test import TestModel
 
@@ -24,7 +24,8 @@ class TaskDraftAgentTests(unittest.TestCase):
             user_message="你来帮我想，一般的报告要求怎么写",
         )
         deps.prepare = MagicMock(return_value={"prepared": True})
-        agent = _build_agent()
+        with patch("app.task_draft_agent.build_collaboration_model", return_value=TestModel()):
+            agent = _build_agent()
         with agent.override(model=TestModel(
             call_tools=["propose_task_draft"],
             custom_output_text="已形成完整需求草案，请审阅。",

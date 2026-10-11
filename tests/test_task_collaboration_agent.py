@@ -55,7 +55,8 @@ class TaskCollaborationAgentTests(unittest.TestCase):
 
     def test_agent_can_read_authoritative_artifact_before_answering(self):
         deps = TaskAgentDeps(context=self.context(), user_message="当前目录是什么？")
-        agent = _build_agent()
+        with patch("app.task_collaboration_agent.build_collaboration_model", return_value=TestModel()):
+            agent = _build_agent()
         with (
             patch("app.task_collaboration_agent.execute_read_tool", return_value={
                 "exists": True, "titles": ["政策环境", "技术路径", "实施建议"],
@@ -71,7 +72,8 @@ class TaskCollaborationAgentTests(unittest.TestCase):
 
     def test_agent_can_start_from_task_map(self):
         deps = TaskAgentDeps(context=self.context(), user_message="这些材料主要讲什么？")
-        agent = _build_agent()
+        with patch("app.task_collaboration_agent.build_collaboration_model", return_value=TestModel()):
+            agent = _build_agent()
         with (
             patch("app.task_collaboration_agent.execute_read_tool", return_value={
                 "materials": [{"filename": "政策文件.pdf", "topic": "低空经济政策目标"}],

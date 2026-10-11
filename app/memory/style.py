@@ -27,7 +27,7 @@ from app.memory.style_profile import (
 from app.template_engine import compile_template
 
 _SAMPLE_LENGTH = 150
-_STYLE_LEARNER_VERSION = "editorial-v6-role-isolation"
+_STYLE_LEARNER_VERSION = "editorial-v7-transferable-style"
 _DEFAULT_PROFILE_NAME = "综合报告风格"
 _ASSET_ROLE_ORDER = ("editorial", "structure", "layout")
 _ASSET_ROLE_LABELS = {
@@ -136,15 +136,11 @@ def _validate_profile_payload(payload: dict, *, require_editorial: bool = True) 
 
 _VARIANT_PROMPT = """以下是一次提交的模板学习来源，画像名称参考类型为 {type}，来源数为 {count}。
 
-严格遵守来源用途边界：
-- 文体参考：只用于语言、段落组织、文档形态的软信号、材料表达方式与表达范例；不得据此复制事实。
-- 结构参考：只用于观察标题层级与组织模式；不得把目录当作新报告的固定目录。
-- Word 版式母版：由程序从原始 DOCX 提取格式，不参与本次语言或结构推断。
-- 未提供某种用途的字段必须留空/使用 unknown；不得从其它用途来源推断。
+按来源用途提炼可观察的写作特征：文体参考用于语言、段落组织、文档形态的软信号与材料表达方式；结构参考用于标题层级与组织模式；Word 版式母版由程序从 DOCX 提取格式。样例中的业务事实只用于理解表达方式，未来报告的目录由任务目标和证据决定。缺少某项用途时，该用途字段留空或写 unknown。
 
 {reports}
 
-请提炼该类型报告的写作规范,严格输出 JSON(不要任何解释)。来源用途是能力边界：文体参考只学习表达，结构参考才可提供组织建议，只有 DOCX 版式母版可用于 Word 版式复用；不得因为样例含目录就默认冻结未来报告目录:
+请根据上述用途提炼该类型报告的写作规范，严格输出以下 JSON：
 {{
   "name": "报告类型名(沿用 {type})",
   "structure": {{
@@ -169,6 +165,14 @@ _VARIANT_PROMPT = """以下是一次提交的模板学习来源，画像名称�
     "analysis_style": "先事实后判断等"
   }},
   "writing_patterns": {{
+    "transferable_style": {{
+      "voice": "跨题材可复用的正式度与语气力度表达特征，不包含样例立场",
+      "sentence_rhythm": "跨题材可复用的句长、节奏和句间连接方式，不含样例主体与结论",
+      "paragraph_progression": "跨题材可复用的段落推进方式，不含样例事件或固定章节",
+      "fact_expression": "如何在句中安放时间、主体、数值与来源，不含样例事实",
+      "judgment_expression": "如何从证据过渡到解释并控制确定性，不继承样例立场",
+      "attribution_style": "来源与判断主体如何归属，不含样例机构或人名"
+    }},
     "information_progression": "段落通常如何从已知信息推进到判断",
     "paragraph_architecture": "段内常见组织方式,不要写固定句数",
     "sentence_rhythm": "长短句、复句和承接方式",
@@ -188,7 +192,7 @@ _VARIANT_PROMPT = """以下是一次提交的模板学习来源，画像名称�
     "fact_selection": "一段中如何选择主事实、背景事实和限定事实",
     "detail_retention": "时间、数字、主体、文件名等具体信息通常保留到什么程度",
     "multi_source_synthesis": "多来源一致、互补或差异信息如何合并表达",
-    "fact_to_analysis": "事实如何支撑解释、判断、风险或建议，不得把相关性写成因果",
+    "fact_to_analysis": "事实如何支撑解释、判断、风险或建议，区分相关性与可证实的因果关系",
     "boundary_expression": "证据不足、仅能部分证明或存在不确定性时如何表述",
     "structure_choice": "何时采用自然段、清单或表格以承载材料信息"
   }},
@@ -210,7 +214,7 @@ _VARIANT_PROMPT = """以下是一次提交的模板学习来源，画像名称�
   ]
 }}"""
 
-_STYLE_SAMPLE_NOTE = """以下是按章节与自然段抽取的候选样例。请分析表达方式，不要复述或泛化其中的业务事实：
+_STYLE_SAMPLE_NOTE = """以下是按章节与自然段抽取的候选样例。请提炼句式、节奏、论证推进与材料表达方式；业务事实仅作为样例语境：
 {style_samples}
 """
 

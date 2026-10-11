@@ -33,6 +33,8 @@ from app.planning.evidence_context import fact_line, inference_line, evidence_id
 from app.token_monitor import update_call_funnel, update_call_metrics, update_call_products
 from app.config import settings
 from app.model_connection import capacity
+from app.runtime_profiles import stage_profile
+from app.writing.evidence_references import repair_references, EvidenceReferenceBlocked
 from app.context_budget import (
     ContextSection,
     build_prompt_from_sections,
@@ -87,36 +89,15 @@ def _writer_argument_contract(value):
     return value
 
 
-_SYSTEM = """你是文档撰稿人。依据 Narrative Plan、ChapterPlan 与机构风格,撰写成文的自然语言文档。
-每次只撰写提示中指定的一个交付单元。交付单元可能是一整章,也可能是 Narrative Plan 规划的小节或连续文章段落组；严格输出 JSON,不要任何解释:
+_SYSTEM = """你是文档撰稿人。依据当前交付单元的 Narrative Plan、ChapterPlan、证据和适用的模板表达参考，一次自然写成。
+交付单元可能是一章、小节或连续文章段落组。只输出 JSON:
 {"paragraphs": [{"sentences": [{"text": "句子内容", "fact_ids": [1], "inference_ids": []}]}]}
-要求:
-1. 按 Narrative Plan 与 ChapterPlan 的核心问题、事实主次和逻辑顺序组织内容；它们是论证指令，不是正文底稿。
-   purpose、transition、completion_criteria 等内部说明不能直接改写为正文。用证据之间的具体关系衔接，避免向读者讲解写作过程。
-   规划负责证据、论证关系与范围，模板表达参考负责适用的句式、节奏和展开方式；不得用通用报告腔覆盖模板文体，也不得继承模板业务结论。没有匹配参考时按当前文体自然表达。
-2. 不重复 Report Memory 中"前文已表述"的内容(其他章节/前章摘要)
-3. 每个段落围绕一个核心观点,事实与分析自然融合,判断必须有依据
-4. 引用按句中的具体主张绑定，id 必须真实存在。事实与有依据的判断可以自然融合在一句中，分别绑定直接相关的 fact_ids/inference_ids。
-   若推断只是概括已表达的事实关系，不要为引用推断再写一句同义复述；证据类型不是句子类型，也不是逐项输出清单。
-5. 正文不得出现来源标签、内部编号或证据标注;引用关系只写在 JSON 的 fact_ids/inference_ids 中
-6. 只撰写当前指定交付单元,不要扩写成整章或输出其他章节内容
-7. 只有纯粹组织结构、且不包含事实前提或评价判断的过渡句可以没有引用；这类句子必须显式标记 source_level="TRANSITION"，并保持少量简短。事实性或评价性内容不得伪装成过渡句。
-8. 对材料未直接证明的成效、完成状态、数量变化或评价,不得写成既成事实；必须保留证据边界或明确标注待补充
-9. 段落、句式、详略、表格或分项表达由 ChapterPlan、模板风格、材料信息量和分层策略共同决定;不要机械套用固定格式
-10. 不要把无关 Fact 压缩拼接进同一句;一段一主题,一个句子通常只承担一个核心事实或一个直接相关的事实组
-11. 具体事实优先,少使用“机制完善、顶层定标、全面就位”等没有新增信息的抽象套话
-12. 不要把事实清单直接排列成正文;每段应围绕具体问题自然组织证据，使读者理解事实之间的关系。
-    paragraph.argument 指明应完成的实质论证，结合原始事实展开其比较、解释和适用范围，不得仅缩写为一句结论；也不得把该内部安排照抄为正文。
-    不强制每段都有抽象主题句或过渡句；直接相关的比较与限制可一起表达。已说明的限制和结论不再完整复述，收束应回应核心问题而非再次列清单。
-13. Narrative Plan 中 detail_level=expand 的话题应适度展开;brief/reference 只简要承接,不得平均铺陈
-14. paragraphs 是文档自然段,sentences 是段内溯源单位;同一自然段中的多句话应放入同一个 paragraphs[].sentences,不要把每句话都拆成一个 paragraph
-15. 当前交付单元的目标字数是近似目标,不是最低字数。证据充分时完成本单元核心论证并接近目标后收束；
-    若提示中另有明确最低要求则满足该下限。不得用重复表述、空泛套话或虚构事实凑字数；证据不足时可以欠填。
-16. Narrative Plan 中 paragraph.target_words 是段落篇幅的分配参考,不是自然段硬下限;相邻计划段若一段只承担引出或过渡、无法独立形成论证,应合并成自然段。不得为保留计划段数制造单句段,也不得靠空泛扩写凑段落目标;交付单元篇幅要求仍按篇幅提示执行。
-17. 引用采用最小且逐句绑定:每个 fact_id/inference_id 都必须直接支持当前句中的具体主张,不得仅因其出现在本段、本小节或 Narrative Plan 中就引用。
-    不得把整段证据列表复制到每一句;一句含多个可独立核验的主张时应拆句并分别绑定。
-    事实陈述优先引用直接事实,分析判断引用对应推断;只有句子确实同时陈述两者时才同时引用。未绑定 ID 的句子只有在纯组织性过渡且显式标记 source_level="TRANSITION" 时才可保留。
-18. 来源语义画像采用开放分类，不是少数标签的封闭清单。必须逐条保留来源给出的实现状态、时间、归属、条件、范围、否定和例外；多个来源语义不同时应分别表述，不能综合成更确定或更强的现状陈述。"""
+写作方法:
+1. 依当前计划的核心问题、事实主次和 paragraph.argument 展开具体证据关系；purpose、transition、completion_criteria 是内部指令。每段围绕一个可由证据完成的论证，事实和判断可以自然融合；Report Memory 中已充分表达的内容简要承接。
+2. 模板表达参考决定适用的句式、节奏、详略和组织方式，业务事实只来自本次证据。detail_level=expand 的关系可充分解释，brief/reference 简要处理。段落与句子按阅读逻辑组织：paragraphs 是自然段，sentences 是段内溯源单位，直接相关的相邻计划段可合为一个多句自然段。
+3. 引用采用最小且逐句绑定：fact_ids 支撑事实陈述，inference_ids 支撑相应分析；一句同时包含两类主张时分别绑定。每个 ID 直接支持当前句的具体主张，多个独立主张可拆成多句。纯组织性过渡可无引用，但须显式标记 source_level="TRANSITION"；正文阅读层不出现内部 ID 或证据标签。
+4. 保留所引依据的具体数值、单位、日期、主体、实现状态、来源归属、条件、否定和例外。比较需有对应对象的可比前后证据；计划、预计、目标或材料观点用对应语气表述。局部材料未提供的信息只说明其实际覆盖范围，具体事实和限制放在相关判断附近。
+5. 当前交付单元的目标字数是近似目标；提示另设最低要求时按其执行。证据充分时通过解释机制、比较与边界完成论证并接近篇幅；证据不足时在可支持的范围收束。paragraph.target_words 只分配篇幅，自然段按论证关系形成。"""
 
 
 def _filter_facts_by_roles(
@@ -365,11 +346,19 @@ def _focused_unit_evidence(
         fact_ids = set(_int_ids(chapter_plan.get("primary_fact_ids")))
     if not inference_ids:
         inference_ids = set(_int_ids(chapter_plan.get("primary_inference_ids")))
-    selected_inferences = [item for item in inferences if int(item.get("id") or 0) in inference_ids] if inference_ids else list(inferences)
+    # No assignments: preserve old-plan fallback for legacy workflows. Once
+    # the planner explicitly assigns evidence, never re-expand a missing ID to
+    # the entire chapter pool (quality regression and significant token waste).
+    if not fact_ids and not inference_ids:
+        return list(facts), list(inferences)
+    selected_inferences = [
+        item for item in inferences if int(item.get("id") or 0) in inference_ids
+    ] if inference_ids else []
     fact_ids.update(fid for item in selected_inferences for fid in evidence_ids(item.get("based_fact_ids")))
-    selected_facts = [item for item in facts if int(item.get("id") or 0) in fact_ids] if fact_ids else list(facts)
-    # Older plans may not contain assignments; preserve their usable fallback.
-    return selected_facts or list(facts), selected_inferences or list(inferences)
+    selected_facts = [
+        item for item in facts if int(item.get("id") or 0) in fact_ids
+    ] if fact_ids else []
+    return selected_facts, selected_inferences
 
 
 def _split_embedded_subheading(text: str, allowed_titles: list[str] | None = None) -> list[dict]:
@@ -698,7 +687,7 @@ class WriterAgent(BaseAgent):
             if str(exc) != "MODEL_OUTPUT_TRUNCATED":
                 raise
             retry_limit = writer_output_retry_limit(
-                initial_limit, settings.writer_output_tokens,
+                initial_limit, stage_profile("writer").output_tokens,
             )
             if retry_limit <= initial_limit:
                 raise
@@ -899,6 +888,8 @@ class WriterAgent(BaseAgent):
                 ),
             )
             chapter_assessment.update(getattr(self, "_last_chapter_generation_stats", {}) or {})
+            if chapter_assessment.get("blocked_units"):
+                failed_chapters.append(chapter_title)
             if style_variant is not None and task_id:
                 try:
                     from app.memory.style_profile import assess_style_alignment
@@ -1069,7 +1060,9 @@ class WriterAgent(BaseAgent):
             except Exception:
                 pass
             if progress_callback:
-                progress_callback(chapter_index, chapter_count, chapter_title, "done", round(time.time() - chapter_start, 1))
+                progress_callback(chapter_index, chapter_count, chapter_title,
+                                  "partial" if chapter_assessment.get("blocked_units") else "done",
+                                  round(time.time() - chapter_start, 1))
             if chapter_callback:
                 chapter_callback({
                     "report_id": report.id,
@@ -1081,7 +1074,7 @@ class WriterAgent(BaseAgent):
                     "inference_ids": sorted(written_inference_ids),
                     "narrative_plan": narrative_plan,
                     "duration_seconds": round(time.time() - chapter_start, 1),
-                    "status": "done",
+                    "status": "partial" if chapter_assessment.get("blocked_units") else "done",
                     **chapter_assessment,
                 })
         if failed_chapters:
@@ -1123,6 +1116,20 @@ class WriterAgent(BaseAgent):
             style_block=style_block,
         )
         paragraph_plan = list(article_plan.get("paragraphs") or [])
+        try:
+            article_plan, article_facts, article_inferences, repairs = repair_references(
+                article_plan, article_facts, article_inferences, task_id,
+            )
+        except EvidenceReferenceBlocked as exc:
+            save_task_artifact(task_id, "writer_evidence_block", {"section": "article"},
+                               {"error": str(exc)}, status="blocked", run_id=run_id)
+            raise
+        if repairs:
+            save_task_artifact(task_id, "writer_evidence_repair", {"section": "article"},
+                               {"repairs": repairs, "plan": article_plan}, run_id=run_id)
+        paragraph_plan = list(article_plan.get("paragraphs") or [])
+        valid_fact_ids.update(int(item["id"]) for item in article_facts)
+        valid_inf_ids.update(int(item["id"]) for item in article_inferences)
         evidence_units = paragraph_plan or list(article_plan.get("beats") or [])
         allowed_fact_ids = {
             fact_id for unit in evidence_units
@@ -1137,7 +1144,7 @@ class WriterAgent(BaseAgent):
         article_style = style_block
         safe_words = max(
             500,
-            int(settings.writer_output_tokens * settings.writer_visible_word_token_ratio * 0.82),
+            int(stage_profile("writer").output_tokens * settings.writer_visible_word_token_ratio * 0.82),
         )
         groups = _article_beat_groups(evidence_units, safe_words)
         generated: list[dict] = []
@@ -1629,7 +1636,7 @@ class WriterAgent(BaseAgent):
             ],
             min(6000, capacity()[0] // 3),
         )
-        payload = self.generate_json(prompt, max_tokens=min(3072, settings.writer_output_tokens))
+        payload = self.generate_json(prompt, max_tokens=min(3072, stage_profile("writer").output_tokens))
         generated = []
         for item in _coerce_paragraphs(payload):
             for sentence in item.get("sentences") or []:
@@ -1996,9 +2003,37 @@ class WriterAgent(BaseAgent):
                 # one purpose-matched block here instead of injecting the same
                 # template twice and over-constraining prose.
                 unit_style = dynamic_style
+            reference_plan = dict(unit.get("plan") or {})
+            planned_facts, planned_inferences = unit_evidence_ids(reference_plan)
+            if not planned_facts:
+                reference_plan["fact_ids"] = list(chapter_plan.get("primary_fact_ids") or [])
+            if not planned_inferences:
+                reference_plan["inference_ids"] = list(chapter_plan.get("primary_inference_ids") or [])
+            try:
+                repaired_plan, repaired_facts, repaired_inferences, repairs = repair_references(
+                    reference_plan, chapter_facts, chapter_inferences, getattr(self, "_task_id", ""),
+                )
+            except EvidenceReferenceBlocked as exc:
+                unit_stats.append({"unit_index": unit["index"], "generation_status": "blocked",
+                                   "error": str(exc), "generation_calls": 0})
+                if getattr(self, "_task_id", ""):
+                    save_task_artifact(self._task_id, "writer_evidence_block", {
+                        "chapter": chapter_index, "unit": unit["index"],
+                    }, {"error": str(exc), "plan": reference_plan}, status="blocked", run_id=self._run_id)
+                continue
+            had_unit_plan = bool(unit.get("plan"))
+            unit["plan"] = repaired_plan
+            if had_unit_plan:
+                unit_narrative["subsections"] = [repaired_plan]
+            if repairs and getattr(self, "_task_id", ""):
+                save_task_artifact(self._task_id, "writer_evidence_repair", {
+                    "chapter": chapter_index, "unit": unit["index"],
+                }, {"repairs": repairs, "plan": repaired_plan}, run_id=self._run_id)
             unit_facts, unit_inferences = _focused_unit_evidence(
-                chapter_facts, chapter_inferences, unit.get("plan"), chapter_plan,
+                repaired_facts, repaired_inferences, repaired_plan, chapter_plan,
             )
+            valid_fact_ids.update(int(item["id"]) for item in unit_facts)
+            valid_inf_ids.update(int(item["id"]) for item in unit_inferences)
             generated = self._generate_chapter_pass(
                 chapter_title, chapter_index, chapter_count, structure,
                 unit_facts, unit_inferences, unit_style,
@@ -2087,6 +2122,7 @@ class WriterAgent(BaseAgent):
             "generation_units": len(units),
             "generation_calls": generation_calls,
             "generation_unit_stats": unit_stats,
+            "blocked_units": [item for item in unit_stats if item.get("generation_status") == "blocked"],
         }
         return all_results
 
@@ -2202,21 +2238,17 @@ class WriterAgent(BaseAgent):
             + (f"{policy_block}\n\n" if policy_block else "")
             + (
                 "当前小节计划中的 fact_ids/inference_ids 是完成本小节目的的核心证据。"
-                "不得为了简短而遗漏完成条件所必需的核心证据；其他补充事实按论证需要选择，不追求机械全覆盖。\n"
+                "依据完成条件展开核心证据，按论证需要选择补充事实。\n"
                 if unit_plan else ""
             )
             + "本章相关事实清单(当前小节事实优先排列,其余事实仅用于必要背景和关系校验):\n" + "\n".join(selected_facts) + "\n\n"
             + "本章相关推断清单:\n" + "\n".join(selected_inferences) + "\n\n"
             + f"{chapter_style}\n"
-            + "请按当前交付单元契约撰写当前章节或小节。若提供段落执行计划，必须遵守其边界和顺序；"
-              "否则依据证据关系和当前文体设计自然段。句式、节奏和承接方式由匹配的模板表达参考指导，不要求每段添加主题句或过渡句;"
-              "自然段数量和每段篇幅由规划的语义关系、证据密度与阅读需要决定，不要套用固定段数;"
-              "不要把 fact 清单改写成一串短句。输出必须是一个 JSON 对象,优先只包含 paragraphs 字段;"
-              "paragraphs 每项代表一个自然段,包含 paragraph_id 和 sentences 数组;paragraph_id 对应当前计划中的段落标识。"
-              "计划中不同论证段应分别输出,不得把全部段落压缩成一个对象;sentences 每项包含 text/fact_ids/inference_ids。"
-              "无引用句仅可用于纯组织性过渡,必须额外标记 source_level=\"TRANSITION\"；实质性事实、判断以及反问句中的事实前提都必须绑定依据。"
-              "同一自然段内多句话应放在同一个 paragraph 中,不要每句话单独建段。"
-              "不要输出小标题或 source_level=\"SUBHEADING\";小标题由系统按 Narrative Plan 渲染。不要输出解释、备选文本、Markdown 代码块或额外字段。"
+            + "按当前交付单元契约和证据关系写成自然段。已有段落执行计划时保留各实质论证的边界与顺序；"
+              "句式、节奏和承接方式参考匹配模板。"
+              "只输出 JSON 对象的 paragraphs：每项是一个自然段，paragraph_id 对应计划标识，"
+              "sentences 每项包含 text、fact_ids、inference_ids。事实和判断逐句绑定直接依据；"
+              "纯组织性过渡句标记 source_level=\"TRANSITION\"。小标题由系统按 Narrative Plan 渲染。"
             )
 
         empty_prompt = build_prompt([], [])

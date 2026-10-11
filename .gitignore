@@ -1,3 +1,7 @@
+# Local credentials and deployment overrides must never enter source archives.
+.env
+.env.*
+!.env.example
 __pycache__/
 *.pyc
 *.db

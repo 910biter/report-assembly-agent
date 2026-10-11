@@ -80,6 +80,7 @@ class ProductExtensionTests(unittest.TestCase):
             patch("app.runtime_profiles.settings.structured_output_tokens", 3000),
             patch("app.runtime_profiles.settings.prompt_overhead_tokens", 2000),
             patch("app.runtime_profiles.settings.safety_margin_tokens", 1000),
+            patch("app.runtime_profiles.capacity", return_value=(16000, 3000)),
         ):
             self.assertEqual(ContextManager({}).budget_tokens(), 10000)
 
@@ -145,14 +146,33 @@ class ProductExtensionTests(unittest.TestCase):
             name="示例画像",
             writing_style={"tone": "审慎"},
             writing_patterns={
-                "fact_expression": "保留具体名称和数字",
-                "judgment_expression": "使用有依据的审慎判断",
+                "transferable_style": {
+                    "fact_expression": "先明确主体和时间，再呈现关键数据",
+                    "judgment_expression": "从可核验事实过渡到有限度解释",
+                },
             },
         )
         block = variant.writer_prompt_block()
         self.assertIn("fact_expression", block)
         self.assertIn("judgment_expression", block)
         self.assertNotIn("配对案例", block)
+
+    def test_legacy_template_does_not_transfer_source_topic_or_stance(self):
+        variant = StyleVariant(
+            library_id=1,
+            name="样例画像",
+            writing_style={"tone": "犀利批判"},
+            writing_patterns={"judgment_expression": "将个案揭示为体系黑幕"},
+            terminology={"preferred": ["黑幕"], "forbidden": ["客观中立"]},
+            style_samples=[{"content": "模板原文中的专属机构和事实。"}],
+            exemplar_bank=[{"content": "模板例文中的领域结论。"}],
+            chapter_styles=[{"chapter_type": "批判", "rules": "定性为监管真空"}],
+            reasoning_profile={"analysis_framework": "揭露个案并批判制度"},
+        )
+        block = variant.writer_prompt_block({"purpose": "客观分析公开融资安排"})
+        for source_specific in ("犀利批判", "黑幕", "客观中立", "专属机构", "监管真空", "揭露个案"):
+            self.assertNotIn(source_specific, block)
+        self.assertIn("以用户本次要求和当前证据确定语气", block)
 
     def test_new_capabilities_have_independent_audit_tables(self):
         for table in (
@@ -313,7 +333,7 @@ class ProductExtensionTests(unittest.TestCase):
         self.assertEqual(_style_sample_type({"discourse_flow": []}, 4, 4), "conclusion")
 
     def test_style_learning_job_exposes_progress_without_internal_paths(self):
-        job = create_style_job([], job_id="test-empty-style-job")
+        job = create_style_job([], job_id="test-empty-style-job", owner_user_id=1)
         self.assertEqual(job["status"], "queued")
         self.assertNotIn("files", job)
         run_style_job(job["id"])

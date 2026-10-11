@@ -34,7 +34,6 @@ async function submit() {
       <div class="login-heading">
         <p>报告整编工作台</p>
         <h1>登录工作区</h1>
-        <span>使用管理员分配的账号继续。</span>
       </div>
       <form class="login-form" @submit.prevent="submit">
         <label for="login-username">用户名</label>
@@ -56,7 +55,6 @@ async function submit() {
 .login-heading { margin: 24px 0 28px; }
 .login-heading p { margin: 0 0 5px; color: var(--muted-foreground); font-size: 12px; }
 .login-heading h1 { margin: 0; font-size: 27px; font-weight: 600; letter-spacing: -.03em; }
-.login-heading span { display: block; margin-top: 9px; color: var(--muted-foreground); font-size: 13px; }
 .login-form { display: grid; gap: 9px; }
 .login-form label { margin-top: 10px; font-size: 13px; color: var(--foreground); }
 .login-form input { width: 100%; height: 40px; padding: 0 12px; border: 1px solid var(--border-strong); border-radius: var(--radius-control); background: var(--muted); color: var(--foreground); outline: none; }

@@ -40,7 +40,8 @@ def isolated_extraction(monkeypatch):
     for name in ("update_call_funnel", "update_call_metrics", "update_call_products"):
         monkeypatch.setattr(extractor, name, lambda *args, **kwargs: None)
     monkeypatch.setattr(extractor.EvidenceAgent, "_record_material_scan", lambda *args: None)
-    monkeypatch.setattr(extractor, "fact_exists", lambda *args: False)
+    monkeypatch.setattr(extractor, "_identity_candidates", lambda *args: [])
+    monkeypatch.setattr(extractor, "match_propositions", lambda *args: ({}, {}))
     monkeypatch.setattr(extractor, "save_fact_with_evidence", lambda *args, **kwargs: 123)
     monkeypatch.setattr(extractor, "save_claim", lambda *args, **kwargs: None)
     monkeypatch.setattr(extractor, "embed_texts", lambda texts: [])

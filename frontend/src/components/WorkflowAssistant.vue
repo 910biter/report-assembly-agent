@@ -538,7 +538,7 @@ onBeforeUnmount(() => {
             <p>
               {{
                 draft.requirements ||
-                "填写业务目标后，可以先和助手讨论报告重点、材料范围和预期结构。"
+                "尚未填写报告要求"
               }}
             </p>
             <button class="ask-link" @click="tab = 'discuss'">
@@ -549,13 +549,12 @@ onBeforeUnmount(() => {
             <template v-if="isMaterialSession">
               <small>讨论范围</small>
               <h3>{{ task?.theme?.replace("材料理解：", "") || "所选材料" }}</h3>
-              <p>助手只会检索这份材料的解析单元和材料理解结果，可用于快速了解内容、结构、关键事实及证据边界。</p>
               <button class="ask-link" @click="tab = 'discuss'">开始讨论材料</button>
             </template>
             <template v-else>
               <small>材料理解</small>
               <h3>选择一份材料</h3>
-              <p>在材料详情中点击“与助手讨论”，即可围绕单份材料查看摘要、结构、关键事实和证据边界。</p>
+              <p>在材料详情中选择“与助手讨论”。</p>
             </template>
           </template>
           <template v-else>
@@ -566,7 +565,7 @@ onBeforeUnmount(() => {
                 <h3>{{ currentStage.label }}</h3>
               </div>
             </div>
-            <p>{{ currentStage.description }}</p>
+            <p v-if="['requirement_review', 'directory_review', 'failed', 'paused', 'review'].includes(task?.stage)">{{ currentStage.description }}</p>
             <dl>
               <div>
                 <dt>材料解析</dt>

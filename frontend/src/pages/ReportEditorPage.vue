@@ -876,11 +876,11 @@ function qaStatusLabel(issue: QualityIssue) {
           >
             证据</button
           ><button
-            class="tab"
-            :class="{ active: sideTab === 'discuss' }"
+            class="context-assistant"
+            type="button"
             @click="openTaskAssistant"
           >
-            助手
+            问助手
           </button>
         </div>
         <div v-if="sideTab === 'evidence'" class="panel-body">
@@ -935,18 +935,11 @@ function qaStatusLabel(issue: QualityIssue) {
               "
               class="empty"
             >
-              <div><strong>没有绑定依据</strong>该句可能是结构或过渡表达。</div>
+              <div><strong>没有绑定依据</strong></div>
             </div></template
           >
           <div v-else class="empty">
-            <div>
-              <strong>选择一句正文</strong
-              >{{
-                mode === "trace"
-                  ? "查看对应事实、原文和分析推论。"
-                  : "点击正文后可查看依据。"
-              }}
-            </div>
+            <div><strong>选择一句正文查看依据</strong></div>
           </div>
         </div>
         <div v-else-if="sideTab === 'qa'" class="panel-body qa-workspace">
@@ -1050,18 +1043,8 @@ function qaStatusLabel(issue: QualityIssue) {
             </article>
           </template>
           <div v-else class="empty">
-            <div>
-              <strong>选择正文中的问题标记</strong
-              >只展示与当前句子、段落或章节对应的问题。
-            </div>
+            <div><strong>选择正文中的问题标记</strong></div>
           </div>
-        </div>
-        <div v-else class="panel-body assistant-handoff">
-          <b>使用统一任务助手</b>
-          <p>助手会读取当前选中的句子、章节及其来源，并保留任务级连续会话。</p>
-          <button class="btn primary" type="button" @click="openTaskAssistant">
-            打开任务助手
-          </button>
         </div>
       </aside>
     </div>
@@ -1361,10 +1344,8 @@ function qaStatusLabel(issue: QualityIssue) {
   border-left: 2px solid var(--document-inference-border);
   padding-left: 10px;
 }
-.assistant-handoff p {
-  color: var(--color-muted);
-  line-height: 1.6;
-}
+.context-assistant { margin-left: auto; border: 0; background: transparent; color: var(--muted-foreground); font-size: 12px; cursor: pointer; }
+.context-assistant:hover { color: var(--foreground); }
 .mode-review .sentence.qa-target {
   background: var(--warning-soft);
   box-shadow: 0 0 0 2px var(--warning);

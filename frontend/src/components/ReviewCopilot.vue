@@ -839,7 +839,6 @@ async function archiveCurrent() {
         </div>
         <div v-else class="copilot-empty">
           <b>{{ threads.length ? "开始一段新讨论" : "与助手讨论当前产物" }}</b>
-          <p>可以询问依据、讨论组织方式，或要求提出局部修改方案。</p>
           <button
             v-if="threads.length"
             type="button"
@@ -874,7 +873,7 @@ async function archiveCurrent() {
       ></div>
       <aside v-if="historyOpen" class="side-drawer history-drawer">
         <div class="drawer-head">
-          <div><b>历史会话</b><small>按最近更新排序</small></div>
+          <div><b>历史会话</b></div>
           <span class="drawer-actions"
             ><button v-if="thread?.status === 'open'" @click="archiveCurrent">
               归档当前</button
@@ -1077,10 +1076,8 @@ async function archiveCurrent() {
   display: block;
   color: var(--color-text);
 }
-.copilot-empty p {
-  margin: 6px 0 12px;
-}
 .copilot-empty button {
+  margin-top: 10px;
   border: 0;
   background: transparent;
   color: var(--color-primary);
@@ -1159,14 +1156,8 @@ async function archiveCurrent() {
   padding: 12px 13px;
   border-bottom: 1px solid var(--color-border);
 }
-.drawer-head b,
-.drawer-head small {
+.drawer-head b {
   display: block;
-}
-.drawer-head small {
-  margin-top: 1px;
-  color: var(--color-muted);
-  font-size: 11px;
 }
 .drawer-head button {
   padding: 4px;

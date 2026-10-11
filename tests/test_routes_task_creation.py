@@ -1,4 +1,5 @@
 from contextlib import contextmanager
+from types import SimpleNamespace
 
 
 def test_create_task_initializes_run_id_before_building_payload(monkeypatch):
@@ -12,6 +13,9 @@ def test_create_task_initializes_run_id_before_building_payload(monkeypatch):
     from app.api import routes
 
     captured = {}
+
+    monkeypatch.setattr(routes.settings, "multiuser_enabled", False)
+    monkeypatch.setattr(routes.style, "get_variant", lambda variant_id: SimpleNamespace(status="confirmed"))
 
     monkeypatch.setattr(routes, "_collect_material_ids", lambda *args: [31, 32, 33])
     monkeypatch.setattr(routes, "attach_draft_thread", lambda *args: None)

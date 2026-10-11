@@ -7,6 +7,7 @@ import UiPanel from "@/components/ui/UiPanel.vue";
 import UiSectionHeader from "@/components/ui/UiSectionHeader.vue";
 import UiTabs from "@/components/ui/UiTabs.vue";
 import UiButton from "@/components/ui/UiButton.vue";
+import AppIcon from "@/components/AppIcon.vue";
 
 const qc = useQueryClient();
 const upload = ref<HTMLInputElement>();
@@ -373,10 +374,9 @@ onBeforeUnmount(() => window.clearTimeout(pollTimer));
     <UiPageHeader title="模板中心" />
     <UiPanel class="upload-bar" :padded="false">
       <div class="upload-copy">
-        <span class="upload-mark">DOCX</span>
+        <span class="upload-mark"><AppIcon name="documents" :size="20" /></span>
         <div>
           <h2>学习新模板</h2>
-          <p>一批来源生成一个模板画像；逐份指定它能提供的学习内容。</p>
         </div>
       </div>
       <div class="upload-controls">
@@ -390,8 +390,8 @@ onBeforeUnmount(() => window.clearTimeout(pollTimer));
             @change="onFilesChanged"
           />
         </label>
-        <p class="role-explainer">
-          文体学习与结构参考可多选；Word 版式母版仅限一份 DOCX。默认仅作为文体参考。
+        <p v-if="selectedFiles.length" class="role-explainer">
+          文体与结构可多选；Word 版式母版仅限一份 DOCX。未选择时按文体参考。
         </p>
       </div>
       <div v-if="selectedFiles.length" class="source-role-list">
@@ -455,11 +455,10 @@ onBeforeUnmount(() => window.clearTimeout(pollTimer));
       </div>
     </UiPanel>
     <p v-if="error" class="error-text">{{ error }}</p>
-    <section class="template-layout">
+    <section class="template-layout" :class="{ 'has-selection': selected }">
       <UiPanel class="templates" :padded="false">
         <UiSectionHeader
-          title="模板与画像"
-          description="选择一个资产查看分层学习结果"
+          title="模板"
         />
         <div v-if="variants.data.value?.length" class="template-list">
           <article
@@ -505,16 +504,13 @@ onBeforeUnmount(() => window.clearTimeout(pollTimer));
         </div>
         <div v-else class="empty">
           <div>
-            <strong>暂无模板资产</strong>上传 DOCX
-            后生成文档Schema与初始报告画像。
+            <strong>暂无模板</strong>上传参考文件开始学习。
           </div>
         </div>
       </UiPanel>
-      <UiPanel class="profile-panel" :padded="false">
-        <template v-if="selected"
-          ><div class="profile-title">
+      <UiPanel v-if="selected" class="profile-panel" :padded="false">
+        <div class="profile-title">
             <div>
-              <small>模板画像</small>
               <div class="name-editor">
                 <input
                   v-model="editingName"
@@ -550,10 +546,14 @@ onBeforeUnmount(() => window.clearTimeout(pollTimer));
                 <dt>结构参考</dt><dd>{{ selected.structure?.asset_roles?.role_assignment_known === false ? '来源用途未记录' : !selected.structure?.asset_roles?.structural_reference ? '未选择' : selected.structure?.asset_roles?.structural_reference_available ? `已识别 ${learningEvidence.structure?.observed_headings || 0} 个标题` : '已选择，未识别标题层级' }}</dd>
                 <dt>Word 版式母版</dt><dd>{{ selected.structure?.asset_roles?.layout_master_available ? (selected.structure?.asset_roles?.role_assignment_known === false ? '存在，但用途未记录' : '可用') : '未提供，将按任务使用默认版式' }}</dd>
               </dl>
-              <p class="schema-note">{{ selected.structure?.asset_roles?.note || '文体、结构与导出版式由系统分别处理。' }}</p>
+              <p v-if="selected.structure?.asset_roles?.note" class="schema-note">{{ selected.structure.asset_roles.note }}</p>
             </div>
-            <div class="profile-block learning-evidence">
-              <h3>学习依据</h3>
+            <details class="profile-block learning-evidence">
+              <summary>
+                <span>学习依据</span>
+                <small v-if="learningEvidence.topic_probe?.truncated_sources || learningEvidence.profile_prompt?.truncated" class="evidence-warning">存在输入裁剪</small>
+                <small v-else-if="learningEvidence.source_count !== undefined">{{ learningEvidence.source_count }} 份来源</small>
+              </summary>
               <div v-if="learningEvidence.source_count !== undefined">
                 <dl>
                 <dt>来源文件</dt><dd>{{ learningEvidence.source_count || 0 }} 份</dd>
@@ -598,7 +598,7 @@ onBeforeUnmount(() => window.clearTimeout(pollTimer));
               <p v-else class="schema-note">
                 该历史画像没有保存逐文件用途与模型输入覆盖记录，因此不推测哪些材料参与了哪类学习。
               </p>
-            </div>
+            </details>
             <div class="confidence-line">
               <span>导出可用性</span
               ><b>{{
@@ -649,7 +649,6 @@ onBeforeUnmount(() => window.clearTimeout(pollTimer));
               <dl>
                 <dt>推荐形态</dt><dd>{{ documentShapeLabel }}</dd>
                 <dt>标题呈现</dt><dd>{{ headingPolicyLabel }}</dd>
-                <dt>使用原则</dt><dd>最终结构由任务目标与材料决定；该画像只提供文体与呈现建议。</dd>
               </dl>
             </div>
             <div v-if="editorialRows.length" class="profile-block">
@@ -744,9 +743,7 @@ onBeforeUnmount(() => window.clearTimeout(pollTimer));
                 <span>可检索成文范例</span>
                 <b>{{ selected.exemplar_bank?.length || 0 }} 条</b>
               </div>
-              <p>
-                Writer 只会选取与当前章节目的匹配的范例，匹配不足时不强行注入；范例只用于组织和表达，不复制业务事实。
-              </p>
+              <p>范例仅用于组织和表达，不复制业务事实。</p>
             </div>
             <div class="example-list">
               <article
@@ -767,10 +764,6 @@ onBeforeUnmount(() => window.clearTimeout(pollTimer));
               </article>
             </div>
           </div>
-        </template>
-        <div v-else class="empty">
-          <div><strong>选择一个模板</strong>查看文档版式、语言与成文画像。</div>
-        </div>
       </UiPanel>
     </section>
   </div>
@@ -805,9 +798,12 @@ onBeforeUnmount(() => window.clearTimeout(pollTimer));
 }
 .template-layout {
   display: grid;
-  grid-template-columns: minmax(260px, 0.65fr) minmax(0, 1.35fr);
+  grid-template-columns: minmax(0, 780px);
   min-width: 0;
   gap: 16px;
+}
+.template-layout.has-selection {
+  grid-template-columns: minmax(260px, 0.65fr) minmax(0, 1.35fr);
 }
 .templates,
 .profile-panel {
@@ -888,14 +884,11 @@ onBeforeUnmount(() => window.clearTimeout(pollTimer));
   min-width: 0;
   flex: 1;
 }
-.profile-title small {
-  color: var(--color-primary);
-}
 .name-editor {
   display: flex;
   align-items: center;
   gap: 8px;
-  margin-top: 5px;
+  margin-top: 0;
 }
 .name-editor input {
   min-width: 0;
@@ -1021,7 +1014,7 @@ onBeforeUnmount(() => window.clearTimeout(pollTimer));
   font-size: 11px;
 }
 @media (max-width: 1100px) {
-  .template-layout {
+  .template-layout.has-selection {
     grid-template-columns: 1fr;
   }
   .upload-bar {
@@ -1206,11 +1199,6 @@ onBeforeUnmount(() => window.clearTimeout(pollTimer));
   font-size: 17px;
   letter-spacing: -0.015em;
 }
-.upload-copy p {
-  margin-top: 3px;
-  color: var(--muted-foreground);
-  font-size: 13px;
-}
 .upload-mark {
   display: grid;
   place-items: center;
@@ -1221,9 +1209,6 @@ onBeforeUnmount(() => window.clearTimeout(pollTimer));
   border-radius: 8px;
   color: var(--primary);
   background: var(--card);
-  font-size: 10px;
-  font-weight: 800;
-  letter-spacing: 0.06em;
   box-shadow: none;
 }
 .upload-field {
@@ -1379,6 +1364,21 @@ onBeforeUnmount(() => window.clearTimeout(pollTimer));
 }
 .learning-evidence dl {
   grid-template-columns: 104px minmax(0, 1fr);
+}
+.learning-evidence summary {
+  cursor: pointer;
+  color: var(--foreground);
+  font-size: 14px;
+  font-weight: 600;
+}
+.learning-evidence summary small {
+  margin-left: 12px;
+  color: var(--muted-foreground);
+  font-size: 12px;
+  font-weight: 400;
+}
+.learning-evidence[open] summary {
+  margin-bottom: 8px;
 }
 .learning-source-list {
   display: grid;

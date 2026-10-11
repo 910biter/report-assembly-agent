@@ -9,7 +9,7 @@ from app.model_connection import Connection
 from app.gateway import (
     OpenAICompatibleGateway,
     _completion_was_truncated,
-    _context_safe_max_tokens,
+    _context_exceeded,
     last_generation_stats,
 )
 from app.evidence.extractor import EvidenceAgent
@@ -81,6 +81,9 @@ class _HealthResponse:
 
 class VllmGatewayTests(unittest.TestCase):
     def setUp(self):
+        from app.vllm_capacity import reset
+        reset()
+        self.addCleanup(reset)
         connection = Connection("http://vllm.test/v1", "qwen3.6-27b", service_kind="vllm", vllm_priority=True)
         for target in ("app.model_connection.load_connection", "app.gateway.load_connection"):
             mock = patch(target, return_value=connection)
@@ -113,11 +116,9 @@ class VllmGatewayTests(unittest.TestCase):
         self.assertEqual(selected_facts, ["1. A", "3. C"])
         self.assertEqual(selected_inferences, [])
 
-    def test_context_overflow_reduces_only_generation_ceiling(self):
+    def test_context_overflow_is_classified_without_shrinking_output(self):
         response = _ContextOverflowResponse()
-        with patch.object(settings, "model_context_window_tokens", 15360):
-            adjusted = _context_safe_max_tokens(response, requested_max_tokens=3072)
-        self.assertEqual(adjusted, 2560)
+        self.assertTrue(_context_exceeded(response))
 
     def test_evidence_stage_budget_preserves_source_coverage_without_selecting_all(self):
         candidates = []

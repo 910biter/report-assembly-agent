@@ -23,7 +23,6 @@ def main():
         "service_kind": "vllm",
         "context_tokens": settings.model_context_window_tokens,
         "output_tokens": settings.generation_reserve_tokens,
-        "tokenizer_path": values.get("IRA_GENERATION_TOKENIZER_PATH") or "",
         "vllm_priority": True,
     })
     save_connection(connection)

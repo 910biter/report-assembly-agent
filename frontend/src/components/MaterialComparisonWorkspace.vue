@@ -279,9 +279,8 @@ async function handoff() {
   <section class="comparison-workspace" :class="{ embedded }">
     <header v-if="!embedded">
       <div>
-        <small>INCREMENTAL REVIEW</small>
         <h2>新增材料对比</h2>
-        <p>以既有报告为基线，核验新材料带来的事实变化；确认前不修改正文。</p>
+        <p>核验新材料与既有报告的关系，不修改报告正文。</p>
       </div>
       <button class="btn tertiary" @click="$emit('close')">关闭</button>
     </header>
@@ -725,10 +724,6 @@ async function handoff() {
 .comparison-workspace h2,
 .comparison-workspace p {
   margin-top: 0;
-}
-.comparison-workspace header small {
-  color: var(--color-primary);
-  font-weight: 650;
 }
 .comparison-shell {
   display: grid;

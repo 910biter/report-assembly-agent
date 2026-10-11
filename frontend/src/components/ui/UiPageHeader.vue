@@ -26,8 +26,8 @@ defineProps<{ title: string; description?: string; featured?: boolean }>();
   align-items: center;
   justify-content: space-between;
   gap: var(--space-6);
-  min-height: 72px;
-  padding: 8px 0 16px;
+  min-height: 48px;
+  padding: 0 0 10px;
   border-bottom: 0;
 }
 .ui-page-header--featured {
@@ -58,8 +58,8 @@ defineProps<{ title: string; description?: string; featured?: boolean }>();
 @media (max-width: 640px) {
   .ui-page-header {
     flex-wrap: wrap;
-    min-height: 56px;
-    padding: 4px 0 8px;
+    min-height: 48px;
+    padding: 0 0 8px;
   }
   .ui-page-header h1 {
     font-size: 24px;

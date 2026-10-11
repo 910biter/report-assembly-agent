@@ -371,7 +371,7 @@ def test_incremental_activation_serializes_run_delta_and_payload_transition(monk
 
     def create_delta(*args, **kwargs):
         seen_sessions.append(kwargs["_session"])
-        return {"id": 77}
+        return {"id": 77, "added_materials": [{"material_id": 2}]}
 
     monkeypatch.setattr(task_activation, "create_task_run", create_run)
     monkeypatch.setattr(task_activation, "create_incremental_delta", create_delta)
@@ -388,6 +388,8 @@ def test_incremental_activation_serializes_run_delta_and_payload_transition(monk
     assert payload["graph_status"] == {"status": "ready"}
     assert payload["queue_status"] == {"status": "created"}
     assert payload["incremental_inherited_fact_ids"] == [101]
+    assert payload["material_ids"] == [1, 2]
+    assert result["material_count"] == 2
     assert len(seen_sessions) == 2
     assert seen_sessions[0] is seen_sessions[1]
     with pytest.raises(ValueError, match="PREVIOUS_INCREMENT_PENDING"):

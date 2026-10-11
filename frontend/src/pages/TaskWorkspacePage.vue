@@ -330,18 +330,6 @@ function confirmPlan() {
 function confirmDirectoryPlan() {
   confirmDirectory.mutate();
 }
-function processStageStatus(index: number) {
-  if (index < stageIndex.value) return "已完成";
-  if (index > stageIndex.value) return "等待中";
-  const stage = String(task.data.value?.stage || "created");
-  if (stage === "failed") return "运行异常";
-  if (stage === "paused") return "已暂停";
-  if (stage === "review") return isComparison.value ? "待审阅" : "待审核";
-  if (stage === "done") return "已完成";
-  if (stage === "requirement_review") return "等待确认需求";
-  if (stage === "directory_review") return "等待确认目录";
-  return running.value ? "正在进行" : stage === "created" ? "待运行" : "等待开始";
-}
 function addCheckpointChapter() {
   checkpointStructure.value.push("");
 }
@@ -569,7 +557,7 @@ function versionsList() {
         >
           <b>请确认报告需求</b>
           <p>
-            材料理解已完成。可先与助手讨论主题、受众、重点和篇幅；确认后才会进入分析规划。
+            可与助手讨论主题、受众、重点和篇幅；确认后进入规划。
           </p>
           <div class="checkpoint-form">
             <label>
@@ -607,7 +595,7 @@ function versionsList() {
         >
           <b>请确认最终目录</b>
           <p>
-            事实和分析已经完成。可以查看目录，并与助手讨论章节顺序、合并拆分和重点安排。
+            可调整章节标题、顺序和重点；确认后开始写作。
           </p>
           <ol v-if="checkpointStructure.length" class="checkpoint-outline checkpoint-outline-editable">
             <li
@@ -639,45 +627,7 @@ function versionsList() {
         <div class="surface section-block">
           <div class="section-head">
             <div>
-              <h2>当前状态</h2>
-              <p class="muted">只展示此刻需要关注的结果和下一步操作</p>
-            </div>
-          </div>
-          <div class="status-summary">
-            <div>
-              <span>当前阶段</span><b>{{ processCurrentLabel }}</b>
-            </div>
-            <div>
-              <span>已经产生</span
-              ><b>{{ task.data.value.report_id ? "报告草稿" : "分析产物" }}</b>
-            </div>
-            <div>
-              <span>下一步</span
-              ><b>{{
-                task.data.value.stage === "review"
-                  ? "完成审核"
-                  : task.data.value.stage === "done"
-                    ? "导出或增量更新"
-                    : task.data.value.stage === "requirement_review"
-                      ? "确认需求并开始规划"
-                  : task.data.value.stage === "directory_review"
-                      ? "确认目录并开始写作"
-                      : task.data.value.stage === "paused"
-                        ? "继续运行"
-                        : task.data.value.stage === "failed"
-                          ? "查看异常信息"
-                      : running
-                        ? "等待当前阶段完成"
-                        : "开始运行"
-              }}</b>
-            </div>
-          </div>
-        </div>
-        <div class="surface section-block">
-          <div class="section-head">
-            <div>
-              <h2>质量概览</h2>
-              <p class="muted">业务结果与技术诊断分开呈现</p>
+              <h2>提取结果</h2>
             </div>
           </div>
           <div class="metric-strip flat">
@@ -782,7 +732,6 @@ function versionsList() {
         <div class="section-head">
           <div>
             <h2>{{ isComparison ? "新增材料" : "任务材料" }}</h2>
-            <p class="muted">本任务实际使用的材料及解析状态</p>
           </div>
         </div>
         <div class="data-list">
@@ -827,44 +776,16 @@ function versionsList() {
         <div class="section-head">
           <div>
             <h2>运行过程</h2>
-            <p class="muted">
-              {{ isComparison
-                ? "仅处理新增材料并核验变化，不生成或改写基线报告。"
-                : "查看各环节的完成状态和当前处理进度。" }}
+            <p v-if="isComparison" class="muted">
+              仅处理新增材料并核验变化，不生成或改写基线报告。
             </p>
           </div>
         </div>
-        <div class="process-current">
-          <div>
-            <span>当前环节</span>
-          <strong>{{ processCurrentLabel }}</strong>
-          </div>
-          <div v-if="stageProgress">
-            <span>{{ stageProgress.label }}</span>
-            <strong>{{ stageProgress.done }} / {{ stageProgress.total }}</strong>
-          </div>
-          <div v-else>
-            <span>状态</span>
-            <strong>{{ processStageStatus(stageIndex) }}</strong>
-          </div>
-        </div>
-        <ol v-if="stageIndex >= 0" class="process-steps">
-          <li
-            v-for="(item, index) in stages"
-            :key="item.name"
-            :class="{
-              complete: index < stageIndex,
-              current: index === stageIndex,
-            }"
-            :aria-current="index === stageIndex ? 'step' : undefined"
-          >
-            <span class="process-step-index">{{ index < stageIndex ? "✓" : index + 1 }}</span>
-            <div>
-              <strong>{{ item.name }}</strong>
-              <small>{{ processStageStatus(index) }}</small>
-            </div>
-          </li>
-        </ol>
+        <dl class="process-records">
+          <div><dt>创建时间</dt><dd>{{ task.data.value.created_at || '—' }}</dd></div>
+          <div><dt>执行轮次</dt><dd>第 {{ task.data.value.run_revision || 1 }} 轮</dd></div>
+          <div v-if="task.data.value.queue_status?.queue_wait_seconds != null"><dt>排队耗时</dt><dd>{{ Number(task.data.value.queue_status.queue_wait_seconds).toFixed(1) }} 秒</dd></div>
+        </dl>
         <p v-if="task.data.value.stage === 'failed'" class="notice warning process-error">
           {{ task.data.value.error || task.data.value.failure_reason || "当前环节未完成，请查看任务状态。" }}
         </p>
@@ -978,16 +899,14 @@ function versionsList() {
                   ? "Graph RAG 已启用"
                   : "图谱观测模式"
               }}</span
-            ><small>关系只保存有事实依据的实体联系。</small
             ><span v-if="graphBuildError" class="graph-build-error">{{ graphBuildError }}</span
               ><button class="btn graph-build-button" :disabled="rebuildGraph.isPending.value || graphBuildActive" @click="rebuildGraph.mutate()">{{ graphBuildActive ? (graph.data.value?.background_job?.status === "queued" ? "已排队" : "正在构建") : "构建知识图谱" }}</button
-              ><span v-if="graphBuildActive" class="badge warning">{{ graph.data.value?.background_job?.status === "queued" ? "已排队" : "正在构建" }}</span
             ><span
-              v-else-if="graphBuildStatus === 'partial_ready'"
+              v-if="!graphBuildActive && graphBuildStatus === 'partial_ready'"
               class="badge warning"
               >部分完成</span
             ><span
-              v-else-if="graphBuildStatus === 'degraded'"
+              v-else-if="!graphBuildActive && graphBuildStatus === 'degraded'"
               class="badge danger"
               >构建失败</span
             >
@@ -1085,7 +1004,6 @@ function versionsList() {
       <div v-if="versionsList().length" class="section-head">
         <div>
           <h2>版本记录</h2>
-          <p class="muted">每次快照和增量更新都形成可审阅的历史基线</p>
         </div>
       </div>
       <div v-if="versionsList().length" class="data-list">
@@ -1267,98 +1185,40 @@ function versionsList() {
   padding: 0 4px;
   background: transparent;
   backdrop-filter: none;
+  flex-wrap: wrap;
+  overflow: visible;
+}
+.workspace-browser > .section-block {
+  min-width: 0;
+  padding: 16px 20px;
+}
+.material-row {
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 16px;
+}
+.material-row > div {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.material-row > .badge {
+  white-space: nowrap;
+}
+.process-records {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px 32px;
+  margin: 0;
+}
+.process-records dt {
+  color: var(--muted-foreground);
+  font-size: 12px;
+}
+.process-records dd {
+  margin: 4px 0 0;
+  font-size: 13px;
 }
 .process-panel .section-head {
   margin-bottom: 4px;
-}
-.process-current {
-  display: flex;
-  align-items: flex-end;
-  justify-content: space-between;
-  gap: 20px;
-  padding: 14px 0 16px;
-  border-bottom: 1px solid var(--border);
-}
-.process-current > div {
-  min-width: 0;
-}
-.process-current span,
-.process-current strong {
-  display: block;
-}
-.process-current span {
-  color: var(--muted-foreground);
-  font-size: 12px;
-}
-.process-current strong {
-  margin-top: 5px;
-  font-size: 14px;
-  font-weight: 600;
-}
-.process-steps {
-  display: grid;
-  gap: 0;
-  margin: 0;
-  padding: 18px 0 0;
-  list-style: none;
-}
-.process-steps li {
-  position: relative;
-  display: grid;
-  grid-template-columns: 30px minmax(0, 1fr);
-  gap: 12px;
-  min-width: 0;
-  padding: 0 0 18px;
-}
-.process-steps li:not(:last-child)::before {
-  position: absolute;
-  top: 30px;
-  bottom: 0;
-  left: 14px;
-  width: 1px;
-  background: var(--border);
-  content: "";
-}
-.process-step-index {
-  position: relative;
-  z-index: 1;
-  display: grid;
-  width: 30px;
-  height: 30px;
-  place-items: center;
-  border: 1px solid var(--border-strong);
-  border-radius: 8px;
-  background: var(--surface-raised);
-  color: var(--muted-foreground);
-  font-size: 12px;
-}
-.process-steps li.current .process-step-index {
-  border-color: color-mix(in srgb, var(--primary) 62%, var(--border));
-  background: var(--primary-soft);
-  color: var(--foreground);
-}
-.process-steps li.complete .process-step-index {
-  color: var(--foreground);
-}
-.process-steps li > div {
-  min-width: 0;
-  padding-top: 2px;
-}
-.process-steps strong,
-.process-steps small {
-  display: block;
-}
-.process-steps strong {
-  font-size: 13px;
-  font-weight: 550;
-}
-.process-steps small {
-  margin-top: 3px;
-  color: var(--muted-foreground);
-  font-size: 12px;
-}
-.process-steps li.current small {
-  color: var(--accent);
 }
 .process-error {
   margin-top: 4px;
@@ -1373,19 +1233,6 @@ function versionsList() {
   display: grid;
   align-content: start;
   gap: 24px;
-}
-.status-summary {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 20px;
-}
-.status-summary span,
-.status-summary b {
-  display: block;
-}
-.status-summary span {
-  color: var(--color-muted);
-  font-size: 12px;
 }
 .flat {
   border: 0;
@@ -1710,7 +1557,6 @@ function versionsList() {
   padding: 12px 0;
   border-bottom: 1px solid var(--color-border);
 }
-.graph-summary small,
 .graph-edge small,
 .graph-changes small {
   color: var(--color-muted);
@@ -1876,15 +1722,12 @@ function versionsList() {
   .progress-step::after {
     display: none;
   }
-  .status-summary {
-    grid-template-columns: repeat(2, 1fr);
-  }
   .analysis-layout {
     grid-template-columns: 1fr;
   }
   .analysis-nav {
     display: flex;
-    overflow: auto;
+    flex-wrap: wrap;
   }
   .analysis-nav button {
     width: auto;
@@ -1892,14 +1735,6 @@ function versionsList() {
   }
 }
 @media (max-width: 600px) {
-  .status-summary {
-    grid-template-columns: 1fr;
-  }
-  .process-current {
-    align-items: flex-start;
-    flex-direction: column;
-    gap: 12px;
-  }
   .version-row {
     grid-template-columns: 1fr auto;
   }

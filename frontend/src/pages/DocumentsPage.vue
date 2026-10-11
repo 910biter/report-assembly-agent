@@ -93,7 +93,6 @@ watch(() => route.query.task, () => detail.refetch());
             <span class="workbench-icon"><AppIcon name="documents" :size="19" /></span>
             <div>
               <h2>上传并理解文档</h2>
-              <p>解析结果会保存到材料库，可在后续报告任务中直接复用。</p>
             </div>
           </div>
           <input ref="fileInput" class="visually-hidden" type="file" multiple @change="onFiles" />
@@ -122,7 +121,6 @@ watch(() => route.query.task, () => detail.refetch());
               </div>
               <UiButton v-if="!isProcessing && detail.data.value.stage !== 'failed'" variant="outline" @click="openDiscussion">与助手讨论</UiButton>
             </div>
-            <p v-if="isProcessing" class="processing-copy">正在解析文件并形成材料理解。已完成的内容会在此处保留。</p>
             <div v-if="isProcessing" class="processing-progress">
               <div class="processing-progress__head"><span>{{ progressLabel }}</span><b>{{ currentProgress }}%</b></div>
               <div class="progress-track"><i :style="{ width: `${currentProgress}%` }"></i></div>
@@ -163,7 +161,7 @@ watch(() => route.query.task, () => detail.refetch());
 .parse-workbench { padding: 24px; }
 .workbench-copy, .result-head, .document-title { display: flex; align-items: center; gap: 13px; }
 .workbench-copy h2, .result-head h2, .document-history h2 { margin: 0; font-size: 16px; }
-.workbench-copy p, .processing-copy, .summary-block p, .document-result > p { color: var(--muted-foreground); line-height: 1.7; }
+.summary-block p, .document-result > p { color: var(--muted-foreground); line-height: 1.7; }
 .workbench-icon { display: grid; place-items: center; width: 38px; height: 38px; color: var(--accent); background: var(--primary-soft); border: 1px solid color-mix(in srgb, var(--primary) 32%, var(--border)); border-radius: 8px; }
 .parse-actions { display: flex; gap: 10px; margin-top: 20px; }
 .selected-files { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }

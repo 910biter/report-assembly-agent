@@ -10,7 +10,7 @@ import UiButton from "@/components/ui/UiButton.vue";
 import { useUiStore } from "@/stores/ui";
 
 const ui = useUiStore();
-const modelForm = ref({ base_url: "", model_name: "", api_key: "", service_kind: "openai", context_tokens: 18432, output_tokens: 8192, tokenizer_path: "", output_parameter: "max_tokens", send_temperature: true, vllm_priority: false });
+const modelForm = ref({ base_url: "", model_name: "", api_key: "", service_kind: "vllm", context_tokens: 0, output_tokens: 8192, output_parameter: "max_tokens" });
 const keyStored = ref(false);
 const clearKey = ref(false);
 const modelBusy = ref(false);
@@ -20,8 +20,10 @@ const connection = useQuery({
   enabled: computed(() => currentUser.value?.role === "admin"),
   queryFn: async () => {
     const value = await api<any>("/api/system/model-connection");
-    const { configured, has_api_key, ...form } = value;
-    modelForm.value = { ...modelForm.value, ...form, api_key: "" };
+    for (const key of Object.keys(modelForm.value) as Array<keyof typeof modelForm.value>) {
+      if (key !== "api_key" && value[key] !== undefined) Object.assign(modelForm.value, { [key]: value[key] });
+    }
+    modelForm.value.api_key = "";
     keyStored.value = value.has_api_key;
     return value;
   },
@@ -168,33 +170,34 @@ async function restartServices() {
   <div class="page-stack settings-page">
     <UiPageHeader title="系统设置" />
     <UiPanel v-if="currentUser?.role === 'admin'" class="section-block">
-      <UiSectionHeader title="模型接入" description="全系统共用 · OpenAI 兼容接口" />
+      <UiSectionHeader title="模型接入" />
       <form class="model-connection-form" @submit.prevent="configureModel(false)">
         <label class="field">接入地址<input v-model="modelForm.base_url" type="url" required placeholder="http://IP:端口/v1" /></label>
         <label class="field">模型名称<input v-model="modelForm.model_name" required placeholder="服务发布的模型名称" /></label>
-        <label class="field">服务类型<select v-model="modelForm.service_kind"><option value="openai">通用 OpenAI 兼容接口</option><option value="vllm">vLLM</option></select></label>
+        <label class="field">服务类型<select v-model="modelForm.service_kind"><option value="vllm">vLLM</option><option value="openai">已有兼容接入</option></select></label>
         <label class="field">API Key<input v-model="modelForm.api_key" type="password" autocomplete="new-password" :placeholder="keyStored ? '已设置；留空保留原 Key' : '本地无鉴权服务可留空'" /></label>
         <label v-if="keyStored"><input v-model="clearKey" type="checkbox" />清除已保存的 Key</label>
         <details class="connection-options">
           <summary>容量与接口能力</summary>
-          <label class="field">上下文窗口（Token）<input v-model.number="modelForm.context_tokens" type="number" min="4096" max="2000000" required /></label>
+          <label class="field">上下文上限（0 使用服务实际窗口）<input v-model.number="modelForm.context_tokens" type="number" min="0" max="2000000" required /></label>
           <label class="field">最大输出（Token）<input v-model.number="modelForm.output_tokens" type="number" min="256" required /></label>
           <label class="field">输出参数<select v-model="modelForm.output_parameter"><option value="max_tokens">max_tokens</option><option value="max_completion_tokens">max_completion_tokens</option></select></label>
-          <label class="field">本机 Tokenizer 目录（可选）<input v-model="modelForm.tokenizer_path" placeholder="留空使用显式估算，不沿用旧模型 Tokenizer" /></label>
-          <label><input v-model="modelForm.send_temperature" type="checkbox" />服务支持 temperature 参数</label>
-          <label v-if="modelForm.service_kind === 'vllm'"><input v-model="modelForm.vllm_priority" type="checkbox" />vLLM 已启用 priority 调度</label>
         </details>
         <div class="service-actions">
           <button class="btn" type="button" :disabled="modelBusy" @click="configureModel(true)">测试连接</button>
           <button class="btn primary" type="submit" :disabled="modelBusy">保存接入</button>
         </div>
         <p v-if="modelMessage" role="status">{{ modelMessage }}</p>
+        <p v-if="modelStatus.data.value?.effective_context_tokens" role="status">
+          有效窗口 {{ modelStatus.data.value.effective_context_tokens.toLocaleString() }} Token ·
+          {{ modelStatus.data.value.token_count_available ? '服务计量可用' : '服务计量暂不可用，使用保守估算' }}
+        </p>
       </form>
     </UiPanel>
 
     <section class="settings-grid">
       <UiPanel class="section-block">
-        <UiSectionHeader title="模型服务" description="核心推理服务连通状态">
+        <UiSectionHeader title="模型服务">
           <template #actions>
             <div class="service-actions">
               <span
@@ -234,10 +237,7 @@ async function restartServices() {
         </div>
       </UiPanel>
       <UiPanel class="section-block">
-        <UiSectionHeader
-          title="任务队列"
-          description="前台任务优先，后台工作按队列调度"
-        />
+        <UiSectionHeader title="任务队列" />
         <dl>
           <dt>当前任务</dt>
           <dd class="mono">
@@ -258,10 +258,7 @@ async function restartServices() {
     </section>
 
     <UiPanel class="section-block appearance-panel">
-      <UiSectionHeader
-        title="界面外观"
-        description="明暗模式独立于强调色；切换后会在此设备上保留。"
-      />
+      <UiSectionHeader title="界面外观" />
       <div class="appearance-controls">
         <div class="appearance-group">
           <span>显示模式</span>
@@ -305,7 +302,6 @@ async function restartServices() {
       <UiSectionHeader
         class="performance-head"
         title="应用主机资源与模型调用"
-        description="硬件采样仅来自本机；远端 API 的 GPU、显存不在采集范围内。调用耗时包含网络与服务端排队。"
       >
         <template #actions>
           <div v-if="performance.data.value?.task" class="task-context">
@@ -424,8 +420,7 @@ async function restartServices() {
         </div>
       </div>
       <div v-else class="performance-empty">
-        <b>暂无完整任务性能数据</b
-        ><span>任务完成后，这里将展示真实 Token 与阶段耗时分布。</span>
+        <b>暂无任务性能数据</b>
       </div>
     </UiPanel>
   </div>
@@ -757,10 +752,6 @@ dd {
   align-items: center;
   padding: 46px;
   color: var(--color-muted);
-}
-.performance-empty span {
-  margin-top: 5px;
-  font-size: 12px;
 }
 @media (max-width: 1000px) {
   .resource-grid {

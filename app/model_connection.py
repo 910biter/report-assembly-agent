@@ -31,10 +31,10 @@ class Connection:
     service_kind: str = "openai"
     context_tokens: int = 18432
     output_tokens: int = 8192
-    tokenizer_path: str = ""
     output_parameter: str = "max_tokens"
     send_temperature: bool = True
     vllm_priority: bool = False
+    send_json_response_format: bool = False
 
     def headers(self) -> dict:
         return {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
@@ -55,8 +55,8 @@ class Connection:
 
     def options(self) -> dict:
         return {name: getattr(self, name) for name in (
-            "service_kind", "context_tokens", "output_tokens", "tokenizer_path",
-            "output_parameter", "send_temperature", "vllm_priority")}
+            "service_kind", "context_tokens", "output_tokens",
+            "output_parameter", "send_temperature", "vllm_priority", "send_json_response_format")}
 
 
 def _cipher(create: bool = True) -> Fernet:
@@ -96,7 +96,9 @@ def _read_connection() -> Connection:
         raise ValueError("MODEL_CONNECTION_NOT_CONFIGURED")
     encrypted = row["encrypted_api_key"]
     key = _cipher(create=False).decrypt(encrypted.encode()).decode() if encrypted else ""
-    return Connection(row["base_url"], row["model_name"], key, **json.loads(row["options_json"]))
+    options = json.loads(row["options_json"])
+    options.pop("tokenizer_path", None)  # Remove the retired setting when reading existing records.
+    return Connection(row["base_url"], row["model_name"], key, **options)
 
 
 def public_connection() -> dict:
@@ -122,9 +124,10 @@ def connection_identity() -> str:
 def capacity() -> tuple[int, int]:
     try:
         connection = load_connection()
-        return connection.context_tokens, connection.output_tokens
     except ValueError:
         return int(settings.model_context_window_tokens), int(settings.generation_reserve_tokens)
+    from app.vllm_capacity import window
+    return window(connection), connection.output_tokens
 
 
 def connection_from_payload(payload: dict) -> Connection:
@@ -141,23 +144,20 @@ def connection_from_payload(payload: dict) -> Connection:
             key = load_connection().api_key
         except ValueError:
             key = ""
-    kind = str(payload.get("service_kind") or "openai")
+    kind = str(payload.get("service_kind") or "vllm")
     parameter = str(payload.get("output_parameter") or "max_tokens")
     if kind not in {"openai", "vllm"} or parameter not in {"max_tokens", "max_completion_tokens"}:
         raise ValueError("不支持的服务类型或输出参数")
     try:
-        window = int(payload.get("context_tokens", 18432))
+        window = int(payload.get("context_tokens", 0))
         output = int(payload.get("output_tokens", 8192))
     except (ValueError, TypeError):
         raise ValueError("上下文和输出上限必须为整数") from None
-    if not 4096 <= window <= 2_000_000 or not 256 <= output < window - 2048:
-        raise ValueError("容量不合理：上下文至少4096，输出至少256且需预留输入空间")
-    tokenizer = str(payload.get("tokenizer_path") or "").strip()
-    if tokenizer and not Path(tokenizer).is_dir():
-        raise ValueError("Tokenizer 必须是应用主机上的现有目录")
-    return Connection(url, name, str(key).strip(), kind, window, output, tokenizer,
+    if not (window == 0 or 4096 <= window <= 2_000_000) or not 256 <= output <= 2_000_000 or (window and output >= window - 2048):
+        raise ValueError("容量不合理：上下文为0（自动）或至少4096，输出至少256且需预留输入空间")
+    return Connection(url, name, str(key).strip(), kind, window, output,
                       parameter, bool(payload.get("send_temperature", True)),
-                      bool(payload.get("vllm_priority", False)))
+                      bool(payload.get("vllm_priority", False)), bool(payload.get("send_json_response_format", False)))
 
 
 def save_connection(connection: Connection) -> None:
@@ -182,6 +182,8 @@ def save_connection(connection: Connection) -> None:
         _cached = (time.monotonic(), connection)
     from app.context_budget import token_counter
     token_counter.reset()
+    from app.vllm_capacity import reset
+    reset()
 
 
 def test_connection(connection: Connection) -> dict:
@@ -195,4 +197,5 @@ def test_connection(connection: Connection) -> dict:
         body = response.json()
         if not body.get("choices"):
             raise ValueError("接口未返回标准 Chat Completions 响应")
-    return {"connected": True, "model_available": True, "usage_available": bool(body.get("usage"))}
+    from app.vllm_capacity import status
+    return {"connected": True, "model_available": True, "usage_available": bool(body.get("usage")), **status(connection)}

@@ -16,6 +16,25 @@ and conversation. Do not use fixed minimum column widths that force horizontal
 page scrolling. Reuse shared controls, tabs, and spacing. Theme bootstrap and UI
 state must read the same persisted preference key.
 
+### Information hierarchy and UI copy
+
+- Give each page one visible title. App chrome contains navigation and utilities,
+  not a second copy of the page title.
+- Show a description only when it changes a decision: an important constraint,
+  an operation's consequence, a current exception, or a required next action.
+  A heading, control label, or visible state that already says the same thing is
+  sufficient on its own.
+- Keep progress in the progress area, actions in their relevant workspace, and
+  diagnostics behind a deliberate detail view. Do not repeat the same counts,
+  status, or artifact links in adjacent panels.
+- Empty states should state what is absent and, when useful, offer the next
+  action. Avoid predictions about where future content will appear.
+- Keep source scope, access boundaries, destructive consequences, and data
+  limitations visible where the user makes the affected choice.
+- Review copy in context across the whole page, including the sidebar, floating
+  assistant, and responsive layout; removing a sentence must also remove the
+  space reserved for it.
+
 This document defines the visual language, interaction principles, component conventions, and implementation constraints for this project.
 
 All AI coding agents and human contributors MUST follow these rules when creating or modifying frontend UI.

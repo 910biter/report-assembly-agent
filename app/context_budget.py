@@ -2,71 +2,33 @@
 from __future__ import annotations
 
 import contextvars
-import math
-import re
 import threading
 from dataclasses import dataclass, field
 
-from app.config import settings
-
-
 class TokenCounter:
-    """Use the serving model tokenizer locally; retain an explicit safe fallback."""
+    """Network-free packing estimates, calibrated by final vLLM request counts."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._loaded = False
-        self._tokenizer = None
         self.method = "estimated"
-
-    def _load(self) -> None:
-        if self._loaded:
-            return
-        with self._lock:
-            if self._loaded:
-                return
-            self._loaded = True
-            from app.model_connection import public_connection
-            configured = str(public_connection().get("tokenizer_path") or "").strip()
-            candidates = [configured] if configured else []
-            from app.model_connection import model_name
-            model = model_name()
-            if model and ":" not in model:
-                candidates.append(model)
-            for candidate in dict.fromkeys(value for value in candidates if value):
-                try:
-                    from transformers import AutoTokenizer
-
-                    self._tokenizer = AutoTokenizer.from_pretrained(
-                        candidate,
-                        local_files_only=bool(settings.context_tokenizer_local_only),
-                        trust_remote_code=False,
-                    )
-                    self.method = f"tokenizer:{candidate}"
-                    return
-                except Exception:
-                    continue
 
     def reset(self) -> None:
         with self._lock:
-            self._loaded = False
-            self._tokenizer = None
             self.method = "estimated"
 
     def count(self, text: str) -> int:
         value = str(text or "")
         if not value:
             return 0
-        self._load()
-        if self._tokenizer is not None:
-            try:
-                return len(self._tokenizer.encode(value, add_special_tokens=False))
-            except Exception:
-                pass
-        # Conservative multilingual fallback. Its use is visible in every audit.
-        cjk = len(re.findall(r"[\u3400-\u9fff]", value))
-        remainder = len(value) - cjk
-        return max(1, cjk + math.ceil(max(0, remainder) / 3))
+        from app.vllm_capacity import raw_estimate, estimate
+        try:
+            from app.model_connection import load_connection
+            count = estimate(value, load_connection())
+            self.method = "estimated:calibrated" if count > raw_estimate(value) else "estimated"
+            return count
+        except Exception:
+            self.method = "estimated"
+            return raw_estimate(value)
 
     def truncate(self, text: str, budget_tokens: int, suffix: str = "…") -> str:
         value = str(text or "")
@@ -106,7 +68,6 @@ def count_tokens(text: str) -> int:
 
 
 def tokenizer_method() -> str:
-    token_counter._load()
     return token_counter.method
 
 
@@ -136,7 +97,15 @@ def build_prompt_from_sections(stage: str, sections: list[ContextSection],
     ) for section in sections]
     costs = [[count_tokens(item + separator) for item in section.items] for section in normalized]
     selected: list[list[str]] = [[] for _ in normalized]
+    selected_costs: list[list[int]] = [[] for _ in normalized]
     cursors = [0 for _ in normalized]
+    # Suffix minimum avoids O(records^2) scanning on huge planning / QA contexts.
+    cheapest_tail: list[list[int]] = []
+    for part in costs:
+        tail = [budget + 1] * (len(part) + 1)
+        for index in range(len(part) - 1, -1, -1):
+            tail[index] = min(part[index], tail[index + 1])
+        cheapest_tail.append(tail)
     used = 0
 
     def take(section_index: int) -> bool:
@@ -148,6 +117,7 @@ def build_prompt_from_sections(stage: str, sections: list[ContextSection],
             if used + cost > budget:
                 continue
             selected[section_index].append(normalized[section_index].items[cursor])
+            selected_costs[section_index].append(cost)
             used += cost
             return True
         return False
@@ -159,7 +129,7 @@ def build_prompt_from_sections(stage: str, sections: list[ContextSection],
 
     while True:
         available = [index for index, section in enumerate(normalized)
-                     if any(used + cost <= budget for cost in costs[index][cursors[index]:])]
+                     if used + cheapest_tail[index][cursors[index]] <= budget]
         if not available:
             break
         # Weight controls relative importance; selected count prevents monopolies.
@@ -177,13 +147,15 @@ def build_prompt_from_sections(stage: str, sections: list[ContextSection],
             if used + marker_cost <= budget:
                 output_lines.append(marker)
                 used += marker_cost
-        selected_tokens = sum(count_tokens(item + separator) for item in selected[index])
+        selected_tokens = sum(selected_costs[index])
         section_audit[section.name] = {
             "candidate_items": len(section.items),
             "selected_items": len(selected[index]),
             "omitted_items": omitted,
             "candidate_tokens": sum(costs[index]),
             "selected_tokens": selected_tokens,
+            "required_items": min(section.required_items, len(section.items)),
+            "required_missing_items": max(0, min(section.required_items, len(section.items)) - len(selected[index])),
             "selection_rate": round(len(selected[index]) / max(len(section.items), 1), 4),
         }
     prompt = separator.join(output_lines)
@@ -195,6 +167,7 @@ def build_prompt_from_sections(stage: str, sections: list[ContextSection],
         "actual_tokens": actual_tokens,
         "utilization": round(actual_tokens / max(budget, 1), 4),
         "truncated": any(item["omitted_items"] for item in section_audit.values()),
+        "required_missing_items": sum(item["required_missing_items"] for item in section_audit.values()),
         "sections": section_audit,
     }
     publish_context_audit(audit)

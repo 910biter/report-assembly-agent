@@ -75,7 +75,7 @@ def _evidence_checkpoint_complete(task: dict, expected_signature: str) -> bool:
     return bool(task.get("fact_ids")) and signature_matches(task, "evidence", expected_signature)
 
 
-_MATERIAL_ANALYSIS_PROMPT = """你是材料分析师。理解一份情报材料,输出 JSON:
+_MATERIAL_ANALYSIS_PROMPT = """你是材料分析师。只依据本次可见的一份材料，概括其主题、结构、陈述性质和可支持范围。只输出 JSON:
 {
   "doc_type": "模型根据当前材料判断的开放材料形态标签；无法确定时写 unknown",
   "topic": "核心主题(一句话)",
@@ -696,6 +696,11 @@ class WorkflowController:
                     kind="major",
                 )
                 self._update(current_draft_version_id=version.version_id)
+                if self.task.get("qa_notes"):
+                    self._update(qa_notes=[
+                        {**issue, "report_version_id": version.version_id}
+                        for issue in self.task["qa_notes"]
+                    ])
                 update_task_run(
                     str(self.task.get("run_id") or ""),
                     candidate_version_id=version.version_id,
@@ -1506,7 +1511,7 @@ class WorkflowController:
             resolve_relations(clusters, fact_rows, self.task_id)
             extraction = self.task.get("evidence_status") or {}
             coverage = dict(extraction.get("coverage") or {"status": "unknown"})
-            if extraction.get("status") != "complete":
+            if extraction.get("status") != "completed":
                 coverage["status"] = "unknown"
             ledger = build_ledger(
                 self.task_id, extraction.get("needs") or needs, fact_rows,
@@ -3372,68 +3377,57 @@ def _report_word_estimate(text: str) -> int:
 
 def _material_understanding_text(units: list[Unit], budget_tokens: int = 4000,
                                  theme: str = "") -> tuple[str, dict]:
-    """Select a bounded prompt view without truncating stored Units.
+    """Token-safe representative view of a document, in original source order.
 
-    采样原则(结构覆盖 + 任务相关性 + Token Budget):
-    1. 结构锚点(标题/表格)全选——保证主要章节被代表性覆盖;
-    2. 正文按任务主题相关度降序,预算内填充——任务重点优先;
-    3. 预算不足时分批/截断只影响采样范围,不删存储数据。
+    Selection priority is structural anchors then task relevance. Rendering is
+    *always* original order: relevance ranking must not rearrange chronology.
+    Prefix/page delimiters are included in the budget, even for short files.
     """
-    non_empty = [u for u in units if (u.content or "").strip()]
-    raw_chars = sum(len(u.content or "") for u in non_empty)
-    raw_tokens = sum(count_tokens(u.content or "") for u in non_empty)
-    if raw_tokens <= budget_tokens:
-        text = "\n".join(u.content for u in non_empty)
-        return text, {
-            "raw_chars": raw_chars,
-            "context_chars": len(text),
-            "raw_tokens": raw_tokens,
-            "context_tokens": count_tokens(text),
-            "budget_tokens": budget_tokens,
-            "utilization": round(count_tokens(text) / max(budget_tokens, 1), 4),
-            "truncated": False,
-            "selected_units": len(non_empty),
-            "total_units": len(units),
-        }
-    anchors = [u for u in non_empty if u.kind in ("heading", "table")]
-    body = [u for u in non_empty if u.kind not in ("heading", "table")]
-    selected: list[Unit] = []
+    budget = max(0, int(budget_tokens))
+    indexed = [(index, unit) for index, unit in enumerate(units) if (unit.content or "").strip()]
+    raw_chars = sum(len(unit.content or "") for _, unit in indexed)
+    raw_tokens = sum(count_tokens(unit.content or "") for _, unit in indexed)
+
+    def line(unit):
+        locator = (
+            f"[第{unit.page}页] " if unit.page is not None else
+            f"[段/块{unit.paragraph}] " if unit.paragraph is not None else ""
+        )
+        return locator + (unit.content or "")
+
+    # Precompute each rendered block's cost exactly once.
+    entries = [(index, unit, line(unit)) for index, unit in indexed]
+    rank = sorted(entries, key=lambda row: (
+        0 if row[1].kind in ("heading", "table") else 1,
+        -_text_relevance(theme, row[1].content or "") if theme and row[1].kind not in ("heading", "table") else 0,
+        row[0],
+    ))
+    selected = []
     total = 0
-    # 任务相关性:正文按主题相关度降序(相关度高的先进入预算)
-    if theme:
-        body = sorted(body, key=lambda u: _text_relevance(theme, u.content or ""), reverse=True)
-    for unit in [*anchors, *body]:
-        block_tokens = count_tokens(unit.content or "")
-        if total + block_tokens > budget_tokens:
-            continue
-        selected.append(unit)
-        total += block_tokens
-    seen: set[int] = set()
-    blocks: list[str] = []
-    for unit in selected:
-        key = id(unit)
-        if key in seen:
-            continue
-        seen.add(key)
-        if unit.page is not None:
-            prefix = f"[第{unit.page}页] "
-        elif unit.paragraph is not None:
-            prefix = f"[段/块{unit.paragraph}] "
-        else:
-            prefix = ""
-        blocks.append(prefix + (unit.content or ""))
-    text = "\n".join(blocks)
+    for index, unit, block in rank:
+        cost = count_tokens(block + "\n")
+        if total + cost <= budget:
+            selected.append((index, block))
+            total += cost
+    selected.sort(key=lambda pair: pair[0])
+    text = "\n".join(block for _, block in selected)
+    actual = count_tokens(text)
+    # Exact tokenization can be slightly non-additive around a separator.
+    while selected and actual > budget:
+        selected.pop()
+        text = "\n".join(block for _, block in selected)
+        actual = count_tokens(text)
     return text, {
         "raw_chars": raw_chars,
         "context_chars": len(text),
         "raw_tokens": raw_tokens,
-        "context_tokens": count_tokens(text),
-        "budget_tokens": budget_tokens,
-        "utilization": round(count_tokens(text) / max(budget_tokens, 1), 4),
-        "truncated": True,
-        "selected_units": len(blocks),
+        "context_tokens": actual,
+        "budget_tokens": budget,
+        "utilization": round(actual / max(budget, 1), 4),
+        "truncated": len(selected) < len(indexed),
+        "selected_units": len(selected),
         "total_units": len(units),
-        "selection_strategy": "structure_anchors_task_relevance",
+        "selection_strategy": "anchors_relevance_source_order",
     }
 
 

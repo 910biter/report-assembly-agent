@@ -35,6 +35,7 @@ class Evidence:
     page: int | None = None
     paragraph: int | None = None
     id: int | None = None
+    visibility: dict = field(default_factory=dict)
 
 
 @dataclass

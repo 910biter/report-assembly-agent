@@ -47,7 +47,8 @@ def test_incremental_graph_reuses_inherited_coverage_without_llm_extraction():
         def task_graph(self, *_args, **_kwargs):
             return {"stats": {"entity_count": 2, "assertion_count": 1}}
 
-    with patch("app.graph.graph_service", ReusingGraph()):
+    with patch("app.graph.service.workspace_for_task", return_value="workspace-1"), \
+            patch("app.graph.graph_service", ReusingGraph()):
         status = controller._build_task_graph(facts)
 
     assert status["status"] == "reused"
@@ -75,7 +76,8 @@ def test_incremental_graph_extracts_only_uncovered_facts():
             extracted.append([fact["id"] for fact in graph_facts])
             return GraphBuildResult(status="ready", assertions=1)
 
-    with patch("app.graph.graph_service", DeltaGraph()):
+    with patch("app.graph.service.workspace_for_task", return_value="workspace-1"), \
+            patch("app.graph.graph_service", DeltaGraph()):
         status = controller._build_task_graph(facts)
 
     assert extracted == [[4, 5]]
@@ -121,7 +123,8 @@ def test_incremental_graph_trusts_explicit_facts_from_ready_base_task():
                 return GraphBuildResult(status="ready")
 
         facts = [{"id": value, "content": f"fact {value}"} for value in range(1, 5)]
-        with patch("app.graph.graph_service", ReadyBaseGraph()):
+        with patch("app.graph.service.workspace_for_task", return_value="workspace-1"), \
+                patch("app.graph.graph_service", ReadyBaseGraph()):
             status = controller._build_task_graph(facts)
 
     assert extracted == [[3, 4]], status
@@ -145,7 +148,8 @@ def test_initial_graph_build_still_processes_all_facts():
             extracted.append([fact["id"] for fact in graph_facts])
             return GraphBuildResult(status="ready")
 
-    with patch("app.graph.graph_service", InitialGraph()):
+    with patch("app.graph.service.workspace_for_task", return_value="workspace-1"), \
+            patch("app.graph.graph_service", InitialGraph()):
         controller._build_task_graph(facts)
 
     assert extracted == [[1, 2, 3]]

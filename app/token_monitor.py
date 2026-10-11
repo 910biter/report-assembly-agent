@@ -59,7 +59,9 @@ def log_llm_call(call_id: str, agent: str, input_chars: int, stats_delta: dict,
                  latency_seconds: float, retry_count: int = 0,
                  success: bool = True, error: str = "",
                  returned_chars: int = 0, valid_json_chars: int = 0,
-                 context_audit: dict | None = None) -> None:
+                 context_audit: dict | None = None,
+                 request_capacity: dict | None = None) -> None:
+    context_audit = {**(context_audit or {}), **(request_capacity or {})}
     ctx = current_context()
     prompt_tokens = int(stats_delta.get("prompt_tokens") or 0)
     output_tokens = int(stats_delta.get("output_tokens") or 0)

@@ -20,9 +20,6 @@ cp deploy/env.example .env
 
 ```dotenv
 IRA_DB_URL=postgresql+psycopg://ira:ira@127.0.0.1:5432/ira
-IRA_GENERATION_URL=http://127.0.0.1:8100/v1
-IRA_GENERATION_MODEL=qwen3.6-27b
-IRA_GENERATION_TOKENIZER_PATH=/path/to/generation-model
 IRA_EMBEDDING_MODEL_PATH=/path/to/Qwen3-Embedding-0.6B
 IRA_QDRANT_URL=http://127.0.0.1:6333
 IRA_VECTOR_BACKEND=qdrant
@@ -50,7 +47,7 @@ sudo systemctl enable --now ira-vllm
 curl -fsS http://127.0.0.1:8100/v1/models
 ```
 
-具体模型路径、上下文窗口、并发和 GPU 利用率配置见 `deploy/vllm.env.example`。`IRA_MODEL_CONTEXT_WINDOW_TOKENS` 必须与 vLLM 的 `--max-model-len` 一致。
+具体模型路径、上下文窗口、并发和 GPU 利用率配置见 `deploy/vllm.env.example`。应用模型接入统一在管理员系统设置中配置地址、模型名和 Key，不再从 `.env` 配置生成模型或 Tokenizer。上下文上限填 `0` 可读取 vLLM `/tokenize` 返回的实际 `max_model_len`；显式配置只能进一步收紧窗口。
 
 ## 5. 应用
 
