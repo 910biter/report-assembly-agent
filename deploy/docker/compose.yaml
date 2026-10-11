@@ -1,0 +1,52 @@
+services:
+  app:
+    image: ${IRA_APP_IMAGE:-report-assembly-agent:offline}
+    restart: unless-stopped
+    user: ${APP_UID:-1000}:${APP_GID:-1000}
+    env_file: ./app.env
+    environment:
+      IRA_HOST: 0.0.0.0
+      IRA_PORT: 8000
+      IRA_DB_URL: postgresql+psycopg://ira:${POSTGRES_PASSWORD}@postgres:5432/ira
+      IRA_QDRANT_URL: http://qdrant:6333
+      IRA_VECTOR_BACKEND: qdrant
+      IRA_RUNTIME_ROOT: /opt/app/runtime
+      IRA_EMBEDDING_MODEL_PATH: /opt/models/embedding
+      IRA_DOCLING_ARTIFACTS_PATH: /opt/models/docling
+      HF_HOME: /opt/models/hf
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      IRA_DOCLING_DEVICE: cpu
+      IRA_ASR_DEVICE: cpu
+    ports:
+      - "${APP_PORT:-8000}:8000"
+    volumes:
+      - ./data/app:/opt/app/runtime
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+  postgres:
+    image: ${IRA_POSTGRES_IMAGE:-postgres:16}
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ira
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ira
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ira -d ira"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+  qdrant:
+    image: ${IRA_QDRANT_IMAGE:-qdrant/qdrant:v1.13.6}
+    restart: unless-stopped
+    volumes:
+      - qdrantdata:/qdrant/storage
+
+volumes:
+  pgdata:
+  qdrantdata:

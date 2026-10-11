@@ -84,9 +84,10 @@ class Settings(BaseSettings):
     # Parser and multimodal extraction are Docling-only. The project no longer
     # maintains a separate OCR/ASR/Vision provider path.
     docling_device: str = "cpu"  # Docling layout/table/OCR/ASR device: cuda / cpu
+    docling_artifacts_path: str = ""  # Optional pre-fetched Docling models for offline deployment
     asr_device: str = "cpu"  # ASR device: cuda / cpu; 当前与 OCR 一样保持 CPU
     asr_model: str = "medium"  # ASR whisper 档位: tiny/base/small/medium/large(默认 medium:中文质量高且 CPU 可跑)
-    asr_language: str = "zh"  # ASR 转写语言(默认中文;空=whisper 自动检测)
+    asr_language: str = ""  # 自动识别语种;明确知道全是中文时可设置 zh
     ocr_languages: str = "ch,en"  # OCR 语言列表(逗号分隔,如 ch,en;空=后端默认)
     gateway_timeout_seconds: int = 900
     # 上下文容量配置(物理上限派生,非内容决策):

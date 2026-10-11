@@ -1,7 +1,7 @@
 """Shared model configuration for user-facing collaboration agents."""
 from __future__ import annotations
 import json
-import httpx
+import httpx2 as httpx
 import asyncio
 
 from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings

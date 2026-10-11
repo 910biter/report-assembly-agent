@@ -2,6 +2,7 @@ import json
 from dataclasses import replace
 
 import httpx
+import httpx2
 import pytest
 
 from app import vllm_capacity as vc
@@ -109,7 +110,8 @@ def test_collaboration_hook_verifies_serialized_wire_payload(monkeypatch):
     monkeypatch.setattr(vc, "verify_request", lambda c, payload, safety: seen.append(payload) or {"request_count_method": "vllm_tokenize"})
     model = build_collaboration_model()
     client = model.client._client
-    request = httpx.Request("POST", "http://service/v1/chat/completions",
+    assert isinstance(client, httpx2.AsyncClient)
+    request = httpx2.Request("POST", "http://service/v1/chat/completions",
                             json={"model": "model", "messages": [], "max_completion_tokens": 1024})
     asyncio.run(client.event_hooks["request"][0](request))
     assert seen[0]["max_tokens"] == 1024

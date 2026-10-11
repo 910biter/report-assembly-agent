@@ -3,6 +3,7 @@ import json
 from unittest.mock import patch
 
 import httpx
+import httpx2
 import pytest
 
 from app import model_connection as mc
@@ -89,7 +90,7 @@ def test_gateway_uses_snapshot_and_generic_wire_parameter(monkeypatch):
 
 def test_collaboration_wire_parameter_adapter():
     from app.collaboration_model import _legacy_output_parameter
-    request = httpx.Request("POST", "http://host/v1/chat/completions", json={"max_completion_tokens": 20, "messages": []})
+    request = httpx2.Request("POST", "http://host/v1/chat/completions", json={"max_completion_tokens": 20, "messages": []})
     asyncio.run(_legacy_output_parameter(request))
     content = b"".join(request.stream)
     assert json.loads(content)["max_tokens"] == 20

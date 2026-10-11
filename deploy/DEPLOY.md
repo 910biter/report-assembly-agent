@@ -1,14 +1,15 @@
 # 部署指南
 
-生产部署只有一套运行架构：PostgreSQL 保存业务真源，Docling 在 CPU 解析材料，本地 Transformers 在 CPU 生成向量，Qdrant 提供检索，vLLM 通过 OpenAI-compatible API 提供生成，FastAPI 提供应用服务。系统不支持 SQLite、旧 Parser 或 Ollama 回退。
+生产运行架构：PostgreSQL 保存业务真源，Docling 在 CPU 解析材料，本地 Transformers 在 CPU 生成向量，Qdrant 提供检索，独立模型 API 提供生成，FastAPI 提供应用服务。系统不支持 SQLite、旧 Parser 或 Ollama 回退。
+
+离线 Docker 交付优先使用 `deploy/docker/README.md`：应用镜像基于 Ubuntu 24.04，包含 CPU Python 依赖和 FFmpeg；PostgreSQL、Qdrant 分容器持久化。项目容器不要求 GPU 或目标机 Python。下面是原生部署说明；只有选择在同一机器自行部署 vLLM 时才需要 GPU/CUDA。
 
 ## 1. 环境
 
 - Ubuntu 22.04+
 - Python 3.12
 - PostgreSQL 15+
-- NVIDIA GPU 与匹配的 CUDA 驱动
-- 生成模型、Embedding 模型和 Docling 模型已放入本地磁盘或 Hugging Face 缓存
+- Embedding 模型和 Docling 模型已放入本地磁盘或 Hugging Face 缓存
 
 ```bash
 python3 -m venv .venv
@@ -49,6 +50,8 @@ curl -fsS http://127.0.0.1:8100/v1/models
 ```
 
 具体模型路径、上下文窗口、并发和 GPU 利用率配置见 `deploy/vllm.env.example`。应用模型接入统一在管理员系统设置中配置地址、模型名和 Key，不再从 `.env` 配置生成模型或 Tokenizer。上下文上限填 `0` 可读取 vLLM `/tokenize` 返回的实际 `max_model_len`；显式配置只能进一步收紧窗口。
+
+音频材料使用 Docling 的原生 ASR 管线和 OpenAI Whisper，不调用 vLLM。部署主依赖后安装系统 `ffmpeg`，并预下载所选 Whisper 权重到运行用户的 `~/.cache/whisper/`；默认 `IRA_ASR_MODEL=medium`、CPU 执行、自动识别语种。已知全部为中文时可设置 `IRA_ASR_LANGUAGE=zh`。音频模型文件不提交到 Git；长录音的 CPU 转写耗时应单独评估。
 
 ## 5. 应用
 
