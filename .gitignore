@@ -6,6 +6,7 @@ __pycache__/
 *.pyc
 *.db
 runtime/
+deploy/offline/
 *.log
 .DS_Store
 node_modules/

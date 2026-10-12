@@ -1,0 +1,14 @@
+[Unit]
+Description=Report Assembly Agent offline container stack
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/report-assembly-agent/runtime.sh start
+ExecStop=/opt/report-assembly-agent/runtime.sh stop
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target

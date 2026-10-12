@@ -26,6 +26,34 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Docker image import failed' }
     & docker compose --env-file .env config --quiet
     if ($LASTEXITCODE -ne 0) { throw 'Compose configuration invalid' }
+    $adminStatus = (& docker compose --env-file .env run --rm -T app python -m app.auth.bootstrap --status | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0) { throw 'Administrator status check failed' }
+    if ($adminStatus -eq 'needs-bootstrap') {
+        $passwordFile = Join-Path $bundle 'initial-admin-password'
+        if (-not (Test-Path -LiteralPath $passwordFile)) {
+            $randomBytes = New-Object byte[] 24
+            $random = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+            try { $random.GetBytes($randomBytes) } finally { $random.Dispose() }
+            $password = [BitConverter]::ToString($randomBytes).Replace('-', '').ToLowerInvariant()
+            Set-Content -LiteralPath $passwordFile -Value $password -NoNewline
+            $access = Get-Acl -LiteralPath $passwordFile
+            $access.SetAccessRuleProtection($true, $false)
+            $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+            $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+                $identity,
+                [System.Security.AccessControl.FileSystemRights]::FullControl,
+                [System.Security.AccessControl.AccessControlType]::Allow
+            )
+            $access.SetAccessRule($rule)
+            Set-Acl -LiteralPath $passwordFile -AclObject $access
+        }
+        $password = (Get-Content -LiteralPath $passwordFile -Raw).TrimEnd([char[]]@([char]13, [char]10))
+        $password | & docker compose --env-file .env run --rm -T app python -m app.auth.bootstrap admin --password-stdin
+        if ($LASTEXITCODE -ne 0) { throw 'Administrator bootstrap failed' }
+        Write-Output "Administrator: admin; initial password: $passwordFile"
+    } elseif ($adminStatus -ne 'admin-ready') {
+        throw "Unexpected administrator state: $adminStatus"
+    }
     & docker compose --env-file .env up -d --pull never
     if ($LASTEXITCODE -ne 0) { throw 'Compose startup failed' }
     & docker compose --env-file .env ps
