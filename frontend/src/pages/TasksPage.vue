@@ -14,16 +14,17 @@ import { usePersistentPageSize } from "@/lib/pagination";
 
 type TaskView =
   | "all"
-  | "comparison"
   | "pending"
   | "active"
   | "paused"
   | "review"
   | "completed"
   | "failed";
+type TaskType = "all" | "standard" | "comparison";
 const queryClient = useQueryClient();
 const search = ref("");
 const view = ref<TaskView>("all");
+const taskTypeFilter = ref<TaskType>("all");
 const dateRange = ref("all");
 const variant = ref("");
 const sortBy = ref("updated_desc");
@@ -51,8 +52,6 @@ const templateNames = computed(
 
 function inView(task: TaskSummary, target: TaskView) {
   if (target === "all") return true;
-  if (target === "comparison") return task.run_mode === "material_comparison";
-  if (task.run_mode === "material_comparison") return false;
   if (target === "pending") return task.stage === "created";
   if (target === "paused") return task.stage === "paused";
   if (target === "review") return task.stage === "review";
@@ -61,6 +60,11 @@ function inView(task: TaskSummary, target: TaskView) {
   return !["created", "review", "done", "failed", "paused"].includes(
     task.stage,
   );
+}
+function inTaskType(task: TaskSummary, target: TaskType) {
+  if (target === "all") return true;
+  const comparison = task.run_mode === "material_comparison";
+  return target === "comparison" ? comparison : !comparison;
 }
 function parseTimestamp(value?: string) {
   if (!value) return 0;
@@ -84,48 +88,42 @@ const viewItems = computed(() => [
   {
     key: "all" as const,
     label: "全部",
-    count: (tasks.data.value || []).length,
-  },
-  {
-    key: "comparison" as const,
-    label: "材料对比",
-    count: (tasks.data.value || []).filter((item) => inView(item, "comparison"))
-      .length,
+    count: (tasks.data.value || []).filter((item) => inTaskType(item, taskTypeFilter.value)).length,
   },
   {
     key: "pending" as const,
     label: "待运行",
-    count: (tasks.data.value || []).filter((item) => inView(item, "pending"))
+    count: (tasks.data.value || []).filter((item) => inTaskType(item, taskTypeFilter.value) && inView(item, "pending"))
       .length,
   },
   {
     key: "active" as const,
     label: "进行中",
-    count: (tasks.data.value || []).filter((item) => inView(item, "active"))
+    count: (tasks.data.value || []).filter((item) => inTaskType(item, taskTypeFilter.value) && inView(item, "active"))
       .length,
   },
   {
     key: "paused" as const,
     label: "已暂停",
-    count: (tasks.data.value || []).filter((item) => inView(item, "paused"))
+    count: (tasks.data.value || []).filter((item) => inTaskType(item, taskTypeFilter.value) && inView(item, "paused"))
       .length,
   },
   {
     key: "review" as const,
     label: "待审核",
-    count: (tasks.data.value || []).filter((item) => inView(item, "review"))
+    count: (tasks.data.value || []).filter((item) => inTaskType(item, taskTypeFilter.value) && inView(item, "review"))
       .length,
   },
   {
     key: "completed" as const,
     label: "已完成",
-    count: (tasks.data.value || []).filter((item) => inView(item, "completed"))
+    count: (tasks.data.value || []).filter((item) => inTaskType(item, taskTypeFilter.value) && inView(item, "completed"))
       .length,
   },
   {
     key: "failed" as const,
     label: "异常",
-    count: (tasks.data.value || []).filter((item) => inView(item, "failed"))
+    count: (tasks.data.value || []).filter((item) => inTaskType(item, taskTypeFilter.value) && inView(item, "failed"))
       .length,
   },
 ]);
@@ -140,6 +138,7 @@ const filtered = computed(() => {
           .includes(keyword),
     )
     .filter((task) => inView(task, view.value))
+    .filter((task) => inTaskType(task, taskTypeFilter.value))
     .filter(withinDate)
     .filter(
       (task) =>
@@ -156,7 +155,7 @@ const filtered = computed(() => {
     });
 });
 const visibleTasks = computed(() => filtered.value.slice((page.value - 1) * pageSize.value, page.value * pageSize.value));
-watch([search, view, dateRange, variant, sortBy, pageSize], () => {
+watch([search, view, taskTypeFilter, dateRange, variant, sortBy, pageSize], () => {
   page.value = 1;
   selectedId.value = null;
 });
@@ -173,6 +172,7 @@ const selected = computed(
 const hasFilters = computed(() =>
   Boolean(
     search.value ||
+    taskTypeFilter.value !== "all" ||
     dateRange.value !== "all" ||
     variant.value ||
     sortBy.value !== "updated_desc",
@@ -180,6 +180,7 @@ const hasFilters = computed(() =>
 );
 function resetFilters() {
   search.value = "";
+  taskTypeFilter.value = "all";
   dateRange.value = "all";
   variant.value = "";
   sortBy.value = "updated_desc";
@@ -242,6 +243,11 @@ function taskType(task: TaskSummary) {
               v-model="search"
               placeholder="搜索任务名称、ID 或更新说明"
           /></label>
+          <select v-model="taskTypeFilter" aria-label="任务类型">
+            <option value="all">全部类型</option>
+            <option value="standard">普通任务</option>
+            <option value="comparison">材料对比</option>
+          </select>
           <select v-model="dateRange">
             <option value="all">全部时间</option>
             <option value="7">近 7 天</option>
@@ -394,28 +400,29 @@ function taskType(task: TaskSummary) {
 }
 .browser-main {
   min-width: 0;
+  container-type: inline-size;
 }
 .view-tabs {
-  display: flex;
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
   min-width: 0;
-  overflow-x: auto;
   gap: 4px;
-  padding: 8px 0;
+  padding: 8px 12px;
   border-bottom: 1px solid var(--border);
   background: transparent;
-  scrollbar-width: thin;
-  scrollbar-color: var(--border-strong) transparent;
 }
 .view-tabs button {
   display: flex;
-  flex: 0 0 auto;
+  min-width: 0;
   align-items: center;
+  justify-content: center;
   gap: 7px;
-  padding: 8px 12px;
+  padding: 8px 6px;
   border: 0;
   border-bottom: 2px solid transparent;
   background: transparent;
   color: var(--muted-foreground);
+  white-space: nowrap;
   transition:
     color var(--motion-fast),
     background var(--motion-fast);
@@ -636,6 +643,18 @@ function taskType(task: TaskSummary) {
   text-align: center;
 }
 @media (max-width: 1180px) {
+}
+@container (max-width: 900px) {
+  .view-tabs {
+    display: flex;
+    overflow-x: auto;
+    scrollbar-width: thin;
+    scrollbar-color: var(--border-strong) transparent;
+  }
+  .view-tabs button {
+    flex: 1 0 auto;
+    padding-inline: 12px;
+  }
 }
 @media (max-width: 900px) {
   .search-box {

@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import subprocess
+import threading
 import uuid
 import time
 from datetime import datetime
@@ -87,6 +88,8 @@ from app.auth.authorization import authorize_request
 from app.auth.ownership import require_owner
 
 router = APIRouter(prefix="/api", dependencies=[Depends(authorize_request)])
+_RESOURCE_NETWORK_SAMPLE: tuple[float, int, int] | None = None
+_RESOURCE_NETWORK_LOCK = threading.Lock()
 
 
 def _request_owner(request: Request | None) -> int | None:
@@ -2001,10 +2004,13 @@ def system_performance_summary():
 
 def _resource_snapshot() -> dict:
     import psutil
+    global _RESOURCE_NETWORK_SAMPLE
     payload: dict = {
         "gpu": {"available": False, "processes": []},
         "cpu": {"load_avg": [], "cores": 0, "percent": 0.0},
         "memory": {"total_mb": 0, "used_mb": 0, "available_mb": 0, "percent": 0.0},
+        "disk": {"available": False},
+        "network": {"available": False, "rx_bytes_per_second": None, "tx_bytes_per_second": None},
         "collected_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
     try:
@@ -2053,6 +2059,38 @@ def _resource_snapshot() -> dict:
         }
     except Exception:
         payload["gpu"] = {"available": False, "processes": []}
+    try:
+        usage = psutil.disk_usage(str(settings.runtime_root))
+        payload["disk"] = {
+            "available": True,
+            "total_bytes": int(usage.total),
+            "used_bytes": int(usage.used),
+            "free_bytes": int(usage.free),
+            "percent": round(float(usage.percent), 1),
+            "path": str(settings.runtime_root),
+        }
+    except Exception:
+        pass
+    try:
+        counters = psutil.net_io_counters()
+        if counters is not None:
+            with _RESOURCE_NETWORK_LOCK:
+                now = time.monotonic()
+                current = (now, int(counters.bytes_recv), int(counters.bytes_sent))
+                previous = _RESOURCE_NETWORK_SAMPLE
+                elapsed = now - previous[0] if previous else 0
+                payload["network"] = {
+                    "available": bool(previous and elapsed > 0),
+                    "rx_bytes_per_second": round(max(0, current[1] - previous[1]) / elapsed, 1)
+                    if previous and elapsed > 0 else None,
+                    "tx_bytes_per_second": round(max(0, current[2] - previous[2]) / elapsed, 1)
+                    if previous and elapsed > 0 else None,
+                    "scope": "应用运行环境网络收发",
+                    "sample_interval_seconds": round(elapsed, 1) if elapsed > 0 else None,
+                }
+                _RESOURCE_NETWORK_SAMPLE = current
+    except Exception:
+        pass
     return payload
 
 

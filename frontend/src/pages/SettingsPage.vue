@@ -114,6 +114,21 @@ function compact(value: number) {
   if (number >= 1_000) return `${(number / 1_000).toFixed(1)}K`;
   return String(Math.round(number));
 }
+function bytes(value: number | null | undefined) {
+  const amount = Number(value);
+  if (!Number.isFinite(amount) || amount < 0) return "—";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let scaled = amount;
+  let index = 0;
+  while (scaled >= 1024 && index < units.length - 1) {
+    scaled /= 1024;
+    index += 1;
+  }
+  return `${scaled.toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
+}
+function rate(value: number | null | undefined) {
+  return value == null ? "采样中" : `${bytes(value)}/s`;
+}
 function duration(seconds: number) {
   const value = Number(seconds || 0);
   if (value >= 3600) return `${(value / 3600).toFixed(1)} 小时`;
@@ -316,31 +331,25 @@ async function restartServices() {
       <div class="resource-grid">
         <article>
           <div>
-            <span>GPU 利用率</span
-            ><b>{{
-              resources.data.value?.gpu?.available
-                ? `${resources.data.value.gpu.utilization}%`
-                : "不可用"
-            }}</b>
+          <span>数据盘使用</span
+            ><b>{{ resources.data.value?.disk?.available ? `${resources.data.value.disk.percent}%` : "不可用" }}</b>
           </div>
           <progress
-            :value="resources.data.value?.gpu?.utilization || 0"
+            :value="resources.data.value?.disk?.percent || 0"
             max="100"
           ></progress
-          ><small>应用主机 GPU；不代表远端 API 算力</small>
+          ><small>运行数据所在文件系统 · 可用 {{ bytes(resources.data.value?.disk?.free_bytes) }}</small>
         </article>
         <article>
           <div>
-            <span>显存</span
-            ><b
-              >{{ resources.data.value?.gpu?.available ? `${compact(resources.data.value.gpu.used_mb)} / ${compact(resources.data.value.gpu.total_mb)} MB` : '未接入 GPU 采样' }}</b
-            >
+            <span>网络收发</span
+              ><b>{{ resources.data.value?.network?.available ? "实时" : "采样中" }}</b>
           </div>
-          <progress
-            :value="resources.data.value?.gpu?.used_mb || 0"
-            :max="resources.data.value?.gpu?.total_mb || 1"
-          ></progress
-          ><small>应用主机显存；远端模型显存未采集</small>
+          <div class="network-rates">
+            <span>↓ {{ rate(resources.data.value?.network?.rx_bytes_per_second) }}</span>
+            <span>↑ {{ rate(resources.data.value?.network?.tx_bytes_per_second) }}</span>
+          </div>
+          <small>应用运行环境流量，不代表远端链路质量</small>
         </article>
         <article>
           <div>
@@ -655,6 +664,17 @@ dd {
   height: 5px;
   margin: 13px 0 7px;
   accent-color: var(--color-primary);
+}
+.network-rates {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 13px 0 7px;
+  font-variant-numeric: tabular-nums;
+}
+.network-rates span {
+  color: var(--color-foreground);
+  font-size: 12px;
 }
 .resource-grid small,
 .run-totals small {

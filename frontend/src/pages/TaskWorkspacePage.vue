@@ -32,7 +32,6 @@ onMounted(() => window.addEventListener("ira:task-artifact-updated", refreshAfte
 onBeforeUnmount(() => window.removeEventListener("ira:task-artifact-updated", refreshAfterAssistantUpdate));
 const requestedTab = String(route.query.tab || "overview");
 const active = ref(requestedTab === "runtime" ? "materials" : requestedTab);
-const workspacePane = ref(requestedTab === "runtime" ? "process" : "materials");
 const analysisType = ref("facts");
 const analysisPage = ref(1);
 const analysisPageSize = usePersistentPageSize("analysis");
@@ -250,11 +249,11 @@ const taskTabs = computed(() =>
   isComparison.value
     ? [
         ["comparison", "对比结果"],
-        ["materials", "材料与过程"],
+        ["materials", "材料"],
       ]
     : [
         ["overview", "概览"],
-        ["materials", "材料与过程"],
+        ["materials", "材料"],
         ["analysis", "分析"],
         ["report", "报告"],
         ["versions", "版本"],
@@ -693,7 +692,7 @@ function versionsList() {
               }}</span>
             </div>
             <strong>打开</strong></RouterLink
-          ><button class="artifact-link" @click="active = 'materials'; workspacePane = 'materials'">
+          ><button class="artifact-link" @click="active = 'materials'">
             <div>
               <b>材料解析</b
               ><span
@@ -716,19 +715,7 @@ function versionsList() {
       </aside>
     </section>
     <section v-else-if="active === 'materials'" class="workspace-browser">
-      <nav class="tabs workspace-subtabs" aria-label="材料与运行过程">
-        <button
-          class="tab"
-          :class="{ active: workspacePane === 'materials' }"
-          @click="workspacePane = 'materials'"
-        >材料</button>
-        <button
-          class="tab"
-          :class="{ active: workspacePane === 'process' }"
-          @click="workspacePane = 'process'"
-        >运行过程</button>
-      </nav>
-      <section v-if="workspacePane === 'materials'" class="surface section-block">
+      <section class="surface section-block">
         <div class="section-head">
           <div>
             <h2>{{ isComparison ? "新增材料" : "任务材料" }}</h2>
@@ -771,24 +758,6 @@ function versionsList() {
             >
           </div>
         </div>
-      </section>
-      <section v-else class="surface section-block process-panel">
-        <div class="section-head">
-          <div>
-            <h2>运行过程</h2>
-            <p v-if="isComparison" class="muted">
-              仅处理新增材料并核验变化，不生成或改写基线报告。
-            </p>
-          </div>
-        </div>
-        <dl class="process-records">
-          <div><dt>创建时间</dt><dd>{{ task.data.value.created_at || '—' }}</dd></div>
-          <div><dt>执行轮次</dt><dd>第 {{ task.data.value.run_revision || 1 }} 轮</dd></div>
-          <div v-if="task.data.value.queue_status?.queue_wait_seconds != null"><dt>排队耗时</dt><dd>{{ Number(task.data.value.queue_status.queue_wait_seconds).toFixed(1) }} 秒</dd></div>
-        </dl>
-        <p v-if="task.data.value.stage === 'failed'" class="notice warning process-error">
-          {{ task.data.value.error || task.data.value.failure_reason || "当前环节未完成，请查看任务状态。" }}
-        </p>
       </section>
     </section>
     <section v-else-if="active === 'analysis'" class="analysis-layout">
@@ -1176,18 +1145,6 @@ function versionsList() {
   min-width: 0;
   gap: 12px;
 }
-.workspace-subtabs {
-  position: static;
-  z-index: auto;
-  display: flex;
-  width: fit-content;
-  max-width: 100%;
-  padding: 0 4px;
-  background: transparent;
-  backdrop-filter: none;
-  flex-wrap: wrap;
-  overflow: visible;
-}
 .workspace-browser > .section-block {
   min-width: 0;
   padding: 16px 20px;
@@ -1202,26 +1159,6 @@ function versionsList() {
 }
 .material-row > .badge {
   white-space: nowrap;
-}
-.process-records {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 12px 32px;
-  margin: 0;
-}
-.process-records dt {
-  color: var(--muted-foreground);
-  font-size: 12px;
-}
-.process-records dd {
-  margin: 4px 0 0;
-  font-size: 13px;
-}
-.process-panel .section-head {
-  margin-bottom: 4px;
-}
-.process-error {
-  margin-top: 4px;
 }
 .workspace-grid {
   display: grid;
