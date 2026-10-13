@@ -280,11 +280,13 @@ async function restartServices() {
           <div class="appearance-options" role="group" aria-label="显示模式">
             <button
               type="button"
+              :aria-pressed="ui.theme === 'dark'"
               :class="{ active: ui.theme === 'dark' }"
               @click="ui.setTheme('dark')"
             >暗色</button>
             <button
               type="button"
+              :aria-pressed="ui.theme === 'light'"
               :class="{ active: ui.theme === 'light' }"
               @click="ui.setTheme('light')"
             >亮色</button>
@@ -295,19 +297,22 @@ async function restartServices() {
           <div class="palette-options" role="group" aria-label="强调色">
             <button
               type="button"
+              :aria-pressed="ui.palette === 'violet'"
               :class="{ active: ui.palette === 'violet' }"
               @click="ui.setPalette('violet')"
-            ><i class="violet-swatch"></i><b>深紫 · 智能工作区</b><small>默认</small></button>
+            ><i class="violet-swatch"></i><b>深紫</b></button>
             <button
               type="button"
+              :aria-pressed="ui.palette === 'steel'"
               :class="{ active: ui.palette === 'steel' }"
               @click="ui.setPalette('steel')"
-            ><i class="steel-swatch"></i><b>冷灰 · 钢蓝</b><small>推荐</small></button>
+            ><i class="steel-swatch"></i><b>钢蓝</b></button>
             <button
               type="button"
+              :aria-pressed="ui.palette === 'graphite'"
               :class="{ active: ui.palette === 'graphite' }"
               @click="ui.setPalette('graphite')"
-            ><i class="graphite-swatch"></i><b>冷灰 · 石墨</b><small>低干扰</small></button>
+            ><i class="graphite-swatch"></i><b>石墨</b></button>
           </div>
         </div>
       </div>
@@ -349,7 +354,7 @@ async function restartServices() {
             <span>↓ {{ rate(resources.data.value?.network?.rx_bytes_per_second) }}</span>
             <span>↑ {{ rate(resources.data.value?.network?.tx_bytes_per_second) }}</span>
           </div>
-          <small>应用运行环境流量，不代表远端链路质量</small>
+          <small>主机网卡合计流量，不代表远端链路质量</small>
         </article>
         <article>
           <div>
@@ -439,7 +444,7 @@ async function restartServices() {
 .settings-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 24px;
+  gap: 16px;
 }
 dl {
   display: grid;
@@ -490,9 +495,6 @@ dd {
   background: var(--color-surface-soft);
   border-left: 2px solid var(--color-border-strong);
   font-size: 11px;
-}
-.settings-grid > .surface {
-  box-shadow: var(--shadow-panel);
 }
 .appearance-panel {
   padding: 22px 24px;

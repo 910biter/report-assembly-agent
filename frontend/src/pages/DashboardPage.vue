@@ -239,15 +239,17 @@ const createTask = useMutation({
             <div><h3>写作流程</h3></div>
           </div>
           <div class="workflow-mode">
-          <div class="mode-switch" role="radiogroup" aria-label="工作方式">
+          <div class="mode-switch" role="group" aria-label="工作方式">
             <button
               type="button"
+              :aria-pressed="workflowMode === 'automatic'"
               :class="{ active: workflowMode === 'automatic' }"
               @click="workflowMode = 'automatic'"
             >
               <b>直接生成</b><small>按已有主题直接运行</small></button
             ><button
               type="button"
+              :aria-pressed="workflowMode === 'collaborative'"
               :class="{ active: workflowMode === 'collaborative' }"
               @click="workflowMode = 'collaborative'"
             >
@@ -751,7 +753,7 @@ const createTask = useMutation({
 .dashboard-grid {
   display: grid;
   grid-template-columns: minmax(0, 1.7fr) minmax(260px, 0.65fr);
-  gap: 32px;
+  gap: 24px;
 }
 .recent-workspace {
   min-width: 0;

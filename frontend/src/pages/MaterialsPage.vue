@@ -191,31 +191,31 @@ async function discussMaterial() {
               v-model="search"
               placeholder="搜索文件名或关联任务"
           /></label>
-          <select v-model="type">
+          <select v-model="type" aria-label="文件类型">
             <option value="">全部类型</option>
             <option v-for="item in types" :key="item" :value="item">
               {{ item.toUpperCase() }}
             </option>
           </select>
-          <select v-model="status">
+          <select v-model="status" aria-label="解析状态">
             <option value="">全部状态</option>
             <option value="ready">已解析</option>
             <option value="pending">待解析</option>
             <option value="duplicate">重复材料</option>
           </select>
-          <select v-model="usage">
+          <select v-model="usage" aria-label="使用关系">
             <option value="">全部使用关系</option>
             <option value="unused">尚未使用</option>
             <option value="single">单任务使用</option>
             <option value="reused">多任务复用</option>
           </select>
-          <select v-model="dateRange">
+          <select v-model="dateRange" aria-label="解析时间">
             <option value="all">全部时间</option>
             <option value="7">近 7 天</option>
             <option value="30">近 30 天</option>
             <option value="90">近 90 天</option>
           </select>
-          <select v-model="sortBy">
+          <select v-model="sortBy" aria-label="排序方式">
             <option value="recent">最近解析</option>
             <option value="name">按文件名</option>
             <option value="units">内容单元最多</option>
@@ -225,16 +225,7 @@ async function discussMaterial() {
             重置
           </button>
         </div>
-        <div class="result-meta">
-          <span>共 {{ filtered.length }} 份材料</span
-          ><span
-            >{{
-              (list.data.value || []).filter((item) => taskCount(item) > 1)
-                .length
-            }}
-            份被多个任务复用</span
-          >
-        </div>
+        <div class="result-meta">共 {{ filtered.length }} 份材料</div>
         <div v-if="list.isLoading.value" class="loading-line"></div>
         <div class="table-head">
           <span>文件名</span><span>类型</span><span>状态</span
@@ -280,7 +271,6 @@ async function discussMaterial() {
         <template v-if="detail.data.value">
           <div class="detail-head">
             <div>
-              <small>材料详情</small>
               <h2>{{ detail.data.value.filename }}</h2>
             </div>
             <button
@@ -379,6 +369,9 @@ async function discussMaterial() {
 .material-browser--detail-open .filter-bar {
   display: grid;
   grid-template-columns: minmax(0, 1fr) repeat(2, minmax(96px, 120px));
+}
+.material-browser--detail-open .search-box {
+  grid-column: 1 / -1;
 }
 .material-browser--detail-open .table-head,
 .material-browser--detail-open .file-row {
@@ -534,12 +527,9 @@ async function discussMaterial() {
   gap: 12px;
   padding: 22px 22px 12px;
 }
-.detail-head small {
-  color: var(--subtle-foreground);
-  font-size: 11px;
-}
 .detail-head h2 {
-  margin: 3px 0;
+  min-width: 0;
+  margin: 0;
   word-break: break-all;
   line-height: 1.45;
 }
@@ -633,8 +623,6 @@ async function discussMaterial() {
   .filter-bar > select {
     flex-basis: 145px;
   }
-}
-@media (max-width: 1080px) {
 }
 @media (max-width: 800px) {
   .search-box {

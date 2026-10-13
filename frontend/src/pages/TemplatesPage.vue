@@ -161,7 +161,7 @@ const promptSectionRows = computed(() => {
   }));
 });
 function capabilitySummary(roles: any) {
-  if (roles?.role_assignment_known === false) return "来源用途未记录";
+  if (roles?.role_assignment_known === false) return "";
   const capabilities = [
     roles?.editorial_reference && "文体",
     roles?.structural_reference && "结构",
@@ -475,8 +475,7 @@ onBeforeUnmount(() => window.clearTimeout(pollTimer));
               <strong>{{ item.name || `模板 ${item.id}` }}</strong
               ><small
                 >{{ item.source_reports?.length || 0 }} 份来源 ·
-                {{ item.document_shape?.kind === 'continuous_article' ? '连续文章' : item.document_shape?.kind === 'message_push' ? '推送文章' : item.document_shape?.kind === 'news_release' ? '新闻稿' : item.document_shape?.kind === 'article_sections' ? '分节文章' : item.document_shape?.kind === 'research_review' ? '研究综述' : '正式报告' }} ·
-                {{ capabilitySummary(item.asset_roles) }}</small
+                {{ item.document_shape?.kind === 'continuous_article' ? '连续文章' : item.document_shape?.kind === 'message_push' ? '推送文章' : item.document_shape?.kind === 'news_release' ? '新闻稿' : item.document_shape?.kind === 'article_sections' ? '分节文章' : item.document_shape?.kind === 'research_review' ? '研究综述' : '正式报告' }}<template v-if="capabilitySummary(item.asset_roles)"> · {{ capabilitySummary(item.asset_roles) }}</template></small
               >
             </div>
             <div class="item-actions">
@@ -622,8 +621,8 @@ onBeforeUnmount(() => window.clearTimeout(pollTimer));
                 >
               </dl>
             </div>
-            <div v-if="hierarchyRows.length" class="profile-block">
-              <h3>识别出的标题层级</h3>
+            <details v-if="hierarchyRows.length" class="profile-block hierarchy-details">
+              <summary>识别标题 <span>{{ hierarchyRows.length }}</span></summary>
               <div class="hierarchy-list">
                 <div
                   v-for="(item, index) in hierarchyRows"
@@ -633,7 +632,7 @@ onBeforeUnmount(() => window.clearTimeout(pollTimer));
                   <span>{{ item.depth + 1 }}级</span><b>{{ item.label }}</b>
                 </div>
               </div>
-            </div>
+            </details>
             <div v-if="quality.unknown_items?.length" class="notice warning">
               <strong>仍有 {{ quality.unknown_items.length }} 项待确认</strong
               ><span>{{ quality.unknown_items.slice(0, 6).join("、") }}</span>
@@ -772,15 +771,18 @@ onBeforeUnmount(() => window.clearTimeout(pollTimer));
 <style scoped>
 .upload-bar {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(280px, 380px) auto;
+  grid-template-columns: minmax(0, 1fr) minmax(260px, 380px) auto;
   min-width: 0;
   align-items: center;
   gap: 16px;
-  padding: 20px 24px;
+  padding: 16px 20px;
+  border-color: var(--border-strong);
+  background: var(--card);
 }
 .upload-controls {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(128px, 0.55fr);
+  grid-column: 2;
+  grid-template-columns: minmax(0, 1fr);
   gap: 8px;
 }
 .asset-role-select {
@@ -798,9 +800,14 @@ onBeforeUnmount(() => window.clearTimeout(pollTimer));
 }
 .template-layout {
   display: grid;
-  grid-template-columns: minmax(0, 780px);
+  grid-template-columns: minmax(0, 1fr);
   min-width: 0;
   gap: 16px;
+}
+.template-layout:not(.has-selection) .template-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  column-gap: 20px;
 }
 .template-layout.has-selection {
   grid-template-columns: minmax(260px, 0.65fr) minmax(0, 1.35fr);
@@ -823,7 +830,11 @@ onBeforeUnmount(() => window.clearTimeout(pollTimer));
   cursor: pointer;
 }
 .template-item .item-actions { grid-column: 2; justify-content: flex-start; }
-.upload-bar > .btn { justify-self: end; width: auto; }
+.upload-bar > :deep(.ui-button) {
+  grid-column: 3;
+  justify-self: end;
+  min-width: 140px;
+}
 .template-item:hover,
 .template-item.selected {
   background: var(--color-surface-soft);
@@ -1017,17 +1028,13 @@ onBeforeUnmount(() => window.clearTimeout(pollTimer));
   .template-layout.has-selection {
     grid-template-columns: 1fr;
   }
-  .upload-bar {
-    grid-template-columns: 1fr auto;
-  }
-  .upload-bar > div {
-    grid-column: 1/-1;
+}
+@media (max-width: 900px) {
+  .template-layout:not(.has-selection) .template-list {
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 @media (max-width: 650px) {
-  .upload-bar {
-    grid-template-columns: 1fr;
-  }
   .template-item {
     grid-template-columns: 48px 1fr;
   }
@@ -1184,14 +1191,9 @@ onBeforeUnmount(() => window.clearTimeout(pollTimer));
   font-size: 12px;
   font-weight: 650;
 }
-.upload-bar {
-  min-height: 112px;
-  grid-template-columns: minmax(0, 1fr) minmax(220px, 360px) auto;
-  border-color: var(--border-strong);
-  background: var(--card);
-}
 .upload-copy {
   display: flex;
+  grid-column: 1;
   align-items: center;
   gap: 14px;
 }
@@ -1276,45 +1278,15 @@ onBeforeUnmount(() => window.clearTimeout(pollTimer));
   line-height: 1.7;
 }
 @media (max-width: 1100px) {
-  .upload-bar {
-    grid-template-columns: 1fr auto;
-  }
-  .upload-copy {
-    grid-column: 1/-1;
-  }
   .upload-field {
     min-width: 0;
-  }
-}
-@media (max-width: 650px) {
-  .asset-count {
-    display: none;
-  }
-  .upload-bar {
-    grid-template-columns: 1fr;
-  }
-  .upload-copy {
-    grid-column: auto;
-  }
-  .upload-bar .btn {
-    width: 100%;
   }
 }
 .asset-count {
   display: none;
 }
-.upload-bar {
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: start;
-}
-.upload-copy,
-.upload-controls,
 .source-role-list {
   grid-column: 1 / -1;
-}
-.upload-controls {
-  grid-template-columns: minmax(240px, 0.8fr) minmax(0, 1.2fr);
-  align-items: center;
 }
 .role-explainer {
   margin: 0;
@@ -1365,11 +1337,21 @@ onBeforeUnmount(() => window.clearTimeout(pollTimer));
 .learning-evidence dl {
   grid-template-columns: 104px minmax(0, 1fr);
 }
-.learning-evidence summary {
+.learning-evidence summary,
+.hierarchy-details summary {
   cursor: pointer;
   color: var(--foreground);
   font-size: 14px;
   font-weight: 600;
+}
+.hierarchy-details summary span {
+  margin-left: 8px;
+  color: var(--muted-foreground);
+  font-size: 12px;
+  font-weight: 400;
+}
+.hierarchy-details .hierarchy-list {
+  margin-top: 12px;
 }
 .learning-evidence summary small {
   margin-left: 12px;
@@ -1446,12 +1428,31 @@ onBeforeUnmount(() => window.clearTimeout(pollTimer));
     grid-column: 2;
   }
 }
+@media (max-width: 1000px) {
+  .upload-bar {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+  .upload-copy {
+    grid-column: 1 / -1;
+  }
+  .upload-controls {
+    grid-column: 1;
+  }
+  .upload-bar > :deep(.ui-button) {
+    grid-column: 2;
+  }
+}
 @media (max-width: 650px) {
   .upload-bar {
     grid-template-columns: minmax(0, 1fr);
   }
   .upload-controls {
     grid-template-columns: minmax(0, 1fr);
+    grid-column: 1;
+  }
+  .upload-bar > :deep(.ui-button) {
+    grid-column: 1;
+    justify-self: stretch;
   }
   .source-role-row {
     grid-template-columns: minmax(0, 1fr) minmax(0, auto);
