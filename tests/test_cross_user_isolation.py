@@ -79,13 +79,26 @@ def test_two_users_and_admin_cannot_cross_resource_boundaries(monkeypatch):
         foreign_material, foreign_variant, foreign_report, foreign_version = resources[1]
         assert [row["task_id"] for row in client.get("/api/tasks", headers=own).json()] == [task_ids[0]]
         assert [row["id"] for row in client.get("/api/materials", headers=own).json()] == [resources[0][0]]
+        own_materials = client.get(f"/api/tasks/{task_ids[0]}/materials", headers=own)
+        assert own_materials.status_code == 200
+        assert own_materials.json()[0]["units_count"] == 1
+        assert own_materials.json()[0]["page_count"] == 0
+        assert "images" not in own_materials.json()[0]
+        overview = client.get(f"/api/materials/{resources[0][0]}?summary_only=true", headers=own)
+        assert overview.status_code == 200
+        assert overview.json()["unit_count"] == 1
+        assert "units" not in overview.json()
+        assert "tasks" not in overview.json()
+        assert client.get(f"/api/materials/{resources[0][0]}", headers=own).json()["units"][0]["content"].startswith("private content")
         assert [row["id"] for row in client.get("/api/reports", headers=own).json()] == [resources[0][2]]
         assert [row["id"] for row in client.get("/api/style/variants", headers=own).json()] == [resources[0][1]]
         for url in (
-            f"/api/tasks/{task_ids[1]}", f"/api/materials/{foreign_material}",
+            f"/api/tasks/{task_ids[1]}", f"/api/tasks/{task_ids[1]}/materials",
+            f"/api/materials/{foreign_material}", f"/api/materials/{foreign_material}?summary_only=true",
             f"/api/reports/{foreign_report}", f"/api/reports/{foreign_report}/export",
             f"/api/style/variants/{foreign_variant}/profile",
             f"/api/report-versions/{foreign_version}",
+            f"/api/tasks/{task_ids[1]}/research-brief/sources?query=private",
         ):
             assert client.get(url, headers=own).status_code == 404, url
         assert client.post("/api/interactions", headers=write, json={

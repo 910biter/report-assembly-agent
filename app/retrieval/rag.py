@@ -25,6 +25,8 @@ def hybrid_retrieve_units(
     keywords: list[str] | None = None,
     required_terms: list[str] | None = None,
     filters: dict | None = None,
+    semantic_candidates: list[RetrievalHit] | None = None,
+    lexical_candidates: list[RetrievalHit] | None = None,
 ) -> tuple[list[RetrievalHit], dict]:
     """Retrieve with coverage-aware expansion.
 
@@ -40,8 +42,14 @@ def hybrid_retrieve_units(
     target_terms = list(dict.fromkeys(required + keyword_terms + query_terms))
 
     candidate_limit = max(top_k * 3, top_k + 8)
-    semantic = _semantic_hits(query, candidate_limit, filters)
+    semantic = (
+        list(semantic_candidates)
+        if semantic_candidates is not None
+        else _semantic_hits(query, candidate_limit, filters)
+    )
     keyword = _keyword_hits(units_by_material, target_terms, candidate_limit)
+    if lexical_candidates:
+        keyword.extend(lexical_candidates)
     hits = _merge_hits(semantic + keyword)
     ranked = _rerank(hits, units_by_material, query, target_terms)
     selected = ranked[:top_k]

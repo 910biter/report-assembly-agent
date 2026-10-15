@@ -174,6 +174,32 @@ def test_bulk_invalid_vectors_and_missing_provenance_are_not_indexed():
         assert store.save_unit_vectors([(1, [1.0, 0.0]), (2, [float("nan"), 0.0]), (3, [1.0, 0.0])]) == {1}
 
 
+def test_duplicate_unit_text_is_embedded_once_and_cached_across_runs():
+    from app.retrieval import embedder
+
+    counter = {"calls": 0, "texts": []}
+
+    def fake_embed(texts, query=False, **kwargs):
+        counter["calls"] += 1
+        counter["texts"].extend(texts)
+        return [[float(index), 1.0] for index, _text in enumerate(texts, start=1)]
+
+    with patch.object(embedder.model_gateway, "embed", side_effect=fake_embed):
+        first, errors = embedder.embed_texts_adaptive([
+            "unique-source-2026-alpha", "unique-source-2026-alpha", "unique-source-2026-beta",
+        ])
+        second, second_errors = embedder.embed_texts_adaptive([
+            "unique-source-2026-alpha", "unique-source-2026-beta",
+        ])
+
+    assert not errors and not second_errors
+    assert counter["calls"] == 1
+    assert len(counter["texts"]) == 2
+    assert first[0] == first[1]
+    assert first[0] == second[0]
+    assert first[2] == second[1]
+
+
 def test_fact_cache_refreshes_content_changes_and_expired_vectors():
     import numpy as np
     cm = ContextManager({"id": "t"})

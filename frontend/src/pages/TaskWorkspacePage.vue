@@ -8,6 +8,8 @@ import StatusBadge from "@/components/StatusBadge.vue";
 import MaterialComparisonWorkspace from "@/components/MaterialComparisonWorkspace.vue";
 import UiPageHeader from "@/components/ui/UiPageHeader.vue";
 import UiPagination from "@/components/ui/UiPagination.vue";
+import UiDataBrowser from "@/components/ui/UiDataBrowser.vue";
+import ResearchBrief from "@/components/ResearchBrief.vue";
 import { usePersistentPageSize } from "@/lib/pagination";
 import { stageGroups, stageMeta } from "@/domain/workflowStages";
 import { useUiStore } from "@/stores/ui";
@@ -63,6 +65,16 @@ const materials = useQuery({
   enabled: computed(() => ["materials", "overview"].includes(active.value)),
   staleTime: 30000,
 });
+const selectedMaterialId = ref<number | null>(null);
+const materialDetail = useQuery({
+  queryKey: computed(() => ["material-overview", selectedMaterialId.value]),
+  queryFn: () => api<any>(`/api/materials/${selectedMaterialId.value}?summary_only=true`),
+  enabled: computed(() => active.value === "materials" && selectedMaterialId.value !== null),
+  staleTime: 30000,
+});
+function selectTaskMaterial(id: number) {
+  selectedMaterialId.value = id;
+}
 const analysis = useQuery({
   queryKey: ["task-analysis", taskId, analysisType, analysisPage, analysisPageSize],
   queryFn: () => api<{ items: any[]; total: number }>(`/api/tasks/${taskId}/analysis/page?kind=${analysisType.value}&page=${analysisPage.value}&page_size=${analysisPageSize.value}`),
@@ -623,6 +635,14 @@ function versionsList() {
             </button>
           </div>
         </div>
+        <ResearchBrief
+          v-if="!isComparison && task.data.value.research_brief?.coverage?.selected"
+          :brief="task.data.value.research_brief"
+          :task-id="taskId"
+          browse
+          @discuss="ui.openAssistant({ taskId })"
+          @browse="active = 'materials'"
+        />
         <div class="surface section-block">
           <div class="section-head">
             <div>
@@ -715,6 +735,7 @@ function versionsList() {
       </aside>
     </section>
     <section v-else-if="active === 'materials'" class="workspace-browser">
+      <UiDataBrowser class="task-material-browser" :detail-open="selectedMaterialId !== null" detail-width="390px" label="任务材料浏览器">
       <section class="surface section-block">
         <div class="section-head">
           <div>
@@ -722,18 +743,22 @@ function versionsList() {
           </div>
         </div>
         <div class="data-list">
-          <div
+          <button
             v-for="item in materials.data.value || []"
-            :key="item.filename"
+            :key="item.id"
             class="data-row material-row"
+            :class="{ selected: selectedMaterialId === item.id }"
+            :aria-label="`查看 ${item.filename} 的材料概览`"
+            :aria-pressed="selectedMaterialId === item.id"
+            @click="selectTaskMaterial(item.id)"
           >
             <div>
               <b>{{ item.filename }}</b
               ><span
                 >{{ item.file_type }} · {{ item.units_count }} 个内容单元<span
-                  v-if="item.pages?.length"
+                  v-if="item.page_count"
                 >
-                  · {{ item.pages.length }} 页</span
+                  · {{ item.page_count }} 页</span
                 ></span
               >
             </div>
@@ -756,9 +781,39 @@ function versionsList() {
                       : "处理中"
               }}</span
             >
-          </div>
+          </button>
         </div>
       </section>
+      <template v-if="selectedMaterialId !== null" #detail>
+        <div class="task-material-detail">
+          <header class="task-material-detail-head">
+            <div><small>任务材料</small><h2>{{ materialDetail.data.value?.filename || "正在读取材料…" }}</h2></div>
+            <button type="button" class="task-material-close" aria-label="关闭材料详情" @click="selectedMaterialId = null">×</button>
+          </header>
+          <div v-if="materialDetail.isPending.value" class="task-material-detail-body muted">正在读取材料详情…</div>
+          <div v-else-if="materialDetail.isError.value" class="task-material-detail-body muted">材料详情读取失败，请稍后重试。</div>
+          <template v-else-if="materialDetail.data.value">
+            <div class="task-material-detail-body">
+              <div class="task-material-stats">
+                <div><strong>{{ (materialDetail.data.value.file_type || '—').toUpperCase() }}</strong><span>文件类型</span></div>
+                <div><strong>{{ materialDetail.data.value.unit_count || 0 }}</strong><span>内容单元</span></div>
+                <div><strong>{{ materialDetail.data.value.page_count || 0 }}</strong><span>已解析页</span></div>
+              </div>
+              <section v-if="materialDetail.data.value.insight?.topic || materialDetail.data.value.insight?.key_points?.length" class="task-material-insight">
+                <small>材料理解</small>
+                <h3>{{ materialDetail.data.value.insight.topic || materialDetail.data.value.filename }}</h3>
+                <p v-if="materialDetail.data.value.insight.doc_type || materialDetail.data.value.insight.material_role" class="muted">{{ [materialDetail.data.value.insight.doc_type, materialDetail.data.value.insight.material_role].filter(Boolean).join(' · ') }}</p>
+                <ul v-if="materialDetail.data.value.insight.key_points?.length"><li v-for="(point, index) in materialDetail.data.value.insight.key_points.slice(0, 4)" :key="index">{{ point }}</li></ul>
+              </section>
+              <div v-else class="task-material-empty">
+                <strong>{{ materialDetail.data.value.parse_status === 'ready' ? '暂无理解摘要' : '材料尚未解析' }}</strong>
+                <p>{{ materialDetail.data.value.parse_status === 'ready' ? '正文已解析，当前没有可展示的主题和要点。' : '解析完成后，这里会显示材料的主题和关键内容。' }}</p>
+              </div>
+            </div>
+          </template>
+        </div>
+      </template>
+      </UiDataBrowser>
     </section>
     <section v-else-if="active === 'analysis'" class="analysis-layout">
       <aside class="analysis-nav surface">
@@ -1113,7 +1168,7 @@ function versionsList() {
   background: var(--surface-hover);
 }
 .progress-step.current > span {
-  color: var(--foreground);
+  color: var(--primary-foreground);
   border-color: var(--color-primary);
   background: var(--color-primary);
 }
@@ -1137,21 +1192,51 @@ function versionsList() {
   position: sticky;
   z-index: 5;
   top: var(--header-height);
-  padding: 7px 4px 9px;
+  gap: 0;
+  padding: 7px 0 9px;
   background: var(--background);
+}
+.workspace-tabs .tab {
+  flex: 1 0 72px;
+  text-align: center;
 }
 .workspace-browser {
   display: grid;
   min-width: 0;
   gap: 12px;
 }
+.workspace-browser .task-material-browser { min-height: 0; }
 .workspace-browser > .section-block {
+  min-width: 0;
+  padding: 16px 20px;
+}
+.task-material-browser > :first-child > .section-block {
   min-width: 0;
   padding: 16px 20px;
 }
 .material-row {
   grid-template-columns: minmax(0, 1fr) auto;
   gap: 16px;
+  width: 100%;
+  border: 0;
+  border-bottom: 1px solid var(--color-border);
+  background: transparent;
+  color: inherit;
+  text-decoration: none;
+  cursor: pointer;
+  text-align: left;
+}
+.material-row.selected {
+  background: var(--surface-hover);
+  box-shadow: inset 2px 0 var(--color-primary);
+}
+.material-row:hover,
+.material-row:focus-visible {
+  background: var(--surface-hover);
+}
+.material-row:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: -2px;
 }
 .material-row > div {
   min-width: 0;
@@ -1160,6 +1245,61 @@ function versionsList() {
 .material-row > .badge {
   white-space: nowrap;
 }
+.task-material-detail { min-width: 0; }
+.task-material-detail-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 20px 20px 16px;
+  border-bottom: 1px solid var(--border);
+}
+.task-material-detail-head > div { min-width: 0; }
+.task-material-detail-head small,
+.task-material-insight > small {
+  color: var(--color-muted);
+  font-size: 12px;
+}
+.task-material-detail-head h2 {
+  margin: 5px 0 0;
+  overflow-wrap: anywhere;
+  font-size: 16px;
+  line-height: 1.45;
+}
+.task-material-close {
+  flex: none;
+  width: 28px;
+  height: 28px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-muted);
+  cursor: pointer;
+  font-size: 19px;
+  line-height: 1;
+}
+.task-material-close:hover { color: var(--foreground); background: var(--surface-hover); }
+.task-material-detail-body { padding: 20px; overflow-wrap: anywhere; }
+.task-material-stats {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  padding-bottom: 20px;
+  border-bottom: 1px solid var(--border);
+}
+.task-material-stats div { min-width: 0; }
+.task-material-stats strong,
+.task-material-stats span { display: block; }
+.task-material-stats strong { color: var(--foreground); font-size: 18px; }
+.task-material-stats span { margin-top: 3px; color: var(--color-muted); font-size: 12px; }
+.task-material-insight { padding: 20px 0; }
+.task-material-insight h3 { margin: 7px 0 4px; font-size: 15px; line-height: 1.5; }
+.task-material-insight p { margin: 7px 0 0; font-size: 12px; }
+.task-material-insight ul { margin: 13px 0 0; padding-left: 20px; }
+.task-material-insight li { margin: 8px 0; font-size: 13px; line-height: 1.65; }
+.task-material-empty { padding: 22px 0; }
+.task-material-empty strong { color: var(--foreground); font-size: 13px; }
+.task-material-empty p { margin: 6px 0 0; color: var(--color-muted); font-size: 12px; line-height: 1.6; }
 .workspace-grid {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 340px;
@@ -1638,7 +1778,6 @@ function versionsList() {
 }
 .text-button:disabled {
   cursor: not-allowed;
-  opacity: .45;
 }
 .checkpoint-add {
   margin: -2px 0 12px;
@@ -1653,8 +1792,11 @@ function versionsList() {
     grid-template-columns: 1fr;
   }
   .progress-rail {
-    grid-template-columns: 1fr;
-    gap: 12px;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px 12px;
+  }
+  .progress-block {
+    padding: 14px 16px;
   }
   .progress-step::after {
     display: none;

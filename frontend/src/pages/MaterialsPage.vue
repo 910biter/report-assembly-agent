@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import { useQuery } from "@tanstack/vue-query";
-import { RouterLink, useRouter } from "vue-router";
+import { RouterLink, useRoute, useRouter } from "vue-router";
 import { api } from "@/api/http";
 import type { MaterialSummary } from "@/api/types";
 import AppIcon from "@/components/AppIcon.vue";
@@ -19,6 +19,7 @@ const usage = ref("");
 const dateRange = ref("all");
 const sortBy = ref("recent");
 const router = useRouter();
+const route = useRoute();
 const ui = useUiStore();
 const openingAssistant = ref(false);
 const selected = ref<number | null>(null);
@@ -99,7 +100,9 @@ watch([search, type, status, usage, dateRange, sortBy, pageSize], () => {
   page.value = 1;
   selected.value = null;
 });
-watch(page, () => { selected.value = null; });
+watch(page, () => {
+  if (!visibleMaterials.value.some((item) => item.id === selected.value)) selected.value = null;
+});
 watch(() => filtered.value.length, (total) => {
   page.value = Math.min(page.value, Math.max(1, Math.ceil(total / pageSize.value)));
 });
@@ -121,11 +124,23 @@ function resetFilters() {
   dateRange.value = "all";
   sortBy.value = "recent";
 }
-async function selectMaterial(id: number) {
+function selectMaterial(id: number) {
   selected.value = id;
   detailTab.value = "overview";
-  await discussMaterial();
 }
+watch(
+  [() => route.query.materialId, () => route.query.detailTab, list.data],
+  ([materialId, tab, items]) => {
+    const id = Number(materialId);
+    if (!Number.isSafeInteger(id) || id <= 0 || !items?.length) return;
+    const index = filtered.value.findIndex((item) => item.id === id);
+    if (index < 0) return;
+    page.value = Math.floor(index / pageSize.value) + 1;
+    selected.value = id;
+    detailTab.value = tab === "content" ? "content" : "overview";
+  },
+  { immediate: true },
+);
 function formatDate(value?: string) {
   if (!value) return "尚未解析";
   const date = new Date(value);

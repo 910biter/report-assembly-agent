@@ -4,10 +4,14 @@
 - 建表:ORM create_all(表结构唯一真源 = app/infrastructure/orm.py)
 - 业务数据访问统一走 session_scope(零裸 SQL)
 """
+import logging
+
 from app.config import settings
 
 _engine = None
 _SessionLocal = None
+_UNIT_TRGM_INDEX_READY = False
+logger = logging.getLogger(__name__)
 
 _DEFAULT_PG_URL = "postgresql+psycopg://ira:ira@127.0.0.1:5432/ira"
 
@@ -23,6 +27,30 @@ def _get_engine():
     _engine = create_engine(url, pool_pre_ping=True, pool_size=8, max_overflow=16)
     _SessionLocal = sessionmaker(bind=_engine, autoflush=False, expire_on_commit=False)
     return _engine
+
+
+def _ensure_unit_search_index() -> bool:
+    """Install an optional PostgreSQL trigram index for bounded source lookup."""
+    global _UNIT_TRGM_INDEX_READY
+    engine = _get_engine()
+    if engine.dialect.name != "postgresql":
+        return False
+    try:
+        with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
+            connection.execute(__import__("sqlalchemy").text(
+                "CREATE EXTENSION IF NOT EXISTS pg_trgm"
+            ))
+            connection.execute(__import__("sqlalchemy").text(
+                "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_units_content_trgm "
+                "ON units USING GIN (content gin_trgm_ops)"
+            ))
+        _UNIT_TRGM_INDEX_READY = True
+    except Exception as exc:
+        # Source search remains correct via the database's bounded LIKE query;
+        # lack of extension privileges must not prevent the application booting.
+        _UNIT_TRGM_INDEX_READY = False
+        logger.info("Optional unit trigram index unavailable: %s", type(exc).__name__)
+    return _UNIT_TRGM_INDEX_READY
 
 
 def session_scope():
@@ -360,6 +388,7 @@ def init_db() -> None:
     _repair_schema_constraints()
     _remove_retired_schema()
     _migrate_integrity()
+    _ensure_unit_search_index()
 
 
 def check_connection() -> bool:

@@ -4,7 +4,11 @@
 单批超时按 workload(字符数)与历史吞吐反馈动态计算,
 超时/失败时批量减半重试(不整份失败,不固定批数/秒数)。
 """
+import hashlib
 import time
+import unicodedata
+from collections import OrderedDict
+from threading import RLock
 
 from app.gateway import model_gateway
 from app.llm_scheduler import invoke
@@ -13,10 +17,88 @@ from app.llm_scheduler import invoke
 _EMBED_TOKEN_BUDGET = 8192
 # 历史吞吐反馈(chars/s,最近 5 次):驱动动态超时与后续分批
 _throughput: list[float] = []
+_VECTOR_CACHE_LIMIT = 2048
+_vector_cache: OrderedDict[str, list[float]] = OrderedDict()
+_vector_cache_lock = RLock()
+_embedding_dedupe_lock = RLock()
+_vector_cache_stats = {"hits": 0, "misses": 0, "evictions": 0}
+
+
+def _normalized_text(text: str) -> str:
+    return unicodedata.normalize("NFC", str(text or "").replace("\r\n", "\n").replace("\r", "\n"))
+
+
+def _cache_key(text: str, query: bool) -> tuple[str, str]:
+    from app.config import settings
+
+    normalized = _normalized_text(text)
+    identity = "\0".join((
+        str(settings.embedding_backend or ""),
+        str(settings.embedding_model or ""),
+        str(settings.embedding_model_path or ""),
+        str(settings.embedding_max_length or ""),
+        "query" if query else "document",
+        str(settings.embedding_query_instruction or "") if query else "",
+        normalized,
+    ))
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest(), normalized
+
+
+def _cache_get(key: str) -> list[float] | None:
+    with _vector_cache_lock:
+        value = _vector_cache.get(key)
+        if value is None:
+            _vector_cache_stats["misses"] += 1
+            return None
+        _vector_cache.move_to_end(key)
+        _vector_cache_stats["hits"] += 1
+        return list(value)
+
+
+def _cache_put(key: str, vector: list[float]) -> None:
+    with _vector_cache_lock:
+        _vector_cache[key] = [float(value) for value in vector]
+        _vector_cache.move_to_end(key)
+        while len(_vector_cache) > _VECTOR_CACHE_LIMIT:
+            _vector_cache.popitem(last=False)
+            _vector_cache_stats["evictions"] += 1
+
+
+def embedding_cache_stats(*, reset: bool = False) -> dict:
+    """Return bounded in-process cache counters; no source text is retained in keys."""
+    with _vector_cache_lock:
+        result = {**_vector_cache_stats, "entries": len(_vector_cache), "capacity": _VECTOR_CACHE_LIMIT}
+        if reset:
+            for key in _vector_cache_stats:
+                _vector_cache_stats[key] = 0
+        return result
 
 
 def embed_texts(texts: list[str], query: bool = False) -> list[list[float]]:
-    return invoke("embed", model_gateway.embed, texts, query=query)
+    if not texts:
+        return []
+    with _embedding_dedupe_lock:
+        return _embed_texts_cached(texts, query)
+
+
+def _embed_texts_cached(texts: list[str], query: bool) -> list[list[float]]:
+    keys_and_texts = [_cache_key(text, query) for text in texts]
+    vectors: dict[str, list[float]] = {}
+    missing: dict[str, str] = {}
+    for key, normalized in keys_and_texts:
+        cached = _cache_get(key)
+        if cached is not None:
+            vectors[key] = cached
+        else:
+            missing.setdefault(key, normalized)
+    if missing:
+        values = invoke("embed", model_gateway.embed, list(missing.values()), query=query)
+        if len(values) != len(missing):
+            raise RuntimeError("EMBEDDING_RESULT_COUNT_MISMATCH")
+        for key, vector in zip(missing, values):
+            vectors[key] = list(vector)
+            _cache_put(key, vector)
+    return [list(vectors[key]) for key, _text in keys_and_texts]
 
 
 def _batch_by_tokens(texts: list[str], budget: int) -> list[list[str]]:
@@ -54,14 +136,33 @@ def embed_texts_adaptive(texts: list[str]) -> tuple[list[list[float] | None], li
     """
     if not texts:
         return [], []
-    batches = _batch_by_tokens(texts, _EMBED_TOKEN_BUDGET)
-    vectors: list[list[float] | None] = [None] * len(texts)
+    with _embedding_dedupe_lock:
+        return _embed_texts_adaptive_cached(texts)
+
+
+def _embed_texts_adaptive_cached(texts: list[str]) -> tuple[list[list[float] | None], list[str]]:
+    keys_and_texts = [_cache_key(text, False) for text in texts]
+    unique_texts: dict[str, str] = {}
+    unique_vectors: dict[str, list[float] | None] = {}
+    for key, normalized in keys_and_texts:
+        cached = _cache_get(key)
+        if cached is not None:
+            unique_vectors[key] = cached
+        else:
+            unique_texts.setdefault(key, normalized)
+    pending = list(unique_texts.items())
+    pending_vectors: list[list[float] | None] = [None] * len(pending)
     errors: list[str] = []
     offset = 0
+    batches = _batch_by_tokens([text for _key, text in pending], _EMBED_TOKEN_BUDGET)
     for batch in batches:
-        _embed_chunk(list(batch), offset, vectors, errors)
+        _embed_chunk(list(batch), offset, pending_vectors, errors)
         offset += len(batch)
-    return vectors, errors
+    for (key, _text), vector in zip(pending, pending_vectors):
+        unique_vectors[key] = vector
+        if vector is not None:
+            _cache_put(key, vector)
+    return [unique_vectors.get(key) for key, _text in keys_and_texts], errors
 
 
 def _embed_chunk(chunk: list[str], base: int, vectors: list, errors: list[str]) -> None:

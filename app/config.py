@@ -53,7 +53,7 @@ class Settings(BaseSettings):
     embedding_max_length: int = 8192
     embedding_cpu_threads: int = 8
     embedding_query_instruction: str = "Retrieve relevant evidence passages for the current report analysis question"
-    llm_concurrency: int = 1  # OpenAI-compatible serving continuous batching入口并发
+    llm_concurrency: int = 1  # 全模型生成总并发；总量>1时工作流预留一个交互槽位
     evidence_batch_concurrency: int = 1  # 独立 Evidence 批次并发；仅 vLLM 部署建议设为2
     evidence_max_adaptive_split_depth: int = 4
     evidence_max_adaptive_split_calls: int = 12
@@ -65,6 +65,7 @@ class Settings(BaseSettings):
     interactive_input_tokens: int = 8192
     interactive_history_tokens: int = 3072
     interactive_output_tokens: int = 2048
+    assistant_retrieval_candidate_limit: int = 96  # bounded unit candidates before reranking
     interactive_request_limit: int = 15  # 协作助手最多进行的模型往返次数
     interactive_tool_calls_limit: int = 30  # 协作助手最多进行的工具调用次数
     comparison_output_tokens: int = 3200

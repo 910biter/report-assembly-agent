@@ -1,5 +1,6 @@
 import threading
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -318,10 +319,6 @@ class InteractionRuntimeTests(unittest.TestCase):
         update.assert_called_once_with(4, {"status": "retried", "retryable": False})
 
     def test_interaction_lane_is_not_blocked_by_workflow_lane(self):
-        original_generation = llm_scheduler._generation_slots
-        original_interactive = llm_scheduler._interactive_slots
-        llm_scheduler._generation_slots = threading.BoundedSemaphore(1)
-        llm_scheduler._interactive_slots = threading.BoundedSemaphore(1)
         workflow_started = threading.Event()
         release_workflow = threading.Event()
         interaction_done = threading.Event()
@@ -331,19 +328,49 @@ class InteractionRuntimeTests(unittest.TestCase):
             release_workflow.wait(2)
 
         try:
-            worker = threading.Thread(
-                target=lambda: llm_scheduler.invoke("agent", workflow_call), daemon=True,
-            )
-            worker.start()
-            self.assertTrue(workflow_started.wait(1))
-            llm_scheduler.invoke("review_copilot", interaction_done.set)
-            self.assertTrue(interaction_done.is_set())
-            release_workflow.set()
-            worker.join(1)
+            with patch("app.llm_scheduler.settings.llm_concurrency", 2), \
+                    patch("app.llm_scheduler.settings.interactive_concurrency", 1), \
+                    patch("app.llm_scheduler._shared_slot", side_effect=lambda _lane: nullcontext()):
+                worker = threading.Thread(
+                    target=lambda: llm_scheduler.invoke("agent", workflow_call), daemon=True,
+                )
+                worker.start()
+                self.assertTrue(workflow_started.wait(1))
+                llm_scheduler.invoke("review_copilot", interaction_done.set)
+                self.assertTrue(interaction_done.is_set())
+                release_workflow.set()
+                worker.join(1)
         finally:
             release_workflow.set()
-            llm_scheduler._generation_slots = original_generation
-            llm_scheduler._interactive_slots = original_interactive
+
+    def test_total_generation_capacity_reserves_a_slot_for_assistant(self):
+        first_started = threading.Event()
+        second_started = threading.Event()
+        release_first = threading.Event()
+
+        def first_workflow():
+            first_started.set()
+            release_first.wait(2)
+
+        with patch("app.llm_scheduler.settings.llm_concurrency", 2), \
+                patch("app.llm_scheduler.settings.interactive_concurrency", 1), \
+                patch("app.llm_scheduler._shared_slot", side_effect=lambda _lane: nullcontext()):
+            first = threading.Thread(
+                target=lambda: llm_scheduler.invoke("agent", first_workflow), daemon=True,
+            )
+            second = threading.Thread(
+                target=lambda: llm_scheduler.invoke("agent", second_started.set), daemon=True,
+            )
+            first.start()
+            self.assertTrue(first_started.wait(1))
+            second.start()
+            self.assertFalse(second_started.wait(0.1))
+            llm_scheduler.invoke("review_copilot", lambda: None)
+            self.assertFalse(second_started.is_set())
+            release_first.set()
+            second.join(1)
+            first.join(1)
+            self.assertTrue(second_started.is_set())
 
 
 if __name__ == "__main__":

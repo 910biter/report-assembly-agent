@@ -90,11 +90,22 @@ For a direct bundle installation, the initial `admin` password is written to
 `initial-admin-password` in the bundle directory, rather than the package
 state directory. Keep that file private and change the password after login.
 
-On Windows with Docker Desktop running Linux containers, set the password in
-`.env` and run
-`powershell -ExecutionPolicy Bypass -File .\install-bundle.ps1` from the bundle
-directory. Use a local NTFS directory rather than a network drive for the
-persisted application files.
+On Windows 10/11 x86_64, enable WSL 2 and hardware virtualization, then
+install and start Docker Desktop with Linux containers. Extract the Windows
+ZIP to a local NTFS directory (not a network drive) and run
+`powershell -ExecutionPolicy Bypass -File .\install-bundle.ps1` there. The
+installer verifies checksums, generates a database password on first install,
+imports the Linux images, creates the first administrator, starts the stack,
+and waits for the application health endpoint. Keep the extracted directory:
+it contains the Compose configuration and persistent application files.
+Docker Desktop must be running for the service to remain available. This
+bundle does not install Docker Desktop or WSL 2, and does not provide a
+Windows service that runs before a user session starts.
+
+For a private-network HTTP test only, set `IRA_AUTH_HTTP_TEST_MODE=true` in
+`app.env` before installation. Use HTTPS and leave it false for deployment
+beyond a controlled test network. The Windows ZIP contains the application,
+PostgreSQL and Qdrant images, but not Docker Desktop or a generation model.
 
 The health endpoint may report the generation model unavailable until its API
 is configured. Do not use `docker compose down -v`: that removes database and

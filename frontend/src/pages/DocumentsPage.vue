@@ -7,6 +7,7 @@ import AppIcon from "@/components/AppIcon.vue";
 import UiButton from "@/components/ui/UiButton.vue";
 import UiPageHeader from "@/components/ui/UiPageHeader.vue";
 import UiPanel from "@/components/ui/UiPanel.vue";
+import ResearchBrief from "@/components/ResearchBrief.vue";
 import { useUiStore } from "@/stores/ui";
 
 const route = useRoute();
@@ -119,7 +120,6 @@ watch(() => route.query.task, () => detail.refetch());
                 <small>{{ isProcessing ? "正在处理" : detail.data.value.stage === "failed" ? "处理异常" : "解析完成" }}</small>
                 <h2>{{ detail.data.value.theme }}</h2>
               </div>
-              <UiButton v-if="!isProcessing && detail.data.value.stage !== 'failed'" variant="outline" @click="openDiscussion">与助手讨论</UiButton>
             </div>
             <div v-if="isProcessing" class="processing-progress">
               <div class="processing-progress__head"><span>{{ progressLabel }}</span><b>{{ currentProgress }}%</b></div>
@@ -131,9 +131,7 @@ watch(() => route.query.task, () => detail.refetch());
             </div>
             <p v-else-if="detail.data.value.error" class="form-error">{{ detail.data.value.error }}</p>
             <template v-else>
-              <section class="summary-block">
-                <h3>摘要</h3><p>{{ active.summary || "尚未形成摘要。" }}</p>
-              </section>
+              <ResearchBrief v-if="detail.data.value.research_brief" :brief="detail.data.value.research_brief" :task-id="selectedTaskId" embedded @discuss="openDiscussion" />
               <section v-for="document in active.documents || []" :key="document.material_id" class="document-result">
                 <div class="document-title"><AppIcon name="document" :size="16" /><div><small>{{ document.doc_type || "已解析材料" }}</small><h3>{{ document.filename }}</h3></div></div>
                 <p>{{ document.summary || document.title }}</p>

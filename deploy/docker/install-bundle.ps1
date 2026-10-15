@@ -4,11 +4,11 @@ if (-not [Environment]::Is64BitOperatingSystem) { throw 'Windows x86_64 is requi
 if (-not (Get-Command docker -ErrorAction SilentlyContinue)) { throw 'Install Docker Desktop with the WSL 2 Linux-container backend first' }
 & docker compose version | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'Docker Compose is unavailable' }
+$serverOs = (& docker info --format '{{.OSType}}' 2>$null | Out-String).Trim()
+if ($LASTEXITCODE -ne 0) { throw 'Docker Desktop is not running. Start it and retry' }
+if ($serverOs -ne 'linux') { throw 'Switch Docker Desktop to Linux containers and retry' }
 $envFile = Join-Path $bundle '.env'
 if (-not (Test-Path -LiteralPath $envFile)) { throw 'Missing .env' }
-if ((Get-Content -LiteralPath $envFile) -contains 'POSTGRES_PASSWORD=replace-with-a-strong-password') {
-    throw 'Set a unique POSTGRES_PASSWORD in .env before installation'
-}
 foreach ($line in Get-Content -LiteralPath (Join-Path $bundle 'SHA256SUMS')) {
     if ($line -notmatch '^([0-9a-f]{64})  (.+)$') { throw 'Invalid checksum manifest' }
     $expected = $Matches[1]
@@ -18,6 +18,17 @@ foreach ($line in Get-Content -LiteralPath (Join-Path $bundle 'SHA256SUMS')) {
     if ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) {
         throw "Checksum mismatch: $relative"
     }
+}
+if ((Get-Content -LiteralPath $envFile) -contains 'POSTGRES_PASSWORD=replace-with-a-strong-password') {
+    $randomBytes = New-Object byte[] 32
+    $random = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $random.GetBytes($randomBytes) } finally { $random.Dispose() }
+    $dbPassword = [BitConverter]::ToString($randomBytes).Replace('-', '').ToLowerInvariant()
+    $content = (Get-Content -LiteralPath $envFile -Raw).Replace(
+        'POSTGRES_PASSWORD=replace-with-a-strong-password',
+        "POSTGRES_PASSWORD=$dbPassword"
+    )
+    Set-Content -LiteralPath $envFile -Value $content -NoNewline
 }
 New-Item -ItemType Directory -Path (Join-Path $bundle 'data/app') -Force | Out-Null
 Push-Location $bundle
@@ -58,5 +69,19 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Compose startup failed' }
     & docker compose --env-file .env ps
     if ($LASTEXITCODE -ne 0) { throw 'Compose status check failed' }
+    $port = 8000
+    foreach ($line in Get-Content -LiteralPath $envFile) {
+        if ($line -match '^APP_PORT=(\d+)$') { $port = [int]$Matches[1] }
+    }
+    $healthUrl = "http://127.0.0.1:$port/api/health"
+    $healthy = $false
+    for ($attempt = 0; $attempt -lt 30; $attempt++) {
+        try {
+            $response = Invoke-WebRequest -Uri $healthUrl -TimeoutSec 5 -UseBasicParsing
+            if ($response.StatusCode -eq 200) { $healthy = $true; break }
+        } catch { Start-Sleep -Seconds 2 }
+    }
+    if (-not $healthy) { throw "Application did not become healthy: $healthUrl. Check docker compose logs app" }
+    Write-Output "Application ready: http://127.0.0.1:$port"
 }
 finally { Pop-Location }

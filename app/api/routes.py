@@ -285,6 +285,7 @@ def get_document_analysis(task_id: str):
     task = short_term.load_task(task_id)
     if task is None or task.get("run_mode") != "document_analysis":
         return JSONResponse({"error": "DOCUMENT_ANALYSIS_NOT_FOUND"}, status_code=404)
+    from app.research_brief import build_research_brief
     return {
         "task_id": task_id,
         "theme": task.get("theme", "文档解析"),
@@ -295,6 +296,7 @@ def get_document_analysis(task_id: str):
         "material_analysis_status": task.get("material_analysis_status") or {},
         "queue_status": task.get("queue_status") or {},
         "analysis": task.get("document_analysis") or {},
+        "research_brief": build_research_brief(task),
         "error": task.get("error") or task.get("failure_reason") or "",
     }
 
@@ -600,6 +602,7 @@ def get_task(task_id: str):
     if task is None:
         return JSONResponse({"error": "TASK_NOT_FOUND"}, status_code=404)
     view = _task_view(task)
+    from app.research_brief import build_research_brief
     queue_status = dict(view.get("queue_status") or {})
     if settings.multiuser_enabled and queue_status.get("status") in {"queued", "running"}:
         from app.workflow.queue_store import position
@@ -615,6 +618,7 @@ def get_task(task_id: str):
         "report_id": view.get("report_id"),
         "material_ids": view.get("material_ids") or [],
         "material_count": len(view.get("material_ids") or []),
+        "research_brief": build_research_brief(view),
         "variant_id": view.get("variant_id"),
         "run_revision": int(view.get("run_revision") or 1),
         "run_mode": view.get("run_mode") or "initial",
@@ -761,7 +765,7 @@ def delete_task(task_id: str):
 
 @router.get("/tasks/{task_id}/materials")
 def task_materials(task_id: str):
-    """任务材料解析状态:每份材料的内容单元数/页数/图片文本/解析异常。"""
+    """Return lightweight parse status for the materials in a task."""
     task = short_term.load_task(task_id)
     if task is None:
         return JSONResponse({"error": "TASK_NOT_FOUND"}, status_code=404)
@@ -785,24 +789,26 @@ def task_materials(task_id: str):
     if not material_ids:
         return []
     with session_scope() as s:
-        parsed_ids = {r["material_id"] for r in s.execute(
-            select(ORMUnit.c.material_id).distinct()
-        ).mappings().all()}
+        unit_stats = {
+            row["material_id"]: row
+            for row in s.execute(
+                select(
+                    ORMUnit.c.material_id,
+                    func.count(ORMUnit.c.id).label("unit_count"),
+                    func.count(func.distinct(ORMUnit.c.page)).label("page_count"),
+                )
+                .where(ORMUnit.c.material_id.in_(material_ids))
+                .group_by(ORMUnit.c.material_id)
+            ).mappings()
+        }
         materials = s.execute(
             select(ORMMaterial).where(ORMMaterial.c.id.in_(material_ids))
         ).mappings().all()
-        parsed_count = sum(1 for m in materials if m["id"] in parsed_ids)
+        parsed_count = sum(1 for m in materials if m["id"] in unit_stats)
         result = []
         for material in materials:
-            units = s.execute(
-                select(
-                    ORMUnit.c.kind, ORMUnit.c.content, ORMUnit.c.image_desc,
-                    ORMUnit.c.page, ORMUnit.c.metadata_json,
-                ).where(ORMUnit.c.material_id == material["id"])
-            ).mappings().all()
-            pages = {u["page"] for u in units if u["page"] is not None}
-            images = [u for u in units if u["kind"] == "image"]
-            parsed = len(units) > 0
+            stats = unit_stats.get(material["id"])
+            parsed = stats is not None
             profile = parse_profiles.get(int(material["id"]), {})
             if parsed:
                 # Units 已入库时材料正文可用。向量化或历史解析告警不应显示成
@@ -815,24 +821,40 @@ def task_materials(task_id: str):
             else:
                 parse_status = "pending"  # 未解析(尚未轮到/中断),与材料库 unit_count 判断一致
             result.append({
+                "id": material["id"],
                 "filename": material["filename"],
                 "file_type": material["file_type"],
-                "units_count": len(units),
-                "pages": sorted(pages),
+                "units_count": stats["unit_count"] if stats else 0,
+                "page_count": stats["page_count"] if stats else 0,
                 "is_duplicate": material["is_duplicate"],
                 "parsed_count": parsed_count,
                 "duplicate_of": material["duplicate_of"],
-                "images": [{
-                    "text": u["content"],
-                    "ocr_text": u["content"],
-                    "image_desc": u["image_desc"],
-                } for u in images],
                 "parse_status": parse_status,
                 "parse_error": parse_errors.get(material["filename"], ""),
                 "embed_error": embed_errors.get(material["filename"], ""),
                 "parse_profile": profile,
             })
     return result
+
+
+@router.get("/tasks/{task_id}/research-brief/sources")
+def research_brief_sources(
+    task_id: str,
+    query: str = Query(..., min_length=1, max_length=2000),
+    material_id: int | None = Query(None, ge=1),
+    limit: int = Query(5, ge=1, le=8),
+    request: Request = None,
+):
+    """Resolve a brief clue to candidate source units with document locators."""
+    if _request_owner(request) is not None:
+        require_owner("task", task_id, request.state.principal)
+    task = short_term.load_task(task_id)
+    if task is None:
+        return JSONResponse({"error": "TASK_NOT_FOUND"}, status_code=404)
+    from app.control_agent import _search_material_units
+    return _search_material_units(
+        task_id, query=query, material_id=material_id, limit=limit,
+    )
 
 
 def _split_inference_ids(task: dict) -> tuple[list[int], list[int]]:
@@ -1084,44 +1106,53 @@ def list_materials(request: Request):
 
 
 @router.get("/materials/{material_id}")
-def get_material(material_id: int, request: Request = None):
+def get_material(material_id: int, request: Request = None, summary_only: bool = False):
     """Material detail with parsed units and its reusable understanding result."""
-    material_tasks = _material_task_index(_request_owner(request))
     with session_scope() as s:
         material = s.execute(
             select(ORMMaterial).where(ORMMaterial.c.id == material_id)
         ).mappings().first()
         if material is None:
             return JSONResponse({"error": "MATERIAL_NOT_FOUND"}, status_code=404)
-        units = s.execute(
+        units = [] if summary_only else s.execute(
             select(ORMUnit).where(ORMUnit.c.material_id == material_id).order_by(ORMUnit.c.id)
         ).mappings().all()
+        counts = s.execute(
+            select(func.count(ORMUnit.c.id), func.count(func.distinct(ORMUnit.c.page)))
+            .where(ORMUnit.c.material_id == material_id)
+        ).one() if summary_only else (len(units), len({u["page"] for u in units if u["page"] is not None}))
         insight = s.execute(
             select(ORMInsight).where(ORMInsight.c.material_id == material_id)
             .order_by(ORMInsight.c.id.desc())
         ).mappings().first()
-    return {
+    result = {
         "id": material["id"], "filename": material["filename"], "file_type": material["file_type"],
         "parsed_at": material["parsed_at"],
-        "parse_status": "ready" if units else "pending",
+        "parse_status": "ready" if counts[0] else "pending",
+        "unit_count": counts[0], "page_count": counts[1],
         "is_duplicate": material["is_duplicate"], "duplicate_of": material["duplicate_of"],
-        "tasks": material_tasks.get(material["id"], []),
         "insight": {
             "doc_type": insight["doc_type"] if insight else "",
             "topic": insight["topic"] if insight else "",
             "key_points": json.loads(insight["key_points"] or "[]") if insight else [],
-            "key_sections": json.loads(insight["key_sections"] or "[]") if insight else [],
-            "entities": json.loads(insight["entities"] or "[]") if insight else [],
-            "times": json.loads(insight["times"] or "[]") if insight else [],
             "material_role": insight["material_role"] if insight else "",
-            "missing_information": json.loads(insight["missing_information"] or "[]") if insight else [],
         },
-        "units": [{
+    }
+    if summary_only:
+        return result
+    result["tasks"] = _material_task_index(_request_owner(request)).get(material_id, [])
+    result["insight"].update({
+        "key_sections": json.loads(insight["key_sections"] or "[]") if insight else [],
+        "entities": json.loads(insight["entities"] or "[]") if insight else [],
+        "times": json.loads(insight["times"] or "[]") if insight else [],
+        "missing_information": json.loads(insight["missing_information"] or "[]") if insight else [],
+    })
+    result["units"] = [{
             "id": u["id"], "kind": u["kind"], "content": u["content"],
             "page": u["page"], "image_desc": u["image_desc"],
             "metadata": json.loads(u["metadata_json"] or "{}"),
-        } for u in units],
-    }
+        } for u in units]
+    return result
 
 
 @router.post("/materials/{material_id}/assistant-session")
