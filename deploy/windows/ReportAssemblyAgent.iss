@@ -14,7 +14,6 @@ DefaultGroupName={#ProductName}
 UninstallDisplayName={#ProductName}
 UninstallDisplayIcon={sys}\imageres.dll,3
 OutputBaseFilename=ReportAssemblyAgent-Setup-0824-x64
-SetupArchitecture=x64
 ArchitecturesAllowed=x64
 ArchitecturesInstallIn64BitMode=x64
 PrivilegesRequired=admin

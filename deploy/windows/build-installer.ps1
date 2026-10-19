@@ -25,16 +25,19 @@ if (-not $InnoCompiler) {
     $candidates = @(
         (Join-Path $env:ProgramFiles 'Inno Setup 7\ISCC.exe'),
         (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 7\ISCC.exe'),
-        (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 7\ISCC.exe')
+        (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 7\ISCC.exe'),
+        (Join-Path $env:ProgramFiles 'Inno Setup 6\ISCC.exe'),
+        (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'),
+        (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe')
     )
     $InnoCompiler = $candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
 }
 if (-not $InnoCompiler -or -not (Test-Path -LiteralPath $InnoCompiler)) {
-    throw 'Inno Setup 7 x64 ISCC.exe not found. Set -InnoCompiler or ISCC.'
+    throw 'Inno Setup ISCC.exe not found. Set -InnoCompiler or ISCC.'
 }
 $arguments = @(
     "/DBundleDirectory=$bundle",
-    "--output-dir=$output",
+    "/O$output",
     $script
 )
 & $InnoCompiler @arguments
