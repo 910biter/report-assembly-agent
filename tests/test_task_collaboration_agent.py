@@ -108,6 +108,15 @@ class TaskCollaborationAgentTests(unittest.TestCase):
         self.assertEqual(result.reply, "目录术语可以统一为“可信执行环境（TEE）”。")
         self.assertEqual(result.tool_trace, [])
 
+    def test_current_user_message_is_preserved_after_background_is_reduced(self):
+        message = "甲" * 2500 + "末尾约束：保留原文证据"
+        model_result = SimpleNamespace(output="已理解", usage=SimpleNamespace(
+            requests=1, tool_calls=0, input_tokens=1, output_tokens=1, cache_read_tokens=0,
+        ))
+        with patch("app.task_collaboration_agent._run_agent", return_value=model_result) as run:
+            run_task_collaboration_agent(self.context(), message, [{"role": "user", "content": "历史" * 4000}])
+        self.assertIn(message, run.call_args.args[0])
+
     def test_focus_locator_discards_browser_content_and_reference_text(self):
         locator = _focus_locator(ArtifactFocus.model_validate({
             "artifact_type": "sentence",

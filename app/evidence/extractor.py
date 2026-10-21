@@ -11,6 +11,7 @@ import re
 import contextvars
 import time
 import threading
+from itertools import combinations
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 
@@ -300,7 +301,7 @@ def bind_sources(quote: str, units_by_material: dict[int, list[Unit]], filenames
     )
 
 
-def _conflict_candidate_claims(claims: list[dict], limit: int = 40) -> list[dict]:
+def _conflict_candidate_claims(claims: list[dict]) -> list[dict]:
     """规则预筛:只保留疑似同主题/同数字的候选 Claim,降低冲突检测上下文。"""
     digit_re = re.compile(r"\d+(?:\.\d+)?")
     candidate_ids: set[int] = set()
@@ -318,7 +319,7 @@ def _conflict_candidate_claims(claims: list[dict], limit: int = 40) -> list[dict
             if grams_a & grams_b:
                 candidate_ids.update([claims[i].get("id"), claims[j].get("id")])
     result = [c for c in claims if c.get("id") in candidate_ids]
-    return result[:limit]
+    return result
 
 
 _CONFLICT_WORD_GROUPS = (
@@ -401,7 +402,7 @@ def _claim_field_chars(items: list[dict]) -> dict[str, int]:
     return fields
 
 
-def _conflict_candidate_groups(claims: list[dict], limit: int = 12) -> list[dict]:
+def _conflict_candidate_groups(claims: list[dict]) -> list[dict]:
     """Build high-recall conflict groups before LLM.
 
     We keep this deliberately permissive: numbers/dates/status oppositions and
@@ -455,7 +456,63 @@ def _conflict_candidate_groups(claims: list[dict], limit: int = 12) -> list[dict
     for group in groups.values():
         claim_ids = sorted(group.pop("claim_ids"))
         result.append({**group, "claim_ids": claim_ids})
-    return result[:limit]
+    return result
+
+
+def _conflict_prompt_batches(claims: list[dict], groups: list[dict],
+                             input_budget: int, output_tokens: int) -> list[tuple[str, set[int], int]]:
+    """Pack complete candidate groups; split oversized groups into verifiable pairs."""
+    by_id = {int(item["id"]): item for item in claims if str(item.get("id") or "").isdigit()}
+    lines = {
+        claim_id: (
+            f"{claim_id}. [{item.get('source', '')}|{item.get('fact_type', 'unknown')}|"
+            f"陈述性质={normalize_assertion_mode(item.get('assertion_mode'))}"
+            f"（{normalize_assertion_semantics(item.get('assertion_mode'), item.get('assertion_mode_raw'))[1]}）"
+            f"语义画像={semantic_profile_line(item.get('semantic_profile'), item.get('assertion_mode'), item.get('assertion_mode_raw'))}] "
+            f"{item.get('content', '')}"
+        ) for claim_id, item in by_id.items()
+    }
+    prefix = "以下是已通过原文绑定的陈述清单(编号 + 来源 + 类型):\n"
+    separator = "\n\n规则预筛得到的疑似冲突组:\n"
+    suffix = "\n\n请按可比口径分类这些关系,输出 JSON。"
+    max_groups = max(1, int(output_tokens) // 250)
+    pending: list[dict] = []
+    for group in groups:
+        ids = sorted({int(value) for value in group.get("claim_ids") or [] if str(value).isdigit() and int(value) in by_id})
+        if len(ids) < 2:
+            continue
+        pending.append({**group, "claim_ids": ids})
+
+    def render(items: list[dict]) -> tuple[str, set[int]]:
+        ids = {value for group in items for value in group["claim_ids"]}
+        group_lines = [
+            f"- {group['kind']}({group['signal']}): " + ",".join(str(value) for value in group["claim_ids"])
+            for group in items
+        ]
+        return prefix + "\n".join(lines[value] for value in sorted(ids)) + separator + "\n".join(group_lines) + suffix, ids
+
+    expanded: list[dict] = []
+    for group in pending:
+        prompt, _ = render([group])
+        if count_tokens(prompt) <= input_budget:
+            expanded.append(group)
+        else:
+            expanded.extend({**group, "claim_ids": list(pair)} for pair in combinations(group["claim_ids"], 2))
+    batches: list[tuple[str, set[int], int]] = []
+    current: list[dict] = []
+    for group in expanded:
+        prompt, _ = render(current + [group])
+        if current and (len(current) + 1 > max_groups or count_tokens(prompt) > input_budget):
+            previous_prompt, previous_ids = render(current)
+            batches.append((previous_prompt, previous_ids, len(current)))
+            current = []
+        if not current and count_tokens(render([group])[0]) > input_budget:
+            raise ValueError("CONFLICT_PAIR_EXCEEDS_CONTEXT")
+        current.append(group)
+    if current:
+        prompt, ids = render(current)
+        batches.append((prompt, ids, len(current)))
+    return batches
 
 
 def _conflict_entries(claim_ids: list[int], claims_by_id: dict[int, dict]) -> list[dict]:
@@ -1399,80 +1456,76 @@ class EvidenceAgent(BaseAgent):
             return []
         candidate_ids = {cid for group in candidate_groups for cid in group.get("claim_ids", [])}
         candidate_claims = [c for c in candidate_claims if int(c.get("id") or 0) in candidate_ids]
-        claim_lines = [
-            f"{c['id']}. [{c.get('source', '')}|{c.get('fact_type', 'unknown')}|"
-            f"陈述性质={normalize_assertion_mode(c.get('assertion_mode'))}"
-            f"（{normalize_assertion_semantics(c.get('assertion_mode'), c.get('assertion_mode_raw'))[1]}）"
-            f"语义画像={semantic_profile_line(c.get('semantic_profile'), c.get('assertion_mode'), c.get('assertion_mode_raw'))}] {c['content']}"
-            for c in candidate_claims
-        ]
-        group_lines = [
-            f"- {g['kind']}({g['signal']}): " + ",".join(str(i) for i in g.get("claim_ids", []))
-            for g in candidate_groups
-        ]
-        prompt = (
-            "以下是已通过原文绑定的陈述清单(编号 + 来源 + 类型):\n"
-            + "\n".join(claim_lines)
-            + "\n\n规则预筛得到的疑似冲突组:\n"
-            + "\n".join(group_lines)
-            + "\n\n请按可比口径分类这些关系,输出 JSON。"
+        from app.runtime_profiles import stage_input_budget_tokens, stage_profile
+        output_tokens = stage_profile("conflict").output_tokens
+        batches = _conflict_prompt_batches(
+            candidate_claims, candidate_groups,
+            stage_input_budget_tokens("conflict"), output_tokens,
         )
-        try:
-            from app.runtime_profiles import stage_profile
-            payload = self.generate_json(
-                prompt, system=_CONFLICT_SYSTEM,
-                max_tokens=stage_profile("conflict").output_tokens,
+        responses: list[tuple[dict, set[int], str]] = []
+        for prompt, visible_ids, group_count in batches:
+            payload = self.generate_json(prompt, system=_CONFLICT_SYSTEM, max_tokens=output_tokens)
+            if not isinstance(payload, dict) or not isinstance(payload.get("conflicts"), list):
+                update_call_funnel(self.last_call_id, invalid_conflict_schema=1)
+                payload = self.generate_json(
+                    prompt + '\n请按协议返回 JSON 对象，且 conflicts 必须是数组；无关系时使用 {"conflicts": []}。',
+                    system=_CONFLICT_SYSTEM, max_tokens=output_tokens,
+                )
+                if not isinstance(payload, dict) or not isinstance(payload.get("conflicts"), list):
+                    raise ValueError("CONFLICT_OUTPUT_INVALID")
+            call_id = self.last_call_id
+            responses.append((payload, visible_ids, call_id))
+            update_call_metrics(call_id, candidate_total=len(verified_claims), candidate_count=len(visible_ids))
+            update_call_funnel(
+                call_id,
+                candidate_total=len(verified_claims),
+                candidate_count=len(visible_ids),
+                candidate_groups=group_count,
+                quality_guardrail_calls=1,
             )
-        except Exception:
-            return []
-        call_id = self.last_call_id
-        update_call_metrics(call_id, candidate_total=len(verified_claims), candidate_count=len(candidate_claims))
-        update_call_funnel(
-            call_id,
-            candidate_total=len(verified_claims),
-            candidate_count=len(candidate_claims),
-            candidate_groups=len(candidate_groups),
-            quality_guardrail_calls=1,
-        )
         conflicts: list[Conflict] = []
         claims_by_id = {int(claim["id"]): claim for claim in candidate_claims}
-        for item in payload.get("conflicts", []):
-            claim_ids = list(dict.fromkeys(
-                int(value) for value in item.get("claim_ids", [])
-                if str(value).isdigit() and int(value) in claims_by_id
-            ))
-            # A review item is a pairwise proposition. Multi-claim bags do not
-            # state who differs from whom and therefore cannot be persisted as
-            # an explainable conflict.
-            if len(claim_ids) != 2:
-                continue
-            if claims_by_id[claim_ids[0]]["fact_id"] == claims_by_id[claim_ids[1]]["fact_id"]:
-                # Classification variants of one proposition are not two facts
-                # contradicting each other; both remain in the Claim history.
-                continue
-            entries = _conflict_entries(claim_ids, claims_by_id)
-            if len(entries) < 2:
-                continue
-            conflict_type = _normalize_conflict_type(item.get("conflict_type"))
-            conflict = Conflict(
-                fact_key=str(item.get("fact_key", "")),
-                entries=entries,
-                claim_ids=claim_ids,
-                conflict_type=conflict_type,
-                reason=str(item.get("reason", "")).strip(),
-                confidence=_normalize_confidence(item.get("confidence")),
-                status="unresolved" if conflict_type == "direct_contradiction" else "needs_review",
-            )
-            conflict.id = save_conflict(conflict, origin_call_id=call_id, task_id=task_id)
-            conflicts.append(conflict)
-        update_call_metrics(
-            call_id,
-            stored_chars=sum(
+        seen_pairs: set[tuple[int, int]] = set()
+        produced_by_call: dict[str, list[Conflict]] = {}
+        for payload, visible_ids, call_id in responses:
+            for item in payload["conflicts"]:
+                if not isinstance(item, dict):
+                    continue
+                claim_ids = list(dict.fromkeys(
+                    int(value) for value in item.get("claim_ids", [])
+                    if str(value).isdigit() and int(value) in visible_ids
+                ))
+                if len(claim_ids) != 2:
+                    continue
+                pair = tuple(sorted(claim_ids))
+                if pair in seen_pairs:
+                    continue
+                if claims_by_id[claim_ids[0]]["fact_id"] == claims_by_id[claim_ids[1]]["fact_id"]:
+                    continue
+                entries = _conflict_entries(claim_ids, claims_by_id)
+                if len(entries) < 2:
+                    continue
+                seen_pairs.add(pair)
+                conflict_type = _normalize_conflict_type(item.get("conflict_type"))
+                conflict = Conflict(
+                    fact_key=str(item.get("fact_key", "")),
+                    entries=entries,
+                    claim_ids=claim_ids,
+                    conflict_type=conflict_type,
+                    reason=str(item.get("reason", "")).strip(),
+                    confidence=_normalize_confidence(item.get("confidence")),
+                    status="unresolved" if conflict_type == "direct_contradiction" else "needs_review",
+                )
+                conflict.id = save_conflict(conflict, origin_call_id=call_id, task_id=task_id)
+                conflicts.append(conflict)
+                produced_by_call.setdefault(call_id, []).append(conflict)
+        for _, _, call_id in responses:
+            batch_conflicts = produced_by_call.get(call_id, [])
+            update_call_metrics(call_id, stored_chars=sum(
                 len(c.fact_key or "") + sum(len(e.get("statement", "")) + len(e.get("quote", "")) for e in c.entries)
-                for c in conflicts
-            ),
-        )
-        update_call_funnel(call_id, conflict_count=len(conflicts))
+                for c in batch_conflicts
+            ))
+            update_call_funnel(call_id, conflict_count=len(batch_conflicts))
         return conflicts
 
     @staticmethod

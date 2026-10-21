@@ -303,10 +303,63 @@ class WorkflowController:
             from app.licensing.service import LicenseBlocked
             if str(exc) != "TASK_PAUSED" and not isinstance(exc, LicenseBlocked):
                 try:
+                    self._discard_failed_writing_workspace()
+                except Exception:
+                    logger.exception("Could not restore working pointers for task %s", self.task_id)
+                try:
                     self._save_failed_core_chain_audit(exc)
                 except Exception:
                     logger.exception("Could not persist failure audit for task %s", self.task_id)
             raise
+
+    def _discard_failed_writing_workspace(self) -> None:
+        from app.workflow.run_workspace import discard_working_report
+
+        run_id = str(self.task.get("run_id") or "")
+        owns_plan = str(self.task.get("working_plan_run_id") or "") == run_id
+        owns_report = str(self.task.get("working_report_run_id") or "") == run_id
+        if not owns_plan and not owns_report:
+            return
+        working_id = int(self.task.get("working_report_id") or 0) if owns_report else 0
+        live_id = int(self.task.get("report_id") or 0)
+        if working_id:
+            try:
+                discard_working_report(live_id, working_id)
+            except Exception:
+                logger.exception("Could not discard working report for task %s", self.task_id)
+        base_plan_id = int(self.task.get("working_base_plan_id") or 0) if owns_plan else 0
+        fields = {"working_report_id": None, "working_report_hash": "",
+                  "working_report_run_id": "", "working_plan_id": None,
+                  "working_plan_run_id": "", "working_base_plan_id": None,
+                  "working_base_plan_title": None, "working_base_plan_frozen": None}
+        if base_plan_id:
+            fields["plan_id"] = base_plan_id
+            fields["plan_title"] = self.task.get("working_base_plan_title") or ""
+            fields["final_plan_frozen"] = bool(self.task.get("working_base_plan_frozen"))
+        self._update(**fields)
+
+    def _ensure_working_plan(self) -> None:
+        live_report_id = int(self.task.get("report_id") or 0)
+        if not live_report_id:
+            return
+        run_id = str(self.task.get("run_id") or "")
+        if (str(self.task.get("working_plan_run_id") or "") == run_id
+                and int(self.task.get("working_plan_id") or 0) == int(self.task.get("plan_id") or 0)):
+            return
+        from app.workflow.run_workspace import fork_plan
+
+        working_plan_id, base_plan_id = fork_plan(int(self.task["plan_id"]), live_report_id)
+        self._update(
+            plan_id=working_plan_id,
+            working_plan_id=working_plan_id,
+            working_base_plan_id=base_plan_id,
+            working_base_plan_title=self.task.get("plan_title") or "",
+            working_base_plan_frozen=bool(self.task.get("final_plan_frozen")),
+            working_plan_run_id=run_id,
+            working_report_id=None,
+            working_report_hash="",
+            working_report_run_id="",
+        )
 
     def _run_to_review(self) -> str:
         """跑完 解析→去重→规划→事实→冲突→分析→写作,停在评审阶段等待用户。
@@ -480,16 +533,41 @@ class WorkflowController:
         _mark("graph")
         conflict_signature = stage_input_signature("conflict", self.task, plan=self._plan())
         if self._resume_skips(Stage.CONFLICT):
-            self._update(stage=str(Stage.CONFLICT), resume={"stage": "conflict", "status": "reused_after_checkpoint"})
+            self._update(
+                stage=str(Stage.CONFLICT),
+                resume={"stage": "conflict", "status": "reused_after_checkpoint"},
+                conflict_status={"status": "completed", "source": "checkpoint"},
+            )
         elif self.task.get("conflict_ids") and signature_matches(
             self.task, "conflict", conflict_signature,
         ):
-            self._update(stage=str(Stage.CONFLICT), resume={"stage": "conflict", "status": "reused"})
+            self._update(
+                stage=str(Stage.CONFLICT),
+                resume={"stage": "conflict", "status": "reused"},
+                conflict_status={"status": "completed", "source": "reused"},
+            )
         else:
-            with self._token_context("conflict"):
-                self.detect_conflicts()
-        self._update(conflict_input_signature=conflict_signature)
-        self._record_artifact("conflict", {"conflict_ids": self.task.get("conflict_ids", [])})
+            try:
+                with self._token_context("conflict"):
+                    self.detect_conflicts()
+                self._update(conflict_status={"status": "completed"})
+            except Exception as exc:
+                if str(exc) in {"TASK_PAUSED", "EXECUTION_LOCK_LOST"}:
+                    raise
+                logger.exception("Conflict review incomplete for task %s", self.task_id)
+                self._update(
+                    conflict_status={"status": "incomplete", "reason": str(exc)[:300]},
+                    conflict_ids=list(self.task.get("incremental_inherited_conflict_ids") or []),
+                )
+        conflict_complete = (self.task.get("conflict_status") or {}).get("status") != "incomplete"
+        if conflict_complete:
+            self._update(conflict_input_signature=conflict_signature)
+        self._record_artifact(
+            "conflict",
+            {"conflict_ids": self.task.get("conflict_ids", []),
+             "conflict_status": self.task.get("conflict_status", {})},
+            status="done" if conflict_complete else "failed",
+        )
         _mark("conflict")
         if self.task.get("run_mode") == "material_comparison":
             # Comparison is a fact-and-provenance product. Ordinary report
@@ -574,6 +652,7 @@ class WorkflowController:
             "external_ids": self.task.get("external_ids", []),
         })
         _mark("analysis")
+        self._ensure_working_plan()
         final_plan_signature = stage_input_signature("final_plan", self.task, plan=self._plan())
         if self.task.get("intervention_force_final_plan"):
             # Directory feedback is also a FinalPlan input for ordinary
@@ -2094,6 +2173,24 @@ class WorkflowController:
                 },
             )
 
+        from app.workflow.run_workspace import create_working_report, promote_working_report
+
+        live_report_id = int(self.task.get("report_id") or 0)
+        run_id = str(self.task.get("run_id") or "")
+        working_id = int(self.task.get("working_report_id") or 0) if (
+            str(self.task.get("working_report_run_id") or "") == run_id
+        ) else 0
+        if live_report_id and not working_id:
+            working_id, fingerprint = create_working_report(live_report_id, int(plan["id"]))
+            self._update(
+                working_report_id=working_id, working_report_hash=fingerprint,
+                working_report_run_id=run_id,
+            )
+
+        def remember_working_report(report):
+            if not self.task.get("working_report_id"):
+                self._update(working_report_id=report.id, working_report_run_id=run_id)
+
         report = writer_agent.write(
             plan, facts, inferences,
             style_block,
@@ -2103,14 +2200,13 @@ class WorkflowController:
             task_profile=self.task.get("task_profile") or {},
             report_policy=self.task.get("report_policy") or {},
             progress_callback=_write_progress,
-            existing_report_id=self.task.get("report_id"),
-            report_callback=lambda report: self._update(report_id=report.id),
+            existing_report_id=working_id or None,
+            report_callback=remember_working_report,
             chapter_callback=self._record_chapter_artifact,
             task_id=self.task_id,
             target_chapter_titles=target_chapter_titles,
-            run_id=str(self.task.get("run_id") or ""),
+            run_id=run_id,
         )
-        self._update(report_id=report.id)
         if section_title_changes:
             self._persist_section_title_plan(plan, section_title_changes)
         # 验证闭环:只执行确定性、可逆修复；事实与数字疑点保留原文并进入复核。
@@ -2121,6 +2217,22 @@ class WorkflowController:
         if self._auto_quality_fix(report.id, plan):
             self._normalize_report_order(report.id, plan)
         self._run_quality_check(variant, plan, report.id)
+        if live_report_id:
+            self.task = promote_working_report(
+                live_report_id, report.id, str(self.task.get("working_report_hash") or ""),
+                self.task_id,
+            )
+        else:
+            ensure_report_version(
+                report.id, task_id=self.task_id, status="final",
+                change_summary="本轮写作完成快照",
+            )
+            self._update(
+                report_id=report.id,
+                working_report_id=None, working_report_hash="", working_report_run_id="",
+                working_plan_id=None, working_plan_run_id="", working_base_plan_id=None,
+                working_base_plan_title=None, working_base_plan_frozen=None,
+            )
 
     def _record_chapter_artifact(self, payload: dict) -> None:
         # 每章写毕的边界:检查暂停(不打断单次 LLM 调用,只在章/章之间暂停)

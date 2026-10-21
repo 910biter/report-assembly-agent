@@ -151,6 +151,15 @@ def test_planning_context_selects_inference_and_bases_as_one_group():
         assert {1, 2} <= set(audit["sections"]["事实"]["selected_ids"])
 
 
+def test_strict_planning_context_reports_unfitted_required_evidence():
+    import pytest
+
+    facts = [{"id": 1, "content": "a" * 200}]
+    with pytest.raises(ValueError, match="REQUIRED_EVIDENCE_EXCEEDS_CONTEXT"):
+        planning_prompt("narrative", [ContextSection("contract", ["Task"])],
+                        facts, [], 80, required_facts=[1], strict_required=True)
+
+
 def test_small_material_retains_all_facts_despite_repeated_source_profiles():
     facts = [{"id": i, "content": f"Independent observation {i}", "semantic_profile": {
         "facets": [{"axis": "status", "label": "observed", "detail": "confirmed"}],

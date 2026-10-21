@@ -41,6 +41,13 @@ class SemanticBoundaryTests(unittest.TestCase):
             result = validate_agent_tool_call(call, context, message="请改成六章")
         self.assertEqual(result.arguments["required_chapter_count"], 2)
 
+    def test_complete_structure_is_not_reinterpreted_from_chinese_keywords(self):
+        context = TaskAgentContext(task_id="task-1", directory_review_pending=True)
+        call = AgentToolCall(tool_name=AgentToolName.RERUN_FINAL_PLAN,
+                             arguments={"new_structure": ["甲", "乙", "丙"], "required_chapter_count": 3})
+        result = validate_agent_tool_call(call, context, message="拆分第一章，保留前两章")
+        self.assertEqual(result.arguments["new_structure"], ["甲", "乙", "丙"])
+
 
 if __name__ == "__main__":
     unittest.main()

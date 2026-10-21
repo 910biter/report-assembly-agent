@@ -181,6 +181,7 @@ class NarrativeAgent(BaseAgent):
             ], facts, inferences, stage_input_budget_tokens("narrative"),
             required_facts=collect_assigned_ids(chapter_plan, "fact"),
             required_inferences=collect_assigned_ids(chapter_plan, "inference"),
+            strict_required=True,
         )
         generation_error = ""
         self.last_call_id = ""

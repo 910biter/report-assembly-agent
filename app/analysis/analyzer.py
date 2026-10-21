@@ -102,15 +102,22 @@ def _visible_local_inference_refs(prompt: str, inferences: list) -> tuple[set[in
         inference_id = get("id")
         if inference_id is None:
             continue
-        dimension = str(get("dimension") or "未分类")
-        content = str(get("content") or "")
-        analysis_type = str(get("analysis_type") or "SYNTHESIS")
         based_fact_ids = get("based_fact_ids") or []
-        record = f"- [{dimension}] {content} (type={analysis_type}, based_fact_ids={based_fact_ids})"
+        record = _global_inference_record(item)
         if record in lines:
             visible_ids.add(int(inference_id))
             visible_fact_ids.update(_int_ids(based_fact_ids))
     return visible_ids, visible_fact_ids
+
+
+def _global_inference_record(item) -> str:
+    get = item.get if isinstance(item, dict) else lambda key, default=None: getattr(item, key, default)
+    return (
+        f"- [inference_id={get('id')}; {get('dimension') or '未分类'}] {get('content') or ''} "
+        f"(type={get('analysis_type') or 'SYNTHESIS'}, based_fact_ids={get('based_fact_ids') or []}, "
+        f"semantic_profile={semantic_profile_line(get('semantic_profile'))}, "
+        f"source_semantics={source_semantics_line(get('source_semantics'))})"
+    )
 
 
 def _visible_local_inference_ids(prompt: str, inferences: list) -> set[int]:
@@ -310,13 +317,7 @@ class AnalysisAgent(BaseAgent):
             return [], [], {}
         task_fact_ids = {int(f["id"]) for f in facts if f.get("id") is not None}
         inference_lines = ["各维度局部推断:"]
-        inference_lines.extend(
-            f"- [{i.dimension or '未分类'}] {i.content} "
-            f"(type={i.analysis_type or 'SYNTHESIS'}, based_fact_ids={i.based_fact_ids}, "
-            f"semantic_profile={semantic_profile_line(i.semantic_profile)}, "
-            f"source_semantics={source_semantics_line(i.source_semantics)})"
-            for i in local_inferences
-        )
+        inference_lines.extend(_global_inference_record(i) for i in local_inferences)
         instruction = ("请基于局部推断与关键事实做跨维度综合研判,输出 3-6 条全局推论。"
                        "每条必须挂真实 based_fact_ids；不要输出单条置信度相关字段。"
                        "保留所引事实和局部推论的陈述性质；目标/要求/建议不能升级为已实现状态。输出 JSON。")
@@ -339,7 +340,7 @@ class AnalysisAgent(BaseAgent):
             ContextSection("conflicts", [f"来源冲突:{conflicts}"] if conflicts else [], weight=4, required_items=1),
         ], stage_input_budget_tokens("analysis"))
         visible_inference_ids, visible_fact_ids = _visible_local_inference_refs(prompt, local_inferences)
-        visible_ids = visible_fact_ids & task_fact_ids
+        visible_ids = visible_fact_ids & _visible_fact_ids(prompt, referenced_facts) & task_fact_ids
         try:
             payload = self.generate_json(prompt, system=_GLOBAL_SYSTEM)
         except Exception as exc:

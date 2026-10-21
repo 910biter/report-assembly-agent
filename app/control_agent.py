@@ -323,11 +323,6 @@ def validate_agent_tool_call(call: AgentToolCall, context: TaskAgentContext,
         arguments.update(required_dimensions=dimensions, required_dimension_count=expected)
     elif call.tool_name == AgentToolName.RERUN_FINAL_PLAN:
         structure = _clean_text_list(arguments.get("new_structure"))
-        structure = _preserve_confirmed_structure_scope(
-            context.task_id,
-            structure,
-            f"{message}\n{arguments.get('instruction') or ''}",
-        )
         if context.directory_review_pending and not structure:
             raise ValueError("目录讨论阶段需要助手先形成完整的新目录提案")
         expected = _positive_int(arguments.get("required_chapter_count")) or len(structure)
@@ -448,56 +443,6 @@ def _preserve_existing_heading_prefix(old_title: str, new_title: str) -> str:
         return new_title
     prefix_end = old_title.find(clean_old)
     return f"{old_title[:prefix_end]}{clean_new}" if prefix_end >= 0 else clean_new
-
-
-def _preserve_confirmed_structure_scope(task_id: str, proposed: list[str], instruction: str) -> list[str]:
-    """Apply structural edit semantics against persisted titles, not model paraphrases."""
-    if not proposed:
-        return []
-    from app.rendering.headings import strip_heading_prefix
-
-    current = [
-        strip_heading_prefix(str(item)) for item in (_load_plan(task_id, "final").get("titles") or [])
-        if strip_heading_prefix(str(item))
-    ]
-    proposed = [strip_heading_prefix(str(item)) for item in proposed if strip_heading_prefix(str(item))]
-    if not current:
-        return proposed
-
-    text = re.sub(r"\s+", "", str(instruction or ""))
-    split_match = re.search(r"第([一二三四五六七八九十\d]+)章.{0,24}拆分|拆分.{0,12}第([一二三四五六七八九十\d]+)章", text)
-    split_index = _chinese_or_arabic_int(next((value for value in split_match.groups() if value), "")) if split_match else 0
-    preserve_match = re.search(r"(?:保持|保留)(?:原有|原)?前([一二三四五六七八九十\d]+)章(?:不变)?", text)
-    preserve_count = _chinese_or_arabic_int(preserve_match.group(1)) if preserve_match else 0
-    if split_index:
-        preserve_count = max(preserve_count, split_index - 1)
-
-    if preserve_count <= 0:
-        return proposed
-    preserve_count = min(preserve_count, len(current))
-    tail_count = max(0, len(current) - (split_index or preserve_count))
-    replacement_end = len(proposed) - tail_count if tail_count else len(proposed)
-    replacements = proposed[preserve_count:replacement_end]
-    if not replacements:
-        raise ValueError("目录调整缺少目标章节的替代结构")
-    suffix = current[len(current) - tail_count:] if tail_count else []
-    return [*current[:preserve_count], *replacements, *suffix]
-
-
-def _chinese_or_arabic_int(value: str) -> int:
-    raw = str(value or "")
-    if raw.isdigit():
-        return int(raw)
-    numerals = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6,
-                "七": 7, "八": 8, "九": 9, "十": 10}
-    if raw in numerals:
-        return numerals[raw]
-    if raw.startswith("十"):
-        return 10 + numerals.get(raw[1:], 0)
-    if "十" in raw:
-        left, right = raw.split("十", 1)
-        return numerals.get(left, 0) * 10 + numerals.get(right, 0)
-    return 0
 
 
 def _positive_int(value: Any) -> int:

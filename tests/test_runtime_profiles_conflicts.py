@@ -3,7 +3,10 @@ from unittest.mock import patch
 
 from app.config import settings
 from app.model_connection import Connection
-from app.evidence.extractor import EvidenceAgent, _normalize_conflict_type, _split_unit_blocks
+from app.evidence.extractor import (
+    EvidenceAgent, _conflict_candidate_claims, _conflict_candidate_groups,
+    _conflict_prompt_batches, _normalize_conflict_type, _split_unit_blocks,
+)
 from app.runtime_profiles import runtime_profile_manifest, stage_profile
 
 
@@ -49,6 +52,62 @@ class RuntimeProfilesAndConflictTests(unittest.TestCase):
     def test_conflict_type_is_closed_protocol_not_free_text(self):
         self.assertEqual(_normalize_conflict_type("direct_contradiction"), "direct_contradiction")
         self.assertEqual(_normalize_conflict_type("模型随意发明的类型"), "needs_verification")
+
+    def test_conflict_candidates_are_not_silently_capped(self):
+        claims = [
+            {"id": index, "fact_id": index, "content": f"同一事项在{index}年已完成"}
+            for index in range(1, 48)
+        ]
+        candidates = _conflict_candidate_claims(claims)
+        self.assertEqual(len(candidates), len(claims))
+        groups = [
+            {"kind": "date_mismatch", "signal": "test", "claim_ids": [index, index + 1]}
+            for index in range(1, 25, 2)
+        ]
+        batches = _conflict_prompt_batches(candidates[:25], groups, input_budget=1200, output_tokens=500)
+        self.assertGreater(len(batches), 1)
+        self.assertTrue(all(len(visible_ids) >= 2 for _, visible_ids, _ in batches))
+        self.assertEqual(set(range(1, 25)), set().union(*(ids for _, ids, _ in batches)))
+
+    def test_conflict_group_prefilter_keeps_groups_past_old_limit(self):
+        claims = []
+        for index in range(15):
+            topic = chr(0x4e00 + index) * 6
+            claims.extend([
+                {"id": index * 2 + 1, "content": f"{topic}预算为100元"},
+                {"id": index * 2 + 2, "content": f"{topic}预算为200元"},
+            ])
+        groups = _conflict_candidate_groups(claims)
+        self.assertGreater(len(groups), 12)
+
+    def test_conflict_model_failure_is_not_reported_as_no_conflict(self):
+        claims = [
+            {"id": 1, "fact_id": 11, "status": "promoted", "content": "同一事项已经完成"},
+            {"id": 2, "fact_id": 12, "status": "promoted", "content": "同一事项尚未完成"},
+        ]
+        agent = EvidenceAgent()
+        agent.generate_json = lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("MODEL_HTTP_503"))
+        with self.assertRaisesRegex(RuntimeError, "MODEL_HTTP_503"):
+            agent.detect_conflicts(claims, task_id="task-1")
+
+    def test_conflict_schema_is_retried_once_before_marking_incomplete(self):
+        claims = [
+            {"id": 1, "fact_id": 11, "status": "promoted", "content": "同一事项已经完成"},
+            {"id": 2, "fact_id": 12, "status": "promoted", "content": "同一事项尚未完成"},
+        ]
+        agent = EvidenceAgent()
+        replies = iter([{"message": "未发现冲突"}, {"conflicts": []}])
+        agent.generate_json = lambda *args, **kwargs: next(replies)
+        agent.last_call_id = "call-conflict"
+        with (
+            patch("app.evidence.extractor._conflict_candidate_groups", return_value=[
+                {"kind": "status", "signal": "相反", "claim_ids": [1, 2]},
+            ]),
+            patch("app.evidence.extractor.update_call_metrics"),
+            patch("app.evidence.extractor.update_call_funnel") as funnel,
+        ):
+            self.assertEqual(agent.detect_conflicts(claims, task_id="task-1"), [])
+        self.assertTrue(any(call.kwargs.get("invalid_conflict_schema") == 1 for call in funnel.call_args_list))
 
     def test_conflict_detection_excludes_unbound_claims_and_rebuilds_entries(self):
         claims = [

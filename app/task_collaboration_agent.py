@@ -486,15 +486,19 @@ def run_task_collaboration_agent(
     }
     memory_payload = decision_memory or {}
     input_budget = max(1024, int(settings.interactive_input_tokens))
+    current_message_tokens = count_tokens(user_message)
+    if current_message_tokens > input_budget - max(512, input_budget // 4):
+        raise ValueError("USER_MESSAGE_EXCEEDS_INTERACTIVE_CONTEXT")
+    background_budget = max(256, input_budget - current_message_tokens - 512)
     prompt = (
-        f"当前任务主题：{_cap_prompt_text(context.theme, 384)}\n"
-        f"当前完整报告要求：{_cap_prompt_text(context.user_requirements, input_budget // 4)}\n"
+        f"当前任务主题：{_cap_prompt_text(context.theme, background_budget // 8)}\n"
+        f"当前报告要求摘要：{_cap_prompt_text(context.user_requirements, background_budget // 3)}\n"
         f"可读取的任务产物：{_cap_prompt_json(context.available_artifacts, 192)}\n"
-        f"当前页面焦点：{_cap_prompt_json(focus_payload, input_budget // 4)}\n"
+        f"当前页面焦点：{_cap_prompt_json(focus_payload, background_budget // 8)}\n"
         f"当前任务阶段：{context.stage_label}\n"
-        f"结构化决策记忆：{_cap_prompt_json(memory_payload, input_budget // 5)}\n"
-        f"最近对话：\n{_cap_prompt_text(history_text, input_budget // 5) or '无'}\n\n"
-        f"用户本轮消息：{_cap_prompt_text(user_message, input_budget // 5)}"
+        f"结构化决策记忆：{_cap_prompt_json(memory_payload, background_budget // 5)}\n"
+        f"最近对话：\n{_cap_prompt_text(history_text, background_budget // 5) or '无'}\n\n"
+        f"用户本轮消息：{user_message}"
     )
     result = _run_agent(prompt, deps)
     tool_trace = list(deps.tool_trace)
