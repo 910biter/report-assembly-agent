@@ -183,7 +183,9 @@ async function restartServices() {
 
 <template>
   <div class="page-stack settings-page">
-    <UiPageHeader title="系统设置" />
+    <UiPageHeader title="系统设置">
+      <template #actions><RouterLink to="/license"><UiButton variant="secondary">系统授权</UiButton></RouterLink></template>
+    </UiPageHeader>
     <UiPanel v-if="currentUser?.role === 'admin'" class="section-block">
       <UiSectionHeader title="模型接入" />
       <form class="model-connection-form" @submit.prevent="configureModel(false)">

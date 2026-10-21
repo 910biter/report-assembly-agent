@@ -8,6 +8,17 @@ $ErrorActionPreference = 'Stop'
 $bundle = (Resolve-Path -LiteralPath $BundleDirectory).ProviderPath
 $output = [IO.Path]::GetFullPath($OutputDirectory)
 $script = Join-Path $PSScriptRoot 'installer\ReportAssemblyAgent.iss'
+$licenseDirectory = Join-Path $bundle 'payload\app-source\app\licensing'
+foreach ($name in @('_trust', 'protocol', 'service', 'storage')) {
+    if (@(Get-ChildItem -LiteralPath $licenseDirectory -Filter "$name*.pyd" -File -ErrorAction SilentlyContinue).Count -ne 1) {
+        throw "Missing or ambiguous compiled license module: $name"
+    }
+    foreach ($extension in @('.py', '.pyx', '.pyc')) {
+        if (Test-Path -LiteralPath (Join-Path $licenseDirectory "$name$extension")) {
+            throw "License source fallback must not ship: $name$extension"
+        }
+    }
+}
 foreach ($required in @('manifest.json', 'install-native.ps1', 'run-component.ps1', 'uninstall-native.ps1', 'payload')) {
     if (-not (Test-Path -LiteralPath (Join-Path $bundle $required))) {
         throw "Bundle is missing required item: $required"

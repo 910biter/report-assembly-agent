@@ -36,6 +36,7 @@ def _spa_response():
 @web_router.get("/queue")
 @web_router.get("/settings")
 @web_router.get("/login")
+@web_router.get("/license")
 @web_router.get("/admin/users")
 def spa_page(task_id: str = "", report_id: int = 0):
     return _spa_response()

@@ -69,8 +69,11 @@ def invoke(kind: str, fn, *args, **kwargs):
     """统一调用入口。kind 标识调用方(agent/template/qa/embed/health/ui)。"""
     if kind == "health":
         return fn(*args, **kwargs)
+    from app.licensing.service import require_license
+    require_license()
     if kind == "embed":
         with _embedding_lock:
+            require_license()
             return fn(*args, **kwargs)
     # Keep interactive calls in a foreground lane while sharing the same total cap.
     if kind == "review_copilot":
@@ -83,6 +86,8 @@ def _invoke_lane(lane: str, fn, *args, **kwargs):
     with _lane_stats_lock:
         _lane_stats[lane]["submitted"] += 1
     with _generation_capacity.slot(lane), _shared_slot(lane):
+        from app.licensing.service import require_license
+        require_license()
         wait = time.perf_counter() - submitted_at
         with _lane_stats_lock:
             stats = _lane_stats[lane]

@@ -17,7 +17,11 @@ unencrypted; use HTTPS before exposing the port beyond a trusted network.
 
 Run `build-python-runtime.ps1` first to produce a private interpreter, lock
 file, and offline wheelhouse. Supply the Windows PostgreSQL binary ZIP,
-Qdrant Windows ZIP, and FFmpeg LGPL ZIP to `build-native-bundle.ps1`. The
+Qdrant Windows ZIP, and FFmpeg LGPL ZIP to `build-native-bundle.ps1`. Also pass
+`-LicenseBuildPython` pointing to a build interpreter matching the bundled Python
+ABI, with `tools/license-build-requirements.txt` installed and MSVC C++ Build Tools
+available. License modules are compiled and their source removed from the payload;
+end users do not need a compiler. The
 `models` and `profile/.cache/whisper` directories must be present in the
 runtime directory. The build command writes one offline ZIP when `-CreateZip`
 is specified. The build machine may have uv, Git, WSL or Docker; the target

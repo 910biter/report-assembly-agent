@@ -17,3 +17,14 @@ frontend/src/**/*.js
 frontend/vite.config.js
 frontend/vite.config.d.ts
 docs/superpowers/
+# Issuer secrets and generated customer licenses never belong in source archives.
+*.private.pem
+*.license
+issuance.jsonl
+license-secrets/
+license-requests/
+key-password
+issuer-password*
+.native-build/
+app/licensing/*.so
+app/licensing/*.pyd

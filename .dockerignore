@@ -16,3 +16,12 @@ deploy/offline
 *.zip
 *.tar
 *.log
+.native-build
+*.so
+*.pyd
+*.private.pem
+*.license
+license-secrets
+license-requests
+key-password
+issuer-password*

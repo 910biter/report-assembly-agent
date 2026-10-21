@@ -42,6 +42,12 @@ def create_app() -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_application: FastAPI):
+        import threading
+        from app.licensing.service import time_monitor
+        license_stop = threading.Event()
+        license_thread = threading.Thread(target=time_monitor, args=(license_stop,),
+                                          daemon=True, name="license-clock")
+        license_thread.start()
         from app.graph_jobs import start_worker
         start_worker()
         if settings.multiuser_enabled:
@@ -50,12 +56,17 @@ def create_app() -> FastAPI:
         try:
             yield
         finally:
+            license_stop.set()
+            license_thread.join(timeout=2)
             from app.graph_jobs import stop_worker
             stop_worker()
 
     application = FastAPI(title="报告整编 Agent", lifespan=lifespan)
 
+    from app.licensing.http import LicenseMiddleware, router as license_router
+    application.add_middleware(LicenseMiddleware)
     application.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
+    application.include_router(license_router)
     application.include_router(api_router)
     application.include_router(auth_router)
     application.include_router(web_router)

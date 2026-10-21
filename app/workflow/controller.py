@@ -282,6 +282,8 @@ class WorkflowController:
 
     def _control_boundary(self) -> None:
         """Honor pauses here; the gateway also checks after every LLM call."""
+        from app.licensing.service import require_license
+        require_license()
         task = short_term.load_task(self.task_id) or self.task
         if (task.get("control_request") if task else "") == "pause":
             self._update(stage="paused", queue_status={"status": "paused"}, control_request="")
@@ -294,9 +296,12 @@ class WorkflowController:
 
     def run_to_review(self) -> str:
         try:
+            from app.licensing.service import require_license
+            require_license()
             return self._run_to_review()
         except Exception as exc:
-            if str(exc) != "TASK_PAUSED":
+            from app.licensing.service import LicenseBlocked
+            if str(exc) != "TASK_PAUSED" and not isinstance(exc, LicenseBlocked):
                 try:
                     self._save_failed_core_chain_audit(exc)
                 except Exception:

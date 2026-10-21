@@ -1,11 +1,13 @@
 import { createRouter, createWebHistory } from "vue-router";
 import DashboardPage from "@/pages/DashboardPage.vue";
 import { authMode, currentUser, ensureSession } from "@/lib/auth";
+import { refreshLicense } from "@/lib/license";
 
 const router = createRouter({
   history: createWebHistory(),
   routes: [
     { path: "/login", component: () => import("@/pages/LoginPage.vue"), meta: { title: "登录", public: true } },
+    { path: "/license", component: () => import("@/pages/LicensePage.vue"), meta: { title: "系统授权", public: true } },
     { path: "/", component: DashboardPage, meta: { title: "工作台" } },
     { path: "/tasks", component: () => import("@/pages/TasksPage.vue"), meta: { title: "任务" } },
     { path: "/tasks/:taskId", component: () => import("@/pages/TaskWorkspacePage.vue"), meta: { title: "任务工作台", wide: true } },
@@ -28,11 +30,16 @@ router.beforeEach(async (to) => {
   } catch {
     return to.path === "/login" ? true : { path: "/login", query: { redirect: to.fullPath } };
   }
-  if (authMode.value === "off") return to.path === "/login" ? "/" : true;
+  if (authMode.value === "off") return to.path === "/login" ? true : "/login";
   if (!currentUser.value && to.path !== "/login") {
     return { path: "/login", query: { redirect: to.fullPath } };
   }
   if (currentUser.value && to.path === "/login") return "/";
+  if (currentUser.value && to.path !== "/license") {
+    try {
+      if (!(await refreshLicense()).active) return "/license";
+    } catch { return "/license"; }
+  }
   if (to.meta.admin && currentUser.value?.role !== "admin") return "/";
   return true;
 });
@@ -53,3 +60,7 @@ router.onError((error, to) => {
 });
 
 export default router;
+
+window.addEventListener("ira-license-required", () => {
+  if (router.currentRoute.value.path !== "/license") void router.replace("/license");
+});

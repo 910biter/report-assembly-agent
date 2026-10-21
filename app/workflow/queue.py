@@ -97,6 +97,8 @@ def reconcile_interrupted_tasks() -> int:
 
 def enqueue_task(task_id: str, priority: int = TASK_PRIORITY_NORMAL) -> dict:
     """Queue a task if it is not already queued/running."""
+    from app.licensing.service import require_license
+    require_license()
     if short_term.load_task(task_id) is None:
         return {"status": "not_found"}
     if settings.multiuser_enabled:
@@ -280,6 +282,10 @@ def _durable_request_control(task_id: str, task: dict, action: str) -> dict:
 
 def _worker_loop() -> None:
     while True:
+        from app.licensing.service import get_service
+        if not get_service().status()["active"]:
+            time.sleep(1)
+            continue
         if settings.multiuser_enabled:
             try:
                 ran = _durable_claim_and_run()
@@ -304,6 +310,9 @@ def _durable_claim_and_run() -> bool:
     from app.workflow.execution import execution_slot
 
     with execution_slot(wait=True) as slot:
+        from app.licensing.service import get_service
+        if not get_service().status()["active"]:
+            return False
         queue_store.reconcile_running()
         claimed = queue_store.claim_next()
         if claimed is None:
@@ -328,7 +337,7 @@ def _process_item(item: _QueuedTask, *, held_slot=None, entry_id: int | None = N
             _STATS["started"] += 1
             _STATS["queue_wait_seconds"] = round(float(_STATS["queue_wait_seconds"]) + wait, 3)
             _STATS["max_queue_wait_seconds"] = max(float(_STATS["max_queue_wait_seconds"]), round(wait, 3))
-        short_term.update_task(item.task_id, error="", queue_status={
+        short_term.update_task(item.task_id, error="", license_blocked=False, queue_status={
             "status": "running",
             "queue_wait_seconds": round(wait, 1),
             "started_at": round(time.time(), 1),
@@ -380,7 +389,9 @@ def _process_item(item: _QueuedTask, *, held_slot=None, entry_id: int | None = N
                 if entry_id is None:
                     short_term.update_task(item.task_id, **final_fields)
         except Exception as exc:
-            paused = str(exc) == "TASK_PAUSED"
+            from app.licensing.service import LicenseBlocked
+            license_paused = isinstance(exc, LicenseBlocked)
+            paused = str(exc) == "TASK_PAUSED" or license_paused
             finish_status = "paused" if paused else "failed"
             finish_error = str(exc)
             if not paused:
@@ -417,6 +428,7 @@ def _process_item(item: _QueuedTask, *, held_slot=None, entry_id: int | None = N
             # Its failure must restore the last reviewable report.
             next_stage = "paused" if paused else ("review" if interaction_revision else "failed")
             final_fields = {
+                "license_blocked": license_paused,
                 "stage": next_stage,
                 "error": "" if (paused or interaction_revision) else str(exc),
                 "revision_error": (

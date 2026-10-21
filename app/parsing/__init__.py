@@ -25,6 +25,8 @@ def parse_file_with_profile(path: str | Path) -> tuple[list[Unit], dict]:
     Unsupported formats and Docling failures are surfaced explicitly to the
     workflow; no alternate parser path exists.
     """
+    from app.licensing.service import require_license
+    require_license()
     source = Path(path)
     if not can_parse_with_docling(source):
         raise ValueError(f"UNSUPPORTED_FORMAT: {source.suffix.lower()}")

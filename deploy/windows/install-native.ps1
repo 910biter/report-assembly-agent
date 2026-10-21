@@ -72,6 +72,10 @@ if (Get-NetFirewallRule -Name $firewallRuleName -ErrorAction SilentlyContinue) {
 
 Write-InstallProgress 1
 New-Item -ItemType Directory -Path $InstallRoot, $DataRoot -Force | Out-Null
+# Program code must not be writable by ordinary local users, even for a custom path.
+& icacls.exe $InstallRoot /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' `
+    '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX' | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'Failed to secure the program directory ACL' }
 # Data includes database passwords and must not inherit broad user access.
 $installerSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 & icacls.exe $DataRoot /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' `
@@ -107,6 +111,11 @@ $venvPython = Join-Path $venv 'Scripts\python.exe'
 if ($LASTEXITCODE -ne 0) { throw 'Offline dependency installation failed' }
 & (Join-Path $payload 'uv.exe') pip check --python $venvPython --offline
 if ($LASTEXITCODE -ne 0) { throw 'Dependency integrity check failed' }
+# Moved payloads can keep permissive ACLs. The interpreter, installed libraries,
+# model files and application source all belong to the same trusted program tree.
+& icacls.exe $InstallRoot /inheritance:r /grant:r `
+    '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX' /T /C | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'Failed to secure the installed program ACL' }
 
 $config = [ordered]@{
     app_host = '0.0.0.0'

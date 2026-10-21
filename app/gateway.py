@@ -102,6 +102,8 @@ class OpenAICompatibleGateway:
     def _chat(self, prompt: str, system: str | None = None, json_mode: bool = False,
               think: bool | None = None, max_tokens: int | None = None,
               temperature: float | None = None) -> str:
+        from app.licensing.service import require_license
+        require_license()
         connection = load_connection()
         base_url = self._base_url or connection.base_url
         headers = {"Content-Type": "application/json", **connection.headers()}

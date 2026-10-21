@@ -22,6 +22,7 @@ services:
       - "${APP_PORT:-8000}:8000"
     volumes:
       - ./data/app:/opt/app/runtime
+      - /etc/machine-id:/run/ira-host-machine-id:ro
     depends_on:
       postgres:
         condition: service_healthy

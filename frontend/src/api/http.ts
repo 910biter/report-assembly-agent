@@ -1,4 +1,5 @@
 import { authMode, clearSession } from "@/lib/auth";
+import { licenseRequired } from "@/lib/license";
 
 export class ApiError extends Error {
   constructor(message: string, public status: number, public payload: unknown) {
@@ -11,6 +12,7 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const contentType = response.headers.get("content-type") || "";
   const payload = contentType.includes("application/json") ? await response.json() : await response.text();
   if (!response.ok) {
+    licenseRequired(payload);
     if (response.status === 401 && authMode.value === "on" && !path.startsWith("/api/auth/")) {
       clearSession();
       window.location.assign("/login");
@@ -50,6 +52,7 @@ export function uploadForm<T>(
         ? String((payload as { error: unknown }).error)
         : `请求失败（${request.status}）`;
       reject(new ApiError(message, request.status, payload));
+      licenseRequired(payload);
       if (request.status === 401 && authMode.value === "on") {
         clearSession();
         window.location.assign("/login");
