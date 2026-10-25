@@ -162,9 +162,17 @@ const checkpointStructureTitles = computed(() =>
 const checkpointStructureEdited = computed(
   () => checkpointStructureTitles.value.join("\u001f") !== directoryDraftKey,
 );
+const controlError = ref("");
 const command = useMutation({
   mutationFn: ({ path }: { path: string }) => api(path, { method: "POST" }),
-  onSuccess: () => qc.invalidateQueries({ queryKey: ["task", taskId] }),
+  onSuccess: async () => {
+    controlError.value = "";
+    await Promise.all([
+      qc.invalidateQueries({ queryKey: ["task", taskId] }),
+      qc.invalidateQueries({ queryKey: ["tasks"] }),
+    ]);
+  },
+  onError: (error: Error) => { controlError.value = error.message || "操作失败，请重试"; },
 });
 const confirmPlanning = useMutation({
   mutationFn: () =>
@@ -281,12 +289,17 @@ const processCurrentLabel = computed(() => {
     const ahead = task.data.value?.queue_status?.ahead;
     return ahead == null ? "待运行" : `待运行 · 前方 ${ahead} 个任务`;
   }
+  if (resuming.value) return "正在恢复运行";
   if (stageIndex.value >= 0) return stages.value[stageIndex.value]?.name || "处理中";
   return stageMeta[String(task.data.value?.stage || "")]?.label || "处理中";
 });
+const resuming = computed(() =>
+  task.data.value?.stage === "paused" &&
+  ["queued", "running"].includes(task.data.value?.queue_status?.status || ""),
+);
 const running = computed(
   () =>
-    task.data.value?.queue_status?.status === "queued" ||
+    ["queued", "running"].includes(task.data.value?.queue_status?.status || "") ||
     ![
       "created",
       "requirement_review",
@@ -333,7 +346,11 @@ const inferenceCount = computed(() =>
     : Number(artifactCounts.value.inferences || 0),
 );
 function run() {
-  command.mutate({ path: `/api/tasks/${taskId}/run` });
+  command.mutate({
+    path: task.data.value?.stage === "failed"
+      ? `/api/tasks/${taskId}/control/restart`
+      : `/api/tasks/${taskId}/run`,
+  });
 }
 function confirmPlan() {
   confirmPlanning.mutate();
@@ -387,6 +404,7 @@ watch(
   { immediate: true },
 );
 function control(op: string) {
+  controlError.value = "";
   command.mutate({ path: `/api/tasks/${taskId}/control/${op}` });
 }
 function confidence(x: any) {
@@ -458,7 +476,7 @@ function versionsList() {
                   ? "审阅完成"
                   : "对比中"
           }}</span
-        ><StatusBadge v-else :stage="task.data.value.stage" /><button
+        ><StatusBadge v-else :stage="resuming ? task.data.value.queue_status?.status : task.data.value.stage" /><button
           v-if="
             ['created', 'failed'].includes(task.data.value.stage) ||
             task.data.value.requirement_review_pending
@@ -484,11 +502,12 @@ function versionsList() {
         >
           {{ pauseRequested ? "正在暂停…" : "暂停" }}</button
         ><button
-          v-if="task.data.value.stage === 'paused'"
+          v-if="task.data.value.stage === 'paused' && !resuming"
           class="btn primary"
+          :disabled="command.isPending.value"
           @click="control('resume')"
         >
-          继续运行</button
+          {{ command.isPending.value ? "正在恢复…" : "继续运行" }}</button
         ><RouterLink
           v-if="task.data.value.report_id"
           class="btn"
@@ -503,6 +522,7 @@ function versionsList() {
         </div>
       </template>
     </UiPageHeader>
+    <p v-if="controlError" class="muted" role="alert">{{ controlError }}</p>
     <section class="surface progress-block">
       <div v-if="stageIndex >= 0" class="progress-rail" :class="{ compact: isComparison }">
         <div
@@ -532,7 +552,7 @@ function versionsList() {
         <span class="progress-interruption-mark" aria-hidden="true"></span>
         <div>
           <b>{{ processCurrentLabel }}</b>
-          <small>{{ task.data.value.stage === "paused" ? "任务已暂停；暂停前的具体环节未记录" : "任务异常；失败环节未记录" }}</small>
+          <small>{{ resuming ? "已提交恢复请求，等待执行器继续处理" : task.data.value.stage === "paused" ? "任务已暂停；暂停前的具体环节未记录" : "任务异常；失败环节未记录" }}</small>
         </div>
       </div>
     </section>
@@ -555,13 +575,6 @@ function versionsList() {
     />
     <section v-else-if="active === 'overview'" class="workspace-grid">
       <div class="main-column">
-        <div v-if="task.data.value.stage === 'failed'" class="notice warning">
-          <b>任务运行异常</b><br />{{
-            task.data.value.error ||
-            task.data.value.failure_reason ||
-            "请查看运行详情后重新运行。"
-          }}
-        </div>
         <div
           v-if="task.data.value.requirement_review_pending"
           class="notice planning-review"

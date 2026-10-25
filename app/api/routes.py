@@ -1873,10 +1873,10 @@ def model_connection_status():
 
 @router.put("/system/model-connection")
 def update_model_connection(payload: dict):
-    from app.model_connection import connection_from_payload, public_connection, save_connection
+    from app.model_connection import connection_from_payload, model_lanes_busy, public_connection, save_connection
     lanes = model_lane_stats()
     from app.memory.style_jobs import has_active_jobs
-    if task_queue_status().get("running_task_id") or has_active_jobs() or any(v.get("active") or v.get("submitted", 0) > v.get("completed", 0) + v.get("failed", 0) for v in lanes.values()):
+    if task_queue_status().get("running_task_id") or has_active_jobs() or model_lanes_busy(lanes):
         return JSONResponse({"error": "服务正在执行任务或对话，请空闲后修改模型接入"}, status_code=409)
     try:
         save_connection(connection_from_payload(payload))

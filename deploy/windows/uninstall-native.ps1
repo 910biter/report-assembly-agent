@@ -42,7 +42,9 @@ if ($service) {
 
 Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | ForEach-Object {
     $path = $_.ExecutablePath
-    if ($path -and $path.StartsWith($InstallRoot + '\', [StringComparison]::OrdinalIgnoreCase)) {
+    $isLegacyUninstaller = $path -and [IO.Path]::GetFileName($path).Equals('unins000.exe', [StringComparison]::OrdinalIgnoreCase)
+    if ($path -and -not $isLegacyUninstaller -and
+        $path.StartsWith($InstallRoot + '\', [StringComparison]::OrdinalIgnoreCase)) {
         Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
         Write-Log "Stopped application-owned process $($_.ProcessId)"
     }

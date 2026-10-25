@@ -10,7 +10,7 @@ import UiButton from "@/components/ui/UiButton.vue";
 import { useUiStore } from "@/stores/ui";
 
 const ui = useUiStore();
-const modelForm = ref({ base_url: "", model_name: "", api_key: "", service_kind: "vllm", context_tokens: 0, output_tokens: 8192, output_parameter: "max_tokens" });
+const modelForm = ref({ base_url: "", model_name: "", api_key: "", service_kind: "vllm", context_tokens: null as number | null, output_parameter: "max_tokens" });
 const keyStored = ref(false);
 const clearKey = ref(false);
 const modelBusy = ref(false);
@@ -192,12 +192,18 @@ async function restartServices() {
         <label class="field">接入地址<input v-model="modelForm.base_url" type="url" required placeholder="http://IP:端口/v1" /></label>
         <label class="field">模型名称<input v-model="modelForm.model_name" required placeholder="服务发布的模型名称" /></label>
         <label class="field">服务类型<select v-model="modelForm.service_kind"><option value="vllm">vLLM</option><option value="openai">已有兼容接入</option></select></label>
-        <label class="field">API Key<input v-model="modelForm.api_key" type="password" autocomplete="new-password" :placeholder="keyStored ? '已设置；留空保留原 Key' : '本地无鉴权服务可留空'" /></label>
-        <label v-if="keyStored"><input v-model="clearKey" type="checkbox" />清除已保存的 Key</label>
+        <label class="field">上下文上限（Token）<input v-model.number="modelForm.context_tokens" type="number" min="5120" max="2000000" required /></label>
+        <div class="field credential-field">
+          <div class="credential-heading">
+            <label for="model-api-key">API Key</label>
+            <button v-if="keyStored" class="credential-action" type="button" :aria-pressed="clearKey" @click="clearKey = !clearKey">
+              {{ clearKey ? '撤销清除' : '清除已保存的 Key' }}
+            </button>
+          </div>
+          <input id="model-api-key" v-model="modelForm.api_key" type="password" autocomplete="new-password" :placeholder="clearKey ? '保存配置时将清除 Key' : keyStored ? '已设置；留空保留原 Key' : '本地无鉴权服务可留空'" />
+        </div>
         <details class="connection-options">
-          <summary>容量与接口能力</summary>
-          <label class="field">上下文上限（0 使用服务实际窗口）<input v-model.number="modelForm.context_tokens" type="number" min="0" max="2000000" required /></label>
-          <label class="field">最大输出（Token）<input v-model.number="modelForm.output_tokens" type="number" min="256" required /></label>
+          <summary>接口选项</summary>
           <label class="field">输出参数<select v-model="modelForm.output_parameter"><option value="max_tokens">max_tokens</option><option value="max_completion_tokens">max_completion_tokens</option></select></label>
         </details>
         <div class="service-actions">
@@ -599,6 +605,19 @@ dd {
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 16px;
 }
+.credential-field { min-width: 0; grid-column: 1 / -1; }
+.credential-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.credential-action {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--muted-foreground);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.credential-action:hover { color: var(--foreground); text-decoration: underline; }
+.credential-action:focus-visible { outline: 2px solid var(--ring); outline-offset: 3px; border-radius: 2px; }
 .connection-options,
 .model-connection-form > p,
 .model-connection-form > .service-actions {

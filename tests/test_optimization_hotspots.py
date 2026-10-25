@@ -47,10 +47,41 @@ def test_no_query_embedding_when_vector_backend_is_off():
 def test_deterministic_http_failures_do_not_retry_with_either_error_format():
     from app.graph.service import GraphExtractionAgent
     for agent in (BaseAgent(), GraphExtractionAgent()):
-        for status in (400, 401, 403, 404, 405, 413, 422):
+        for status in (400, 401, 403, 405, 413, 422):
             assert not agent.should_retry(RuntimeError(f"MODEL_HTTP_{status}"))
             assert not agent.should_retry(RuntimeError(f"MODEL_HTTP_{status}:details"))
+        assert agent.should_retry(RuntimeError("MODEL_HTTP_404"))
+        assert agent.should_retry(RuntimeError("MODEL_HTTP_404:details"))
         assert agent.should_retry(RuntimeError("MODEL_HTTP_503"))
+
+
+def test_model_404_retries_three_attempts_then_reports_original_error():
+    agent = BaseAgent()
+    calls = []
+
+    def unavailable():
+        calls.append(1)
+        raise RuntimeError("MODEL_HTTP_404")
+
+    with patch("app.agents.base.log_llm_call"), patch("app.agents.base.time.sleep"):
+        with pytest.raises(RuntimeError, match="MODEL_HTTP_404"):
+            agent._with_retry(unavailable, 10)
+    assert len(calls) == 3
+
+
+def test_model_404_recovers_on_later_attempt():
+    agent = BaseAgent()
+    calls = []
+
+    def intermittently_unavailable():
+        calls.append(1)
+        if len(calls) < 3:
+            raise RuntimeError("MODEL_HTTP_404")
+        return {"ok": True}
+
+    with patch("app.agents.base.log_llm_call"), patch("app.agents.base.time.sleep"):
+        assert agent._with_retry(intermittently_unavailable, 10) == {"ok": True}
+    assert len(calls) == 3
 
 
 def test_evidence_batches_embedding_once_per_query_not_per_material():

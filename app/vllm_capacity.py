@@ -53,6 +53,15 @@ def estimate(text: str, connection) -> int:
     return math.ceil(raw_estimate(text) * factor)
 
 
+def estimate_request_input(connection, payload: dict) -> int:
+    """Estimate serialized messages exactly as final request validation does."""
+    messages = json.dumps(payload.get("messages", []), ensure_ascii=False)
+    tools = payload.get("tools") or []
+    return estimate(messages, connection) + (
+        estimate(json.dumps(tools, ensure_ascii=False), connection) if tools else 0
+    )
+
+
 def _count(connection, payload: dict) -> int:
     # Collapse concurrent probes/counts for one service, not inference requests.
     with _profile(connection).count_lock:
@@ -129,8 +138,7 @@ def verify_request(connection, payload: dict, safety_tokens: int = 0) -> dict:
     output = int(payload.get(connection.output_parameter) or 0)
     if output <= 0 or output > connection.output_tokens:
         raise ValueError("MODEL_INPUT_OVER_BUDGET")
-    estimated = estimate(json.dumps(payload.get("messages", []), ensure_ascii=False), connection)
-    estimated += estimate(json.dumps(tools, ensure_ascii=False), connection) if tools else 0
+    estimated = estimate_request_input(connection, payload)
     method, error = "estimated", profile.error
     count = estimated
     # Only final requests are remotely counted. No network I/O during packing.

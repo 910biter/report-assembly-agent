@@ -554,6 +554,8 @@ class WorkflowController:
             except Exception as exc:
                 if str(exc) in {"TASK_PAUSED", "EXECUTION_LOCK_LOST"}:
                     raise
+                if str(exc).startswith(("MODEL_HTTP_", "MODEL_CONNECTION_NOT_CONFIGURED")):
+                    raise
                 logger.exception("Conflict review incomplete for task %s", self.task_id)
                 self._update(
                     conflict_status={"status": "incomplete", "reason": str(exc)[:300]},
@@ -1430,6 +1432,8 @@ class WorkflowController:
                 })
                 payload = analyzer.generate_json(f"材料文本:\n{text}")
             except Exception as exc:
+                if str(exc).startswith(("MODEL_HTTP_", "MODEL_CONNECTION_NOT_CONFIGURED")):
+                    raise
                 analysis_errors.append({
                     "material_id": material_id,
                     "filename": filenames.get(material_id, ""),
@@ -1609,6 +1613,8 @@ class WorkflowController:
                 "cluster_count": len(clusters),
             })
         except Exception as exc:
+            if str(exc).startswith(("MODEL_HTTP_", "MODEL_CONNECTION_NOT_CONFIGURED")):
+                raise
             # Consolidation is advisory, but a silent failure would make later
             # analysis look complete while operating without its ledger.
             self._update(intelligence_status={
@@ -1664,6 +1670,8 @@ class WorkflowController:
             self._update(graph_status=status, graph_fact_ids=sorted(covered_after))
             return status
         except Exception as exc:
+            if str(exc).startswith(("MODEL_HTTP_", "MODEL_CONNECTION_NOT_CONFIGURED")):
+                raise
             status = {"status": "degraded", "error": str(exc)[:300]}
             self._update(graph_status=status)
             return status
@@ -2086,7 +2094,9 @@ class WorkflowController:
                     f"本轮更新目标:{reason}\n现有章节:{json.dumps(chapters, ensure_ascii=False)}",
                     system=system,
                 )
-        except Exception:
+        except Exception as exc:
+            if str(exc).startswith(("MODEL_HTTP_", "MODEL_CONNECTION_NOT_CONFIGURED")):
+                raise
             return {"rewrite_sections": [], "content_intent": "preserve", "reason": "scope_model_failed"}
         allowed = {str(item["title"]) for item in chapters}
         intent = str(payload.get("content_intent") or "preserve").lower()

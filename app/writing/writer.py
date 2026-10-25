@@ -45,8 +45,6 @@ from app.context_budget import (
 from app.writing.scale_execution import (
     assess_chapter_output,
     measure_text_words,
-    writer_output_token_limit,
-    writer_output_retry_limit,
     writer_scale_prompt_hint,
     report_minimum_words,
 )
@@ -55,26 +53,6 @@ from app.observability.core_chain import aggregate_generation_units, build_gener
 
 ORMSentenceFact = Base.metadata.tables["report_sentence_fact"]
 ORMSentenceInference = Base.metadata.tables["report_sentence_inference"]
-
-
-def _writer_json_overhead(paragraphs: list[dict], fact_ids=(), inference_ids=()) -> int:
-    """Reserve schema and citation space independently of visible prose.
-
-    One placeholder per planned evidence record is a capacity estimate, not a
-    requirement to write separate sentences for facts and judgments.
-    """
-    rows = []
-    for paragraph in paragraphs or [{"fact_ids": fact_ids, "inference_ids": inference_ids}]:
-        sentences = [
-            {"text": "", "fact_ids": [fid], "inference_ids": []}
-            for fid in evidence_ids(paragraph.get("fact_ids"))
-        ] + [
-            {"text": "", "fact_ids": [], "inference_ids": [iid]}
-            for iid in evidence_ids(paragraph.get("inference_ids"))
-        ]
-        rows.append({"paragraph_id": paragraph.get("paragraph_id") or "P1",
-                     "sentences": sentences or [{"text": "", "fact_ids": [], "inference_ids": []}]})
-    return max(256, count_tokens(json.dumps({"paragraphs": rows}, ensure_ascii=False)))
 
 
 def _writer_argument_contract(value):
@@ -666,10 +644,9 @@ def _normalize_sentence_item(sentence) -> dict | None:
 
 class WriterAgent(BaseAgent):
     # Writer is the only workflow Agent that may need a long-form response.
-    output_token_limit = settings.writer_output_tokens
     name = "writer"
     role = _SYSTEM
-    max_retries = 1
+    max_retries = 2
     # Narrative has already made the semantic decisions. Writer should spend
     # its generation budget on report prose rather than hidden reasoning.
     thinking = False
@@ -679,19 +656,6 @@ class WriterAgent(BaseAgent):
         if str(exc) == "MODEL_OUTPUT_TRUNCATED":
             return False
         return super().should_retry(exc)
-
-    def _generate_json_with_budget_retry(self, prompt: str, initial_limit: int) -> tuple[dict, int]:
-        try:
-            return self.generate_json(prompt, max_tokens=initial_limit), initial_limit
-        except Exception as exc:
-            if str(exc) != "MODEL_OUTPUT_TRUNCATED":
-                raise
-            retry_limit = writer_output_retry_limit(
-                initial_limit, stage_profile("writer").output_tokens,
-            )
-            if retry_limit <= initial_limit:
-                raise
-            return self.generate_json(prompt, max_tokens=retry_limit), retry_limit
 
     def write(self, plan: dict, facts: list[dict], inferences: list[dict],
               style_block: str, profile_id: int | None = None, cm=None,
@@ -1454,40 +1418,27 @@ class WriterAgent(BaseAgent):
             "composition_mode": "article_beats",
             "sections": {"事实": {"candidate_items": len(facts), "selected_items": len(fact_lines)}, "推断": {"candidate_items": len(inferences), "selected_items": len(inference_lines)}},
         })
-        output_limit = writer_output_token_limit(
-            target_words,
-            settings.writer_output_tokens,
-            settings.writer_output_tokens_per_word,
-            structured_output_overhead_tokens=_writer_json_overhead(
-                article_plan.get("paragraphs") or [], supplied_fact_ids, supplied_inference_ids,
-            ),
-        )
+        output_limit = stage_profile("writer").output_tokens
         try:
-            payload, effective_output_limit = self._generate_json_with_budget_retry(prompt, output_limit)
+            payload = self.generate_json(prompt)
         except Exception as exc:
             update_call_funnel(
                 self.last_call_id,
                 generation_mode="article_beats",
                 planned_target_words=target_words,
-                writer_output_limit_tokens=(
-                    writer_output_retry_limit(output_limit, settings.writer_output_tokens)
-                    if str(exc) == "MODEL_OUTPUT_TRUNCATED" else output_limit
-                ),
-                writer_initial_output_limit_tokens=output_limit,
+                writer_output_limit_tokens=output_limit,
                 candidate_fact_ids=candidate_fact_ids,
                 candidate_inference_ids=candidate_inference_ids,
                 supplied_fact_ids=supplied_fact_ids,
                 supplied_inference_ids=supplied_inference_ids,
                 generation_error=str(exc)[:300],
             )
-            return []
+            raise
         call_id = self.last_call_id
         update_call_funnel(
             call_id,
             planned_target_words=target_words,
-            writer_output_limit_tokens=effective_output_limit,
-            writer_initial_output_limit_tokens=output_limit,
-            writer_adaptive_retry=effective_output_limit > output_limit,
+            writer_output_limit_tokens=output_limit,
         )
         result: list[dict] = []
         transition_budget = 4 if facts or inferences else 0
@@ -2137,7 +2088,7 @@ class WriterAgent(BaseAgent):
                           generation_unit: dict | None = None) -> list[dict]:
         """单章:按 ChapterPlan 执行生成(不重新规划),过滤无依据句子。
 
-        返回 [{text, fact_ids, inference_ids, paragraph}];单章失败返回 []。
+        返回 [{text, fact_ids, inference_ids, paragraph}];模型调用失败直接上报。
         独立方法以便验证闭环对缺失/问题章节复用(补写)。
         """
         chapter_plan = chapter_plan or {}
@@ -2292,41 +2243,27 @@ class WriterAgent(BaseAgent):
                 },
             },
         })
-        output_limit = writer_output_token_limit(
-            unit_target_words,
-            settings.writer_output_tokens,
-            settings.writer_output_tokens_per_word,
-            structured_output_overhead_tokens=_writer_json_overhead(
-                (unit_plan or narrative_plan).get("paragraphs") or [],
-                supplied_fact_ids, supplied_inference_ids,
-            ),
-        )
+        output_limit = stage_profile("writer").output_tokens
         try:
-            payload, effective_output_limit = self._generate_json_with_budget_retry(prompt, output_limit)
+            payload = self.generate_json(prompt)
         except Exception as exc:
             update_call_funnel(
                 self.last_call_id,
                 generation_mode="chaptered",
                 planned_target_words=unit_target_words,
-                writer_output_limit_tokens=(
-                    writer_output_retry_limit(output_limit, settings.writer_output_tokens)
-                    if str(exc) == "MODEL_OUTPUT_TRUNCATED" else output_limit
-                ),
-                writer_initial_output_limit_tokens=output_limit,
+                writer_output_limit_tokens=output_limit,
                 candidate_fact_ids=candidate_fact_ids,
                 candidate_inference_ids=candidate_inference_ids,
                 supplied_fact_ids=supplied_fact_ids,
                 supplied_inference_ids=supplied_inference_ids,
                 generation_error=str(exc)[:300],
             )
-            return []  # 单章失败不中断,其余章节继续
+            raise
         call_id = self.last_call_id
         update_call_funnel(
             call_id,
             planned_target_words=unit_target_words,
-            writer_output_limit_tokens=effective_output_limit,
-            writer_initial_output_limit_tokens=output_limit,
-            writer_adaptive_retry=effective_output_limit > output_limit,
+            writer_output_limit_tokens=output_limit,
         )
         paragraphs = _coerce_paragraphs(payload)
         result: list[dict] = []

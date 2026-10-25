@@ -34,15 +34,30 @@ accidental corruption but are not a signed publisher provenance statement.
 
 ## Build the standard Windows installer
 
-After generating the bundle directory (do not pass the ZIP file), compile the
-single-file wizard installer with Inno Setup 7 x64:
+After generating the bundle directory (do not pass the ZIP file), download the
+official LZMA SDK 26.05 from https://www.7-zip.org/sdk.html and use its
+`bin/7zSD.sfx` and `bin/x64/7zr.exe` to build the single-file installer:
 
 ```powershell
-.\build-installer.ps1 -BundleDirectory C:\path\to\bundle -OutputDirectory C:\path\to\output
+.\build-installer.ps1 -BundleDirectory C:\path\to\bundle `
+  -OutputDirectory C:\path\to\output `
+  -SfxModule C:\path\to\lzma-sdk\bin\7zSD.sfx `
+  -Archiver C:\path\to\lzma-sdk\bin\x64\7zr.exe
 ```
 
-The Inno Setup publisher requests a commercial license for commercial and
-in-house business use. Decide licensing before distributing the installer.
+The LZMA SDK is public domain and free for commercial use. The script rejects
+an SFX of 4 GiB or larger because Windows may not execute it. The installer
+extracts to a temporary directory, opens a Windows installation dialog, then
+uses `install-native.ps1` for all system changes. The dialog presents progress
+and supports a custom program directory. It registers an uninstall entry in
+Windows Apps & Features; uninstall removes program files and services while
+retaining report data under ProgramData.
+
+Before a full build, `smoke-sfx.ps1 -SfxModule <path> -Archiver <path>` checks
+that the module executes the extracted PowerShell entry point. Allow enough
+free space for temporary extraction and the installed runtime (at least 20 GB
+on the relevant drives). This package is not code-signed; sign the finished
+EXE separately for production distribution.
 
 ## Install on an offline target
 
@@ -51,6 +66,12 @@ choose the install directory, and finish the wizard. Setup registers a normal
 Windows uninstall entry and Start menu shortcut. It checks the Windows build,
 payload hashes, ports, and service/task conflicts before initializing the
 private runtime and background processes.
+If an older installation has been uninstalled but its ProgramData directory
+remains, the wizard asks whether to reuse that data. Confirming creates a
+protected, timestamped sibling backup before reusing the database, accounts,
+reports, and configuration. Declining leaves the existing data untouched.
+An active older installation must be uninstalled first; Setup never replaces
+running services or silently overwrites data.
 
 The standalone bundle ZIP remains available for manual/offline diagnostics:
 Extract the ZIP to local NTFS storage and double-click `Install.cmd`. Accept
@@ -70,10 +91,11 @@ when the network permits it. The host firewall allows inbound connections to
 this port from any source; it does not expose the database or vector store.
 The application firewall rule is removed on uninstall.
 No system Python registration or PATH change is made. Persistent
-data survives reboots in `%ProgramData%\ReportAssemblyAgent`. The source
-bundle is for a **fresh installation**; it intentionally rejects an existing
-installation instead of overwriting a database. Back up and migrate existing
-data explicitly before replacing an older installation.
+data survives reboots in `%ProgramData%\ReportAssemblyAgent`. For a manual
+upgrade after uninstalling the old program, run `install-native.ps1 -ReuseData`
+from an elevated PowerShell session. The existing PostgreSQL major version and
+configured ports must match the bundle; otherwise installation stops without
+modifying the database. The backup is kept after successful installation.
 
 If startup fails, inspect `%ProgramData%\ReportAssemblyAgent\logs`. Do not
 delete the data directory to retry. Restore from a backup or diagnose the

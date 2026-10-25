@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 import re
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
@@ -48,39 +47,6 @@ def declared_report_minimum_words(budget: dict | None) -> int:
         return resolved
     # Read pre-contract historical plans without changing their semantics.
     return max(resolved, int(budget.get("min_words") or 0))
-
-
-def writer_output_token_limit(
-    target_words: int,
-    configured_max_tokens: int,
-    tokens_per_word: float = 1.45,
-    minimum_tokens: int = 512,
-    structured_output_overhead_tokens: int = 256,
-) -> int:
-    """Translate a unit's visible-word target into a calibrated output cap.
-
-    The configured stage cap remains authoritative. Untargeted legacy calls keep
-    that cap; targeted calls receive only the budget calibrated for their unit.
-    """
-    maximum = max(1, int(configured_max_tokens or 1))
-    target = max(0, int(target_words or 0))
-    if not target:
-        return maximum
-    ratio = max(0.1, float(tokens_per_word or 1.45))
-    requested = max(
-        int(minimum_tokens),
-        math.ceil(target * ratio) + max(0, int(structured_output_overhead_tokens)),
-    )
-    return min(maximum, requested)
-
-
-def writer_output_retry_limit(initial_tokens: int, configured_max_tokens: int) -> int:
-    """Return one larger, stage-bounded cap after a genuinely truncated output."""
-    maximum = max(1, int(configured_max_tokens or 1))
-    initial = min(maximum, max(1, int(initial_tokens or 1)))
-    if initial >= maximum:
-        return initial
-    return min(maximum, max(initial * 2, initial + 256))
 
 
 def writer_scale_prompt_hint(

@@ -5,7 +5,8 @@ param(
     [Parameter(Mandatory = $true)][string]$FfmpegArchive,
     [Parameter(Mandatory = $true)][string]$OutputDirectory,
     [switch]$CreateZip,
-    [Parameter(Mandatory = $true)][string]$LicenseBuildPython
+    [Parameter(Mandatory = $true)][string]$LicenseBuildPython,
+    [ValidateSet('msvc', 'mingw32')][string]$LicenseCompiler = 'msvc'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -54,7 +55,7 @@ $targetAbi = & $targetPython -c $abiCode
 if ($LASTEXITCODE -ne 0) { throw 'Cannot read target Python ABI' }
 $buildAbi = & $licensePython -c $abiCode
 if ($LASTEXITCODE -ne 0 -or $buildAbi -ne $targetAbi) { throw 'License build Python must match bundled Python version and architecture' }
-& $licensePython (Join-Path $repo 'tools\build_license_native.py') --output $app
+& $licensePython (Join-Path $repo 'tools\build_license_native.py') --output $app --compiler $LicenseCompiler
 if ($LASTEXITCODE -ne 0) { throw 'Native license build failed; install MSVC and tools/license-build-requirements.txt on build host' }
 $licenseDirectory = (Resolve-Path -LiteralPath (Join-Path $app 'app\licensing')).ProviderPath
 foreach ($name in @('_trust.pyx', 'trusted_keys.json', 'protocol.py', 'service.py', 'storage.py')) {
@@ -62,7 +63,8 @@ foreach ($name in @('_trust.pyx', 'trusted_keys.json', 'protocol.py', 'service.p
     if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
 }
 
-foreach ($name in @('install-native.ps1', 'run-component.ps1', 'uninstall-native.ps1', 'Install.cmd', 'README.md')) {
+foreach ($name in @('install-native.ps1', 'setup-native.ps1', 'run-component.ps1',
+    'uninstall-native.ps1', 'remove-native.ps1', 'Install.cmd', 'README.md')) {
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot $name) -Destination (Join-Path $output $name)
 }
 $hashes = @{}

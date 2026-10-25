@@ -510,7 +510,9 @@ def run_quality_check(report_id: int, plan_structure: list[str],
                     "note": str(item.get("note", "")),
                     "location_source": "model_stable_id" if sentence_ids else "model_scope",
                 })
-        except Exception:
+        except Exception as exc:
+            if str(exc).startswith(("MODEL_HTTP_", "MODEL_CONNECTION_NOT_CONFIGURED")):
+                raise
             logger.exception("LLM report quality check failed for report %s", report_id)
             issues.append({
                 "type": "QA_CHECK_INCOMPLETE",

@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from app.config import settings
 from app.model_connection import Connection
@@ -26,10 +26,41 @@ class RuntimeProfilesAndConflictTests(unittest.TestCase):
                 + settings.safety_margin_tokens
             )
             self.assertLessEqual(total, settings.model_context_window_tokens)
-        self.assertGreater(profiles["evidence"]["output_tokens"], profiles["conflict"]["output_tokens"])
+        self.assertEqual(profiles["evidence"]["output_tokens"], profiles["conflict"]["output_tokens"])
         self.assertEqual(profiles["writer"]["batch_policy"], "subsection")
         self.assertNotEqual(profiles["analysis"]["workload"], profiles["writer"]["workload"])
-        self.assertEqual(profiles["interaction"]["input_tokens"], settings.interactive_input_tokens)
+        self.assertEqual(profiles["interaction"]["input_tokens"], min(
+            settings.interactive_input_tokens,
+            profiles["interaction"]["physical_input_tokens"],
+        ))
+
+    def test_all_stages_share_45_55_usable_window_without_exceeding_service_output(self):
+        with patch("app.runtime_profiles.capacity", return_value=(49152, 32768)):
+            usable = 49152 - settings.prompt_overhead_tokens - settings.safety_margin_tokens
+            for profile in runtime_profile_manifest():
+                self.assertEqual(profile["output_tokens"], usable * 55 // 100)
+                self.assertLessEqual(profile["input_tokens"], usable * 45 // 100)
+        with patch("app.runtime_profiles.capacity", return_value=(18432, 4096)):
+            self.assertEqual(stage_profile("evidence").output_tokens, 4096)
+            self.assertLessEqual(
+                stage_profile("evidence").input_tokens + 4096
+                + settings.prompt_overhead_tokens + settings.safety_margin_tokens,
+                18432,
+            )
+
+    def test_final_plan_reaches_model_with_stage_output_budget(self):
+        from app.planning.planner import PlannerAgent
+
+        session = MagicMock()
+        session.execute.return_value.mappings.return_value.first.return_value = None
+        scope = MagicMock()
+        scope.__enter__.return_value = session
+        with patch("app.planning.planner.session_scope", return_value=scope), \
+             patch.object(PlannerAgent, "generate_json", side_effect=RuntimeError("MODEL_CALLED")) as generate, \
+             patch("app.planning.planner.update_call_funnel"):
+            with self.assertRaisesRegex(RuntimeError, "MODEL_CALLED"):
+                PlannerAgent().finalize_report_plan(1, "fact_id=1 example")
+        self.assertEqual(generate.call_args.kwargs["max_tokens"], stage_profile("final_planner").output_tokens)
 
     def test_evidence_split_preserves_complete_units(self):
         source = (

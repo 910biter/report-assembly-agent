@@ -6,6 +6,7 @@ from unittest.mock import patch
 from app.agents.base import BaseAgent
 from app.config import settings
 from app.model_connection import Connection
+from app.runtime_profiles import stage_profile
 from app.gateway import (
     OpenAICompatibleGateway,
     _completion_was_truncated,
@@ -143,18 +144,17 @@ class VllmGatewayTests(unittest.TestCase):
         )
         self.assertEqual(ranked[0][1].id, 2)
 
-    def test_graph_batches_preserve_all_facts_with_output_capacity_guard(self):
+    def test_graph_batches_preserve_all_facts_with_batch_guard(self):
         facts = [{"id": index, "content": f"fact-{index}"} for index in range(1, 121)]
-        with patch.object(settings, "graph_output_tokens", 4096):
-            batches = _fact_batches(facts)
+        batches = _fact_batches(facts)
         self.assertGreater(len(batches), 1)
         self.assertEqual([item["id"] for batch in batches for item in batch], list(range(1, 121)))
-        self.assertTrue(all(len(batch) <= 51 for batch in batches))
+        self.assertTrue(all(len(batch) <= settings.graph_facts_per_batch for batch in batches))
 
     def test_structured_agents_disable_unbounded_hidden_thinking_by_default(self):
         self.assertFalse(BaseAgent.thinking)
-        self.assertEqual(BaseAgent.output_token_limit, settings.structured_output_tokens)
-        self.assertEqual(WriterAgent.output_token_limit, settings.writer_output_tokens)
+        self.assertFalse(WriterAgent.thinking)
+        self.assertGreater(stage_profile("writer").output_tokens, settings.writer_output_tokens)
 
     def test_queue_propagates_caller_context(self):
         marker = contextvars.ContextVar("test_queue_marker", default="missing")

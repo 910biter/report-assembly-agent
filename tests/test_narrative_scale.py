@@ -1,7 +1,7 @@
 import json
 import unittest
 from contextlib import contextmanager
-from types import MethodType
+from types import MethodType, SimpleNamespace
 from unittest.mock import patch
 
 from app.context import ContextManager
@@ -25,8 +25,6 @@ from app.writing.scale_execution import (
     assess_chapter_output,
     assess_report_scale,
     measure_text_words,
-    writer_output_token_limit,
-    writer_output_retry_limit,
     writer_scale_prompt_hint,
     measure_report_body_words_by_section,
     report_minimum_words,
@@ -386,36 +384,26 @@ class NarrativeScaleTests(unittest.TestCase):
         self.assertEqual("final_plan", normalized["budget"]["target_source"])
         self.assertEqual(9000, normalized["budget"]["preliminary_target_words"])
 
-    def test_writer_output_tokens_scale_with_unit_target_and_respect_stage_cap(self):
-        self.assertEqual(981, writer_output_token_limit(500, 3072, 1.45))
-        self.assertEqual(512, writer_output_token_limit(174, 3072, 1.45))
-        self.assertEqual(823, writer_output_token_limit(391, 3072, 1.45))
-        self.assertEqual(3072, writer_output_token_limit(0, 3072, 1.45))
-        self.assertEqual(3072, writer_output_token_limit(3000, 3072, 1.45))
-
-    def test_writer_truncation_retry_escalates_once_without_repeating_same_cap(self):
-        writer = WriterAgent.__new__(WriterAgent)
-        caps = []
-
-        def fake_generate_json(_prompt, max_tokens=None, **_kwargs):
-            caps.append(max_tokens)
-            if len(caps) == 1:
-                raise RuntimeError("MODEL_OUTPUT_TRUNCATED")
-            return {"paragraphs": []}
-
-        writer.generate_json = fake_generate_json
-        payload, used_cap = writer._generate_json_with_budget_retry("prompt", 512)
-
-        self.assertEqual({"paragraphs": []}, payload)
-        self.assertEqual([512, 1024], caps)
-        self.assertEqual(1024, used_cap)
-        self.assertEqual(3072, writer_output_retry_limit(1600, 3072))
-        self.assertEqual(3072, writer_output_retry_limit(3072, 3072))
-
     def test_writer_does_not_retry_identical_truncated_request(self):
         writer = WriterAgent.__new__(WriterAgent)
         self.assertFalse(writer.should_retry(RuntimeError("MODEL_OUTPUT_TRUNCATED")))
         self.assertTrue(writer.should_retry(RuntimeError("temporary transport error")))
+
+    def test_writer_generation_failure_stops_current_chapter(self):
+        writer = WriterAgent.__new__(WriterAgent)
+        writer.last_call_id = "failed-writer-call"
+        writer.generate_json = lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("MODEL_HTTP_404"))
+        with patch("app.writing.writer.publish_context_audit"), patch("app.writing.writer.update_call_funnel"), \
+                patch("app.writing.writer._writer_prompt_token_budget", return_value=8000), \
+                patch("app.writing.writer.stage_profile", return_value=SimpleNamespace(output_tokens=2048)):
+            with self.assertRaisesRegex(RuntimeError, "MODEL_HTTP_404"):
+                writer._generate_chapter_pass(
+                    "Chapter", 1, 1, ["Chapter"],
+                    [{"id": 1, "content": "可核验事实"}], [], "",
+                    {"title": "Report", "budget": {"target_words": 100}}, {}, {1}, set(),
+                    chapter_plan={"title": "Chapter", "target_words": 100},
+                    generation_unit={"target_words": 100, "plan": {"fact_ids": [1]}},
+                )
 
     def test_writer_scale_hint_keeps_report_bounds_and_nested_allocations_distinct(self):
         hint = writer_scale_prompt_hint(
@@ -538,7 +526,9 @@ class NarrativeScaleTests(unittest.TestCase):
             }]}]}
 
         writer.generate_json = fake_generate_json
-        with patch("app.writing.writer.publish_context_audit"), patch("app.writing.writer.update_call_funnel"):
+        with patch("app.writing.writer.publish_context_audit"), patch("app.writing.writer.update_call_funnel"), \
+                patch("app.writing.writer._writer_prompt_token_budget", return_value=8000), \
+                patch("app.writing.writer.stage_profile", return_value=SimpleNamespace(output_tokens=3072)):
             writer._generate_chapter_pass(
                 "Chapter", 1, 1, ["Chapter"],
                 [{"id": 1, "content": "材料明确记载了这一事实"}], [], "",
@@ -553,7 +543,7 @@ class NarrativeScaleTests(unittest.TestCase):
                 },
             )
 
-        self.assertEqual(981, captured["max_tokens"])
+        self.assertIsNone(captured["max_tokens"])
         self.assertIn("全文目标约 3000 字", captured["prompt"])
         self.assertIn("全文允许范围 2700–3300 字", captured["prompt"])
         self.assertIn("本章分配约 900 字", captured["prompt"])

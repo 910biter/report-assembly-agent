@@ -88,9 +88,8 @@ def _estimate_tokens(text: str) -> int:
 
 
 def _evidence_batch_budget() -> int:
-    """单批可用 tokens = 模型窗口 - 输出预留 - 固定 prompt 开销 - 安全余量。
-    额外再留 20% 余量(A 辅):防 token 估算偏差与输出抖动,确保模型有空间收尾输出完整 JSON。"""
-    return max(1024, int(stage_profile("evidence").input_tokens * 0.8))
+    """Use the shared input budget; overhead and safety were reserved upstream."""
+    return stage_profile("evidence").input_tokens
 
 
 def _dynamic_cutoff(scores: list[float]) -> int:

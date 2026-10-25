@@ -18,25 +18,70 @@ from app.gateway import (
 from app.llm_queue import submit_llm_call
 from app.llm_scheduler import invoke
 from app.token_monitor import log_llm_call, new_call_id
-from app.context_budget import audit_plain_prompt, consume_context_audit, count_tokens
+from app.context_budget import (
+    audit_plain_prompt, build_prompt_from_sections, consume_context_audit,
+    consume_context_pack, count_tokens,
+)
 
 
-def _validate_request_capacity(prompt: str, system: str, output_tokens: int) -> dict:
-    from app.model_connection import capacity, load_connection
-    window, maximum_output = capacity()
-    incoming = count_tokens(system) + count_tokens(prompt)
-    # The profile's overhead already reserves the system prompt. Do not charge
-    # it twice; retain any unused overhead for chat framing and safety.
-    reserve = max(0, int(settings.prompt_overhead_tokens) - count_tokens(system)) + int(settings.safety_margin_tokens)
-    try:
-        uses_vllm = load_connection().service_kind == "vllm"
-    except ValueError:
-        uses_vllm = False
-    # vLLM validates the fully serialized request, including chat framing and tools.
-    if output_tokens > maximum_output or (not uses_vllm and incoming + output_tokens + reserve > window):
-        raise ValueError("MODEL_INPUT_OVER_BUDGET")
-    return {"physical_window_tokens": window, "system_and_user_tokens": incoming,
-            "request_reserve_tokens": reserve, "effective_output_ceiling": output_tokens}
+def _validate_request_capacity(prompt: str, system: str, output_tokens: int,
+                               thinking: bool | None = None) -> dict:
+    from app.model_connection import load_connection
+    from app.vllm_capacity import verify_request
+
+    connection = load_connection()
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt})
+    payload = {
+        "model": connection.model_name,
+        "messages": messages,
+        connection.output_parameter: output_tokens,
+        **connection.extra_body(thinking),
+    }
+    result = verify_request(connection, payload, safety_tokens=int(settings.safety_margin_tokens))
+    return {
+        "physical_window_tokens": result["effective_context_tokens"],
+        "system_and_user_tokens": result["request_input_tokens"],
+        "request_reserve_tokens": int(settings.safety_margin_tokens),
+        "effective_output_ceiling": output_tokens,
+        "request_count_method": result["request_count_method"],
+    }
+
+
+def _prepare_prompt(prompt: str, system: str, output_tokens: int,
+                    stage: str, thinking: bool | None) -> tuple[str, dict]:
+    audit = consume_context_audit()
+    packed = consume_context_pack(prompt)
+    if not audit:
+        audit = audit_plain_prompt(stage, prompt, stage_profile(stage).input_tokens)
+        consume_context_audit()
+    repacks = 0
+    while True:
+        try:
+            capacity_audit = _validate_request_capacity(prompt, system, output_tokens, thinking)
+            break
+        except ValueError as exc:
+            if str(exc) != "MODEL_INPUT_OVER_BUDGET" or stage != "analysis" or not packed or repacks >= 12:
+                raise
+            original_prompt, packed_stage, sections, budget, separator = packed
+            # Keep the output reservation intact. Repack complete records instead
+            # of trimming a serialized request or dropping required sections.
+            next_budget = max(0, budget - max(1, budget // 12))
+            if next_budget == budget:
+                raise
+            prompt, audit = build_prompt_from_sections(packed_stage, sections, next_budget, separator)
+            consume_context_audit()
+            packed = consume_context_pack(prompt)
+            if audit.get("required_missing_items"):
+                raise ValueError("MODEL_REQUIRED_CONTEXT_NOT_FIT") from exc
+            repacks += 1
+    audit["final_user_prompt_tokens"] = count_tokens(prompt)
+    audit["estimated_request_tokens"] = capacity_audit["system_and_user_tokens"]
+    audit["request_repack_count"] = repacks
+    audit.update(capacity_audit)
+    return prompt, audit
 
 
 class BaseAgent:
@@ -48,8 +93,8 @@ class BaseAgent:
     # can consume the output budget before the JSON result is produced.
     thinking: bool | None = False
     temperature: float | None = None
-    output_token_limit: int | None = settings.structured_output_tokens
     last_call_id = ""
+    last_sent_prompt = ""
 
     def should_retry(self, exc: Exception) -> bool:
         """Return whether retrying the same request can reasonably recover."""
@@ -57,21 +102,16 @@ class BaseAgent:
         code = message.split(":", 1)[0]
         return code not in {
             "MODEL_CONNECTION_NOT_CONFIGURED", "MODEL_HTTP_400", "MODEL_HTTP_401",
-            "MODEL_HTTP_403", "MODEL_HTTP_404", "MODEL_HTTP_405", "MODEL_HTTP_413",
+            "MODEL_HTTP_402", "MODEL_HTTP_403", "MODEL_HTTP_405", "MODEL_HTTP_413",
             "MODEL_HTTP_422",
             "MODEL_CONTEXT_EXCEEDED", "MODEL_INPUT_OVER_BUDGET",
         }
 
     def generate(self, prompt: str, system: str | None = None) -> str:
         output_tokens = stage_profile(self.name).output_tokens
-        audit = consume_context_audit()
-        capacity_audit = _validate_request_capacity(prompt, system or self.role, output_tokens)
-        if not audit:
-            audit_plain_prompt(self.name, prompt, stage_profile(self.name).input_tokens)
-            audit = consume_context_audit()
-        audit["final_user_prompt_tokens"] = count_tokens(prompt)
-        audit["estimated_request_tokens"] = count_tokens(f"{system or self.role}\n{prompt}")
-        audit.update(capacity_audit)
+        self.last_sent_prompt = ""
+        prompt, audit = _prepare_prompt(prompt, system or self.role, output_tokens, self.name, None)
+        self.last_sent_prompt = prompt
         generation_options = {
             "system": system or self.role,
             "max_tokens": output_tokens,
@@ -87,15 +127,11 @@ class BaseAgent:
 
     def generate_json(self, prompt: str, system: str | None = None,
                       max_tokens: int | None = None) -> dict:
-        output_tokens = int(max_tokens or stage_profile(self.name).output_tokens)
-        audit = consume_context_audit()
-        capacity_audit = _validate_request_capacity(prompt, system or self.role, output_tokens)
-        if not audit:
-            audit_plain_prompt(self.name, prompt, stage_profile(self.name).input_tokens)
-            audit = consume_context_audit()
-        audit["final_user_prompt_tokens"] = count_tokens(prompt)
-        audit["estimated_request_tokens"] = count_tokens(f"{system or self.role}\n{prompt}")
-        audit.update(capacity_audit)
+        stage_ceiling = stage_profile(self.name).output_tokens
+        output_tokens = min(int(max_tokens or stage_ceiling), stage_ceiling)
+        self.last_sent_prompt = ""
+        prompt, audit = _prepare_prompt(prompt, system or self.role, output_tokens, self.name, self.thinking)
+        self.last_sent_prompt = prompt
         generation_options = {
             "system": system or self.role,
             "think": self.thinking,

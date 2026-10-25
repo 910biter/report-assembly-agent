@@ -676,7 +676,6 @@ def _split_batch_meta(batch_meta: dict, part: str, **split_fields) -> dict:
 
 
 class EvidenceAgent(BaseAgent):
-    output_token_limit = settings.evidence_output_tokens
     name = "evidence"
     role = _SYSTEM
 
@@ -1037,6 +1036,8 @@ class EvidenceAgent(BaseAgent):
                 promoted_facts=0,
                 extraction_error=str(exc)[:300],
             )
+            if str(exc).startswith(("MODEL_HTTP_", "MODEL_CONNECTION_NOT_CONFIGURED")):
+                raise
             if str(exc) in {"MODEL_OUTPUT_TRUNCATED", "MODEL_INPUT_OVER_BUDGET", "MODEL_CONTEXT_EXCEEDED"}:
                 split_parts = _split_unit_blocks(
                     material_text, max(1, count_tokens(material_text) // 2),
@@ -1386,6 +1387,8 @@ class EvidenceAgent(BaseAgent):
             return [need_by_id[need_id] for need_id in uncovered_ids]
         except Exception as exc:
             if str(exc) in {"TASK_PAUSED", "EXECUTION_LOCK_LOST"}:
+                raise
+            if str(exc).startswith(("MODEL_HTTP_", "MODEL_CONNECTION_NOT_CONFIGURED")):
                 raise
             self.coverage_audit_status = {
                 "status": "unknown", "error": str(exc)[:300],

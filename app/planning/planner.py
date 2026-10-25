@@ -18,7 +18,7 @@ from app.models import ReportPlan
 from app.document_shape import normalize_document_shape, normalize_composition_mode
 from app.planning.scale import normalize_chapter_budgets, reconcile_scale_budget
 from app.planning.structure import normalize_contract
-from app.runtime_profiles import stage_input_budget_tokens
+from app.runtime_profiles import stage_input_budget_tokens, stage_profile
 from app.observability.core_chain import collect_assigned_ids, extract_tagged_ids
 from app.token_monitor import update_call_funnel
 from app.planning.evidence_context import bind_plan_evidence
@@ -257,7 +257,9 @@ class PlannerAgent(BaseAgent):
                 candidate_titles = [str(item.get("title") or "") for item in candidate if isinstance(item, dict)]
                 if candidate_titles == affected_titles:
                     changed_chapters = [dict(item) for item in candidate]
-            except Exception:
+            except Exception as exc:
+                if str(exc).startswith(("MODEL_HTTP_", "MODEL_CONNECTION_NOT_CONFIGURED")):
+                    raise
                 # The approved structure remains executable even when the compact
                 # semantic refinement fails; Narrative Plan will refine each chapter.
                 pass
@@ -353,7 +355,7 @@ class PlannerAgent(BaseAgent):
             payload = self.generate_json(
                 prompt,
                 system=_FINAL_SYSTEM,
-                max_tokens=settings.final_planner_output_tokens,
+                max_tokens=stage_profile("final_planner").output_tokens,
             )
         except Exception as exc:
             update_call_funnel(

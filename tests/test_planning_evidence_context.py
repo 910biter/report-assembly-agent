@@ -3,7 +3,6 @@ from app.planning.evidence_context import bind_plan_evidence, fact_line, inferen
 from app.planning.narrative import _sanitize_document_plan
 from app.writing.writer import _focused_unit_evidence, _pack_writer_evidence
 from app.planning.narrative import NarrativeAgent
-from app.writing.writer import _writer_json_overhead
 from app.writing.writer import _writer_argument_contract
 from app.writing.scale_execution import writer_scale_prompt_hint
 from app.memory.style_profile import select_exemplars
@@ -84,12 +83,6 @@ def test_uncertain_judgment_does_not_relax_an_achievable_user_scale():
     assert '不能仅因存在未知项而自行放宽用户下限' in hint
     assert '最低完成要求约 600 字' in hint
     assert '允许低于' not in hint
-
-
-def test_json_budget_accounts_for_citation_density_without_changing_stage_cap():
-    sparse = _writer_json_overhead([{'fact_ids': [1]}])
-    dense = _writer_json_overhead([{'fact_ids': list(range(1, 40)), 'inference_ids': list(range(100, 110))}])
-    assert dense > sparse
 
 
 def test_document_narrative_receives_style_before_designing_paragraphs(monkeypatch):

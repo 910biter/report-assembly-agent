@@ -289,6 +289,7 @@ class AnalysisAgent(BaseAgent):
             )
             raise
         call_id = self.last_call_id
+        visible_ids = _visible_fact_ids(self.last_sent_prompt or prompt, facts)
         inferences, external, parse_audit = self._parse_payload(payload, visible_ids, call_id, facts)
         referenced_ids = sorted({fact_id for item in inferences for fact_id in item.based_fact_ids})
         update_call_funnel(
@@ -355,6 +356,9 @@ class AnalysisAgent(BaseAgent):
             )
             raise
         call_id = self.last_call_id
+        sent_prompt = self.last_sent_prompt or prompt
+        visible_inference_ids, visible_fact_ids = _visible_local_inference_refs(sent_prompt, local_inferences)
+        visible_ids = visible_fact_ids & _visible_fact_ids(sent_prompt, referenced_facts) & task_fact_ids
         inferences, external, parse_audit = self._parse_payload(payload, visible_ids, call_id, facts)
         referenced_ids = sorted({fact_id for item in inferences for fact_id in item.based_fact_ids})
         update_call_funnel(
