@@ -21,12 +21,14 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 }
 
 [Windows.Forms.Application]::EnableVisualStyles()
-$bg = [Drawing.Color]::FromArgb(17, 19, 25)
-$surface = [Drawing.Color]::FromArgb(30, 35, 46)
-$border = [Drawing.Color]::FromArgb(70, 80, 100)
-$primary = [Drawing.Color]::FromArgb(232, 237, 247)
-$muted = [Drawing.Color]::FromArgb(185, 196, 213)
-$accent = [Drawing.Color]::FromArgb(75, 98, 189)
+$bg = [Drawing.Color]::FromArgb(16, 18, 23)
+$surface = [Drawing.Color]::FromArgb(30, 34, 42)
+$raised = [Drawing.Color]::FromArgb(37, 43, 53)
+$border = [Drawing.Color]::FromArgb(77, 87, 103)
+$primary = [Drawing.Color]::FromArgb(244, 247, 251)
+$muted = [Drawing.Color]::FromArgb(194, 204, 218)
+$accent = [Drawing.Color]::FromArgb(82, 111, 183)
+$accentHover = [Drawing.Color]::FromArgb(99, 130, 204)
 $form = New-Object Windows.Forms.Form
 $form.Text = 'AI 报告整编工作台  |  安装'
 $form.ClientSize = New-Object Drawing.Size(680, 428)
@@ -85,7 +87,7 @@ $browse.Location = New-Object Drawing.Point(530, 190)
 $browse.Size = New-Object Drawing.Size(118, 34)
 $browse.FlatStyle = 'Flat'
 $browse.FlatAppearance.BorderColor = $border
-$browse.FlatAppearance.MouseOverBackColor = [Drawing.Color]::FromArgb(43, 50, 65)
+$browse.FlatAppearance.MouseOverBackColor = $raised
 $browse.BackColor = $surface
 $browse.ForeColor = $primary
 $browse.Add_Click({
@@ -111,39 +113,43 @@ $form.Controls.Add($divider)
 $statusPanel = New-Object Windows.Forms.Panel
 $statusPanel.Location = New-Object Drawing.Point(24, 284)
 $statusPanel.Size = New-Object Drawing.Size(632, 120)
-$statusPanel.BackColor = $surface
+$statusPanel.BackColor = $raised
 $statusPanel.BorderStyle = 'FixedSingle'
 $form.Controls.Add($statusPanel)
 
 $status = New-Object Windows.Forms.Label
 $status.Text = '准备就绪'
-$status.Location = New-Object Drawing.Point(32, 298)
+$status.Location = New-Object Drawing.Point(18, 14)
 $status.Size = New-Object Drawing.Size(490, 26)
 $status.ForeColor = $primary
 $status.Font = New-Object Drawing.Font('Microsoft YaHei UI', 10, [Drawing.FontStyle]::Bold)
-$form.Controls.Add($status)
+$statusPanel.Controls.Add($status)
 
 $statusDetail = New-Object Windows.Forms.Label
 $statusDetail.Text = '选择安装位置后开始。'
-$statusDetail.Location = New-Object Drawing.Point(32, 329)
+$statusDetail.Location = New-Object Drawing.Point(18, 45)
 $statusDetail.Size = New-Object Drawing.Size(600, 24)
 $statusDetail.ForeColor = $muted
-$form.Controls.Add($statusDetail)
+$statusPanel.Controls.Add($statusDetail)
 
-$progress = New-Object Windows.Forms.ProgressBar
-$progress.Location = New-Object Drawing.Point(32, 369)
-$progress.Size = New-Object Drawing.Size(354, 12)
-$progress.Maximum = 10
-$progress.Style = 'Continuous'
-$form.Controls.Add($progress)
+$progressTrack = New-Object Windows.Forms.Panel
+$progressTrack.Location = New-Object Drawing.Point(18, 84)
+$progressTrack.Size = New-Object Drawing.Size(306, 10)
+$progressTrack.BackColor = $border
+$statusPanel.Controls.Add($progressTrack)
+$progressFill = New-Object Windows.Forms.Panel
+$progressFill.Location = New-Object Drawing.Point(0, 0)
+$progressFill.Size = New-Object Drawing.Size(0, 10)
+$progressFill.BackColor = $accentHover
+$progressTrack.Controls.Add($progressFill)
 
 $viewLog = New-Object Windows.Forms.Button
 $viewLog.Text = '查看日志'
-$viewLog.Location = New-Object Drawing.Point(400, 355)
+$viewLog.Location = New-Object Drawing.Point(344, 70)
 $viewLog.Size = New-Object Drawing.Size(118, 36)
 $viewLog.FlatStyle = 'Flat'
 $viewLog.FlatAppearance.BorderColor = $border
-$viewLog.FlatAppearance.MouseOverBackColor = [Drawing.Color]::FromArgb(43, 50, 65)
+$viewLog.FlatAppearance.MouseOverBackColor = $raised
 $viewLog.BackColor = $surface
 $viewLog.ForeColor = $primary
 $viewLog.Visible = $false
@@ -152,19 +158,19 @@ $viewLog.Add_Click({
         Start-Process -FilePath 'notepad.exe' -ArgumentList ('"' + $script:stdout + '"') | Out-Null
     }
 })
-$form.Controls.Add($viewLog)
+$statusPanel.Controls.Add($viewLog)
 
 $install = New-Object Windows.Forms.Button
 $install.Text = '开始安装'
-$install.Location = New-Object Drawing.Point(530, 355)
+$install.Location = New-Object Drawing.Point(476, 70)
 $install.Size = New-Object Drawing.Size(118, 36)
 $install.FlatStyle = 'Flat'
 $install.FlatAppearance.BorderSize = 0
-$install.FlatAppearance.MouseOverBackColor = [Drawing.Color]::FromArgb(91, 114, 204)
+$install.FlatAppearance.MouseOverBackColor = $accentHover
 $install.BackColor = $accent
 $install.ForeColor = [Drawing.Color]::White
 $install.Font = New-Object Drawing.Font('Microsoft YaHei UI', 9.5, [Drawing.FontStyle]::Bold)
-$form.Controls.Add($install)
+$statusPanel.Controls.Add($install)
 $form.AcceptButton = $install
 
 $script:process = $null
@@ -191,7 +197,7 @@ $timer.Add_Tick({
                 if ($step -ge 0 -and $step -lt $stages.Count) {
                     $script:currentStep = $step
                     $script:currentDetail = '正在处理，请保持窗口开启'
-                    $progress.Value = [Math]::Min($step, 9)
+                    $progressFill.Width = [int][Math]::Round($progressTrack.Width * [Math]::Min($step, 9) / 10)
                     $status.Text = $stages[$step]
                 }
             } elseif ($line -match '^IRA_FILE\|(.+)$' -and $script:currentStep -eq 0) {
@@ -228,7 +234,7 @@ $timer.Add_Tick({
         $script:exitCode = if ($healthy) { 0 } else { 1 }
     }
     if ($script:exitCode -eq 0) {
-        $progress.Value = 10
+        $progressFill.Width = $progressTrack.Width
         $status.Text = '安装完成，服务已启动。'
         $statusDetail.Text = '现在可以打开工作台。已有数据保持在原位置。'
         $statusDetail.ForeColor = $muted
