@@ -1,8 +1,44 @@
 import inspect
+from contextlib import contextmanager
+from types import SimpleNamespace
 from unittest.mock import patch
+
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import Session
 
 from app.graph.service import GraphBuildResult
 from app.workflow.controller import WorkflowController
+
+
+def test_incremental_evidence_recovers_only_current_run_facts():
+    engine = create_engine("sqlite:///:memory:")
+    with engine.begin() as connection:
+        connection.execute(text("CREATE TABLE facts (id INTEGER PRIMARY KEY, task_id TEXT, introduced_run_id TEXT)"))
+        connection.execute(text("INSERT INTO facts VALUES (1, 'task', 'old'), (2, 'task', 'new'), (9, 'other', 'new')"))
+
+    @contextmanager
+    def session_scope():
+        with Session(engine) as session:
+            yield session
+
+    controller = object.__new__(WorkflowController)
+    controller.task_id = "task"
+    controller.task = {"run_id": "new", "incremental_update": True,
+                       "incremental_added_material_ids": [5], "fact_ids": [1],
+                       "incremental_new_fact_ids": []}
+    controller._update = lambda **fields: controller.task.update(fields)
+    controller._plan = lambda: {"evidence_needs": [], "dimensions": []}
+    controller._load_units = lambda: ({5: []}, {5: "new.pdf"})
+    agent = SimpleNamespace(extract_facts=lambda *a, **kw: [SimpleNamespace(id=3, content="new")],
+                            last_extraction_status={"status": "completed"})
+    with patch("app.workflow.controller.session_scope", session_scope), \
+         patch("app.workflow.controller.evidence_agent", agent), \
+         patch("app.context.ContextManager"), \
+         patch("app.workflow.controller.load_evidence_quotes", return_value=[]):
+        controller.extract_evidence()
+
+    assert controller.task["fact_ids"] == [1, 2, 3]
+    assert controller.task["incremental_new_fact_ids"] == [2, 3]
 
 
 def test_report_completion_does_not_schedule_background_graph_build():

@@ -25,7 +25,7 @@ from app.context_budget import (
 
 
 def _validate_request_capacity(prompt: str, system: str, output_tokens: int,
-                               thinking: bool | None = None) -> dict:
+                               thinking: bool | None = None, *, adaptive_writer: bool = False) -> dict:
     from app.model_connection import load_connection
     from app.vllm_capacity import verify_request
 
@@ -40,12 +40,15 @@ def _validate_request_capacity(prompt: str, system: str, output_tokens: int,
         connection.output_parameter: output_tokens,
         **connection.extra_body(thinking),
     }
-    result = verify_request(connection, payload, safety_tokens=int(settings.safety_margin_tokens))
+    kwargs = {"safety_tokens": int(settings.safety_margin_tokens)}
+    if adaptive_writer:
+        kwargs["adaptive_writer"] = True
+    result = verify_request(connection, payload, **kwargs)
     return {
         "physical_window_tokens": result["effective_context_tokens"],
         "system_and_user_tokens": result["request_input_tokens"],
         "request_reserve_tokens": int(settings.safety_margin_tokens),
-        "effective_output_ceiling": output_tokens,
+        "effective_output_ceiling": result["requested_output_tokens"],
         "request_count_method": result["request_count_method"],
     }
 
@@ -60,7 +63,10 @@ def _prepare_prompt(prompt: str, system: str, output_tokens: int,
     repacks = 0
     while True:
         try:
-            capacity_audit = _validate_request_capacity(prompt, system, output_tokens, thinking)
+            if stage == "writer":
+                capacity_audit = _validate_request_capacity(prompt, system, output_tokens, thinking, adaptive_writer=True)
+            else:
+                capacity_audit = _validate_request_capacity(prompt, system, output_tokens, thinking)
             break
         except ValueError as exc:
             if str(exc) != "MODEL_INPUT_OVER_BUDGET" or stage != "analysis" or not packed or repacks >= 12:
@@ -131,6 +137,7 @@ class BaseAgent:
         output_tokens = min(int(max_tokens or stage_ceiling), stage_ceiling)
         self.last_sent_prompt = ""
         prompt, audit = _prepare_prompt(prompt, system or self.role, output_tokens, self.name, self.thinking)
+        output_tokens = audit["effective_output_ceiling"]
         self.last_sent_prompt = prompt
         generation_options = {
             "system": system or self.role,

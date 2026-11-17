@@ -4,6 +4,8 @@ from unittest.mock import patch
 
 from pydantic_ai import ModelRetry
 from pydantic_ai.models.test import TestModel
+from pydantic_ai.models.function import FunctionModel
+from pydantic_ai.messages import ModelResponse, ToolCallPart, TextPart
 
 from app.control_agent import AgentToolCall, ArtifactFocus, TaskAgentContext
 from app.interaction import _focus_locator
@@ -69,6 +71,24 @@ class TaskCollaborationAgentTests(unittest.TestCase):
             result = agent.run_sync("请读取并说明当前目录", deps=deps)
         self.assertEqual(result.output, "当前目录共三章。")
         self.assertEqual(deps.tool_trace, ["get_final_plan"])
+
+    def test_split_tool_preserves_other_chapters_in_proposal(self):
+        titles = ["政策", "技术", "应用", "治理", "结论"]
+        deps = TaskAgentDeps(context=self.context(), user_message="拆分第五章，其余不变")
+        calls = []
+        def respond(messages, info):
+            if not calls:
+                calls.append(True)
+                return ModelResponse(parts=[ToolCallPart("propose_split_chapter", {"chapter_reference": "第五章", "replacement_titles": ["制约", "展望"]})])
+            return ModelResponse(parts=[TextPart("请确认")])
+        with patch("app.task_collaboration_agent.build_collaboration_model", return_value=TestModel()):
+            agent = _build_agent()
+        with (patch("app.task_collaboration_agent.execute_read_tool", return_value={"titles": titles}),
+              patch("app.control_agent._load_plan", return_value={"titles": titles}),
+              agent.override(model=FunctionModel(respond))):
+            agent.run_sync("拆分第五章", deps=deps)
+        self.assertEqual(deps.pending_action.arguments["new_structure"], [*titles[:4], "制约", "展望"])
+        self.assertEqual(deps.pending_action.arguments["preserved_titles"], titles[:4])
 
     def test_agent_can_start_from_task_map(self):
         deps = TaskAgentDeps(context=self.context(), user_message="这些材料主要讲什么？")

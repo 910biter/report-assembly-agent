@@ -26,12 +26,25 @@ def _report_fingerprint(session, report_id: int) -> str:
         select(ORMSentence).where(ORMSentence.c.report_id == report_id)
         .order_by(ORMSentence.c.id)
     ).mappings().all()
+    sentence_ids = [int(row["id"]) for row in sentences]
+    fact_refs = session.execute(
+        select(ORMSentenceFact.c.sentence_id, ORMSentenceFact.c.fact_id)
+        .where(ORMSentenceFact.c.sentence_id.in_(sentence_ids))
+        .order_by(ORMSentenceFact.c.sentence_id, ORMSentenceFact.c.fact_id)
+    ).all() if sentence_ids else []
+    inference_refs = session.execute(
+        select(ORMSentenceInference.c.sentence_id, ORMSentenceInference.c.inference_id)
+        .where(ORMSentenceInference.c.sentence_id.in_(sentence_ids))
+        .order_by(ORMSentenceInference.c.sentence_id, ORMSentenceInference.c.inference_id)
+    ).all() if sentence_ids else []
     state = {
         "report": {key: report[key] for key in ("plan_id", "title", "style_profile_id", "status")},
         "sentences": [
             {key: row[key] for key in ORMSentence.c.keys() if key != "report_id"}
             for row in sentences
         ],
+        "fact_refs": [tuple(row) for row in fact_refs],
+        "inference_refs": [tuple(row) for row in inference_refs],
     }
     return hashlib.sha256(json.dumps(state, ensure_ascii=False, sort_keys=True, default=str).encode()).hexdigest()
 

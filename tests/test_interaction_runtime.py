@@ -102,6 +102,16 @@ class InteractionRuntimeTests(unittest.TestCase):
             "task-a", plan_id=7, plan_title="新目录", final_plan_frozen=True,
         )
 
+    def test_directory_proposal_passes_snapshot_version_to_planner(self):
+        row = {"task_id": "task-a", "report_id": None, "artifact_type": "final_plan",
+               "before_json": '{"plan_version":3}',
+               "after_json": '{"required_structure":["甲","乙"]}'}
+        with (patch("app.interaction.short_term.load_task", return_value={"directory_review_pending": True, "plan_id": 7}),
+              patch("app.workflow.controller.planner.revise_final_plan_structure", return_value=SimpleNamespace(title="新目录")) as revise,
+              patch("app.interaction.short_term.update_task")):
+            self.assertTrue(_apply_pre_report_checkpoint_proposal(row))
+        self.assertEqual(revise.call_args.kwargs["expected_plan_version"], 3)
+
     def test_section_title_proposals_are_deferred_to_revision_run(self):
         row = {
             "artifact_type": "section_title",

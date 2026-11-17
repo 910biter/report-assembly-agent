@@ -70,9 +70,37 @@ def _article_scale_completion(execution_actual_words: int, report_actual_words: 
     return actual, round(actual / target, 4) if target else None
 
 
+def _evidence_extraction_incomplete(status: dict) -> bool:
+    if status.get("unprocessed_segments"):
+        return True
+    if status.get("status") in {"failed", "running"}:
+        return True
+    return status.get("status") == "partial" and status.get("processing_status") != "completed"
+
+
+def _unresolved_conflict_fact_ids(conflicts: list[dict]) -> set[int]:
+    return {
+        int(entry["fact_id"])
+        for conflict in conflicts if conflict.get("status", "unresolved") == "unresolved"
+        for entry in conflict.get("entries") or []
+        if isinstance(entry, dict) and str(entry.get("fact_id") or "").isdigit()
+        and int(entry["fact_id"]) > 0
+    }
+
+
+def _resumed_conflict_status(previous: dict) -> dict:
+    return dict(previous) if previous.get("status") == "incomplete" else {
+        "status": "completed", "source": "checkpoint",
+    }
+
+
 def _evidence_checkpoint_complete(task: dict, expected_signature: str) -> bool:
     """Progress counters are display data; only the completed input signature proves reuse is safe."""
-    return bool(task.get("fact_ids")) and signature_matches(task, "evidence", expected_signature)
+    status = task.get("evidence_status") or {}
+    if _evidence_extraction_incomplete(status):
+        return False
+    completed_empty = status.get("status") == "completed" or status.get("processing_status") == "completed"
+    return (bool(task.get("fact_ids")) or completed_empty) and signature_matches(task, "evidence", expected_signature)
 
 
 _MATERIAL_ANALYSIS_PROMPT = """你是材料分析师。只依据本次可见的一份材料，概括其主题、结构、陈述性质和可支持范围。只输出 JSON:
@@ -446,6 +474,8 @@ class WorkflowController:
         self._control_boundary()
         evidence_signature = stage_input_signature("evidence", self.task, plan=self._plan())
         if self._resume_skips(Stage.EVIDENCE):
+            if _evidence_extraction_incomplete(self.task.get("evidence_status") or {}):
+                raise RuntimeError("EVIDENCE_EXTRACTION_INCOMPLETE")
             self._ensure_context_manager()
             facts = self._facts()
             self._update(
@@ -479,6 +509,11 @@ class WorkflowController:
             with self._token_context("evidence"):
                 facts = self.extract_evidence()
             progress = dict(self.task.get("evidence_progress") or {})
+            extraction = self.task.get("evidence_status") or {}
+            if _evidence_extraction_incomplete(extraction):
+                progress.update(status="failed", fact_count=len(facts))
+                self._update(evidence_progress=progress)
+                raise RuntimeError("EVIDENCE_EXTRACTION_INCOMPLETE")
             progress.update(status="completed", fact_count=len(facts))
             self._update(evidence_input_signature=evidence_signature, evidence_progress=progress)
         self._control_boundary()
@@ -536,7 +571,7 @@ class WorkflowController:
             self._update(
                 stage=str(Stage.CONFLICT),
                 resume={"stage": "conflict", "status": "reused_after_checkpoint"},
-                conflict_status={"status": "completed", "source": "checkpoint"},
+                conflict_status=_resumed_conflict_status(self.task.get("conflict_status") or {}),
             )
         elif self.task.get("conflict_ids") and signature_matches(
             self.task, "conflict", conflict_signature,
@@ -1311,14 +1346,15 @@ class WorkflowController:
         from app.agents.base import BaseAgent
 
         units_by_material, filenames = self._load_units()
-        if not units_by_material:
+        if not any(str(unit.content or "").strip()
+                   for units in units_by_material.values() for unit in units):
             self._update(material_analysis_status={
                 "status": "failed",
                 "error": "NO_PARSED_MATERIAL_UNITS",
                 "success_count": 0,
                 "total": len(self.task.get("material_ids") or []),
             })
-            return
+            raise RuntimeError("NO_PARSED_MATERIAL_UNITS")
         analyzer = BaseAgent()
         analyzer.name = "material_analyzer"
         analyzer.role = _MATERIAL_ANALYSIS_PROMPT
@@ -1556,11 +1592,14 @@ class WorkflowController:
         # task-owned rows on resume instead of relying only on the final task
         # payload update, which is intentionally written after extraction.
         with session_scope() as s:
+            persisted_query = select(ORMFact.c.id).where(ORMFact.c.task_id == self.task_id)
+            if self.task.get("incremental_update"):
+                persisted_query = persisted_query.where(
+                    ORMFact.c.introduced_run_id == str(self.task.get("run_id") or "")
+                )
             persisted_ids = [
                 int(value)
-                for value in s.execute(
-                    select(ORMFact.c.id).where(ORMFact.c.task_id == self.task_id)
-                ).scalars().all()
+                for value in s.execute(persisted_query).scalars().all()
             ]
         existing_ids = [int(x) for x in (self.task.get("fact_ids") or [])]
         new_ids = [int(f.id) for f in facts if f.id is not None]
@@ -1722,12 +1761,13 @@ class WorkflowController:
     def analyze(self, facts: list[dict]) -> None:
         self._update(stage=str(Stage.ANALYSIS))
         if not facts:
-            if self.task.get("incremental_update"):
-                self._update(
-                    analysis_done=True,
-                    incremental_generated_inference_ids=[],
-                    incremental_generated_external_ids=[],
-                )
+            self._update(
+                analysis_done=True,
+                inference_ids=[], external_ids=[], analysis_global_meta={},
+                analysis_group_audit={"status": "no_facts"},
+                incremental_generated_inference_ids=[],
+                incremental_generated_external_ids=[],
+            )
             return
         conflicts = self._conflicts()
         # 情报底稿:Analysis 读 Ledger(聚簇/关系/覆盖/缺口),而非散乱 Fact
@@ -1804,7 +1844,7 @@ class WorkflowController:
         })
         generated_ids = [int(i.id) for i in inferences if i.id is not None]
         generated_external_ids = [int(i.id) for i in external if i.id is not None]
-        if self.task.get("incremental_update"):
+        if self.task.get("incremental_update") and not self.task.get("intervention_force_analysis"):
             inherited_ids = [int(i) for i in self.task.get("incremental_inherited_inference_ids") or []]
             inherited_external_ids = [int(i) for i in self.task.get("incremental_inherited_external_ids") or []]
             self._update(
@@ -1818,6 +1858,8 @@ class WorkflowController:
             self._update(
                 inference_ids=generated_ids,
                 external_ids=generated_external_ids,
+                incremental_generated_inference_ids=generated_ids if self.task.get("incremental_update") else [],
+                incremental_generated_external_ids=generated_external_ids if self.task.get("incremental_update") else [],
                 analysis_global_meta=global_meta,
             )
         self._update_fact_dispositions()
@@ -1863,13 +1905,14 @@ class WorkflowController:
             facts = self._facts()
             inferences = self._inferences()
             used_ids = {int(fid) for inf in inferences for fid in (inf.get("based_fact_ids") or [])}
+            unresolved_fact_ids = _unresolved_conflict_fact_ids(self._conflicts())
             theme = self.task.get("theme") or ""
             with session_scope() as s:
                 for fact in facts:
                     fid = int(fact["id"])
                     if fid in used_ids:
                         disp = "USED_IN_ANALYSIS"
-                    elif (fact.get("conflict_ids") or "") not in ("", "[]"):
+                    elif fid in unresolved_fact_ids:
                         disp = "CONFLICT_UNRESOLVED"
                     elif theme and _ngram_similarity(theme, fact.get("content") or "") < 0.05:
                         disp = "LOW_RELEVANCE"
@@ -3161,6 +3204,7 @@ class WorkflowController:
             result.append({
                 "id": row["id"],
                 "content": row["content"],
+                "conflict_ids": row.get("conflict_ids") or "[]",
                 "dimension": row.get("dimension") or "",
                 "fact_type": row.get("fact_type") or "",
                 "assertion_mode": normalize_assertion_semantics(

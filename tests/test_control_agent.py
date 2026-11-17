@@ -108,7 +108,7 @@ class ControlAgentTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "未修改章节重复"):
                 validate_agent_tool_call(call, self.context(), "批量改标题")
 
-    def test_split_keeps_unaffected_persisted_chapters_verbatim(self):
+    def test_general_structure_validator_does_not_infer_scope_from_prose(self):
         from app.control_agent import AgentToolCall
         existing = ["政策与目标", "技术路径", "应用实践", "治理体系", "结论与展望"]
         call = AgentToolCall.model_validate({
@@ -121,8 +121,30 @@ class ControlAgentTests(unittest.TestCase):
         })
         with patch("app.control_agent._load_plan", return_value={"titles": existing}):
             normalized = validate_agent_tool_call(call, self.context(), "将第五章拆分为两个章节，前四章保持不变")
-        self.assertEqual(normalized.arguments["new_structure"][:4], existing[:4])
-        self.assertEqual(normalized.arguments["new_structure"][4:], ["核心制约", "突破路径"])
+        self.assertEqual(normalized.arguments["new_structure"], call.arguments["new_structure"])
+
+    def test_explicit_preserved_titles_reject_changed_chapters(self):
+        from app.control_agent import AgentToolCall
+        existing = ["政策与目标", "技术路径", "结论与展望"]
+        call = AgentToolCall.model_validate({
+            "tool_name": "rerun_final_plan",
+            "arguments": {"new_structure": ["政策部署", "技术路径", "结论"],
+                          "preserved_titles": existing[:2]},
+        })
+        with patch("app.control_agent._load_plan", return_value={"titles": existing}):
+            with self.assertRaisesRegex(ValueError, "要求保留的章节"):
+                validate_agent_tool_call(call, self.context(), "")
+
+    def test_preserved_titles_allow_numbered_current_headings(self):
+        from app.control_agent import AgentToolCall
+        call = AgentToolCall.model_validate({
+            "tool_name": "rerun_final_plan",
+            "arguments": {"new_structure": ["政策", "技术", "展望"],
+                          "preserved_titles": ["政策", "技术"]},
+        })
+        with patch("app.control_agent._load_plan", return_value={"titles": ["一、政策", "二、技术", "三、结论"]}):
+            normalized = validate_agent_tool_call(call, self.context(), "")
+        self.assertEqual(normalized.arguments["preserved_titles"], ["政策", "技术"])
 
     def test_focus_keeps_multiple_user_references(self):
         focus = ArtifactFocus.model_validate({

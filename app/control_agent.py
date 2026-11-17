@@ -164,7 +164,7 @@ _MUTATING_ARGUMENT_KEYS = {
     AgentToolName.UPDATE_SECTION_TITLE: {"old_title", "new_title", "instruction"},
     AgentToolName.UPDATE_SECTION_TITLES: {"changes", "instruction"},
     AgentToolName.REGENERATE_CHAPTER: {"chapter_title", "instruction"},
-    AgentToolName.RERUN_FINAL_PLAN: {"instruction", "new_structure", "required_chapter_count"},
+    AgentToolName.RERUN_FINAL_PLAN: {"instruction", "new_structure", "required_chapter_count", "preserved_titles"},
     AgentToolName.PAUSE_TASK: set(),
     AgentToolName.RESUME_TASK: set(),
     AgentToolName.RETRY_TASK: set(),
@@ -182,6 +182,7 @@ def tool_manifest() -> list[dict[str, Any]]:
                 "instruction": "用户对目录调整的完整要求",
                 "new_structure": ["用户明确确认的章节标题，按顺序填写；未确认具体标题时留空"],
                 "required_chapter_count": "用户明确要求的章节数量；未明确时为 0",
+                "preserved_titles": ["用户明确要求保持不变的现有章节标题，按原顺序填写；无此约束时留空"],
             }
         elif name == AgentToolName.REWRITE_SENTENCE:
             item["arguments"] = {
@@ -328,7 +329,18 @@ def validate_agent_tool_call(call: AgentToolCall, context: TaskAgentContext,
         expected = _positive_int(arguments.get("required_chapter_count")) or len(structure)
         if structure and expected and len(structure) != expected:
             raise ValueError(f"章节数量不一致：用户要求 {expected} 章，提案识别到 {len(structure)} 章")
-        arguments.update(new_structure=structure, required_chapter_count=expected)
+        preserved = _clean_text_list(arguments.get("preserved_titles"))
+        if preserved:
+            from app.rendering.headings import strip_heading_prefix
+            current = _load_plan(context.task_id, "final").get("titles") or []
+            keys = [strip_heading_prefix(title).strip() for title in preserved]
+            current_preserved = [strip_heading_prefix(title).strip() for title in current
+                                 if strip_heading_prefix(title).strip() in keys]
+            proposed_preserved = [strip_heading_prefix(title).strip() for title in structure
+                                  if strip_heading_prefix(title).strip() in keys]
+            if len(set(keys)) != len(keys) or current_preserved != keys or proposed_preserved != keys:
+                raise ValueError("要求保留的章节必须存在于当前目录及新目录，且保持原有顺序和标题")
+        arguments.update(new_structure=structure, required_chapter_count=expected, preserved_titles=preserved)
     elif call.tool_name == AgentToolName.CONFIRM_REQUIREMENTS:
         if not context.requirement_review_pending:
             raise ValueError("当前不在需求确认阶段")

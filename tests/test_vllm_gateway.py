@@ -18,7 +18,42 @@ from app.llm_queue import PRIORITY_INTERACTIVE, llm_priority, submit_llm_call
 from app.context import _select_evidence_candidates
 from app.retrieval.reranker import rerank
 from app.graph.service import _fact_batches
-from app.writing.writer import WriterAgent, _pack_writer_evidence
+import pytest
+
+from app.writing.writer import WriterAgent, _pack_writer_evidence, _pack_writer_prompt
+
+
+def test_writer_expands_evidence_only_when_default_is_insufficient(monkeypatch):
+    import app.writing.writer as writer
+    import app.model_connection as model_connection
+    import app.vllm_capacity as vllm_capacity
+    monkeypatch.setattr(writer, "_writer_prompt_token_budget", lambda: 10)
+    monkeypatch.setattr(writer, "count_tokens", lambda text: len(text))
+    monkeypatch.setattr(writer, "capacity", lambda: (100, 50))
+    monkeypatch.setattr(writer.settings, "safety_margin_tokens", 1)
+    monkeypatch.setattr(model_connection, "load_connection", lambda: object())
+    monkeypatch.setattr(vllm_capacity, "estimate_request_input", lambda *_: 10)
+    build = lambda facts, inferences: "fixed" + "".join(facts + inferences)
+    facts, _, budget = _pack_writer_prompt(build, ["1. fact", "2. fact"], [], {})
+    assert facts == ["1. fact", "2. fact"]
+    assert budget == 70
+    facts, _, budget = _pack_writer_prompt(build, [], [], {})
+    assert facts == []
+    assert budget == 10
+
+
+def test_writer_fails_before_generation_if_evidence_cannot_fit(monkeypatch):
+    import app.writing.writer as writer
+    import app.model_connection as model_connection
+    import app.vllm_capacity as vllm_capacity
+    monkeypatch.setattr(writer, "_writer_prompt_token_budget", lambda: 1)
+    monkeypatch.setattr(writer, "count_tokens", lambda text: len(text))
+    monkeypatch.setattr(writer, "capacity", lambda: (100, 50))
+    monkeypatch.setattr(writer.settings, "safety_margin_tokens", 1)
+    monkeypatch.setattr(model_connection, "load_connection", lambda: object())
+    monkeypatch.setattr(vllm_capacity, "estimate_request_input", lambda *_: 70)
+    with pytest.raises(ValueError, match="WRITER_EVIDENCE_CONTEXT_NOT_FIT"):
+        _pack_writer_prompt(lambda f, i: "fixed", ["1. fact"], [], {})
 
 
 class _Response:

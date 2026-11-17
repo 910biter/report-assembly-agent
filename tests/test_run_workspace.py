@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
 from app.infrastructure.orm import (
-    Base, ORMPlan, ORMReport, ORMReportVersion, ORMSentence, ORMShortMemory,
+    Base, ORMPlan, ORMReport, ORMReportVersion, ORMSentence, ORMSentenceFact, ORMSentenceInference, ORMShortMemory,
 )
 from app.workflow import run_workspace
 from app.workflow import controller as controller_module
@@ -90,6 +90,18 @@ def test_concurrent_live_edit_blocks_promotion_without_losing_either_copy(worksp
         assert session.execute(select(ORMSentence.c.content).where(
             ORMSentence.c.report_id == working_id
         )).scalar_one() == "原文"
+    run_workspace.discard_working_report(report_id, working_id)
+
+
+@pytest.mark.parametrize("reference_table,reference_key", [(ORMSentenceFact, "fact_id"), (ORMSentenceInference, "inference_id")])
+def test_concurrent_citation_edit_blocks_promotion(workspace_db, reference_table, reference_key):
+    scope, plan_id, report_id = workspace_db
+    working_id, fingerprint = run_workspace.create_working_report(report_id, plan_id)
+    with scope() as session:
+        sentence_id = session.execute(select(ORMSentence.c.id).where(ORMSentence.c.report_id == report_id)).scalar_one()
+        session.execute(insert(reference_table).values(sentence_id=sentence_id, **{reference_key: 42}))
+    with pytest.raises(ValueError, match="REPORT_CHANGED_DURING_RUN"):
+        run_workspace.promote_working_report(report_id, working_id, fingerprint, "task-1")
     run_workspace.discard_working_report(report_id, working_id)
 
 

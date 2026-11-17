@@ -129,7 +129,7 @@ def window(connection) -> int:
     raise ValueError("MODEL_CAPACITY_UNAVAILABLE")
 
 
-def verify_request(connection, payload: dict, safety_tokens: int = 0) -> dict:
+def verify_request(connection, payload: dict, safety_tokens: int = 0, *, adaptive_writer: bool = False) -> dict:
     profile = _profile(connection)
     raw = raw_estimate(json.dumps(payload.get("messages", []), ensure_ascii=False))
     tools = payload.get("tools") or []
@@ -154,6 +154,13 @@ def verify_request(connection, payload: dict, safety_tokens: int = 0) -> dict:
     # A final count may reveal a changed deployment window after the probe.
     if profile.window is not None:
         limit = min(connection.context_tokens, profile.window) if connection.context_tokens else profile.window
+    if adaptive_writer:
+        if count > limit * 70 // 100:
+            raise ValueError("MODEL_INPUT_OVER_BUDGET")
+        output = min(output, limit - count - safety_tokens)
+        if output <= 0:
+            raise ValueError("MODEL_INPUT_OVER_BUDGET")
+        payload[connection.output_parameter] = output
     if count + output + safety_tokens > limit:
         _logger.warning("Model capacity exceeded: counter=%s input=%s output=%s safety=%s window=%s",
                         method, count, output, safety_tokens, limit)

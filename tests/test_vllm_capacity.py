@@ -61,6 +61,23 @@ def test_overflow_never_changes_output_or_messages(monkeypatch):
     assert json.dumps(payload) == before
 
 
+@pytest.mark.parametrize("count,expected", [(4000, 5500), (6000, 3900)])
+def test_writer_output_adapts_only_to_actual_remaining_capacity(monkeypatch, count, expected):
+    c = replace(connection(), context_tokens=10000, output_tokens=5500)
+    monkeypatch.setattr(vc.httpx, "post", lambda url, **kw: response(url, count=count, window=10000))
+    payload = {"model": "model", "messages": [{"role": "user", "content": "x"}], "max_tokens": 5500}
+    result = vc.verify_request(c, payload, 100, adaptive_writer=True)
+    assert payload["max_tokens"] == expected
+    assert result["requested_output_tokens"] == expected
+
+
+def test_writer_rejects_input_above_seventy_percent(monkeypatch):
+    c = replace(connection(), context_tokens=10000, output_tokens=5500)
+    monkeypatch.setattr(vc.httpx, "post", lambda url, **kw: response(url, count=7001, window=10000))
+    with pytest.raises(ValueError, match="MODEL_INPUT_OVER_BUDGET"):
+        vc.verify_request(c, {"model": "model", "messages": [], "max_tokens": 5500}, 100, adaptive_writer=True)
+
+
 def test_failure_has_cooldown_then_recovery(monkeypatch):
     now = [1000.0]
     calls = []

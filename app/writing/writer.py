@@ -67,15 +67,15 @@ def _writer_argument_contract(value):
     return value
 
 
-_SYSTEM = """你是文档撰稿人。依据当前交付单元的 Narrative Plan、ChapterPlan、证据和适用的模板表达参考，一次自然写成。
-交付单元可能是一章、小节或连续文章段落组。只输出 JSON:
-{"paragraphs": [{"sentences": [{"text": "句子内容", "fact_ids": [1], "inference_ids": []}]}]}
-写作方法:
-1. 依当前计划的核心问题、事实主次和 paragraph.argument 展开具体证据关系；purpose、transition、completion_criteria 是内部指令。每段围绕一个可由证据完成的论证，事实和判断可以自然融合；Report Memory 中已充分表达的内容简要承接。
-2. 模板表达参考决定适用的句式、节奏、详略和组织方式，业务事实只来自本次证据。detail_level=expand 的关系可充分解释，brief/reference 简要处理。段落与句子按阅读逻辑组织：paragraphs 是自然段，sentences 是段内溯源单位，直接相关的相邻计划段可合为一个多句自然段。
-3. 引用采用最小且逐句绑定：fact_ids 支撑事实陈述，inference_ids 支撑相应分析；一句同时包含两类主张时分别绑定。每个 ID 直接支持当前句的具体主张，多个独立主张可拆成多句。纯组织性过渡可无引用，但须显式标记 source_level="TRANSITION"；正文阅读层不出现内部 ID 或证据标签。
-4. 保留所引依据的具体数值、单位、日期、主体、实现状态、来源归属、条件、否定和例外。比较需有对应对象的可比前后证据；计划、预计、目标或材料观点用对应语气表述。局部材料未提供的信息只说明其实际覆盖范围，具体事实和限制放在相关判断附近。
-5. 当前交付单元的目标字数是近似目标；提示另设最低要求时按其执行。证据充分时通过解释机制、比较与边界完成论证并接近篇幅；证据不足时在可支持的范围收束。paragraph.target_words 只分配篇幅，自然段按论证关系形成。"""
+_SYSTEM = """你是报告撰稿人。依据当前交付单元计划、已提供证据、用户要求与匹配的模板表达，完成可直接纳入报告的正文。
+以 JSON 对象返回段落及逐句溯源：
+{"paragraphs": [{"paragraph_id": "P1", "sentences": [{"text": "句子内容", "fact_ids": [1], "inference_ids": [], "source_level": ""}]}]}
+写作时：
+1. 按当前单元的论证目的、证据关系和计划顺序展开内容；purpose、completion_criteria 等字段用于指导写作，Report Memory 用于术语一致、前后承接和观点递进。
+2. 每个自然段完成一个连贯论证，段内可含多个句子；相邻且直接相关的计划段可自然合段。paragraph_id 沿用当前计划标识，paragraph.target_words 用于篇幅分配。
+3. 引用 ID 从本次提供的证据中选择：事实句以直接支持其主张的 fact_ids 溯源，分析句以 inference_ids 溯源；复合主张分别绑定相应依据，多个独立主张分句表达。纯组织性过渡句可使用 source_level="TRANSITION"，正文呈现自然语言。
+4. 保留证据中的主体、数值、时间、条件、来源归属、实现状态、否定与例外，并按计划提供的证据边界限定主张范围。比较使用口径可比的依据；计划、预计、目标和来源观点保持原有陈述性质。将信息缺口限定在实际检查范围，并在相关判断附近表达。
+5. 模板用于迁移文体、节奏、详略和组织方式，事实内容由本次证据支撑。证据充足时完整展开机制、比较和边界；证据有限时完成可支持的论证并说明具体缺口。"""
 
 
 def _filter_facts_by_roles(
@@ -106,9 +106,8 @@ def _business_block(task_profile: dict | None, chapter_plan: dict) -> str:
         return ""
     lines = [f"材料包模式: {task_profile.get('report_mode', 'generic')}"]
     if task_profile.get("report_mode") == "requirement_summary":
-        lines.append("当前材料未证明实际完成过程或结果时，不得虚构已发生事项、成效提升或量化业绩。")
-        lines.append("如果材料只能证明规则、结构、字段、标准或缺失项，应写成连贯的说明、边界判断和后续动作建议,不能退化为事实清单。")
-        lines.append("模板材料主要用于版式、结构和写作口吻学习；除确有内容约束外，不应作为正文事实反复表述。")
+        lines.append("实际完成过程、效果和量化业绩以材料直接支持的内容为准；材料提供规则、结构、字段、标准或缺项时，将其组织为连贯说明、适用边界和后续动作建议。")
+        lines.append("模板材料用于版式、结构和表达方式迁移；正文事实以任务材料为来源。")
     if chapter_plan.get("allowed_roles"):
         lines.append("本章允许使用的材料角色: " + "、".join(normalize_text_list(chapter_plan.get("allowed_roles"))))
     if task_profile.get("missing_inputs") and chapter_handles_information_gaps(chapter_plan):
@@ -432,6 +431,35 @@ def _writer_prompt_token_budget() -> int:
     """Serving-derived Writer input budget in tokens."""
     from app.runtime_profiles import stage_input_budget_tokens
     return stage_input_budget_tokens("writer")
+
+
+def _pack_writer_prompt(build_prompt, fact_lines, inference_lines, inference_fact_ids):
+    """Expand only when the default budget cannot carry the available evidence."""
+    default_budget = _writer_prompt_token_budget()
+    empty_prompt = build_prompt([], [])
+    available = max(0, default_budget - count_tokens(empty_prompt))
+    facts, inferences = _pack_writer_evidence(fact_lines, inference_lines, available, inference_fact_ids)
+    budget = default_budget
+    if len(facts) < len(fact_lines) or len(inferences) < len(inference_lines):
+        window = capacity()[0]
+        # The request estimator includes message framing and the system prompt.
+        from app.model_connection import load_connection
+        from app.vllm_capacity import estimate_request_input
+        connection = load_connection()
+        payload = {"messages": [{"role": "system", "content": _SYSTEM},
+                                {"role": "user", "content": empty_prompt}]}
+        fixed = estimate_request_input(connection, payload)
+        max_input = window * 70 // 100
+        available = max(0, max_input - fixed - int(settings.safety_margin_tokens))
+        expanded_facts, expanded_inferences = _pack_writer_evidence(
+            fact_lines, inference_lines, available, inference_fact_ids,
+        )
+        if len(expanded_facts) + len(expanded_inferences) > len(facts) + len(inferences):
+            facts, inferences = expanded_facts, expanded_inferences
+            budget = max_input
+    if (fact_lines or inference_lines) and not (facts or inferences):
+        raise ValueError("WRITER_EVIDENCE_CONTEXT_NOT_FIT")
+    return facts, inferences, budget
 
 
 def _pack_writer_evidence(
@@ -1324,7 +1352,7 @@ class WriterAgent(BaseAgent):
         contract = json.dumps({
             "central_thread": article_plan.get("central_thread") or "",
             "evidence_boundaries": [
-                {"beat_id": beat.get("beat_id"), "must_not_claim": beat.get("must_not_claim") or [],
+                {"beat_id": beat.get("beat_id"), "evidence_boundaries": beat.get("must_not_claim") or [],
                  "excluded_content": beat.get("excluded_content") or []}
                 for beat in article_plan.get("beats") or []
                 if beat.get("must_not_claim") or beat.get("excluded_content")
@@ -1343,28 +1371,21 @@ class WriterAgent(BaseAgent):
             str(item.get("paragraph_id")): index
             for index, item in enumerate(planned_paragraphs, start=1) if item.get("paragraph_id")
         }
-        output_shape = json.dumps({"paragraphs": [
-            {"paragraph_id": item.get("paragraph_id") or f"P{index}",
-             "sentences": [{"text": "正文句子", "fact_ids": [], "inference_ids": []}]}
-            for index, item in enumerate(planned_paragraphs, start=1)
-        ] or [{"sentences": [{"text": "正文句子", "fact_ids": [], "inference_ids": []}]}]}, ensure_ascii=False)
         if group_index < group_count:
             pass_contract = (
-                f"这是连续文章的第 {group_index}/{group_count} 段写作，不是全文结尾。"
-                "只完成本批 Narrative Plan 的论证，结尾自然引向下一层问题；"
-                "不得使用‘综上’‘总之’‘结论’或给出全文性判断。"
+                f"当前为连续文章第 {group_index}/{group_count} 个写作片段；完成本片段论证后，"
+                "以自然衔接引出下一组待讨论的问题。"
             )
         else:
             pass_contract = (
-                "这是连续文章的最后一个写作片段，可能包含多个自然段。承接上文完成剩余论证，"
-                "只在确有必要时给出一次简洁收束，不重复前文已经得出的结论。"
+                "当前为连续文章的最后一个写作片段；承接前文完成剩余论证，并围绕全文核心判断自然收束。"
             )
 
         def build_prompt(selected_facts: list[str], selected_inferences: list[str]) -> str:
             return (
                 f"报告标题:{plan.get('title', '')}\n"
                 f"用户成文要求:{plan.get('user_requirements') or ''}\n"
-                f"文档形态:{(plan.get('document_shape') or {}).get('kind', '')}；本次必须写成一篇连续文章，不要章节标题、编号、Markdown 标题或分节标签。\n"
+                f"文档形态:{(plan.get('document_shape') or {}).get('kind', '')}；成文形式:连续文章，标题由系统渲染，正文以连续自然段推进，段落层级承载论证结构。\n"
                 + writer_scale_prompt_hint(
                     plan.get("budget"), unit_target_words=target_words,
                     unit_label="当前文章片段",
@@ -1372,31 +1393,22 @@ class WriterAgent(BaseAgent):
                 ) + "\n"
                 f"核心判断:{plan.get('core_judgment', '')}\n"
                 f"全文叙事逻辑:{plan.get('narrative_logic', '')}\n"
-                f"当前片段论证契约(内部指令，不是正文底稿；保持实质性论证次序，纯引出与相邻论证可自然合段):\n{contract}\n\n"
+                f"当前片段论证契约:\n{contract}\n\n"
                 + f"连续写作位置:{pass_contract}\n\n"
-                + (f"上一连续片段结尾(只用于自然承接，不得重复):{article_plan.get('previous_tail')}\n\n" if article_plan.get("previous_tail") else "")
+                + (f"上一连续片段结尾(承接参照):{article_plan.get('previous_tail')}\n\n" if article_plan.get("previous_tail") else "")
                 + (rules + "\n" if rules else "")
                 + (f"业务边界:\n{_business_block(task_profile, {})}\n\n" if task_profile else "")
                 + (f"{policy_block}\n\n" if policy_block else "")
                 + "允许引用的事实:\n" + "\n".join(selected_facts) + "\n\n"
                 + "允许引用的推断:\n" + "\n".join(selected_inferences) + "\n\n"
                 + f"{style_block}\n"
-                + "按当前论证关系和匹配的模板表达参考自然成文，不额外套入固定的开篇、转折或总结流程。相邻段可直接由具体事实承接，不要求显式过渡句；每句事实性或评价性内容必须绑定下列允许 ID。"
-                  "纯组织性过渡句若无引用，必须显式标记 source_level=\"TRANSITION\"，且不得含事实前提或评价判断。"
-                  "每个有独立论证目的的计划段对应一个 paragraph_id，按计划顺序输出；不得把整个片段放入一个段落对象。"
-                  "只承担纯引出或过渡、没有独立论证的计划段可并入相邻段，不得合并不同实质论证。"
-                + f"输出 JSON 结构示例(空引用须替换为支持实际主张的允许 ID):{output_shape}；"
-                  "source_level 仅在纯过渡句时可选填 TRANSITION。"
+                + "依论证契约和模板表达完成本片段正文；按计划段落标识组织输出。"
             )
 
-        empty_prompt = build_prompt([], [])
-        available = _writer_prompt_token_budget() - count_tokens(empty_prompt)
-        if available <= 0:
-            raise ValueError("ARTICLE_PLAN_EXCEEDS_WRITER_CONTEXT")
         candidate_fact_ids = extract_numbered_ids(fact_lines)
         candidate_inference_ids = extract_numbered_ids(inference_lines)
-        fact_lines, inference_lines = _pack_writer_evidence(
-            fact_lines, inference_lines, available,
+        fact_lines, inference_lines, prompt_budget = _pack_writer_prompt(
+            build_prompt, fact_lines, inference_lines,
             {int(item['id']): evidence_ids(item.get('based_fact_ids')) for item in inferences},
         )
         prompt = build_prompt(fact_lines, inference_lines)
@@ -1414,7 +1426,7 @@ class WriterAgent(BaseAgent):
         allowed_inference_ids = set(supplied_inference_ids) & set(allowed_inference_ids)
         publish_context_audit({
             "stage": "writer", "tokenizer_method": tokenizer_method(),
-            "budget_tokens": _writer_prompt_token_budget(), "actual_tokens": count_tokens(prompt),
+            "budget_tokens": prompt_budget, "actual_tokens": count_tokens(prompt),
             "composition_mode": "article_beats",
             "sections": {"事实": {"candidate_items": len(facts), "selected_items": len(fact_lines)}, "推断": {"candidate_items": len(inferences), "selected_items": len(inference_lines)}},
         })
@@ -1559,8 +1571,8 @@ class WriterAgent(BaseAgent):
         ]
         scope_label = "指定句子" if sentence_id else "指定段落"
         output_rule = (
-            "只输出一个 sentences 元素" if sentence_id
-            else "按自然表达输出该段所需的多个 sentences 元素"
+            "用一个句子完成改写" if sentence_id
+            else "按自然表达组织该段所需句子"
         )
         prompt, _audit = build_prompt_from_sections(
             "writer",
@@ -1569,10 +1581,8 @@ class WriterAgent(BaseAgent):
                     f"章节：{chapter_title}；目标：{scope_label}",
                     f"用户要求：{instruction}",
                     f"原内容：{original}",
-                    "只修改指定范围，保持与前后文衔接。具体事实优先，不得引入未提供的信息。"
-                    "每个事实性句子必须绑定最小且直接支持它的 fact_ids/inference_ids；不得把整段证据列表复制到每句，"
-                    "不得沿用不再支持新表达的旧引用。"
-                    f"严格输出 JSON：{{\"paragraphs\":[{{\"sentences\":[{{\"text\":\"...\",\"fact_ids\":[],\"inference_ids\":[]}}]}}]}}；{output_rule}。",
+                    "结合前后文完成目标范围的改写，事实与判断均从下方可用证据中取材，"
+                    f"每句绑定直接支持其主张的 fact_ids/inference_ids；{output_rule}。",
                 ], weight=6, required_items=4),
                 ContextSection("前后文", context_lines, weight=2),
                 ContextSection("可用事实", [
@@ -2111,10 +2121,8 @@ class WriterAgent(BaseAgent):
                 "central_message": narrative_plan.get("central_message") or "",
                 "logic_order": narrative_plan.get("logic_order") or [],
                 "current_unit": {key: value for key, value in unit_plan.items() if key != "target_words"},
-                "topics": narrative_plan.get("topics") or [],
                 "background_fact_ids": narrative_plan.get("background_fact_ids") or [],
-                "must_not_claim": narrative_plan.get("must_not_claim") or [],
-                "transition_hint": narrative_plan.get("transition_hint") or "",
+                "evidence_boundaries": narrative_plan.get("must_not_claim") or [],
                 "evidence_reason": generation_unit.get("evidence_reason") or narrative_plan.get("evidence_reason") or "",
                 "missing_information": generation_unit.get("missing_information") or narrative_plan.get("missing_information") or [],
             }
@@ -2159,18 +2167,27 @@ class WriterAgent(BaseAgent):
             key=lambda item: 0 if int(item.get("id") or 0) in preferred_inference_ids else 1,
         )
         inference_lines = [inference_line(item) for item in ordered_inferences]
-        memory_block = self._memory_block(report_memory)
+        memory_block = self._memory_block(
+            report_memory,
+            fact_ids={int(item.get("id")) for item in chapter_facts if item.get("id") is not None},
+            inference_ids={int(item.get("id")) for item in chapter_inferences if item.get("id") is not None},
+        )
         planned_subsections = [
             strip_heading_prefix(str(item.get("title") or ""))
             for item in narrative_plan.get("subsections") or []
             if isinstance(item, dict) and str(item.get("title") or "").strip()
         ]
+        adjacent_chapters = []
+        if chapter_index > 1 and chapter_index - 2 < len(structure):
+            adjacent_chapters.append(f"前章:{structure[chapter_index - 2]}")
+        if chapter_index < chapter_count and chapter_index < len(structure):
+            adjacent_chapters.append(f"后章:{structure[chapter_index]}")
         def build_prompt(selected_facts: list[str], selected_inferences: list[str]) -> str:
             return (
             f"报告标题:{plan.get('title', '')}\n"
             f"用户成文要求:{plan.get('user_requirements') or ''}\n"
             + f"文档形态:{document_shape['kind']}；一级标题:{document_shape['heading_policy']}；二级标题:{document_shape['subheading_policy']}。"
-              "内部语义单元只用于组织证据；是否显示标题由文档形态决定，不得自行添加编号或 Markdown 标题。\n"
+              "正文按该形态呈现，标题由系统依据选定结构渲染。\n"
             f"报告核心判断:{plan.get('core_judgment', '')}\n"
             f"总体叙事逻辑:{plan.get('narrative_logic', '')}\n"
             + (f"本轮更新目标:{plan.get('update_instruction', '')}\n" if plan.get("update_instruction") else "")
@@ -2182,33 +2199,25 @@ class WriterAgent(BaseAgent):
                 f"「{generation_unit.get('title', '')}」。\n"
                 if generation_unit.get("title") else "当前章节未规划多级小节,本次完整撰写本章。\n"
             )
-            + "全文章节结构:" + (" / ".join(structure)) + "\n\n"
-            + f"Report Memory(前文状态):\n{memory_block}\n\n"
-            + f"当前交付单元契约(章节边界与当前叙事计划,完整执行):\n{execution_contract}\n\n"
+            + (f"相邻章节:{'；'.join(adjacent_chapters)}\n" if adjacent_chapters else "")
+            + f"当前交付单元契约:\n{execution_contract}\n\n"
+            + (f"前文衔接信息:\n{memory_block}\n\n" if memory_block != "无" else "")
             + (f"业务约束:\n{business_block}\n\n" if business_block else "")
             + (f"{policy_block}\n\n" if policy_block else "")
             + (
-                "当前小节计划中的 fact_ids/inference_ids 是完成本小节目的的核心证据。"
-                "依据完成条件展开核心证据，按论证需要选择补充事实。\n"
+                "当前计划列出的核心事实与推断优先支撑本单元论证，并按需结合补充证据。\n"
                 if unit_plan else ""
             )
-            + "本章相关事实清单(当前小节事实优先排列,其余事实仅用于必要背景和关系校验):\n" + "\n".join(selected_facts) + "\n\n"
-            + "本章相关推断清单:\n" + "\n".join(selected_inferences) + "\n\n"
+            + "本单元可用事实:\n" + "\n".join(selected_facts) + "\n\n"
+            + "本单元可用推断:\n" + "\n".join(selected_inferences) + "\n\n"
             + f"{chapter_style}\n"
-            + "按当前交付单元契约和证据关系写成自然段。已有段落执行计划时保留各实质论证的边界与顺序；"
-              "句式、节奏和承接方式参考匹配模板。"
-              "只输出 JSON 对象的 paragraphs：每项是一个自然段，paragraph_id 对应计划标识，"
-              "sentences 每项包含 text、fact_ids、inference_ids。事实和判断逐句绑定直接依据；"
-              "纯组织性过渡句标记 source_level=\"TRANSITION\"。小标题由系统按 Narrative Plan 渲染。"
+            + "完成当前交付单元的论证；按计划标识对应自然段，并采用匹配模板的表达节奏。"
             )
 
-        empty_prompt = build_prompt([], [])
-        prompt_budget = _writer_prompt_token_budget()
-        evidence_tokens = max(0, prompt_budget - count_tokens(empty_prompt))
         candidate_fact_ids = extract_numbered_ids(fact_lines)
         candidate_inference_ids = extract_numbered_ids(inference_lines)
-        fact_lines, inference_lines = _pack_writer_evidence(
-            fact_lines, inference_lines, evidence_tokens,
+        fact_lines, inference_lines, prompt_budget = _pack_writer_prompt(
+            build_prompt, fact_lines, inference_lines,
             {int(item['id']): evidence_ids(item.get('based_fact_ids')) for item in ordered_inferences},
         )
         prompt = build_prompt(fact_lines, inference_lines)
@@ -2462,10 +2471,8 @@ class WriterAgent(BaseAgent):
                 ContextSection("任务", [
                     f"章节:{chapter_title}(局部重写第 {target} 段,保持与前后段衔接)",
                     f"待改进方面:{missing}",
-                    "请重写该段落:解决待改进方面,用支撑事实展开,不要罗列事实编号,"
-                    "不要重复段落外的内容。引用须最小且逐句绑定,每个 ID 都必须直接支持对应句子;"
-                    "不得将整段或整个主题的证据列表复制到每句。输出 JSON,优先只包含 paragraphs 字段"
-                    "(一个自然段对象,内部 sentences 每项含 text/fact_ids/inference_ids)。",
+                    "围绕待改进方面，以支撑证据完成该段论证，并与前后段自然衔接。"
+                    "重写结果仅包含目标段落，正文使用自然语言，溯源按系统约定逐句提供。",
                 ], weight=4, required_items=3),
                 ContextSection("Narrative Topic", ["Narrative Topic 计划:", topic_block], weight=4, required_items=2),
                 ContextSection("原段落", ["原段落:", original], weight=4, required_items=2),
@@ -2547,10 +2554,12 @@ class WriterAgent(BaseAgent):
         return {"fact_ids": written_fact_ids, "inference_ids": written_inference_ids}
 
     @staticmethod
-    def _memory_block(report_memory: dict) -> str:
+    def _memory_block(report_memory: dict, fact_ids: set[int] | None = None,
+                      inference_ids: set[int] | None = None) -> str:
         """Report Memory 摘要:注入最近前文状态,保持衔接但不维护依赖图。"""
         lines = []
-        # 统一术语:全部注入(术语定义全文一致,不受依赖限制)
+        relevant_facts = None if fact_ids is None else {int(value) for value in fact_ids}
+        relevant_inferences = None if inference_ids is None else {int(value) for value in inference_ids}
         terms = report_memory.get("unified_terms", [])
         if terms:
             term_lines = []
@@ -2559,38 +2568,54 @@ class WriterAgent(BaseAgent):
                     term_lines.append(f"{t.get('term', '')}({t.get('definition', '')[:40]})")
                 else:
                     term_lines.append(str(t))
-            lines.append(f"已定义术语(后文保持定义一致): {', '.join(term_lines)}")
-        # 已形成判断:全部注入(可引用/发展,不重新论证)
+            lines.append(f"统一术语: {', '.join(term_lines)}")
         judgments = report_memory.get("formed_judgments", [])
         if judgments:
-            lines.append("已形成判断(可引用发展,不要重新论证一遍):")
+            lines.append("前文判断(供后文引用、发展或承接):")
             for j in judgments[-6:]:
                 lines.append(f"- {j}")
-        # 未解决问题:全部注入(后续章节优先回应)
         unresolved = report_memory.get("unresolved_issues", [])
         if unresolved:
-            lines.append(f"尚未解决的问题(后续章节如有证据优先回应): {'; '.join(normalize_text_list(unresolved)[-4:])}")
-        # 章节摘要:按自然顺序注入最近前文章节,避免依赖图字段造成规划失败。
+            lines.append(f"待回应问题: {'; '.join(normalize_text_list(unresolved)[-4:])}")
         summaries = report_memory.get("chapter_summaries", [])
         relevant = summaries[-2:]
         if relevant:
-            lines.append("前文章节记忆(用于承接其结论,不要重复其内容):")
+            lines.append("前文章节摘要:")
             for s in relevant:
                 core = s.get("core_message") or ""
                 lines.append(f"- {s['chapter']}: {s['summary'][:100]}" + (f" | 核心: {core[:60]}" if core else ""))
-        # 已表达观点:避免原样重复(注入最近几条)
         points = report_memory.get("expressed_points", [])
         if points:
-            lines.append(f"前文已表达观点(避免原样重复,如需引用须换角度): {'; '.join(normalize_text_list(points)[-4:])}")
-        # Fact 角色:复用须承担新逻辑作用
+            lines.append(f"前文已表达观点: {'; '.join(normalize_text_list(points)[-4:])}")
         roles = report_memory.get("fact_roles", {})
         if roles:
-            role_str = ", ".join(f"{fid}→{role}" for fid, role in list(roles.items())[-8:])
-            lines.append(f"前文 Fact 已承担角色(复用须承担新角色): {role_str}")
-        used = report_memory.get("used_fact_ids", set())
+            role_items = []
+            for key, role in roles.items():
+                try:
+                    fact_id = int(key)
+                except (TypeError, ValueError):
+                    continue
+                if relevant_facts is None or fact_id in relevant_facts:
+                    role_items.append((fact_id, role))
+            role_str = ", ".join(f"{fact_id}→{role}" for fact_id, role in role_items[-8:])
+            if role_str:
+                lines.append(f"当前单元相关事实在前文的作用: {role_str}")
+        used = report_memory.get("used_fact_ids", set()) or set()
+        try:
+            used = {int(value) for value in used}
+        except (TypeError, ValueError):
+            used = set()
+        if relevant_facts is not None:
+            used &= relevant_facts
         if used:
-            lines.append(f"前文已使用事实编号: {sorted(used)}")
-        used_inf = report_memory.get("used_inference_ids", set())
+            lines.append(f"当前单元相关已用事实编号: {sorted(used)}")
+        used_inf = report_memory.get("used_inference_ids", set()) or set()
+        try:
+            used_inf = {int(value) for value in used_inf}
+        except (TypeError, ValueError):
+            used_inf = set()
+        if relevant_inferences is not None:
+            used_inf &= relevant_inferences
         if used_inf:
-            lines.append(f"前文已使用推断编号: {sorted(used_inf)}(如需再次引用必须承担新的逻辑作用,禁止原文重复)")
+            lines.append(f"当前单元相关已用推断编号: {sorted(used_inf)}")
         return "\n".join(lines) or "无"
