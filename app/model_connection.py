@@ -114,6 +114,13 @@ def model_name() -> str:
     return public_connection()["model_name"]
 
 
+def model_lanes_busy(lanes: dict) -> bool:
+    return any(
+        lane.get("active", 0) or lane.get("submitted", 0) > lane.get("completed", 0) + lane.get("failed", 0)
+        for lane in (lanes["workflow"], lanes["interactive"])
+    )
+
+
 def connection_identity() -> str:
     try:
         return load_connection().identity
@@ -132,6 +139,8 @@ def capacity() -> tuple[int, int]:
 
 def connection_from_payload(payload: dict) -> Connection:
     url = str(payload.get("base_url") or "").strip().rstrip("/")
+    if url.endswith("/chat/completions"):
+        url = url.removesuffix("/chat/completions")
     parsed = urlsplit(url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
         raise ValueError("接入地址必须是无账号、查询参数的 HTTP(S) 地址")
@@ -148,13 +157,31 @@ def connection_from_payload(payload: dict) -> Connection:
     parameter = str(payload.get("output_parameter") or "max_tokens")
     if kind not in {"openai", "vllm"} or parameter not in {"max_tokens", "max_completion_tokens"}:
         raise ValueError("不支持的服务类型或输出参数")
+    previous = None
+    if "context_tokens" not in payload:
+        try:
+            previous = load_connection()
+        except ValueError:
+            pass
     try:
-        window = int(payload.get("context_tokens", 0))
-        output = int(payload.get("output_tokens", 8192))
+        window = int(payload.get("context_tokens", previous.context_tokens if previous else 0))
     except (ValueError, TypeError):
-        raise ValueError("上下文和输出上限必须为整数") from None
+        raise ValueError("上下文上限必须为整数") from None
+    explicit_output = payload.get("output_tokens")
+    if explicit_output is None:
+        if not window:
+            raise ValueError("自动分配输出预算需要明确的上下文上限")
+        usable = window - int(settings.prompt_overhead_tokens) - int(settings.safety_margin_tokens)
+        output = previous.output_tokens if previous else usable * 55 // 100
+    else:
+        try:
+            output = int(explicit_output)
+        except (ValueError, TypeError):
+            raise ValueError("输出上限必须为整数") from None
     if not (window == 0 or 4096 <= window <= 2_000_000) or not 256 <= output <= 2_000_000 or (window and output >= window - 2048):
         raise ValueError("容量不合理：上下文为0（自动）或至少4096，输出至少256且需预留输入空间")
+    if window and (window - int(settings.prompt_overhead_tokens) - int(settings.safety_margin_tokens)) * 45 // 100 < 1024:
+        raise ValueError("上下文上限不足以为输入保留至少1024 Token")
     return Connection(url, name, str(key).strip(), kind, window, output,
                       parameter, bool(payload.get("send_temperature", True)),
                       bool(payload.get("vllm_priority", False)), bool(payload.get("send_json_response_format", False)))
@@ -188,7 +215,8 @@ def save_connection(connection: Connection) -> None:
 
 def test_connection(connection: Connection) -> dict:
     # Verify generation, not just /models, which some compatible services omit.
-    with httpx.Client(timeout=30, follow_redirects=False) as client:
+    with httpx.Client(timeout=30, follow_redirects=False,
+                      transport=httpx.HTTPTransport(retries=2)) as client:
         response = client.post(f"{connection.base_url}/chat/completions", headers=connection.headers(), json={
             "model": connection.model_name, "messages": [{"role": "user", "content": "Reply OK."}],
             connection.output_parameter: 32, **connection.extra_body(False),

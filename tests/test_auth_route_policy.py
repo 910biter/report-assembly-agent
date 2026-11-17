@@ -5,6 +5,8 @@ from app.auth.authorization import required_resources
 
 @pytest.mark.parametrize("params,expected", [
     ({"task_id": "t-1"}, [("task", "t-1")]),
+    ({"task_id": "t-1", "material_id": 3}, [("task", "t-1"), ("material", 3)]),
+    ({"material_id": 3}, [("material", 3)]),
     ({"report_id": 4, "sentence_id": 9}, [("report", 4)]),
     ({"base_version_id": 1, "target_version_id": 2},
      [("report_version", 1), ("report_version", 2)]),

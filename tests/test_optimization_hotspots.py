@@ -47,10 +47,41 @@ def test_no_query_embedding_when_vector_backend_is_off():
 def test_deterministic_http_failures_do_not_retry_with_either_error_format():
     from app.graph.service import GraphExtractionAgent
     for agent in (BaseAgent(), GraphExtractionAgent()):
-        for status in (400, 401, 403, 404, 405, 413, 422):
+        for status in (400, 401, 403, 405, 413, 422):
             assert not agent.should_retry(RuntimeError(f"MODEL_HTTP_{status}"))
             assert not agent.should_retry(RuntimeError(f"MODEL_HTTP_{status}:details"))
+        assert agent.should_retry(RuntimeError("MODEL_HTTP_404"))
+        assert agent.should_retry(RuntimeError("MODEL_HTTP_404:details"))
         assert agent.should_retry(RuntimeError("MODEL_HTTP_503"))
+
+
+def test_model_404_retries_three_attempts_then_reports_original_error():
+    agent = BaseAgent()
+    calls = []
+
+    def unavailable():
+        calls.append(1)
+        raise RuntimeError("MODEL_HTTP_404")
+
+    with patch("app.agents.base.log_llm_call"), patch("app.agents.base.time.sleep"):
+        with pytest.raises(RuntimeError, match="MODEL_HTTP_404"):
+            agent._with_retry(unavailable, 10)
+    assert len(calls) == 3
+
+
+def test_model_404_recovers_on_later_attempt():
+    agent = BaseAgent()
+    calls = []
+
+    def intermittently_unavailable():
+        calls.append(1)
+        if len(calls) < 3:
+            raise RuntimeError("MODEL_HTTP_404")
+        return {"ok": True}
+
+    with patch("app.agents.base.log_llm_call"), patch("app.agents.base.time.sleep"):
+        assert agent._with_retry(intermittently_unavailable, 10) == {"ok": True}
+    assert len(calls) == 3
 
 
 def test_evidence_batches_embedding_once_per_query_not_per_material():
@@ -172,6 +203,32 @@ def test_bulk_invalid_vectors_and_missing_provenance_are_not_indexed():
     store.client = Mock()
     with patch.object(store, "_unit_payloads", return_value={1: {"unit_id": 1}, 2: {"unit_id": 2}}), patch.object(store, "ensure_collection"):
         assert store.save_unit_vectors([(1, [1.0, 0.0]), (2, [float("nan"), 0.0]), (3, [1.0, 0.0])]) == {1}
+
+
+def test_duplicate_unit_text_is_embedded_once_and_cached_across_runs():
+    from app.retrieval import embedder
+
+    counter = {"calls": 0, "texts": []}
+
+    def fake_embed(texts, query=False, **kwargs):
+        counter["calls"] += 1
+        counter["texts"].extend(texts)
+        return [[float(index), 1.0] for index, _text in enumerate(texts, start=1)]
+
+    with patch.object(embedder.model_gateway, "embed", side_effect=fake_embed):
+        first, errors = embedder.embed_texts_adaptive([
+            "unique-source-2026-alpha", "unique-source-2026-alpha", "unique-source-2026-beta",
+        ])
+        second, second_errors = embedder.embed_texts_adaptive([
+            "unique-source-2026-alpha", "unique-source-2026-beta",
+        ])
+
+    assert not errors and not second_errors
+    assert counter["calls"] == 1
+    assert len(counter["texts"]) == 2
+    assert first[0] == first[1]
+    assert first[0] == second[0]
+    assert first[2] == second[1]
 
 
 def test_fact_cache_refreshes_content_changes_and_expired_vectors():

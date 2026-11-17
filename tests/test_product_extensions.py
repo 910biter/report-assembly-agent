@@ -77,12 +77,11 @@ class ProductExtensionTests(unittest.TestCase):
     def test_context_budget_tracks_serving_window_and_stage_reserves(self):
         with (
             patch("app.runtime_profiles.settings.model_context_window_tokens", 16000),
-            patch("app.runtime_profiles.settings.structured_output_tokens", 3000),
             patch("app.runtime_profiles.settings.prompt_overhead_tokens", 2000),
             patch("app.runtime_profiles.settings.safety_margin_tokens", 1000),
             patch("app.runtime_profiles.capacity", return_value=(16000, 3000)),
         ):
-            self.assertEqual(ContextManager({}).budget_tokens(), 10000)
+            self.assertEqual(ContextManager({}).budget_tokens(), 5850)
 
     def test_graph_visualization_materializes_literal_value_targets(self):
         records = {

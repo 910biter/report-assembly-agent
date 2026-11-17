@@ -20,9 +20,13 @@ from app.infrastructure.orm import (
 )
 from app.memory import short_term
 from app.models import Unit
-from app.retrieval.rag import hybrid_retrieve_units
+from app.config import settings
+from app.retrieval.rag import RetrievalHit, _semantic_hits, hybrid_retrieve_units
 from app.retrieval.embedder import embed_texts
 from app.retrieval.store import vector_store
+from app.retrieval.source_candidates import (
+    count_task_units, load_source_candidates, search_source_candidates,
+)
 from app.workflow.queue import request_control, task_queue_status
 from app.workflow.stages import STAGE_LABELS, workflow_map
 
@@ -160,7 +164,7 @@ _MUTATING_ARGUMENT_KEYS = {
     AgentToolName.UPDATE_SECTION_TITLE: {"old_title", "new_title", "instruction"},
     AgentToolName.UPDATE_SECTION_TITLES: {"changes", "instruction"},
     AgentToolName.REGENERATE_CHAPTER: {"chapter_title", "instruction"},
-    AgentToolName.RERUN_FINAL_PLAN: {"instruction", "new_structure", "required_chapter_count"},
+    AgentToolName.RERUN_FINAL_PLAN: {"instruction", "new_structure", "required_chapter_count", "preserved_titles"},
     AgentToolName.PAUSE_TASK: set(),
     AgentToolName.RESUME_TASK: set(),
     AgentToolName.RETRY_TASK: set(),
@@ -178,6 +182,7 @@ def tool_manifest() -> list[dict[str, Any]]:
                 "instruction": "用户对目录调整的完整要求",
                 "new_structure": ["用户明确确认的章节标题，按顺序填写；未确认具体标题时留空"],
                 "required_chapter_count": "用户明确要求的章节数量；未明确时为 0",
+                "preserved_titles": ["用户明确要求保持不变的现有章节标题，按原顺序填写；无此约束时留空"],
             }
         elif name == AgentToolName.REWRITE_SENTENCE:
             item["arguments"] = {
@@ -319,17 +324,23 @@ def validate_agent_tool_call(call: AgentToolCall, context: TaskAgentContext,
         arguments.update(required_dimensions=dimensions, required_dimension_count=expected)
     elif call.tool_name == AgentToolName.RERUN_FINAL_PLAN:
         structure = _clean_text_list(arguments.get("new_structure"))
-        structure = _preserve_confirmed_structure_scope(
-            context.task_id,
-            structure,
-            f"{message}\n{arguments.get('instruction') or ''}",
-        )
         if context.directory_review_pending and not structure:
             raise ValueError("目录讨论阶段需要助手先形成完整的新目录提案")
         expected = _positive_int(arguments.get("required_chapter_count")) or len(structure)
         if structure and expected and len(structure) != expected:
             raise ValueError(f"章节数量不一致：用户要求 {expected} 章，提案识别到 {len(structure)} 章")
-        arguments.update(new_structure=structure, required_chapter_count=expected)
+        preserved = _clean_text_list(arguments.get("preserved_titles"))
+        if preserved:
+            from app.rendering.headings import strip_heading_prefix
+            current = _load_plan(context.task_id, "final").get("titles") or []
+            keys = [strip_heading_prefix(title).strip() for title in preserved]
+            current_preserved = [strip_heading_prefix(title).strip() for title in current
+                                 if strip_heading_prefix(title).strip() in keys]
+            proposed_preserved = [strip_heading_prefix(title).strip() for title in structure
+                                  if strip_heading_prefix(title).strip() in keys]
+            if len(set(keys)) != len(keys) or current_preserved != keys or proposed_preserved != keys:
+                raise ValueError("要求保留的章节必须存在于当前目录及新目录，且保持原有顺序和标题")
+        arguments.update(new_structure=structure, required_chapter_count=expected, preserved_titles=preserved)
     elif call.tool_name == AgentToolName.CONFIRM_REQUIREMENTS:
         if not context.requirement_review_pending:
             raise ValueError("当前不在需求确认阶段")
@@ -444,56 +455,6 @@ def _preserve_existing_heading_prefix(old_title: str, new_title: str) -> str:
         return new_title
     prefix_end = old_title.find(clean_old)
     return f"{old_title[:prefix_end]}{clean_new}" if prefix_end >= 0 else clean_new
-
-
-def _preserve_confirmed_structure_scope(task_id: str, proposed: list[str], instruction: str) -> list[str]:
-    """Apply structural edit semantics against persisted titles, not model paraphrases."""
-    if not proposed:
-        return []
-    from app.rendering.headings import strip_heading_prefix
-
-    current = [
-        strip_heading_prefix(str(item)) for item in (_load_plan(task_id, "final").get("titles") or [])
-        if strip_heading_prefix(str(item))
-    ]
-    proposed = [strip_heading_prefix(str(item)) for item in proposed if strip_heading_prefix(str(item))]
-    if not current:
-        return proposed
-
-    text = re.sub(r"\s+", "", str(instruction or ""))
-    split_match = re.search(r"第([一二三四五六七八九十\d]+)章.{0,24}拆分|拆分.{0,12}第([一二三四五六七八九十\d]+)章", text)
-    split_index = _chinese_or_arabic_int(next((value for value in split_match.groups() if value), "")) if split_match else 0
-    preserve_match = re.search(r"(?:保持|保留)(?:原有|原)?前([一二三四五六七八九十\d]+)章(?:不变)?", text)
-    preserve_count = _chinese_or_arabic_int(preserve_match.group(1)) if preserve_match else 0
-    if split_index:
-        preserve_count = max(preserve_count, split_index - 1)
-
-    if preserve_count <= 0:
-        return proposed
-    preserve_count = min(preserve_count, len(current))
-    tail_count = max(0, len(current) - (split_index or preserve_count))
-    replacement_end = len(proposed) - tail_count if tail_count else len(proposed)
-    replacements = proposed[preserve_count:replacement_end]
-    if not replacements:
-        raise ValueError("目录调整缺少目标章节的替代结构")
-    suffix = current[len(current) - tail_count:] if tail_count else []
-    return [*current[:preserve_count], *replacements, *suffix]
-
-
-def _chinese_or_arabic_int(value: str) -> int:
-    raw = str(value or "")
-    if raw.isdigit():
-        return int(raw)
-    numerals = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6,
-                "七": 7, "八": 8, "九": 9, "十": 10}
-    if raw in numerals:
-        return numerals[raw]
-    if raw.startswith("十"):
-        return 10 + numerals.get(raw[1:], 0)
-    if "十" in raw:
-        left, right = raw.split("十", 1)
-        return numerals.get(left, 0) * 10 + numerals.get(right, 0)
-    return 0
 
 
 def _positive_int(value: Any) -> int:
@@ -1030,6 +991,8 @@ def _load_quality_issue_at(context: TaskAgentContext, index: int) -> dict[str, A
 
 def _load_materials(task_id: str, *, offset: int = 0, limit: int = 24) -> dict[str, Any]:
     task = short_term.load_task(task_id) or {}
+    from app.research_brief import build_research_brief
+    brief = build_research_brief(task)
     ids = [int(item) for item in task.get("material_ids") or [] if str(item).isdigit()]
     page_offset, page_limit = _clamp_page(offset, limit, maximum=50)
     with session_scope() as s:
@@ -1093,6 +1056,9 @@ def _load_materials(task_id: str, *, offset: int = 0, limit: int = 24) -> dict[s
         "returned_count": len(material_views),
         "next_offset": page_offset + page_limit if page_offset + page_limit < int(total) else None,
         "truncated": page_offset + len(material_views) < int(total),
+        "coverage": brief["coverage"],
+        "scope": brief["coverage"]["coverage_note"],
+        "coverage_completeness": brief["coverage"]["completeness"],
         "notice": "字段标记为 truncated_fields 时，请使用 search_material_units 核验原文；insight_status=missing 表示当前任务尚未完成材料理解，不得借用其他任务结果。",
     }
 
@@ -1113,34 +1079,62 @@ def _search_material_units(task_id: str, *, query: str, material_id: int | None 
             return {"query": query, "items": [], "error": "MATERIAL_NOT_IN_TASK"}
         material_ids = [int(material_id)]
     if not query or not material_ids:
-        return {"query": query, "items": [], "total": 0, "strategy": "not_run"}
-    with session_scope() as s:
-        unit_rows = s.execute(select(ORMUnit).where(
-            ORMUnit.c.material_id.in_(material_ids),
-        )).mappings().all()
-        material_rows = s.execute(select(ORMMaterial.c.id, ORMMaterial.c.filename).where(
-            ORMMaterial.c.id.in_(material_ids),
-        )).mappings().all()
+        return {"query": query, "items": [], "total": 0, "strategy": "not_run",
+                "scope": "没有执行原文检索；不能据此判断材料不含相关内容。"}
+    if len(query) > 2000:
+        return {"query": query[:2000], "items": [], "total": 0, "error": "QUERY_TOO_LONG"}
+    requested_limit = max(1, int(limit or 6))
+    effective_limit = min(requested_limit, 8)
+    candidate_limit = max(effective_limit, min(
+        256, int(settings.assistant_retrieval_candidate_limit or 96),
+    ))
+    from app.retrieval.source_candidates import load_small_source_scope
+    small_scope = load_small_source_scope(material_ids, candidate_limit)
+    if small_scope is None:
+        lexical_rows, lexical_meta = search_source_candidates(
+            material_ids, query, candidate_limit,
+        )
+    else:
+        lexical_rows, lexical_meta = [], {
+            "candidate_count": len(small_scope), "term_count": 0,
+            "index": "small_scope", "bounded": True,
+        }
+    lexical_hits = [
+        RetrievalHit(
+            unit_id=int(row["unit_id"]),
+            score=min(1.0, int(row.get("term_matches") or 0) / max(1, int(lexical_meta["term_count"]))),
+            source="keyword",
+            coverage_terms=list(row.get("matched_terms") or []),
+        )
+        for row in lexical_rows
+    ]
+    semantic_hits = _semantic_hits(
+        query, candidate_limit, {"material_id": material_ids},
+    )
+    candidate_ids = list(dict.fromkeys(
+        [int(row["unit_id"]) for row in lexical_rows]
+        + [int(hit.unit_id) for hit in semantic_hits]
+    ))
+    candidate_rows = small_scope if small_scope is not None else load_source_candidates(material_ids, candidate_ids)
     units_by_material: dict[int, list[Unit]] = {}
     by_unit: dict[int, dict[str, Any]] = {}
-    for row in unit_rows:
+    for row in candidate_rows:
         content = str(row.get("content") or "").strip()
         if not content:
             continue
         unit = Unit(
-            id=int(row["id"]), material_id=int(row["material_id"]), kind=str(row.get("kind") or "text"),
+            id=int(row["unit_id"]), material_id=int(row["material_id"]), kind=str(row.get("kind") or "text"),
             content=content, page=row.get("page"), paragraph=row.get("paragraph"),
-            image_desc=row.get("image_desc"), metadata_json=str(row.get("metadata_json") or "{}"),
+            metadata_json="{}",
         )
         units_by_material.setdefault(unit.material_id, []).append(unit)
         by_unit[unit.id] = dict(row)
-    requested_limit = max(1, int(limit or 6))
-    effective_limit = min(requested_limit, 8)
     hits, metadata = hybrid_retrieve_units(
         query, units_by_material, top_k=effective_limit,
         filters={"material_id": material_ids},
+        semantic_candidates=semantic_hits,
+        lexical_candidates=lexical_hits,
     )
-    filenames = {int(row["id"]): str(row["filename"]) for row in material_rows}
     items = []
     for hit in hits:
         row = by_unit.get(int(hit.unit_id))
@@ -1148,24 +1142,39 @@ def _search_material_units(task_id: str, *, query: str, material_id: int | None 
             continue
         items.append({
             "unit_id": int(hit.unit_id), "material_id": int(row["material_id"]),
-            "filename": filenames.get(int(row["material_id"]), ""),
+            "filename": str(row.get("filename") or ""),
             "kind": str(row.get("kind") or "text"), "page": row.get("page"),
             "paragraph": row.get("paragraph"), "excerpt": _bounded_text(row.get("content"), 1000),
             "retrieval": {"source": hit.source, "score": round(float(hit.score), 4)},
         })
-    candidate_count = sum(len(items) for items in units_by_material.values())
+    candidate_count = len(by_unit)
+    total_unit_count = len(small_scope) if small_scope is not None else count_task_units(material_ids)
+    searchable_material_count = len(units_by_material)
+    metadata.update({
+        "lexical_candidate_count": lexical_meta["candidate_count"],
+        "semantic_candidate_count": len(semantic_hits),
+        "lexical_index": lexical_meta["index"],
+        "candidate_limit": candidate_limit,
+    })
     return {
         "query": query,
         "items": items,
         "total": len(items),
         "candidate_units": candidate_count,
+        "selected_material_count": len(material_ids),
+        "searchable_material_count": searchable_material_count,
+        "searchable_unit_count": total_unit_count,
+        "scope": "只在当前任务材料中检索；检索先取有限候选再排序，返回片段不代表全量阅读或事实核验。",
         "requested_limit": requested_limit,
         "effective_limit": effective_limit,
-        "truncated": candidate_count > len(items),
+        "truncated": total_unit_count > candidate_count or candidate_count > len(items),
         "next_step": (
-            "结果仅为候选片段；如需扩大覆盖，请用更具体的问题、限定材料或分多次检索。"
-            if candidate_count > len(items) else "当前候选范围已完整返回。"
+            "本次只排序了有限候选；如需扩大覆盖，请用更具体的问题、限定材料或分多次检索。"
+            if total_unit_count > candidate_count or candidate_count > len(items)
+            else "当前可检索材料范围内已返回匹配候选。"
         ),
+        "total_scoped_units": total_unit_count,
+        "retrieval_candidate_units": candidate_count,
         "strategy": metadata,
     }
 
@@ -1173,6 +1182,8 @@ def _search_material_units(task_id: str, *, query: str, material_id: int | None 
 def _load_task_map(task_id: str, report_id: int | None) -> dict[str, Any]:
     """Small, task-scoped map used as the assistant's first retrieval step."""
     task = short_term.load_task(task_id) or {}
+    from app.research_brief import build_research_brief
+    brief = build_research_brief(task)
     analysis = _load_plan(task_id, "analysis", include_details=False)
     final = _load_plan(task_id, "final", include_details=False)
     materials = _load_materials(task_id).get("materials") or []
@@ -1196,6 +1207,15 @@ def _load_task_map(task_id: str, report_id: int | None) -> dict[str, Any]:
             }
             for item in materials[:12]
         ],
+        "research_brief": {
+            "coverage": brief["coverage"],
+            "focus": brief["focus"],
+            "topic_candidates": brief["topic_candidates"],
+            "open_questions": brief["open_questions"][:4],
+            "preliminary": brief["preliminary"],
+            "completeness": brief["coverage"]["completeness"],
+            "coverage_note": brief["coverage"]["coverage_note"],
+        },
         "analysis_plan": analysis.get("summary") if analysis.get("exists") else {},
         "final_plan": final.get("summary") if final.get("exists") else {},
         "fact_highlights": facts,

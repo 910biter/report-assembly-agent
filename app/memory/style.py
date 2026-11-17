@@ -262,7 +262,9 @@ def analyze_library(
                     prompt, max_tokens=settings.style_probe_output_tokens,
                 )
                 topic_type = _normalize_profile_label(payload.get("topic_type"))
-            except Exception:
+            except Exception as exc:
+                if str(exc).startswith(("MODEL_HTTP_", "MODEL_CONNECTION_NOT_CONFIGURED")):
+                    raise
                 pass
         features.append({
             "filename": report.get("filename", ""),

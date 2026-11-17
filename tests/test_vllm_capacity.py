@@ -2,6 +2,7 @@ import json
 from dataclasses import replace
 
 import httpx
+import httpx2
 import pytest
 
 from app import vllm_capacity as vc
@@ -60,6 +61,23 @@ def test_overflow_never_changes_output_or_messages(monkeypatch):
     assert json.dumps(payload) == before
 
 
+@pytest.mark.parametrize("count,expected", [(4000, 5500), (6000, 3900)])
+def test_writer_output_adapts_only_to_actual_remaining_capacity(monkeypatch, count, expected):
+    c = replace(connection(), context_tokens=10000, output_tokens=5500)
+    monkeypatch.setattr(vc.httpx, "post", lambda url, **kw: response(url, count=count, window=10000))
+    payload = {"model": "model", "messages": [{"role": "user", "content": "x"}], "max_tokens": 5500}
+    result = vc.verify_request(c, payload, 100, adaptive_writer=True)
+    assert payload["max_tokens"] == expected
+    assert result["requested_output_tokens"] == expected
+
+
+def test_writer_rejects_input_above_seventy_percent(monkeypatch):
+    c = replace(connection(), context_tokens=10000, output_tokens=5500)
+    monkeypatch.setattr(vc.httpx, "post", lambda url, **kw: response(url, count=7001, window=10000))
+    with pytest.raises(ValueError, match="MODEL_INPUT_OVER_BUDGET"):
+        vc.verify_request(c, {"model": "model", "messages": [], "max_tokens": 5500}, 100, adaptive_writer=True)
+
+
 def test_failure_has_cooldown_then_recovery(monkeypatch):
     now = [1000.0]
     calls = []
@@ -109,7 +127,8 @@ def test_collaboration_hook_verifies_serialized_wire_payload(monkeypatch):
     monkeypatch.setattr(vc, "verify_request", lambda c, payload, safety: seen.append(payload) or {"request_count_method": "vllm_tokenize"})
     model = build_collaboration_model()
     client = model.client._client
-    request = httpx.Request("POST", "http://service/v1/chat/completions",
+    assert isinstance(client, httpx2.AsyncClient)
+    request = httpx2.Request("POST", "http://service/v1/chat/completions",
                             json={"model": "model", "messages": [], "max_completion_tokens": 1024})
     asyncio.run(client.event_hooks["request"][0](request))
     assert seen[0]["max_tokens"] == 1024

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 import re
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
@@ -48,39 +47,6 @@ def declared_report_minimum_words(budget: dict | None) -> int:
         return resolved
     # Read pre-contract historical plans without changing their semantics.
     return max(resolved, int(budget.get("min_words") or 0))
-
-
-def writer_output_token_limit(
-    target_words: int,
-    configured_max_tokens: int,
-    tokens_per_word: float = 1.45,
-    minimum_tokens: int = 512,
-    structured_output_overhead_tokens: int = 256,
-) -> int:
-    """Translate a unit's visible-word target into a calibrated output cap.
-
-    The configured stage cap remains authoritative. Untargeted legacy calls keep
-    that cap; targeted calls receive only the budget calibrated for their unit.
-    """
-    maximum = max(1, int(configured_max_tokens or 1))
-    target = max(0, int(target_words or 0))
-    if not target:
-        return maximum
-    ratio = max(0.1, float(tokens_per_word or 1.45))
-    requested = max(
-        int(minimum_tokens),
-        math.ceil(target * ratio) + max(0, int(structured_output_overhead_tokens)),
-    )
-    return min(maximum, requested)
-
-
-def writer_output_retry_limit(initial_tokens: int, configured_max_tokens: int) -> int:
-    """Return one larger, stage-bounded cap after a genuinely truncated output."""
-    maximum = max(1, int(configured_max_tokens or 1))
-    initial = min(maximum, max(1, int(initial_tokens or 1)))
-    if initial >= maximum:
-        return initial
-    return min(maximum, max(initial * 2, initial + 256))
 
 
 def writer_scale_prompt_hint(
@@ -132,31 +98,29 @@ def writer_scale_prompt_hint(
     nested = target and (chapter_target or unit_target)
     hint = "篇幅预算：" + "；".join(constraints) + "。"
     if nested:
-        hint += "章节与交付单元是全文预算的内部拆分，不可相加；避免单个部分超额挤占其他部分。"
+        hint += "章节与交付单元按层级共同分配全文预算，各层目标用于安排所属内容。"
     if maximum:
-        hint += "全文不得超过上限。"
+        hint += f"全文控制在 {maximum} 字以内。"
     if soft_maximum:
-        hint += "优先控制在软控制线以内。"
+        hint += "成文规模优先贴近全文软控制线。"
     if minimum:
         if evidence == "sufficient":
             hint += (
-                "最终规模评估判定证据充足；必须完整执行当前计划，未达到本单元最低完成要求前不得收束，"
-                "不得因核心观点已被简要提及而提前结束。"
+                "证据评估为充足：完整展开当前计划中的论证，并在达到本单元最低完成要求后收束。"
             )
         elif evidence in {"limited", "insufficient"}:
             if capacity_shortfall:
                 hint += (
                     f"现有材料的篇幅承载估计约 {supported_maximum} 字，低于用户下限；"
-                    "保留真实证据边界，并明确不能满足篇幅的具体原因，不得重复扩写或编造。"
+                    "完整呈现材料能够支持的论证，并说明篇幅受限的具体依据。"
                 )
             else:
                 hint += (
-                    "部分判断存在证据边界，不代表材料不能支撑约定篇幅；"
-                    "须在已有事实、比较和适用范围内充分展开，不能仅因存在未知项而自行放宽用户下限。"
+                    "按用户篇幅下限写作；围绕已有事实、比较和适用范围充分展开，并说明具体的信息缺口。"
                 )
         else:
-            hint += "不得仅因正文简洁而自行判断证据不足；确有具体证据缺口时才可欠填，并保留证据边界。"
-    hint += "完成当前论证且接近对应目标后收束；不得重复、泛化扩写或为凑字数编造内容。"
+            hint += "按用户篇幅下限组织完整论证；具体证据缺口及其对成文规模的影响以计划记录为准。"
+    hint += "每段围绕证据、关系或适用范围提供有效信息，完成当前论证并接近对应目标后自然收束。"
     return hint
 
 

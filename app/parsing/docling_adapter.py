@@ -18,7 +18,8 @@ _SUPPORTED = {
     ".html", ".htm", ".md", ".txt", ".adoc", ".asciidoc", ".xml",
     ".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp",
     ".odt", ".ods", ".odp", ".epub", ".eml",
-    ".mp3", ".wav", ".m4a", ".flac", ".ogg", ".mp4", ".mov", ".avi", ".mkv", ".vtt",
+    ".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg",
+    ".mp4", ".mov", ".avi", ".mkv", ".webm", ".vtt",
 }
 
 
@@ -185,6 +186,8 @@ def _convert(source: Path, ext: str, do_ocr: bool) -> tuple[list[Unit], dict]:
     units = _units_from_docling_dict(data)
     if not units and markdown:
         units = _units_from_markdown(markdown)
+    if ext in _AUDIO_EXTS and not any(unit.content.strip() for unit in units):
+        raise ValueError("ASR_EMPTY_TRANSCRIPT")
     profile = _profile_from_docling_dict(data, markdown, source)
     profile["conversion_status"] = str(getattr(result, "status", "") or "")
     profile["ocr_enabled"] = bool(do_ocr)
@@ -197,7 +200,7 @@ _CONVERTER_CACHE: dict = {}
 _parse_lock = threading.Lock()
 
 
-_AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".flac", ".ogg", ".aac", ".opus"}
+_AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".flac", ".ogg", ".aac"}
 _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 
 
@@ -270,6 +273,8 @@ def _pdf_pipeline_options(do_ocr: bool):
     )
 
     options = PdfPipelineOptions()
+    if settings.docling_artifacts_path:
+        options.artifacts_path = Path(settings.docling_artifacts_path)
     options.do_ocr = bool(do_ocr)
     # Layout, table recognition and OCR all belong to the Docling pipeline.
     _accelerator = getattr(options, "accelerator_options", None)

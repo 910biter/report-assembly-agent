@@ -8,6 +8,8 @@ import StatusBadge from "@/components/StatusBadge.vue";
 import MaterialComparisonWorkspace from "@/components/MaterialComparisonWorkspace.vue";
 import UiPageHeader from "@/components/ui/UiPageHeader.vue";
 import UiPagination from "@/components/ui/UiPagination.vue";
+import UiDataBrowser from "@/components/ui/UiDataBrowser.vue";
+import ResearchBrief from "@/components/ResearchBrief.vue";
 import { usePersistentPageSize } from "@/lib/pagination";
 import { stageGroups, stageMeta } from "@/domain/workflowStages";
 import { useUiStore } from "@/stores/ui";
@@ -32,7 +34,6 @@ onMounted(() => window.addEventListener("ira:task-artifact-updated", refreshAfte
 onBeforeUnmount(() => window.removeEventListener("ira:task-artifact-updated", refreshAfterAssistantUpdate));
 const requestedTab = String(route.query.tab || "overview");
 const active = ref(requestedTab === "runtime" ? "materials" : requestedTab);
-const workspacePane = ref(requestedTab === "runtime" ? "process" : "materials");
 const analysisType = ref("facts");
 const analysisPage = ref(1);
 const analysisPageSize = usePersistentPageSize("analysis");
@@ -64,6 +65,16 @@ const materials = useQuery({
   enabled: computed(() => ["materials", "overview"].includes(active.value)),
   staleTime: 30000,
 });
+const selectedMaterialId = ref<number | null>(null);
+const materialDetail = useQuery({
+  queryKey: computed(() => ["material-overview", selectedMaterialId.value]),
+  queryFn: () => api<any>(`/api/materials/${selectedMaterialId.value}?summary_only=true`),
+  enabled: computed(() => active.value === "materials" && selectedMaterialId.value !== null),
+  staleTime: 30000,
+});
+function selectTaskMaterial(id: number) {
+  selectedMaterialId.value = id;
+}
 const analysis = useQuery({
   queryKey: ["task-analysis", taskId, analysisType, analysisPage, analysisPageSize],
   queryFn: () => api<{ items: any[]; total: number }>(`/api/tasks/${taskId}/analysis/page?kind=${analysisType.value}&page=${analysisPage.value}&page_size=${analysisPageSize.value}`),
@@ -151,9 +162,17 @@ const checkpointStructureTitles = computed(() =>
 const checkpointStructureEdited = computed(
   () => checkpointStructureTitles.value.join("\u001f") !== directoryDraftKey,
 );
+const controlError = ref("");
 const command = useMutation({
   mutationFn: ({ path }: { path: string }) => api(path, { method: "POST" }),
-  onSuccess: () => qc.invalidateQueries({ queryKey: ["task", taskId] }),
+  onSuccess: async () => {
+    controlError.value = "";
+    await Promise.all([
+      qc.invalidateQueries({ queryKey: ["task", taskId] }),
+      qc.invalidateQueries({ queryKey: ["tasks"] }),
+    ]);
+  },
+  onError: (error: Error) => { controlError.value = error.message || "操作失败，请重试"; },
 });
 const confirmPlanning = useMutation({
   mutationFn: () =>
@@ -250,11 +269,11 @@ const taskTabs = computed(() =>
   isComparison.value
     ? [
         ["comparison", "对比结果"],
-        ["materials", "材料与过程"],
+        ["materials", "材料"],
       ]
     : [
         ["overview", "概览"],
-        ["materials", "材料与过程"],
+        ["materials", "材料"],
         ["analysis", "分析"],
         ["report", "报告"],
         ["versions", "版本"],
@@ -270,12 +289,17 @@ const processCurrentLabel = computed(() => {
     const ahead = task.data.value?.queue_status?.ahead;
     return ahead == null ? "待运行" : `待运行 · 前方 ${ahead} 个任务`;
   }
+  if (resuming.value) return "正在恢复运行";
   if (stageIndex.value >= 0) return stages.value[stageIndex.value]?.name || "处理中";
   return stageMeta[String(task.data.value?.stage || "")]?.label || "处理中";
 });
+const resuming = computed(() =>
+  task.data.value?.stage === "paused" &&
+  ["queued", "running"].includes(task.data.value?.queue_status?.status || ""),
+);
 const running = computed(
   () =>
-    task.data.value?.queue_status?.status === "queued" ||
+    ["queued", "running"].includes(task.data.value?.queue_status?.status || "") ||
     ![
       "created",
       "requirement_review",
@@ -322,7 +346,11 @@ const inferenceCount = computed(() =>
     : Number(artifactCounts.value.inferences || 0),
 );
 function run() {
-  command.mutate({ path: `/api/tasks/${taskId}/run` });
+  command.mutate({
+    path: task.data.value?.stage === "failed"
+      ? `/api/tasks/${taskId}/control/restart`
+      : `/api/tasks/${taskId}/run`,
+  });
 }
 function confirmPlan() {
   confirmPlanning.mutate();
@@ -376,6 +404,7 @@ watch(
   { immediate: true },
 );
 function control(op: string) {
+  controlError.value = "";
   command.mutate({ path: `/api/tasks/${taskId}/control/${op}` });
 }
 function confidence(x: any) {
@@ -447,7 +476,7 @@ function versionsList() {
                   ? "审阅完成"
                   : "对比中"
           }}</span
-        ><StatusBadge v-else :stage="task.data.value.stage" /><button
+        ><StatusBadge v-else :stage="resuming ? task.data.value.queue_status?.status : task.data.value.stage" /><button
           v-if="
             ['created', 'failed'].includes(task.data.value.stage) ||
             task.data.value.requirement_review_pending
@@ -473,11 +502,12 @@ function versionsList() {
         >
           {{ pauseRequested ? "正在暂停…" : "暂停" }}</button
         ><button
-          v-if="task.data.value.stage === 'paused'"
+          v-if="task.data.value.stage === 'paused' && !resuming"
           class="btn primary"
+          :disabled="command.isPending.value"
           @click="control('resume')"
         >
-          继续运行</button
+          {{ command.isPending.value ? "正在恢复…" : "继续运行" }}</button
         ><RouterLink
           v-if="task.data.value.report_id"
           class="btn"
@@ -492,6 +522,7 @@ function versionsList() {
         </div>
       </template>
     </UiPageHeader>
+    <p v-if="controlError" class="muted" role="alert">{{ controlError }}</p>
     <section class="surface progress-block">
       <div v-if="stageIndex >= 0" class="progress-rail" :class="{ compact: isComparison }">
         <div
@@ -521,7 +552,7 @@ function versionsList() {
         <span class="progress-interruption-mark" aria-hidden="true"></span>
         <div>
           <b>{{ processCurrentLabel }}</b>
-          <small>{{ task.data.value.stage === "paused" ? "任务已暂停；暂停前的具体环节未记录" : "任务异常；失败环节未记录" }}</small>
+          <small>{{ resuming ? "已提交恢复请求，等待执行器继续处理" : task.data.value.stage === "paused" ? "任务已暂停；暂停前的具体环节未记录" : "任务异常；失败环节未记录" }}</small>
         </div>
       </div>
     </section>
@@ -544,13 +575,6 @@ function versionsList() {
     />
     <section v-else-if="active === 'overview'" class="workspace-grid">
       <div class="main-column">
-        <div v-if="task.data.value.stage === 'failed'" class="notice warning">
-          <b>任务运行异常</b><br />{{
-            task.data.value.error ||
-            task.data.value.failure_reason ||
-            "请查看运行详情后重新运行。"
-          }}
-        </div>
         <div
           v-if="task.data.value.requirement_review_pending"
           class="notice planning-review"
@@ -624,6 +648,14 @@ function versionsList() {
             </button>
           </div>
         </div>
+        <ResearchBrief
+          v-if="!isComparison && task.data.value.research_brief?.coverage?.selected"
+          :brief="task.data.value.research_brief"
+          :task-id="taskId"
+          browse
+          @discuss="ui.openAssistant({ taskId })"
+          @browse="active = 'materials'"
+        />
         <div class="surface section-block">
           <div class="section-head">
             <div>
@@ -693,7 +725,7 @@ function versionsList() {
               }}</span>
             </div>
             <strong>打开</strong></RouterLink
-          ><button class="artifact-link" @click="active = 'materials'; workspacePane = 'materials'">
+          ><button class="artifact-link" @click="active = 'materials'">
             <div>
               <b>材料解析</b
               ><span
@@ -716,37 +748,30 @@ function versionsList() {
       </aside>
     </section>
     <section v-else-if="active === 'materials'" class="workspace-browser">
-      <nav class="tabs workspace-subtabs" aria-label="材料与运行过程">
-        <button
-          class="tab"
-          :class="{ active: workspacePane === 'materials' }"
-          @click="workspacePane = 'materials'"
-        >材料</button>
-        <button
-          class="tab"
-          :class="{ active: workspacePane === 'process' }"
-          @click="workspacePane = 'process'"
-        >运行过程</button>
-      </nav>
-      <section v-if="workspacePane === 'materials'" class="surface section-block">
+      <UiDataBrowser class="task-material-browser" :detail-open="selectedMaterialId !== null" detail-width="390px" label="任务材料浏览器">
+      <section class="surface section-block">
         <div class="section-head">
           <div>
             <h2>{{ isComparison ? "新增材料" : "任务材料" }}</h2>
           </div>
         </div>
         <div class="data-list">
-          <div
+          <button
             v-for="item in materials.data.value || []"
-            :key="item.filename"
+            :key="item.id"
             class="data-row material-row"
+            :class="{ selected: selectedMaterialId === item.id }"
+            :aria-label="`查看 ${item.filename} 的材料概览`"
+            :aria-pressed="selectedMaterialId === item.id"
+            @click="selectTaskMaterial(item.id)"
           >
             <div>
               <b>{{ item.filename }}</b
               ><span
                 >{{ item.file_type }} · {{ item.units_count }} 个内容单元<span
-                  v-if="item.pages?.length"
+                  v-if="item.page_count"
                 >
-                  · {{ item.pages.length }} 页</span
+                  · {{ item.page_count }} 页</span
                 ></span
               >
             </div>
@@ -769,27 +794,39 @@ function versionsList() {
                       : "处理中"
               }}</span
             >
-          </div>
+          </button>
         </div>
       </section>
-      <section v-else class="surface section-block process-panel">
-        <div class="section-head">
-          <div>
-            <h2>运行过程</h2>
-            <p v-if="isComparison" class="muted">
-              仅处理新增材料并核验变化，不生成或改写基线报告。
-            </p>
-          </div>
+      <template v-if="selectedMaterialId !== null" #detail>
+        <div class="task-material-detail">
+          <header class="task-material-detail-head">
+            <div><small>任务材料</small><h2>{{ materialDetail.data.value?.filename || "正在读取材料…" }}</h2></div>
+            <button type="button" class="task-material-close" aria-label="关闭材料详情" @click="selectedMaterialId = null">×</button>
+          </header>
+          <div v-if="materialDetail.isPending.value" class="task-material-detail-body muted">正在读取材料详情…</div>
+          <div v-else-if="materialDetail.isError.value" class="task-material-detail-body muted">材料详情读取失败，请稍后重试。</div>
+          <template v-else-if="materialDetail.data.value">
+            <div class="task-material-detail-body">
+              <div class="task-material-stats">
+                <div><strong>{{ (materialDetail.data.value.file_type || '—').toUpperCase() }}</strong><span>文件类型</span></div>
+                <div><strong>{{ materialDetail.data.value.unit_count || 0 }}</strong><span>内容单元</span></div>
+                <div><strong>{{ materialDetail.data.value.page_count || 0 }}</strong><span>已解析页</span></div>
+              </div>
+              <section v-if="materialDetail.data.value.insight?.topic || materialDetail.data.value.insight?.key_points?.length" class="task-material-insight">
+                <small>材料理解</small>
+                <h3>{{ materialDetail.data.value.insight.topic || materialDetail.data.value.filename }}</h3>
+                <p v-if="materialDetail.data.value.insight.doc_type || materialDetail.data.value.insight.material_role" class="muted">{{ [materialDetail.data.value.insight.doc_type, materialDetail.data.value.insight.material_role].filter(Boolean).join(' · ') }}</p>
+                <ul v-if="materialDetail.data.value.insight.key_points?.length"><li v-for="(point, index) in materialDetail.data.value.insight.key_points.slice(0, 4)" :key="index">{{ point }}</li></ul>
+              </section>
+              <div v-else class="task-material-empty">
+                <strong>{{ materialDetail.data.value.parse_status === 'ready' ? '暂无理解摘要' : '材料尚未解析' }}</strong>
+                <p>{{ materialDetail.data.value.parse_status === 'ready' ? '正文已解析，当前没有可展示的主题和要点。' : '解析完成后，这里会显示材料的主题和关键内容。' }}</p>
+              </div>
+            </div>
+          </template>
         </div>
-        <dl class="process-records">
-          <div><dt>创建时间</dt><dd>{{ task.data.value.created_at || '—' }}</dd></div>
-          <div><dt>执行轮次</dt><dd>第 {{ task.data.value.run_revision || 1 }} 轮</dd></div>
-          <div v-if="task.data.value.queue_status?.queue_wait_seconds != null"><dt>排队耗时</dt><dd>{{ Number(task.data.value.queue_status.queue_wait_seconds).toFixed(1) }} 秒</dd></div>
-        </dl>
-        <p v-if="task.data.value.stage === 'failed'" class="notice warning process-error">
-          {{ task.data.value.error || task.data.value.failure_reason || "当前环节未完成，请查看任务状态。" }}
-        </p>
-      </section>
+      </template>
+      </UiDataBrowser>
     </section>
     <section v-else-if="active === 'analysis'" class="analysis-layout">
       <aside class="analysis-nav surface">
@@ -1144,7 +1181,7 @@ function versionsList() {
   background: var(--surface-hover);
 }
 .progress-step.current > span {
-  color: var(--foreground);
+  color: var(--primary-foreground);
   border-color: var(--color-primary);
   background: var(--color-primary);
 }
@@ -1168,33 +1205,51 @@ function versionsList() {
   position: sticky;
   z-index: 5;
   top: var(--header-height);
-  padding: 7px 4px 9px;
+  gap: 0;
+  padding: 7px 0 9px;
   background: var(--background);
+}
+.workspace-tabs .tab {
+  flex: 1 0 72px;
+  text-align: center;
 }
 .workspace-browser {
   display: grid;
   min-width: 0;
   gap: 12px;
 }
-.workspace-subtabs {
-  position: static;
-  z-index: auto;
-  display: flex;
-  width: fit-content;
-  max-width: 100%;
-  padding: 0 4px;
-  background: transparent;
-  backdrop-filter: none;
-  flex-wrap: wrap;
-  overflow: visible;
-}
+.workspace-browser .task-material-browser { min-height: 0; }
 .workspace-browser > .section-block {
+  min-width: 0;
+  padding: 16px 20px;
+}
+.task-material-browser > :first-child > .section-block {
   min-width: 0;
   padding: 16px 20px;
 }
 .material-row {
   grid-template-columns: minmax(0, 1fr) auto;
   gap: 16px;
+  width: 100%;
+  border: 0;
+  border-bottom: 1px solid var(--color-border);
+  background: transparent;
+  color: inherit;
+  text-decoration: none;
+  cursor: pointer;
+  text-align: left;
+}
+.material-row.selected {
+  background: var(--surface-hover);
+  box-shadow: inset 2px 0 var(--color-primary);
+}
+.material-row:hover,
+.material-row:focus-visible {
+  background: var(--surface-hover);
+}
+.material-row:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: -2px;
 }
 .material-row > div {
   min-width: 0;
@@ -1203,26 +1258,61 @@ function versionsList() {
 .material-row > .badge {
   white-space: nowrap;
 }
-.process-records {
+.task-material-detail { min-width: 0; }
+.task-material-detail-head {
   display: flex;
-  flex-wrap: wrap;
-  gap: 12px 32px;
-  margin: 0;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 20px 20px 16px;
+  border-bottom: 1px solid var(--border);
 }
-.process-records dt {
-  color: var(--muted-foreground);
+.task-material-detail-head > div { min-width: 0; }
+.task-material-detail-head small,
+.task-material-insight > small {
+  color: var(--color-muted);
   font-size: 12px;
 }
-.process-records dd {
-  margin: 4px 0 0;
-  font-size: 13px;
+.task-material-detail-head h2 {
+  margin: 5px 0 0;
+  overflow-wrap: anywhere;
+  font-size: 16px;
+  line-height: 1.45;
 }
-.process-panel .section-head {
-  margin-bottom: 4px;
+.task-material-close {
+  flex: none;
+  width: 28px;
+  height: 28px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-muted);
+  cursor: pointer;
+  font-size: 19px;
+  line-height: 1;
 }
-.process-error {
-  margin-top: 4px;
+.task-material-close:hover { color: var(--foreground); background: var(--surface-hover); }
+.task-material-detail-body { padding: 20px; overflow-wrap: anywhere; }
+.task-material-stats {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  padding-bottom: 20px;
+  border-bottom: 1px solid var(--border);
 }
+.task-material-stats div { min-width: 0; }
+.task-material-stats strong,
+.task-material-stats span { display: block; }
+.task-material-stats strong { color: var(--foreground); font-size: 18px; }
+.task-material-stats span { margin-top: 3px; color: var(--color-muted); font-size: 12px; }
+.task-material-insight { padding: 20px 0; }
+.task-material-insight h3 { margin: 7px 0 4px; font-size: 15px; line-height: 1.5; }
+.task-material-insight p { margin: 7px 0 0; font-size: 12px; }
+.task-material-insight ul { margin: 13px 0 0; padding-left: 20px; }
+.task-material-insight li { margin: 8px 0; font-size: 13px; line-height: 1.65; }
+.task-material-empty { padding: 22px 0; }
+.task-material-empty strong { color: var(--foreground); font-size: 13px; }
+.task-material-empty p { margin: 6px 0 0; color: var(--color-muted); font-size: 12px; line-height: 1.6; }
 .workspace-grid {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 340px;
@@ -1701,7 +1791,6 @@ function versionsList() {
 }
 .text-button:disabled {
   cursor: not-allowed;
-  opacity: .45;
 }
 .checkpoint-add {
   margin: -2px 0 12px;
@@ -1716,8 +1805,11 @@ function versionsList() {
     grid-template-columns: 1fr;
   }
   .progress-rail {
-    grid-template-columns: 1fr;
-    gap: 12px;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px 12px;
+  }
+  .progress-block {
+    padding: 14px 16px;
   }
   .progress-step::after {
     display: none;

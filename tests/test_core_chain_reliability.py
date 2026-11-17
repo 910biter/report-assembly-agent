@@ -136,7 +136,7 @@ def test_chapter_narrative_respects_input_budget_and_records_fallback(monkeypatc
     monkeypatch.setattr(agent, "generate_json", fail)
     monkeypatch.setattr(narrative, "save_task_artifact", lambda *args, **kwargs: None)
     monkeypatch.setattr(narrative, "update_call_funnel", lambda *args, **kwargs: None)
-    monkeypatch.setattr("app.runtime_profiles.stage_input_budget_tokens", lambda stage: 900)
+    monkeypatch.setattr("app.runtime_profiles.stage_input_budget_tokens", lambda stage: 1500)
     chapter = {"title": "Chapter", "target_words": 1200, "subsections": [
         {"title": "Topic", "fact_ids": [1, 20], "purpose": "Explain evidence"},
     ]}
@@ -144,7 +144,7 @@ def test_chapter_narrative_respects_input_budget_and_records_fallback(monkeypatc
 
     result = agent.plan_chapter("task", chapter, {}, facts, [])
 
-    assert count_tokens(prompts[0]) <= 900
+    assert count_tokens(prompts[0]) <= 1500
     assert result["generation_status"] == "fallback"
     assert result["generation_error"] == "unavailable"
     assert result["subsections"][0]["fact_ids"] == [1, 20]

@@ -181,6 +181,7 @@ class NarrativeAgent(BaseAgent):
             ], facts, inferences, stage_input_budget_tokens("narrative"),
             required_facts=collect_assigned_ids(chapter_plan, "fact"),
             required_inferences=collect_assigned_ids(chapter_plan, "inference"),
+            strict_required=True,
         )
         generation_error = ""
         self.last_call_id = ""
@@ -192,6 +193,8 @@ class NarrativeAgent(BaseAgent):
                 raise ValueError("EMPTY_NARRATIVE_PLAN")
         except Exception as exc:
             if str(exc) in {"TASK_PAUSED", "EXECUTION_LOCK_LOST"}:
+                raise
+            if str(exc).startswith(("MODEL_HTTP_", "MODEL_CONNECTION_NOT_CONFIGURED")):
                 raise
             payload = {}
             generation_error = str(exc)[:300]
@@ -277,6 +280,8 @@ class NarrativeAgent(BaseAgent):
         except Exception as exc:
             if str(exc) in {"TASK_PAUSED", "EXECUTION_LOCK_LOST"}:
                 raise
+            if str(exc).startswith(("MODEL_HTTP_", "MODEL_CONNECTION_NOT_CONFIGURED")):
+                raise
             payload = {}
             generation_error = str(exc)[:300]
         call_id = self.last_call_id
@@ -358,7 +363,9 @@ class NarrativeAgent(BaseAgent):
                 prompt, system=_QA_SYSTEM,
                 max_tokens=stage_profile("narrative_qa").output_tokens,
             )
-        except Exception:
+        except Exception as exc:
+            if str(exc).startswith(("MODEL_HTTP_", "MODEL_CONNECTION_NOT_CONFIGURED")):
+                raise
             return {"topics": [], "structure_note": ""}
         topics = []
         for item in payload.get("topics") or []:

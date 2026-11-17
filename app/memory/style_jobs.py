@@ -13,7 +13,7 @@ from app.parsing import parse_file
 
 _LOCK = threading.RLock()
 _JOBS: dict[str, dict] = {}
-_TERMINAL = {"completed", "failed"}
+_TERMINAL = {"completed", "failed", "license_paused"}
 
 
 def create_job(files: list[dict], job_id: str | None = None,
@@ -73,8 +73,11 @@ def run_job(job_id: str) -> None:
     failures: list[dict] = []
     total = len(files)
     try:
+        from app.licensing.service import require_license
+        require_license()
         _update(job_id, status="running", phase="parsing", message="正在解析模板与成品报告")
         for index, item in enumerate(files, start=1):
+            require_license()
             filename = str(item.get("filename") or "")
             path = Path(str(item.get("path") or ""))
             asset_roles = style.normalize_asset_roles(
@@ -115,6 +118,7 @@ def run_job(job_id: str) -> None:
             return
 
         def progress(event: dict) -> None:
+            require_license()
             phase = str(event.get("phase") or "learning")
             current = int(event.get("current") or 0)
             count = max(1, int(event.get("total") or 1))
@@ -147,9 +151,16 @@ def run_job(job_id: str) -> None:
             finished_at=_now(),
         )
     except Exception as exc:
-        _fail(job_id, str(exc), failures=failures)
+        from app.licensing.service import LicenseBlocked
+        if isinstance(exc, LicenseBlocked):
+            _update(job_id, status="license_paused", phase="license_paused",
+                    message="授权已暂停，续期后将重新开始模板学习", error="LICENSE_REQUIRED")
+        else:
+            _fail(job_id, str(exc), failures=failures)
     finally:
-        for item in files:
+        with _LOCK:
+            paused = (_JOBS.get(job_id) or {}).get("status") == "license_paused"
+        for item in ([] if paused else files):
             path = Path(str(item.get("path") or ""))
             try:
                 path.unlink(missing_ok=True)
@@ -158,6 +169,17 @@ def run_job(job_id: str) -> None:
                     shutil.rmtree(parent, ignore_errors=True)
             except Exception:
                 pass
+
+
+def resume_licensed_jobs() -> None:
+    """Resume only license-paused template jobs after entitlement is restored."""
+    with _LOCK:
+        identifiers = [key for key, job in _JOBS.items() if job["status"] == "license_paused"]
+        for key in identifiers:
+            _JOBS[key]["status"] = "queued"
+    for key in identifiers:
+        threading.Thread(target=run_job, args=(key,), daemon=True,
+                         name=f"style-resume-{key}").start()
 
 
 def _update(job_id: str, **values) -> None:

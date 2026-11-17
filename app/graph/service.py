@@ -122,7 +122,6 @@ class GraphExtractionOutcome:
 class GraphExtractionAgent(BaseAgent):
     name = "graph_extract"
     role = _GRAPH_SYSTEM
-    output_token_limit = settings.graph_output_tokens
 
     def should_retry(self, exc: Exception) -> bool:
         # Repeating an output-limited request cannot recover. The graph service

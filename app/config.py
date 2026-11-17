@@ -53,7 +53,7 @@ class Settings(BaseSettings):
     embedding_max_length: int = 8192
     embedding_cpu_threads: int = 8
     embedding_query_instruction: str = "Retrieve relevant evidence passages for the current report analysis question"
-    llm_concurrency: int = 1  # OpenAI-compatible serving continuous batching入口并发
+    llm_concurrency: int = 1  # 全模型生成总并发；总量>1时工作流预留一个交互槽位
     evidence_batch_concurrency: int = 1  # 独立 Evidence 批次并发；仅 vLLM 部署建议设为2
     evidence_max_adaptive_split_depth: int = 4
     evidence_max_adaptive_split_calls: int = 12
@@ -65,28 +65,23 @@ class Settings(BaseSettings):
     interactive_input_tokens: int = 8192
     interactive_history_tokens: int = 3072
     interactive_output_tokens: int = 2048
+    assistant_retrieval_candidate_limit: int = 96  # bounded unit candidates before reranking
     interactive_request_limit: int = 15  # 协作助手最多进行的模型往返次数
     interactive_tool_calls_limit: int = 30  # 协作助手最多进行的工具调用次数
     comparison_output_tokens: int = 3200
     style_probe_output_tokens: int = 256
     style_profile_output_tokens: int = 4096
     material_analysis_input_tokens: int = 4000
-    material_analysis_output_tokens: int = 2048
-    planner_output_tokens: int = 3072
-    analysis_output_tokens: int = 5120
     analysis_target_inferences_per_batch: int = 8  # Suggested count; increasing output room must not increase generation demand.
     analysis_inference_token_budget: int = 384  # Analysis 单条推断的资源估算，不是领域规则
     analysis_facts_per_batch: int = 45  # 资源边界；语义分组仍由运行时维度与事实关系决定
-    narrative_output_tokens: int = 4096
-    narrative_qa_output_tokens: int = 2048
-    qa_output_tokens: int = 2048
-    conflict_output_tokens: int = 2048
     # Parser and multimodal extraction are Docling-only. The project no longer
     # maintains a separate OCR/ASR/Vision provider path.
     docling_device: str = "cpu"  # Docling layout/table/OCR/ASR device: cuda / cpu
+    docling_artifacts_path: str = ""  # Optional pre-fetched Docling models for offline deployment
     asr_device: str = "cpu"  # ASR device: cuda / cpu; 当前与 OCR 一样保持 CPU
     asr_model: str = "medium"  # ASR whisper 档位: tiny/base/small/medium/large(默认 medium:中文质量高且 CPU 可跑)
-    asr_language: str = "zh"  # ASR 转写语言(默认中文;空=whisper 自动检测)
+    asr_language: str = ""  # 自动识别语种;明确知道全是中文时可设置 zh
     ocr_languages: str = "ch,en"  # OCR 语言列表(逗号分隔,如 ch,en;空=后端默认)
     gateway_timeout_seconds: int = 900
     # 上下文容量配置(物理上限派生,非内容决策):
@@ -95,12 +90,9 @@ class Settings(BaseSettings):
     # long planning requests. Keep this aligned with vLLM max-model-len.
     model_context_window_tokens: int = 18432
     generation_reserve_tokens: int = 8192  # 单次模型输出上限/预留，覆盖 Evidence 与小节成文
-    structured_output_tokens: int = 3072  # Planner/Analysis/QA 等结构化阶段默认输出预算
-    final_planner_output_tokens: int = 8192  # 完整章节契约优先保留输出空间；24K 窗口仍保留输入与安全余量
-    writer_output_tokens: int = 3072  # 单个 Narrative subsection 的正文输出预算
-    writer_output_tokens_per_word: float = 1.45  # 正文 token 估算比例；JSON/溯源结构余量单独计入
+    final_planner_output_tokens: int = 8192  # 局部目录调整的目标输出量；物理上限由统一窗口分配控制
+    writer_output_tokens: int = 3072  # 规划写作单元的建议规模，不限制 Writer 的实际输出上限
     writer_visible_word_token_ratio: float = 0.30  # JSON+引用绑定后的保守可见正文容量
-    evidence_output_tokens: int = 5120  # Evidence 高密度批次需要比普通结构化阶段更大的输出空间
     evidence_first_pass_input_tokens: int = 160000  # 首轮 Evidence 总输入资源边界
     evidence_gap_input_tokens: int = 60000  # 单轮缺口检索输入资源边界
     # Final request tokenization is provided by vLLM. Keep a measured
@@ -120,7 +112,6 @@ class Settings(BaseSettings):
     # rebuildable query projection and must never become a second fact source.
     graph_workspace_id: str = "default"
     graph_max_hops: int = 2
-    graph_output_tokens: int = 6144
     graph_facts_per_batch: int = 12
     graph_batch_concurrency: int = 2
     neo4j_uri: str = ""  # e.g. bolt://127.0.0.1:7687

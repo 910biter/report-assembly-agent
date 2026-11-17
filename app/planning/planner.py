@@ -18,7 +18,7 @@ from app.models import ReportPlan
 from app.document_shape import normalize_document_shape, normalize_composition_mode
 from app.planning.scale import normalize_chapter_budgets, reconcile_scale_budget
 from app.planning.structure import normalize_contract
-from app.runtime_profiles import stage_input_budget_tokens
+from app.runtime_profiles import stage_input_budget_tokens, stage_profile
 from app.observability.core_chain import collect_assigned_ids, extract_tagged_ids
 from app.token_monitor import update_call_funnel
 from app.planning.evidence_context import bind_plan_evidence
@@ -219,7 +219,8 @@ class PlannerAgent(BaseAgent):
         return save_plan(plan)
 
     def revise_final_plan_structure(self, plan_id: int, required_structure: list[str],
-                                    instruction: str = "", refine: bool = True) -> ReportPlan:
+                                    instruction: str = "", refine: bool = True,
+                                    expected_plan_version: int | None = None) -> ReportPlan:
         """Apply an approved structure diff without regenerating unchanged chapters."""
         from app.config import settings
         from app.rendering.headings import strip_heading_prefix
@@ -234,10 +235,16 @@ class PlannerAgent(BaseAgent):
             row = s.execute(select(ORMPlan).where(ORMPlan.c.id == plan_id)).mappings().first()
         if row is None:
             raise ValueError(f"PLAN_NOT_FOUND: {plan_id}")
+        source_version = int(row.get("plan_version") or 1)
+        if expected_plan_version is not None and source_version != expected_plan_version:
+            raise ValueError("PLAN_CHANGED_SINCE_PROPOSAL")
         old_chapters = json.loads(row["chapter_plans"] or "[]")
         old_final = json.loads(row["final_plan_json"] or "{}")
-        old_by_title = {str(item.get("title") or ""): dict(item) for item in old_chapters}
-        affected_old = [item for item in old_chapters if str(item.get("title") or "") not in set(titles)]
+        old_keys = [strip_heading_prefix(str(item.get("title") or "")) for item in old_chapters]
+        if any(not key for key in old_keys) or len(set(old_keys)) != len(old_keys):
+            raise ValueError("AMBIGUOUS_EXISTING_STRUCTURE")
+        old_by_title = {key: dict(item) for key, item in zip(old_keys, old_chapters)}
+        affected_old = [item for key, item in zip(old_keys, old_chapters) if key not in set(titles)]
         affected_titles = [title for title in titles if title not in old_by_title]
         changed_chapters = _fallback_local_restructure(affected_old, affected_titles)
 
@@ -257,7 +264,9 @@ class PlannerAgent(BaseAgent):
                 candidate_titles = [str(item.get("title") or "") for item in candidate if isinstance(item, dict)]
                 if candidate_titles == affected_titles:
                     changed_chapters = [dict(item) for item in candidate]
-            except Exception:
+            except Exception as exc:
+                if str(exc).startswith(("MODEL_HTTP_", "MODEL_CONNECTION_NOT_CONFIGURED")):
+                    raise
                 # The approved structure remains executable even when the compact
                 # semantic refinement fails; Narrative Plan will refine each chapter.
                 pass
@@ -298,7 +307,7 @@ class PlannerAgent(BaseAgent):
         plan.chapter_plans = normalized["chapter_plans"]
         plan.structure = [str(item.get("title") or "") for item in plan.chapter_plans]
         plan.final_plan_json = _plan_snapshot(plan, "final")
-        return update_plan(plan)
+        return update_plan(plan, expected_plan_version=source_version)
 
     def finalize_report_plan(self, plan_id: int, context_block: str,
                              required_structure: list[str] | None = None,
@@ -353,7 +362,7 @@ class PlannerAgent(BaseAgent):
             payload = self.generate_json(
                 prompt,
                 system=_FINAL_SYSTEM,
-                max_tokens=settings.final_planner_output_tokens,
+                max_tokens=stage_profile("final_planner").output_tokens,
             )
         except Exception as exc:
             update_call_funnel(
@@ -538,7 +547,7 @@ def save_plan(plan: ReportPlan) -> ReportPlan:
     return plan
 
 
-def update_plan(plan: ReportPlan) -> ReportPlan:
+def update_plan(plan: ReportPlan, *, expected_plan_version: int | None = None) -> ReportPlan:
     import time as _time
     normalized = normalize_contract({"chapter_plans": plan.chapter_plans})
     plan.chapter_plans = normalized["chapter_plans"]
@@ -550,6 +559,8 @@ def update_plan(plan: ReportPlan) -> ReportPlan:
             .where(ORMPlan.c.id == plan.id)
             .with_for_update()
         ).first()
+        if expected_plan_version is not None and (row is None or int(row[0] or 1) != expected_plan_version):
+            raise ValueError("PLAN_CHANGED_SINCE_PROPOSAL")
         next_version = int(row[0] or 1) + 1 if row else 1
         plan.plan_version = next_version
         plan.plan_stage = "final"

@@ -398,7 +398,9 @@ def _classify_batches(candidates: dict[int, list[dict]], focus: str) -> dict[int
             payload = _ComparisonAgent().generate_json(
                 prompt, max_tokens=settings.comparison_output_tokens,
             )
-        except Exception:
+        except Exception as exc:
+            if str(exc).startswith(("MODEL_HTTP_", "MODEL_CONNECTION_NOT_CONFIGURED")):
+                raise
             payload = {}
         for item in payload.get("items", []) if isinstance(payload, dict) else []:
             try:

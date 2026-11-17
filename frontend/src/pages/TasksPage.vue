@@ -14,16 +14,17 @@ import { usePersistentPageSize } from "@/lib/pagination";
 
 type TaskView =
   | "all"
-  | "comparison"
   | "pending"
   | "active"
   | "paused"
   | "review"
   | "completed"
   | "failed";
+type TaskType = "all" | "standard" | "comparison";
 const queryClient = useQueryClient();
 const search = ref("");
 const view = ref<TaskView>("all");
+const taskTypeFilter = ref<TaskType>("all");
 const dateRange = ref("all");
 const variant = ref("");
 const sortBy = ref("updated_desc");
@@ -51,8 +52,6 @@ const templateNames = computed(
 
 function inView(task: TaskSummary, target: TaskView) {
   if (target === "all") return true;
-  if (target === "comparison") return task.run_mode === "material_comparison";
-  if (task.run_mode === "material_comparison") return false;
   if (target === "pending") return task.stage === "created";
   if (target === "paused") return task.stage === "paused";
   if (target === "review") return task.stage === "review";
@@ -61,6 +60,11 @@ function inView(task: TaskSummary, target: TaskView) {
   return !["created", "review", "done", "failed", "paused"].includes(
     task.stage,
   );
+}
+function inTaskType(task: TaskSummary, target: TaskType) {
+  if (target === "all") return true;
+  const comparison = task.run_mode === "material_comparison";
+  return target === "comparison" ? comparison : !comparison;
 }
 function parseTimestamp(value?: string) {
   if (!value) return 0;
@@ -84,48 +88,42 @@ const viewItems = computed(() => [
   {
     key: "all" as const,
     label: "全部",
-    count: (tasks.data.value || []).length,
-  },
-  {
-    key: "comparison" as const,
-    label: "材料对比",
-    count: (tasks.data.value || []).filter((item) => inView(item, "comparison"))
-      .length,
+    count: (tasks.data.value || []).filter((item) => inTaskType(item, taskTypeFilter.value)).length,
   },
   {
     key: "pending" as const,
     label: "待运行",
-    count: (tasks.data.value || []).filter((item) => inView(item, "pending"))
+    count: (tasks.data.value || []).filter((item) => inTaskType(item, taskTypeFilter.value) && inView(item, "pending"))
       .length,
   },
   {
     key: "active" as const,
     label: "进行中",
-    count: (tasks.data.value || []).filter((item) => inView(item, "active"))
+    count: (tasks.data.value || []).filter((item) => inTaskType(item, taskTypeFilter.value) && inView(item, "active"))
       .length,
   },
   {
     key: "paused" as const,
     label: "已暂停",
-    count: (tasks.data.value || []).filter((item) => inView(item, "paused"))
+    count: (tasks.data.value || []).filter((item) => inTaskType(item, taskTypeFilter.value) && inView(item, "paused"))
       .length,
   },
   {
     key: "review" as const,
     label: "待审核",
-    count: (tasks.data.value || []).filter((item) => inView(item, "review"))
+    count: (tasks.data.value || []).filter((item) => inTaskType(item, taskTypeFilter.value) && inView(item, "review"))
       .length,
   },
   {
     key: "completed" as const,
     label: "已完成",
-    count: (tasks.data.value || []).filter((item) => inView(item, "completed"))
+    count: (tasks.data.value || []).filter((item) => inTaskType(item, taskTypeFilter.value) && inView(item, "completed"))
       .length,
   },
   {
     key: "failed" as const,
     label: "异常",
-    count: (tasks.data.value || []).filter((item) => inView(item, "failed"))
+    count: (tasks.data.value || []).filter((item) => inTaskType(item, taskTypeFilter.value) && inView(item, "failed"))
       .length,
   },
 ]);
@@ -140,6 +138,7 @@ const filtered = computed(() => {
           .includes(keyword),
     )
     .filter((task) => inView(task, view.value))
+    .filter((task) => inTaskType(task, taskTypeFilter.value))
     .filter(withinDate)
     .filter(
       (task) =>
@@ -156,7 +155,7 @@ const filtered = computed(() => {
     });
 });
 const visibleTasks = computed(() => filtered.value.slice((page.value - 1) * pageSize.value, page.value * pageSize.value));
-watch([search, view, dateRange, variant, sortBy, pageSize], () => {
+watch([search, view, taskTypeFilter, dateRange, variant, sortBy, pageSize], () => {
   page.value = 1;
   selectedId.value = null;
 });
@@ -173,6 +172,7 @@ const selected = computed(
 const hasFilters = computed(() =>
   Boolean(
     search.value ||
+    taskTypeFilter.value !== "all" ||
     dateRange.value !== "all" ||
     variant.value ||
     sortBy.value !== "updated_desc",
@@ -180,6 +180,7 @@ const hasFilters = computed(() =>
 );
 function resetFilters() {
   search.value = "";
+  taskTypeFilter.value = "all";
   dateRange.value = "all";
   variant.value = "";
   sortBy.value = "updated_desc";
@@ -242,13 +243,18 @@ function taskType(task: TaskSummary) {
               v-model="search"
               placeholder="搜索任务名称、ID 或更新说明"
           /></label>
-          <select v-model="dateRange">
+          <select v-model="taskTypeFilter" aria-label="任务类型">
+            <option value="all">全部类型</option>
+            <option value="standard">普通任务</option>
+            <option value="comparison">材料对比</option>
+          </select>
+          <select v-model="dateRange" aria-label="创建或更新时间">
             <option value="all">全部时间</option>
             <option value="7">近 7 天</option>
             <option value="30">近 30 天</option>
             <option value="90">近 90 天</option>
           </select>
-          <select v-model="variant">
+          <select v-model="variant" aria-label="使用模板">
             <option value="">全部模板</option>
             <option
               v-for="item in templates.data.value || []"
@@ -258,7 +264,7 @@ function taskType(task: TaskSummary) {
               {{ item.name || item.label || `模板 ${item.id}` }}
             </option>
           </select>
-          <select v-model="sortBy">
+          <select v-model="sortBy" aria-label="排序方式">
             <option value="updated_desc">最近更新</option>
             <option value="created_desc">最近创建</option>
             <option value="materials_desc">材料最多</option>
@@ -329,14 +335,15 @@ function taskType(task: TaskSummary) {
         <UiPagination v-if="filtered.length" v-model:page="page" v-model:page-size="pageSize" :total="filtered.length" />
         <div v-else-if="!tasks.isLoading.value" class="empty">
           <div>
-            <strong>没有匹配的任务</strong>调整筛选条件，或创建新的报告任务。
+            <strong>{{ hasFilters || view !== 'all' ? '没有匹配的任务' : '尚无任务' }}</strong>
+            {{ hasFilters || view !== 'all' ? '调整筛选条件后再试。' : '创建任务后会显示在这里。' }}
           </div>
         </div>
       </div>
       <template v-if="selected" #detail><div class="task-detail">
         <div class="detail-head">
-          <small>任务摘要</small
-          ><button
+          <h2>{{ selected.theme }}</h2>
+          <button
             class="icon-button"
             aria-label="关闭详情"
             @click="selectedId = null"
@@ -344,7 +351,6 @@ function taskType(task: TaskSummary) {
             <AppIcon name="close" :size="17" />
           </button>
         </div>
-        <h2>{{ selected.theme }}</h2>
         <StatusBadge :stage="selected.stage" />
         <p v-if="selected.queue_status?.status === 'queued' && selected.queue_status?.ahead != null" class="queue-ahead">待运行 · 前方 {{ selected.queue_status.ahead }} 个任务</p>
         <dl>
@@ -394,28 +400,29 @@ function taskType(task: TaskSummary) {
 }
 .browser-main {
   min-width: 0;
+  container-type: inline-size;
 }
 .view-tabs {
-  display: flex;
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
   min-width: 0;
-  overflow-x: auto;
   gap: 4px;
-  padding: 8px 0;
+  padding: 8px 12px;
   border-bottom: 1px solid var(--border);
   background: transparent;
-  scrollbar-width: thin;
-  scrollbar-color: var(--border-strong) transparent;
 }
 .view-tabs button {
   display: flex;
-  flex: 0 0 auto;
+  min-width: 0;
   align-items: center;
+  justify-content: center;
   gap: 7px;
-  padding: 8px 12px;
+  padding: 8px 6px;
   border: 0;
   border-bottom: 2px solid transparent;
   background: transparent;
   color: var(--muted-foreground);
+  white-space: nowrap;
   transition:
     color var(--motion-fast),
     background var(--motion-fast);
@@ -577,13 +584,15 @@ function taskType(task: TaskSummary) {
 }
 .detail-head {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: space-between;
+  gap: 12px;
   color: var(--subtle-foreground);
 }
 .icon-button {
   display: grid;
   place-items: center;
+  flex: 0 0 30px;
   width: 30px;
   height: 30px;
   border: 0;
@@ -594,9 +603,12 @@ function taskType(task: TaskSummary) {
 .icon-button:hover {
   background: var(--muted);
 }
-.task-detail h2 {
-  margin: 12px 0 10px;
+.detail-head h2 {
+  min-width: 0;
+  margin: 0 0 12px;
+  color: var(--foreground);
   line-height: 1.45;
+  overflow-wrap: anywhere;
 }
 .task-detail dl {
   display: grid;
@@ -636,6 +648,18 @@ function taskType(task: TaskSummary) {
   text-align: center;
 }
 @media (max-width: 1180px) {
+}
+@container (max-width: 900px) {
+  .view-tabs {
+    display: flex;
+    overflow-x: auto;
+    scrollbar-width: thin;
+    scrollbar-color: var(--border-strong) transparent;
+  }
+  .view-tabs button {
+    flex: 1 0 auto;
+    padding-inline: 12px;
+  }
 }
 @media (max-width: 900px) {
   .search-box {

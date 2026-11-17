@@ -1,7 +1,7 @@
 """Shared model configuration for user-facing collaboration agents."""
 from __future__ import annotations
 import json
-import httpx
+import httpx2 as httpx
 import asyncio
 
 from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings
@@ -9,6 +9,7 @@ from pydantic_ai.providers.openai import OpenAIProvider
 
 from app.config import settings
 from app.model_connection import load_connection
+from app.runtime_profiles import stage_profile
 
 
 async def _legacy_output_parameter(request: httpx.Request) -> None:
@@ -56,7 +57,7 @@ def build_collaboration_model() -> OpenAIChatModel:
         connection.model_name,
         provider=provider,
         settings=OpenAIChatModelSettings(
-            max_tokens=min(int(settings.interactive_output_tokens), connection.output_tokens),
+            max_tokens=min(int(settings.interactive_output_tokens), stage_profile("interaction").output_tokens),
             temperature=0.2 if connection.send_temperature else None,
             parallel_tool_calls=False,
             extra_body=connection.extra_body(False),

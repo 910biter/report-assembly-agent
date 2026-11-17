@@ -3,7 +3,6 @@ from app.planning.evidence_context import bind_plan_evidence, fact_line, inferen
 from app.planning.narrative import _sanitize_document_plan
 from app.writing.writer import _focused_unit_evidence, _pack_writer_evidence
 from app.planning.narrative import NarrativeAgent
-from app.writing.writer import _writer_json_overhead
 from app.writing.writer import _writer_argument_contract
 from app.writing.scale_execution import writer_scale_prompt_hint
 from app.memory.style_profile import select_exemplars
@@ -86,12 +85,6 @@ def test_uncertain_judgment_does_not_relax_an_achievable_user_scale():
     assert '允许低于' not in hint
 
 
-def test_json_budget_accounts_for_citation_density_without_changing_stage_cap():
-    sparse = _writer_json_overhead([{'fact_ids': [1]}])
-    dense = _writer_json_overhead([{'fact_ids': list(range(1, 40)), 'inference_ids': list(range(100, 110))}])
-    assert dense > sparse
-
-
 def test_document_narrative_receives_style_before_designing_paragraphs(monkeypatch):
     agent = NarrativeAgent()
     captured = {}
@@ -149,6 +142,15 @@ def test_planning_context_selects_inference_and_bases_as_one_group():
     assert count_tokens(prompt) <= 190
     if 9 in audit["sections"]["推断"]["selected_ids"]:
         assert {1, 2} <= set(audit["sections"]["事实"]["selected_ids"])
+
+
+def test_strict_planning_context_reports_unfitted_required_evidence():
+    import pytest
+
+    facts = [{"id": 1, "content": "a" * 200}]
+    with pytest.raises(ValueError, match="REQUIRED_EVIDENCE_EXCEEDS_CONTEXT"):
+        planning_prompt("narrative", [ContextSection("contract", ["Task"])],
+                        facts, [], 80, required_facts=[1], strict_required=True)
 
 
 def test_small_material_retains_all_facts_despite_repeated_source_profiles():

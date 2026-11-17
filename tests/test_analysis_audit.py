@@ -3,6 +3,7 @@ from app.analysis.analyzer import (
     _visible_fact_ids,
     _visible_local_inference_ids,
     _visible_local_inference_refs,
+    _global_inference_record,
 )
 
 
@@ -21,16 +22,19 @@ def test_visible_fact_ids_do_not_count_unrelated_numbered_graph_records():
 
 
 def test_global_scope_contains_only_fact_ids_bound_to_visible_inferences():
-    prompt = """局部判断:
-- [产业] 判断甲 (type=unknown, based_fact_ids=[12, 13])
-- [风险] 判断乙中出现了字面字符串 based_fact_ids=[999] (type=unknown, based_fact_ids=[20])
-"""
-    visible_ids, visible_fact_ids = _visible_local_inference_refs(prompt, [
+    candidates = [
         {"id": 41, "dimension": "产业", "content": "判断甲", "analysis_type": "unknown", "based_fact_ids": [12, 13]},
         {"id": 42, "dimension": "风险", "content": "判断乙中出现了字面字符串 based_fact_ids=[999]", "analysis_type": "unknown", "based_fact_ids": [20]},
-    ])
+    ]
+    prompt = "局部判断:\n" + "\n".join(_global_inference_record(item) for item in candidates)
+    visible_ids, visible_fact_ids = _visible_local_inference_refs(prompt, candidates)
     assert visible_ids == {41, 42}
     assert visible_fact_ids == {12, 13, 20}
+
+
+def test_global_scope_rejects_unshown_inference_record():
+    candidate = {"id": 41, "dimension": "产业", "content": "判断甲", "based_fact_ids": [12]}
+    assert _visible_local_inference_refs("局部判断:\n", [candidate]) == (set(), set())
 
 
 def test_fact_reference_filter_reports_out_of_prompt_ids():

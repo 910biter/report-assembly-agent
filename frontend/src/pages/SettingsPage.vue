@@ -10,7 +10,7 @@ import UiButton from "@/components/ui/UiButton.vue";
 import { useUiStore } from "@/stores/ui";
 
 const ui = useUiStore();
-const modelForm = ref({ base_url: "", model_name: "", api_key: "", service_kind: "vllm", context_tokens: 0, output_tokens: 8192, output_parameter: "max_tokens" });
+const modelForm = ref({ base_url: "", model_name: "", api_key: "", service_kind: "vllm", context_tokens: null as number | null, output_parameter: "max_tokens" });
 const keyStored = ref(false);
 const clearKey = ref(false);
 const modelBusy = ref(false);
@@ -114,6 +114,21 @@ function compact(value: number) {
   if (number >= 1_000) return `${(number / 1_000).toFixed(1)}K`;
   return String(Math.round(number));
 }
+function bytes(value: number | null | undefined) {
+  const amount = Number(value);
+  if (!Number.isFinite(amount) || amount < 0) return "—";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let scaled = amount;
+  let index = 0;
+  while (scaled >= 1024 && index < units.length - 1) {
+    scaled /= 1024;
+    index += 1;
+  }
+  return `${scaled.toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
+}
+function rate(value: number | null | undefined) {
+  return value == null ? "采样中" : `${bytes(value)}/s`;
+}
 function duration(seconds: number) {
   const value = Number(seconds || 0);
   if (value >= 3600) return `${(value / 3600).toFixed(1)} 小时`;
@@ -168,19 +183,27 @@ async function restartServices() {
 
 <template>
   <div class="page-stack settings-page">
-    <UiPageHeader title="系统设置" />
+    <UiPageHeader title="系统设置">
+      <template #actions><RouterLink to="/license"><UiButton variant="secondary">系统授权</UiButton></RouterLink></template>
+    </UiPageHeader>
     <UiPanel v-if="currentUser?.role === 'admin'" class="section-block">
       <UiSectionHeader title="模型接入" />
       <form class="model-connection-form" @submit.prevent="configureModel(false)">
         <label class="field">接入地址<input v-model="modelForm.base_url" type="url" required placeholder="http://IP:端口/v1" /></label>
         <label class="field">模型名称<input v-model="modelForm.model_name" required placeholder="服务发布的模型名称" /></label>
         <label class="field">服务类型<select v-model="modelForm.service_kind"><option value="vllm">vLLM</option><option value="openai">已有兼容接入</option></select></label>
-        <label class="field">API Key<input v-model="modelForm.api_key" type="password" autocomplete="new-password" :placeholder="keyStored ? '已设置；留空保留原 Key' : '本地无鉴权服务可留空'" /></label>
-        <label v-if="keyStored"><input v-model="clearKey" type="checkbox" />清除已保存的 Key</label>
+        <label class="field">上下文上限（Token）<input v-model.number="modelForm.context_tokens" type="number" min="5120" max="2000000" required /></label>
+        <div class="field credential-field">
+          <div class="credential-heading">
+            <label for="model-api-key">API Key</label>
+            <button v-if="keyStored" class="credential-action" type="button" :aria-pressed="clearKey" @click="clearKey = !clearKey">
+              {{ clearKey ? '撤销清除' : '清除已保存的 Key' }}
+            </button>
+          </div>
+          <input id="model-api-key" v-model="modelForm.api_key" type="password" autocomplete="new-password" :placeholder="clearKey ? '保存配置时将清除 Key' : keyStored ? '已设置；留空保留原 Key' : '本地无鉴权服务可留空'" />
+        </div>
         <details class="connection-options">
-          <summary>容量与接口能力</summary>
-          <label class="field">上下文上限（0 使用服务实际窗口）<input v-model.number="modelForm.context_tokens" type="number" min="0" max="2000000" required /></label>
-          <label class="field">最大输出（Token）<input v-model.number="modelForm.output_tokens" type="number" min="256" required /></label>
+          <summary>接口选项</summary>
           <label class="field">输出参数<select v-model="modelForm.output_parameter"><option value="max_tokens">max_tokens</option><option value="max_completion_tokens">max_completion_tokens</option></select></label>
         </details>
         <div class="service-actions">
@@ -265,11 +288,13 @@ async function restartServices() {
           <div class="appearance-options" role="group" aria-label="显示模式">
             <button
               type="button"
+              :aria-pressed="ui.theme === 'dark'"
               :class="{ active: ui.theme === 'dark' }"
               @click="ui.setTheme('dark')"
             >暗色</button>
             <button
               type="button"
+              :aria-pressed="ui.theme === 'light'"
               :class="{ active: ui.theme === 'light' }"
               @click="ui.setTheme('light')"
             >亮色</button>
@@ -280,19 +305,22 @@ async function restartServices() {
           <div class="palette-options" role="group" aria-label="强调色">
             <button
               type="button"
+              :aria-pressed="ui.palette === 'violet'"
               :class="{ active: ui.palette === 'violet' }"
               @click="ui.setPalette('violet')"
-            ><i class="violet-swatch"></i><b>深紫 · 智能工作区</b><small>默认</small></button>
+            ><i class="violet-swatch"></i><b>深紫</b></button>
             <button
               type="button"
+              :aria-pressed="ui.palette === 'steel'"
               :class="{ active: ui.palette === 'steel' }"
               @click="ui.setPalette('steel')"
-            ><i class="steel-swatch"></i><b>冷灰 · 钢蓝</b><small>推荐</small></button>
+            ><i class="steel-swatch"></i><b>钢蓝</b></button>
             <button
               type="button"
+              :aria-pressed="ui.palette === 'graphite'"
               :class="{ active: ui.palette === 'graphite' }"
               @click="ui.setPalette('graphite')"
-            ><i class="graphite-swatch"></i><b>冷灰 · 石墨</b><small>低干扰</small></button>
+            ><i class="graphite-swatch"></i><b>石墨</b></button>
           </div>
         </div>
       </div>
@@ -316,31 +344,25 @@ async function restartServices() {
       <div class="resource-grid">
         <article>
           <div>
-            <span>GPU 利用率</span
-            ><b>{{
-              resources.data.value?.gpu?.available
-                ? `${resources.data.value.gpu.utilization}%`
-                : "不可用"
-            }}</b>
+          <span>数据盘使用</span
+            ><b>{{ resources.data.value?.disk?.available ? `${resources.data.value.disk.percent}%` : "不可用" }}</b>
           </div>
           <progress
-            :value="resources.data.value?.gpu?.utilization || 0"
+            :value="resources.data.value?.disk?.percent || 0"
             max="100"
           ></progress
-          ><small>应用主机 GPU；不代表远端 API 算力</small>
+          ><small>运行数据所在文件系统 · 可用 {{ bytes(resources.data.value?.disk?.free_bytes) }}</small>
         </article>
         <article>
           <div>
-            <span>显存</span
-            ><b
-              >{{ resources.data.value?.gpu?.available ? `${compact(resources.data.value.gpu.used_mb)} / ${compact(resources.data.value.gpu.total_mb)} MB` : '未接入 GPU 采样' }}</b
-            >
+            <span>网络收发</span
+              ><b>{{ resources.data.value?.network?.available ? "实时" : "采样中" }}</b>
           </div>
-          <progress
-            :value="resources.data.value?.gpu?.used_mb || 0"
-            :max="resources.data.value?.gpu?.total_mb || 1"
-          ></progress
-          ><small>应用主机显存；远端模型显存未采集</small>
+          <div class="network-rates">
+            <span>↓ {{ rate(resources.data.value?.network?.rx_bytes_per_second) }}</span>
+            <span>↑ {{ rate(resources.data.value?.network?.tx_bytes_per_second) }}</span>
+          </div>
+          <small>主机网卡合计流量，不代表远端链路质量</small>
         </article>
         <article>
           <div>
@@ -430,7 +452,7 @@ async function restartServices() {
 .settings-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 24px;
+  gap: 16px;
 }
 dl {
   display: grid;
@@ -481,9 +503,6 @@ dd {
   background: var(--color-surface-soft);
   border-left: 2px solid var(--color-border-strong);
   font-size: 11px;
-}
-.settings-grid > .surface {
-  box-shadow: var(--shadow-panel);
 }
 .appearance-panel {
   padding: 22px 24px;
@@ -586,6 +605,19 @@ dd {
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 16px;
 }
+.credential-field { min-width: 0; grid-column: 1 / -1; }
+.credential-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.credential-action {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--muted-foreground);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.credential-action:hover { color: var(--foreground); text-decoration: underline; }
+.credential-action:focus-visible { outline: 2px solid var(--ring); outline-offset: 3px; border-radius: 2px; }
 .connection-options,
 .model-connection-form > p,
 .model-connection-form > .service-actions {
@@ -655,6 +687,17 @@ dd {
   height: 5px;
   margin: 13px 0 7px;
   accent-color: var(--color-primary);
+}
+.network-rates {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 13px 0 7px;
+  font-variant-numeric: tabular-nums;
+}
+.network-rates span {
+  color: var(--color-foreground);
+  font-size: 12px;
 }
 .resource-grid small,
 .run-totals small {

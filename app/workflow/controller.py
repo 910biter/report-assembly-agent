@@ -70,9 +70,37 @@ def _article_scale_completion(execution_actual_words: int, report_actual_words: 
     return actual, round(actual / target, 4) if target else None
 
 
+def _evidence_extraction_incomplete(status: dict) -> bool:
+    if status.get("unprocessed_segments"):
+        return True
+    if status.get("status") in {"failed", "running"}:
+        return True
+    return status.get("status") == "partial" and status.get("processing_status") != "completed"
+
+
+def _unresolved_conflict_fact_ids(conflicts: list[dict]) -> set[int]:
+    return {
+        int(entry["fact_id"])
+        for conflict in conflicts if conflict.get("status", "unresolved") == "unresolved"
+        for entry in conflict.get("entries") or []
+        if isinstance(entry, dict) and str(entry.get("fact_id") or "").isdigit()
+        and int(entry["fact_id"]) > 0
+    }
+
+
+def _resumed_conflict_status(previous: dict) -> dict:
+    return dict(previous) if previous.get("status") == "incomplete" else {
+        "status": "completed", "source": "checkpoint",
+    }
+
+
 def _evidence_checkpoint_complete(task: dict, expected_signature: str) -> bool:
     """Progress counters are display data; only the completed input signature proves reuse is safe."""
-    return bool(task.get("fact_ids")) and signature_matches(task, "evidence", expected_signature)
+    status = task.get("evidence_status") or {}
+    if _evidence_extraction_incomplete(status):
+        return False
+    completed_empty = status.get("status") == "completed" or status.get("processing_status") == "completed"
+    return (bool(task.get("fact_ids")) or completed_empty) and signature_matches(task, "evidence", expected_signature)
 
 
 _MATERIAL_ANALYSIS_PROMPT = """你是材料分析师。只依据本次可见的一份材料，概括其主题、结构、陈述性质和可支持范围。只输出 JSON:
@@ -282,6 +310,8 @@ class WorkflowController:
 
     def _control_boundary(self) -> None:
         """Honor pauses here; the gateway also checks after every LLM call."""
+        from app.licensing.service import require_license
+        require_license()
         task = short_term.load_task(self.task_id) or self.task
         if (task.get("control_request") if task else "") == "pause":
             self._update(stage="paused", queue_status={"status": "paused"}, control_request="")
@@ -294,14 +324,70 @@ class WorkflowController:
 
     def run_to_review(self) -> str:
         try:
+            from app.licensing.service import require_license
+            require_license()
             return self._run_to_review()
         except Exception as exc:
-            if str(exc) != "TASK_PAUSED":
+            from app.licensing.service import LicenseBlocked
+            if str(exc) != "TASK_PAUSED" and not isinstance(exc, LicenseBlocked):
+                try:
+                    self._discard_failed_writing_workspace()
+                except Exception:
+                    logger.exception("Could not restore working pointers for task %s", self.task_id)
                 try:
                     self._save_failed_core_chain_audit(exc)
                 except Exception:
                     logger.exception("Could not persist failure audit for task %s", self.task_id)
             raise
+
+    def _discard_failed_writing_workspace(self) -> None:
+        from app.workflow.run_workspace import discard_working_report
+
+        run_id = str(self.task.get("run_id") or "")
+        owns_plan = str(self.task.get("working_plan_run_id") or "") == run_id
+        owns_report = str(self.task.get("working_report_run_id") or "") == run_id
+        if not owns_plan and not owns_report:
+            return
+        working_id = int(self.task.get("working_report_id") or 0) if owns_report else 0
+        live_id = int(self.task.get("report_id") or 0)
+        if working_id:
+            try:
+                discard_working_report(live_id, working_id)
+            except Exception:
+                logger.exception("Could not discard working report for task %s", self.task_id)
+        base_plan_id = int(self.task.get("working_base_plan_id") or 0) if owns_plan else 0
+        fields = {"working_report_id": None, "working_report_hash": "",
+                  "working_report_run_id": "", "working_plan_id": None,
+                  "working_plan_run_id": "", "working_base_plan_id": None,
+                  "working_base_plan_title": None, "working_base_plan_frozen": None}
+        if base_plan_id:
+            fields["plan_id"] = base_plan_id
+            fields["plan_title"] = self.task.get("working_base_plan_title") or ""
+            fields["final_plan_frozen"] = bool(self.task.get("working_base_plan_frozen"))
+        self._update(**fields)
+
+    def _ensure_working_plan(self) -> None:
+        live_report_id = int(self.task.get("report_id") or 0)
+        if not live_report_id:
+            return
+        run_id = str(self.task.get("run_id") or "")
+        if (str(self.task.get("working_plan_run_id") or "") == run_id
+                and int(self.task.get("working_plan_id") or 0) == int(self.task.get("plan_id") or 0)):
+            return
+        from app.workflow.run_workspace import fork_plan
+
+        working_plan_id, base_plan_id = fork_plan(int(self.task["plan_id"]), live_report_id)
+        self._update(
+            plan_id=working_plan_id,
+            working_plan_id=working_plan_id,
+            working_base_plan_id=base_plan_id,
+            working_base_plan_title=self.task.get("plan_title") or "",
+            working_base_plan_frozen=bool(self.task.get("final_plan_frozen")),
+            working_plan_run_id=run_id,
+            working_report_id=None,
+            working_report_hash="",
+            working_report_run_id="",
+        )
 
     def _run_to_review(self) -> str:
         """跑完 解析→去重→规划→事实→冲突→分析→写作,停在评审阶段等待用户。
@@ -388,6 +474,8 @@ class WorkflowController:
         self._control_boundary()
         evidence_signature = stage_input_signature("evidence", self.task, plan=self._plan())
         if self._resume_skips(Stage.EVIDENCE):
+            if _evidence_extraction_incomplete(self.task.get("evidence_status") or {}):
+                raise RuntimeError("EVIDENCE_EXTRACTION_INCOMPLETE")
             self._ensure_context_manager()
             facts = self._facts()
             self._update(
@@ -421,6 +509,11 @@ class WorkflowController:
             with self._token_context("evidence"):
                 facts = self.extract_evidence()
             progress = dict(self.task.get("evidence_progress") or {})
+            extraction = self.task.get("evidence_status") or {}
+            if _evidence_extraction_incomplete(extraction):
+                progress.update(status="failed", fact_count=len(facts))
+                self._update(evidence_progress=progress)
+                raise RuntimeError("EVIDENCE_EXTRACTION_INCOMPLETE")
             progress.update(status="completed", fact_count=len(facts))
             self._update(evidence_input_signature=evidence_signature, evidence_progress=progress)
         self._control_boundary()
@@ -475,16 +568,43 @@ class WorkflowController:
         _mark("graph")
         conflict_signature = stage_input_signature("conflict", self.task, plan=self._plan())
         if self._resume_skips(Stage.CONFLICT):
-            self._update(stage=str(Stage.CONFLICT), resume={"stage": "conflict", "status": "reused_after_checkpoint"})
+            self._update(
+                stage=str(Stage.CONFLICT),
+                resume={"stage": "conflict", "status": "reused_after_checkpoint"},
+                conflict_status=_resumed_conflict_status(self.task.get("conflict_status") or {}),
+            )
         elif self.task.get("conflict_ids") and signature_matches(
             self.task, "conflict", conflict_signature,
         ):
-            self._update(stage=str(Stage.CONFLICT), resume={"stage": "conflict", "status": "reused"})
+            self._update(
+                stage=str(Stage.CONFLICT),
+                resume={"stage": "conflict", "status": "reused"},
+                conflict_status={"status": "completed", "source": "reused"},
+            )
         else:
-            with self._token_context("conflict"):
-                self.detect_conflicts()
-        self._update(conflict_input_signature=conflict_signature)
-        self._record_artifact("conflict", {"conflict_ids": self.task.get("conflict_ids", [])})
+            try:
+                with self._token_context("conflict"):
+                    self.detect_conflicts()
+                self._update(conflict_status={"status": "completed"})
+            except Exception as exc:
+                if str(exc) in {"TASK_PAUSED", "EXECUTION_LOCK_LOST"}:
+                    raise
+                if str(exc).startswith(("MODEL_HTTP_", "MODEL_CONNECTION_NOT_CONFIGURED")):
+                    raise
+                logger.exception("Conflict review incomplete for task %s", self.task_id)
+                self._update(
+                    conflict_status={"status": "incomplete", "reason": str(exc)[:300]},
+                    conflict_ids=list(self.task.get("incremental_inherited_conflict_ids") or []),
+                )
+        conflict_complete = (self.task.get("conflict_status") or {}).get("status") != "incomplete"
+        if conflict_complete:
+            self._update(conflict_input_signature=conflict_signature)
+        self._record_artifact(
+            "conflict",
+            {"conflict_ids": self.task.get("conflict_ids", []),
+             "conflict_status": self.task.get("conflict_status", {})},
+            status="done" if conflict_complete else "failed",
+        )
         _mark("conflict")
         if self.task.get("run_mode") == "material_comparison":
             # Comparison is a fact-and-provenance product. Ordinary report
@@ -569,6 +689,7 @@ class WorkflowController:
             "external_ids": self.task.get("external_ids", []),
         })
         _mark("analysis")
+        self._ensure_working_plan()
         final_plan_signature = stage_input_signature("final_plan", self.task, plan=self._plan())
         if self.task.get("intervention_force_final_plan"):
             # Directory feedback is also a FinalPlan input for ordinary
@@ -1225,14 +1346,15 @@ class WorkflowController:
         from app.agents.base import BaseAgent
 
         units_by_material, filenames = self._load_units()
-        if not units_by_material:
+        if not any(str(unit.content or "").strip()
+                   for units in units_by_material.values() for unit in units):
             self._update(material_analysis_status={
                 "status": "failed",
                 "error": "NO_PARSED_MATERIAL_UNITS",
                 "success_count": 0,
                 "total": len(self.task.get("material_ids") or []),
             })
-            return
+            raise RuntimeError("NO_PARSED_MATERIAL_UNITS")
         analyzer = BaseAgent()
         analyzer.name = "material_analyzer"
         analyzer.role = _MATERIAL_ANALYSIS_PROMPT
@@ -1346,6 +1468,8 @@ class WorkflowController:
                 })
                 payload = analyzer.generate_json(f"材料文本:\n{text}")
             except Exception as exc:
+                if str(exc).startswith(("MODEL_HTTP_", "MODEL_CONNECTION_NOT_CONFIGURED")):
+                    raise
                 analysis_errors.append({
                     "material_id": material_id,
                     "filename": filenames.get(material_id, ""),
@@ -1468,11 +1592,14 @@ class WorkflowController:
         # task-owned rows on resume instead of relying only on the final task
         # payload update, which is intentionally written after extraction.
         with session_scope() as s:
+            persisted_query = select(ORMFact.c.id).where(ORMFact.c.task_id == self.task_id)
+            if self.task.get("incremental_update"):
+                persisted_query = persisted_query.where(
+                    ORMFact.c.introduced_run_id == str(self.task.get("run_id") or "")
+                )
             persisted_ids = [
                 int(value)
-                for value in s.execute(
-                    select(ORMFact.c.id).where(ORMFact.c.task_id == self.task_id)
-                ).scalars().all()
+                for value in s.execute(persisted_query).scalars().all()
             ]
         existing_ids = [int(x) for x in (self.task.get("fact_ids") or [])]
         new_ids = [int(f.id) for f in facts if f.id is not None]
@@ -1525,6 +1652,8 @@ class WorkflowController:
                 "cluster_count": len(clusters),
             })
         except Exception as exc:
+            if str(exc).startswith(("MODEL_HTTP_", "MODEL_CONNECTION_NOT_CONFIGURED")):
+                raise
             # Consolidation is advisory, but a silent failure would make later
             # analysis look complete while operating without its ledger.
             self._update(intelligence_status={
@@ -1580,6 +1709,8 @@ class WorkflowController:
             self._update(graph_status=status, graph_fact_ids=sorted(covered_after))
             return status
         except Exception as exc:
+            if str(exc).startswith(("MODEL_HTTP_", "MODEL_CONNECTION_NOT_CONFIGURED")):
+                raise
             status = {"status": "degraded", "error": str(exc)[:300]}
             self._update(graph_status=status)
             return status
@@ -1630,12 +1761,13 @@ class WorkflowController:
     def analyze(self, facts: list[dict]) -> None:
         self._update(stage=str(Stage.ANALYSIS))
         if not facts:
-            if self.task.get("incremental_update"):
-                self._update(
-                    analysis_done=True,
-                    incremental_generated_inference_ids=[],
-                    incremental_generated_external_ids=[],
-                )
+            self._update(
+                analysis_done=True,
+                inference_ids=[], external_ids=[], analysis_global_meta={},
+                analysis_group_audit={"status": "no_facts"},
+                incremental_generated_inference_ids=[],
+                incremental_generated_external_ids=[],
+            )
             return
         conflicts = self._conflicts()
         # 情报底稿:Analysis 读 Ledger(聚簇/关系/覆盖/缺口),而非散乱 Fact
@@ -1712,7 +1844,7 @@ class WorkflowController:
         })
         generated_ids = [int(i.id) for i in inferences if i.id is not None]
         generated_external_ids = [int(i.id) for i in external if i.id is not None]
-        if self.task.get("incremental_update"):
+        if self.task.get("incremental_update") and not self.task.get("intervention_force_analysis"):
             inherited_ids = [int(i) for i in self.task.get("incremental_inherited_inference_ids") or []]
             inherited_external_ids = [int(i) for i in self.task.get("incremental_inherited_external_ids") or []]
             self._update(
@@ -1726,6 +1858,8 @@ class WorkflowController:
             self._update(
                 inference_ids=generated_ids,
                 external_ids=generated_external_ids,
+                incremental_generated_inference_ids=generated_ids if self.task.get("incremental_update") else [],
+                incremental_generated_external_ids=generated_external_ids if self.task.get("incremental_update") else [],
                 analysis_global_meta=global_meta,
             )
         self._update_fact_dispositions()
@@ -1771,13 +1905,14 @@ class WorkflowController:
             facts = self._facts()
             inferences = self._inferences()
             used_ids = {int(fid) for inf in inferences for fid in (inf.get("based_fact_ids") or [])}
+            unresolved_fact_ids = _unresolved_conflict_fact_ids(self._conflicts())
             theme = self.task.get("theme") or ""
             with session_scope() as s:
                 for fact in facts:
                     fid = int(fact["id"])
                     if fid in used_ids:
                         disp = "USED_IN_ANALYSIS"
-                    elif (fact.get("conflict_ids") or "") not in ("", "[]"):
+                    elif fid in unresolved_fact_ids:
                         disp = "CONFLICT_UNRESOLVED"
                     elif theme and _ngram_similarity(theme, fact.get("content") or "") < 0.05:
                         disp = "LOW_RELEVANCE"
@@ -2002,7 +2137,9 @@ class WorkflowController:
                     f"本轮更新目标:{reason}\n现有章节:{json.dumps(chapters, ensure_ascii=False)}",
                     system=system,
                 )
-        except Exception:
+        except Exception as exc:
+            if str(exc).startswith(("MODEL_HTTP_", "MODEL_CONNECTION_NOT_CONFIGURED")):
+                raise
             return {"rewrite_sections": [], "content_intent": "preserve", "reason": "scope_model_failed"}
         allowed = {str(item["title"]) for item in chapters}
         intent = str(payload.get("content_intent") or "preserve").lower()
@@ -2089,6 +2226,24 @@ class WorkflowController:
                 },
             )
 
+        from app.workflow.run_workspace import create_working_report, promote_working_report
+
+        live_report_id = int(self.task.get("report_id") or 0)
+        run_id = str(self.task.get("run_id") or "")
+        working_id = int(self.task.get("working_report_id") or 0) if (
+            str(self.task.get("working_report_run_id") or "") == run_id
+        ) else 0
+        if live_report_id and not working_id:
+            working_id, fingerprint = create_working_report(live_report_id, int(plan["id"]))
+            self._update(
+                working_report_id=working_id, working_report_hash=fingerprint,
+                working_report_run_id=run_id,
+            )
+
+        def remember_working_report(report):
+            if not self.task.get("working_report_id"):
+                self._update(working_report_id=report.id, working_report_run_id=run_id)
+
         report = writer_agent.write(
             plan, facts, inferences,
             style_block,
@@ -2098,14 +2253,13 @@ class WorkflowController:
             task_profile=self.task.get("task_profile") or {},
             report_policy=self.task.get("report_policy") or {},
             progress_callback=_write_progress,
-            existing_report_id=self.task.get("report_id"),
-            report_callback=lambda report: self._update(report_id=report.id),
+            existing_report_id=working_id or None,
+            report_callback=remember_working_report,
             chapter_callback=self._record_chapter_artifact,
             task_id=self.task_id,
             target_chapter_titles=target_chapter_titles,
-            run_id=str(self.task.get("run_id") or ""),
+            run_id=run_id,
         )
-        self._update(report_id=report.id)
         if section_title_changes:
             self._persist_section_title_plan(plan, section_title_changes)
         # 验证闭环:只执行确定性、可逆修复；事实与数字疑点保留原文并进入复核。
@@ -2116,6 +2270,22 @@ class WorkflowController:
         if self._auto_quality_fix(report.id, plan):
             self._normalize_report_order(report.id, plan)
         self._run_quality_check(variant, plan, report.id)
+        if live_report_id:
+            self.task = promote_working_report(
+                live_report_id, report.id, str(self.task.get("working_report_hash") or ""),
+                self.task_id,
+            )
+        else:
+            ensure_report_version(
+                report.id, task_id=self.task_id, status="final",
+                change_summary="本轮写作完成快照",
+            )
+            self._update(
+                report_id=report.id,
+                working_report_id=None, working_report_hash="", working_report_run_id="",
+                working_plan_id=None, working_plan_run_id="", working_base_plan_id=None,
+                working_base_plan_title=None, working_base_plan_frozen=None,
+            )
 
     def _record_chapter_artifact(self, payload: dict) -> None:
         # 每章写毕的边界:检查暂停(不打断单次 LLM 调用,只在章/章之间暂停)
@@ -3034,6 +3204,7 @@ class WorkflowController:
             result.append({
                 "id": row["id"],
                 "content": row["content"],
+                "conflict_ids": row.get("conflict_ids") or "[]",
                 "dimension": row.get("dimension") or "",
                 "fact_type": row.get("fact_type") or "",
                 "assertion_mode": normalize_assertion_semantics(

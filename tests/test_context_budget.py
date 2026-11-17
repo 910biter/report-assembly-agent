@@ -1,6 +1,9 @@
 import unittest
 from unittest.mock import patch
 from app.model_connection import Connection
+from app.agents.base import BaseAgent, _prepare_prompt
+from app.config import settings
+from app.vllm_capacity import estimate_request_input
 
 from app.context_budget import (
     ContextSection,
@@ -20,6 +23,9 @@ class ContextBudgetTests(unittest.TestCase):
 
     def tearDown(self):
         consume_context_audit()
+
+    def test_payment_required_is_not_retried(self):
+        self.assertFalse(BaseAgent().should_retry(RuntimeError("MODEL_HTTP_402")))
 
     def test_weighted_packer_uses_spare_capacity_without_cutting_records(self):
         facts = [f"FACT-{index}-" + "事实" * 20 for index in range(12)]
@@ -45,6 +51,40 @@ class ContextBudgetTests(unittest.TestCase):
 
         self.assertLessEqual(count_tokens(truncated), 80)
         self.assertTrue(truncated.endswith("…"))
+
+    def test_final_request_overhead_repacks_complete_records(self):
+        connection = Connection("http://test/v1", "test", context_tokens=8192, output_tokens=4096)
+        system = "Review the supplied records. " * 75
+        records = [f"FACT-{index}: " + "alpha\nbeta\n" * 18 for index in range(80)]
+        with patch("app.model_connection.load_connection", return_value=connection):
+            usable = 8192 - settings.prompt_overhead_tokens - settings.safety_margin_tokens
+            budget, output = usable * 45 // 100, usable * 55 // 100
+            prompt, initial = build_prompt_from_sections("analysis", [
+                ContextSection("instruction", ["Use the records below."], required_items=1),
+                ContextSection("records", records, required_items=1),
+            ], budget)
+            self.assertGreater(initial["sections"]["records"]["selected_items"], 1)
+            request = {"messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}]}
+            self.assertGreater(estimate_request_input(connection, request) + output + settings.safety_margin_tokens, 8192)
+
+            fitted, audit = _prepare_prompt(prompt, system, output, "analysis", False)
+            final_request = {"messages": [{"role": "system", "content": system}, {"role": "user", "content": fitted}]}
+            self.assertGreater(audit["request_repack_count"], 0)
+            self.assertEqual(audit["effective_output_ceiling"], output)
+            self.assertEqual(audit["required_missing_items"], 0)
+            self.assertLessEqual(estimate_request_input(connection, final_request) + output + settings.safety_margin_tokens, 8192)
+            for record in records:
+                if record.split(":", 1)[0] + ":" in fitted:
+                    self.assertIn(record.strip(), fitted)
+
+    def test_repack_reports_when_required_context_cannot_fit(self):
+        connection = Connection("http://test/v1", "test", context_tokens=4096, output_tokens=2048)
+        with patch("app.model_connection.load_connection", return_value=connection):
+            prompt, _ = build_prompt_from_sections("analysis", [
+                ContextSection("required", ["critical " * 100], required_items=1),
+            ], 550)
+            with self.assertRaisesRegex(ValueError, "MODEL_REQUIRED_CONTEXT_NOT_FIT"):
+                _prepare_prompt(prompt, "system " * 1000, 800, "analysis", False)
 
     def test_capacity_aggregation_reports_stage_distribution_and_sections(self):
         calls = [{

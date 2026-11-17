@@ -61,6 +61,9 @@ class ContextSection:
 _pending_audit: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
     "pending_context_audit", default=None,
 )
+_pending_pack: contextvars.ContextVar[tuple | None] = contextvars.ContextVar(
+    "pending_context_pack", default=None,
+)
 
 
 def count_tokens(text: str) -> int:
@@ -83,6 +86,12 @@ def consume_context_audit() -> dict:
     audit = _pending_audit.get() or {}
     _pending_audit.set(None)
     return dict(audit)
+
+
+def consume_context_pack(prompt: str) -> tuple | None:
+    packed = _pending_pack.get()
+    _pending_pack.set(None)
+    return packed if packed and packed[0] == prompt else None
 
 
 def build_prompt_from_sections(stage: str, sections: list[ContextSection],
@@ -171,10 +180,12 @@ def build_prompt_from_sections(stage: str, sections: list[ContextSection],
         "sections": section_audit,
     }
     publish_context_audit(audit)
+    _pending_pack.set((prompt, stage, normalized, budget, separator))
     return prompt, audit
 
 
 def audit_plain_prompt(stage: str, prompt: str, budget_tokens: int) -> dict:
+    _pending_pack.set(None)
     actual = count_tokens(prompt)
     audit = {
         "stage": stage,

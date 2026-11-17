@@ -26,8 +26,12 @@ done
 sleep 2
 cd "$APP_DIR"
 nohup .venv/bin/python run.py > /tmp/app.log 2>&1 < /dev/null &
-sleep 10
-CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:8000/api/tasks 2>/dev/null || echo 000)
+CODE=000
+for attempt in $(seq 1 60); do
+  CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://127.0.0.1:8000/api/health 2>/dev/null) || true
+  [ "$CODE" = "200" ] && break
+  sleep 2
+done
 echo "API: $CODE"
-if [ "$CODE" != "200" ] && [ "$CODE" != "401" ]; then echo "启动失败,见 /tmp/app.log"; tail -5 /tmp/app.log; exit 1; fi
+if [ "$CODE" != "200" ]; then echo "启动失败,见 /tmp/app.log"; tail -5 /tmp/app.log; exit 1; fi
 echo "全部服务就绪"

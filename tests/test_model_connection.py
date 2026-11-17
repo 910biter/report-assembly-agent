@@ -3,6 +3,7 @@ import json
 from unittest.mock import patch
 
 import httpx
+import httpx2
 import pytest
 
 from app import model_connection as mc
@@ -32,6 +33,15 @@ def test_invalid_addresses_rejected(url):
         mc.connection_from_payload({"base_url": url, "model_name": "m"})
 
 
+def test_chat_completions_url_is_normalized_to_api_root():
+    value = mc.connection_from_payload({
+        "base_url": "https://relay.example/v1/chat/completions/",
+        "model_name": "m",
+        "context_tokens": 49152,
+    })
+    assert value.base_url == "https://relay.example/v1"
+
+
 def test_key_omission_preserves_and_empty_clears(monkeypatch):
     monkeypatch.setattr(mc, "load_connection", lambda: mc.Connection("http://localhost/v1", "m", "secret"))
     payload = {"base_url": "http://localhost/v1", "model_name": "m"}
@@ -42,6 +52,25 @@ def test_key_omission_preserves_and_empty_clears(monkeypatch):
 def test_capacity_validation():
     with pytest.raises(ValueError):
         mc.connection_from_payload({"base_url": "http://localhost/v1", "model_name": "m", "context_tokens": 4096, "output_tokens": 4096})
+    with pytest.raises(ValueError, match="输入保留"):
+        mc.connection_from_payload({"base_url": "http://localhost/v1", "model_name": "m", "context_tokens": 4096, "output_tokens": 512})
+
+
+def test_output_limit_defaults_to_shared_capacity_split():
+    connection = mc.connection_from_payload({
+        "base_url": "http://localhost/v1", "model_name": "m", "context_tokens": 49152,
+    })
+    usable = 49152 - mc.settings.prompt_overhead_tokens - mc.settings.safety_margin_tokens
+    assert connection.output_tokens == usable * 55 // 100
+
+
+def test_automatic_output_requires_explicit_context(monkeypatch):
+    def unconfigured():
+        raise ValueError("MODEL_NOT_CONFIGURED")
+
+    monkeypatch.setattr(mc, "load_connection", unconfigured)
+    with pytest.raises(ValueError, match="上下文上限"):
+        mc.connection_from_payload({"base_url": "http://localhost/v1", "model_name": "m"})
 
 
 def test_generic_extensions_empty_and_vllm_priority_opt_in():
@@ -89,7 +118,7 @@ def test_gateway_uses_snapshot_and_generic_wire_parameter(monkeypatch):
 
 def test_collaboration_wire_parameter_adapter():
     from app.collaboration_model import _legacy_output_parameter
-    request = httpx.Request("POST", "http://host/v1/chat/completions", json={"max_completion_tokens": 20, "messages": []})
+    request = httpx2.Request("POST", "http://host/v1/chat/completions", json={"max_completion_tokens": 20, "messages": []})
     asyncio.run(_legacy_output_parameter(request))
     content = b"".join(request.stream)
     assert json.loads(content)["max_tokens"] == 20
@@ -119,6 +148,17 @@ def test_save_checks_real_queue_columns_and_upserts(monkeypatch):
     mc.save_connection(mc.Connection("http://host/v1", "m"))
     assert any("graph_jobs.job_id" in item for item in statements)
     assert any("ON CONFLICT" in item for item in statements)
+
+
+def test_idle_model_switch_ignores_capacity_snapshot():
+    lanes = {
+        "workflow": {"submitted": 0, "completed": 0, "failed": 0, "active": 0},
+        "interactive": {"submitted": 0, "completed": 0, "failed": 0, "active": 0},
+        "capacity": {"active": {"workflow": 0, "interactive": 0}},
+    }
+    assert not mc.model_lanes_busy(lanes)
+    lanes["interactive"]["active"] = 1
+    assert mc.model_lanes_busy(lanes)
 
 
 def test_crypto_key_written_with_restricted_permissions(tmp_path, monkeypatch):

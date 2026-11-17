@@ -1,7 +1,7 @@
 import json
 import unittest
 from contextlib import contextmanager
-from types import MethodType
+from types import MethodType, SimpleNamespace
 from unittest.mock import patch
 
 from app.context import ContextManager
@@ -25,8 +25,6 @@ from app.writing.scale_execution import (
     assess_chapter_output,
     assess_report_scale,
     measure_text_words,
-    writer_output_token_limit,
-    writer_output_retry_limit,
     writer_scale_prompt_hint,
     measure_report_body_words_by_section,
     report_minimum_words,
@@ -56,9 +54,10 @@ class NarrativeScaleTests(unittest.TestCase):
         self.assertEqual([], sentences[2]["inference_ids"])
 
     def test_writer_prompt_requires_minimal_sentence_specific_citations(self):
-        self.assertIn("最小且逐句绑定", WriterAgent.role)
-        self.assertIn("每个 ID 直接支持当前句", WriterAgent.role)
+        self.assertIn("事实句以直接支持其主张的 fact_ids 溯源", WriterAgent.role)
+        self.assertIn("复合主张分别绑定相应依据", WriterAgent.role)
         self.assertIn('source_level="TRANSITION"', WriterAgent.role)
+        self.assertNotRegex(WriterAgent.role, r"不要|不得|不能|禁止|避免")
 
     def test_local_rewrite_cannot_cite_inference_omitted_from_its_context(self):
         writer = WriterAgent.__new__(WriterAgent)
@@ -386,36 +385,26 @@ class NarrativeScaleTests(unittest.TestCase):
         self.assertEqual("final_plan", normalized["budget"]["target_source"])
         self.assertEqual(9000, normalized["budget"]["preliminary_target_words"])
 
-    def test_writer_output_tokens_scale_with_unit_target_and_respect_stage_cap(self):
-        self.assertEqual(981, writer_output_token_limit(500, 3072, 1.45))
-        self.assertEqual(512, writer_output_token_limit(174, 3072, 1.45))
-        self.assertEqual(823, writer_output_token_limit(391, 3072, 1.45))
-        self.assertEqual(3072, writer_output_token_limit(0, 3072, 1.45))
-        self.assertEqual(3072, writer_output_token_limit(3000, 3072, 1.45))
-
-    def test_writer_truncation_retry_escalates_once_without_repeating_same_cap(self):
-        writer = WriterAgent.__new__(WriterAgent)
-        caps = []
-
-        def fake_generate_json(_prompt, max_tokens=None, **_kwargs):
-            caps.append(max_tokens)
-            if len(caps) == 1:
-                raise RuntimeError("MODEL_OUTPUT_TRUNCATED")
-            return {"paragraphs": []}
-
-        writer.generate_json = fake_generate_json
-        payload, used_cap = writer._generate_json_with_budget_retry("prompt", 512)
-
-        self.assertEqual({"paragraphs": []}, payload)
-        self.assertEqual([512, 1024], caps)
-        self.assertEqual(1024, used_cap)
-        self.assertEqual(3072, writer_output_retry_limit(1600, 3072))
-        self.assertEqual(3072, writer_output_retry_limit(3072, 3072))
-
     def test_writer_does_not_retry_identical_truncated_request(self):
         writer = WriterAgent.__new__(WriterAgent)
         self.assertFalse(writer.should_retry(RuntimeError("MODEL_OUTPUT_TRUNCATED")))
         self.assertTrue(writer.should_retry(RuntimeError("temporary transport error")))
+
+    def test_writer_generation_failure_stops_current_chapter(self):
+        writer = WriterAgent.__new__(WriterAgent)
+        writer.last_call_id = "failed-writer-call"
+        writer.generate_json = lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("MODEL_HTTP_404"))
+        with patch("app.writing.writer.publish_context_audit"), patch("app.writing.writer.update_call_funnel"), \
+                patch("app.writing.writer._writer_prompt_token_budget", return_value=8000), \
+                patch("app.writing.writer.stage_profile", return_value=SimpleNamespace(output_tokens=2048)):
+            with self.assertRaisesRegex(RuntimeError, "MODEL_HTTP_404"):
+                writer._generate_chapter_pass(
+                    "Chapter", 1, 1, ["Chapter"],
+                    [{"id": 1, "content": "可核验事实"}], [], "",
+                    {"title": "Report", "budget": {"target_words": 100}}, {}, {1}, set(),
+                    chapter_plan={"title": "Chapter", "target_words": 100},
+                    generation_unit={"target_words": 100, "plan": {"fact_ids": [1]}},
+                )
 
     def test_writer_scale_hint_keeps_report_bounds_and_nested_allocations_distinct(self):
         hint = writer_scale_prompt_hint(
@@ -436,10 +425,11 @@ class NarrativeScaleTests(unittest.TestCase):
         self.assertIn("本章分配约 900 字", hint)
         self.assertIn("当前交付单元目标约 500 字", hint)
         self.assertIn("当前交付单元最低完成要求约 450 字", hint)
-        self.assertIn("最终规模评估判定证据充足", hint)
-        self.assertIn("未达到本单元最低完成要求前不得收束", hint)
-        self.assertIn("全文预算的内部拆分，不可相加", hint)
-        self.assertIn("全文不得超过上限", hint)
+        self.assertIn("证据评估为充足", hint)
+        self.assertIn("达到本单元最低完成要求后收束", hint)
+        self.assertIn("按层级共同分配全文预算", hint)
+        self.assertIn("全文控制在 3300 字以内", hint)
+        self.assertNotRegex(hint, r"不要|不得|不能|禁止|避免")
 
     def test_writer_scale_hint_preserves_one_sided_user_minimum(self):
         hint = writer_scale_prompt_hint(
@@ -460,7 +450,7 @@ class NarrativeScaleTests(unittest.TestCase):
 
         self.assertIn("篇幅承载估计约 2000 字", hint)
         self.assertIn("低于用户下限", hint)
-        self.assertNotIn("未达到本单元最低完成要求前不得收束", hint)
+        self.assertIn("完整呈现材料能够支持的论证", hint)
 
     def test_report_minimum_uses_explicit_output_bound_before_default_ratio(self):
         self.assertEqual(
@@ -512,16 +502,17 @@ class NarrativeScaleTests(unittest.TestCase):
         self.assertIn("全文目标约 3000 字", captured["prompt"])
         self.assertIn("当前文章片段目标约 650 字", captured["prompt"])
         self.assertIn("当前文章片段最低完成要求约 585 字", captured["prompt"])
-        self.assertIn("最终规模评估判定证据充足", captured["prompt"])
-        self.assertNotIn("证据不足时允许欠填", captured["prompt"])
+        self.assertIn("证据评估为充足", captured["prompt"])
+        self.assertIn("标题由系统渲染，正文以连续自然段推进", captured["prompt"])
+        self.assertNotIn("输出 JSON 结构示例", captured["prompt"])
         self.assertNotIn("全文目标:约 650 字", captured["prompt"])
         self.assertEqual(1, captured["prompt"].count("独立业务规则"))
 
     def test_writer_system_prompt_matches_subsection_generation_granularity(self):
         self.assertIn("当前交付单元", WriterAgent.role)
         self.assertNotIn("每次只撰写一个章节", WriterAgent.role)
-        self.assertIn("自然段按论证关系形成", WriterAgent.role)
-        self.assertIn("paragraph.target_words 只分配篇幅", WriterAgent.role)
+        self.assertIn("每个自然段完成一个连贯论证", WriterAgent.role)
+        self.assertIn("paragraph.target_words 用于篇幅分配", WriterAgent.role)
         self.assertIn("连续的引出和解释可同段", NarrativeAgent.role)
         self.assertIn("paragraph.target_words 是篇幅分配参考", NarrativeAgent.role)
 
@@ -538,7 +529,9 @@ class NarrativeScaleTests(unittest.TestCase):
             }]}]}
 
         writer.generate_json = fake_generate_json
-        with patch("app.writing.writer.publish_context_audit"), patch("app.writing.writer.update_call_funnel"):
+        with patch("app.writing.writer.publish_context_audit"), patch("app.writing.writer.update_call_funnel"), \
+                patch("app.writing.writer._writer_prompt_token_budget", return_value=8000), \
+                patch("app.writing.writer.stage_profile", return_value=SimpleNamespace(output_tokens=3072)):
             writer._generate_chapter_pass(
                 "Chapter", 1, 1, ["Chapter"],
                 [{"id": 1, "content": "材料明确记载了这一事实"}], [], "",
@@ -553,12 +546,12 @@ class NarrativeScaleTests(unittest.TestCase):
                 },
             )
 
-        self.assertEqual(981, captured["max_tokens"])
+        self.assertIsNone(captured["max_tokens"])
         self.assertIn("全文目标约 3000 字", captured["prompt"])
         self.assertIn("全文允许范围 2700–3300 字", captured["prompt"])
         self.assertIn("本章分配约 900 字", captured["prompt"])
         self.assertIn("当前交付单元目标约 500 字", captured["prompt"])
-        self.assertIn("全文预算的内部拆分，不可相加", captured["prompt"])
+        self.assertIn("按层级共同分配全文预算", captured["prompt"])
 
     def test_chapter_writer_receives_one_complete_current_unit_contract(self):
         writer = WriterAgent.__new__(WriterAgent)
@@ -571,7 +564,9 @@ class NarrativeScaleTests(unittest.TestCase):
 
         writer.generate_json = fake_generate
         unit_plan = {
-            "title": "Current unit", "fact_ids": [1], "target_words": 500,
+            "title": "Current unit", "core_message": "单元核心信息",
+            "completion_criteria": ["单元完成标准"],
+            "fact_ids": [1], "target_words": 500,
             "paragraphs": [{"purpose": f"独特段落目的{i}", "fact_ids": [1]}
                            for i in range(1, 9)],
         }
@@ -583,22 +578,30 @@ class NarrativeScaleTests(unittest.TestCase):
                 {"core_judgment": "统一核心判断"}, {1}, set(),
                 chapter_plan={"title": "Chapter", "target_words": 500,
                               "required_facts": ["章级事实要求"]},
-                narrative_plan={"subsections": [unit_plan]},
+                narrative_plan={"subsections": [unit_plan], "topics": [{
+                    "topic_id": "T1", "name": "Current unit",
+                    "purpose": "独特段落目的1", "core_message": "单元核心信息",
+                    "fact_ids": [1], "completion_criteria": ["单元完成标准"],
+                }]},
                 generation_unit={"plan": unit_plan, "target_words": 500},
                 institution_rules={"confirmed": True, "must_include": ["必须覆盖的独立要求"]},
             )
 
         prompt = captured["prompt"]
         self.assertEqual(1, prompt.count("独特段落目的8"))
+        self.assertEqual(1, prompt.count("单元核心信息"))
+        self.assertEqual(1, prompt.count("单元完成标准"))
         self.assertEqual(1, prompt.count("统一核心判断"))
         self.assertIn("章级事实要求", prompt)
         self.assertNotIn("…", prompt)
         self.assertNotIn("Discourse Plan(", prompt)
         self.assertNotIn("当前小节计划(", prompt)
         self.assertEqual(1, prompt.count("必须覆盖的独立要求"))
-        contract = json.loads(prompt.split("当前交付单元契约(章节边界与当前叙事计划,完整执行):\n", 1)[1].split("\n\n", 1)[0])
+        contract = json.loads(prompt.split("当前交付单元契约:\n", 1)[1].split("\n\n", 1)[0])
         self.assertEqual(8, len(contract["narrative"]["current_unit"]["paragraphs"]))
         self.assertEqual(["章级事实要求"], contract["chapter"]["required_facts"])
+        self.assertNotIn("全文章节结构:", prompt)
+        self.assertNotIn("Report Memory(前文状态)", prompt)
 
     def test_chapter_writer_without_subsections_keeps_narrative_topics_once(self):
         writer = WriterAgent.__new__(WriterAgent)
@@ -623,8 +626,20 @@ class NarrativeScaleTests(unittest.TestCase):
             )
         prompt = captured["prompt"]
         self.assertEqual(1, prompt.count("唯一论证目的"))
-        contract = json.loads(prompt.split("当前交付单元契约(章节边界与当前叙事计划,完整执行):\n", 1)[1].split("\n\n", 1)[0])
+        contract = json.loads(prompt.split("当前交付单元契约:\n", 1)[1].split("\n\n", 1)[0])
         self.assertEqual("章级主线", contract["narrative"]["central_message"])
+
+    def test_writer_memory_only_includes_prior_ids_relevant_to_current_unit(self):
+        memory = {
+            "fact_roles": {"7": "背景", "81": "比较"},
+            "used_fact_ids": {7, 81},
+            "used_inference_ids": {5, 55},
+        }
+        block = WriterAgent._memory_block(memory, fact_ids={7}, inference_ids={5})
+        self.assertIn("7", block)
+        self.assertIn("5", block)
+        self.assertNotIn("81", block)
+        self.assertNotIn("55", block)
 
     def test_chapter_writer_drops_short_uncited_claim_but_keeps_marked_transition(self):
         writer = WriterAgent.__new__(WriterAgent)

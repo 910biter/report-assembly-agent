@@ -84,10 +84,13 @@ def bind_plan_evidence(plan: dict, facts: list[dict], inferences: list[dict]) ->
 
 
 def planning_prompt(stage: str, sections: list, facts: list[dict], inferences: list[dict],
-                    budget: int, required_facts=(), required_inferences=(), tagged=False) -> tuple[str, dict]:
+                    budget: int, required_facts=(), required_inferences=(), tagged=False,
+                    strict_required: bool = False) -> tuple[str, dict]:
     """Pack an inference together with its bases; each fact is rendered once."""
     headers = "\n可用事实(保留来源语义):\n\n可用推断(依据见事实 ID):\n"
     contract, audit = build_prompt_from_sections(stage, sections, max(0, budget - count_tokens(headers)))
+    if strict_required and audit.get("required_missing_items"):
+        raise ValueError(f"{stage.upper()}_REQUIRED_CONTRACT_EXCEEDS_CONTEXT")
     available = max(0, budget - count_tokens(contract + headers))
     by_fact = {int(item["id"]): item for item in facts if item.get("id") is not None}
     by_inference = {int(item["id"]): item for item in inferences if item.get("id") is not None}
@@ -115,6 +118,14 @@ def planning_prompt(stage: str, sections: list, facts: list[dict], inferences: l
         take(fid=fid)
     for iid in evidence_ids(required_inferences):
         take(iid=iid)
+    if strict_required:
+        missing_facts = sorted(set(evidence_ids(required_facts)) - set(selected_facts))
+        missing_inferences = sorted(set(evidence_ids(required_inferences)) - set(selected_inferences))
+        if missing_facts or missing_inferences:
+            raise ValueError(
+                f"{stage.upper()}_REQUIRED_EVIDENCE_EXCEEDS_CONTEXT: "
+                f"facts={missing_facts}, inferences={missing_inferences}"
+            )
     # Retrieval/anchor order remains authoritative. Share spare capacity between
     # facts and judgments, rather than letting either monopolize the window.
     fids, iids = list(by_fact), list(by_inference)

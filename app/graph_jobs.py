@@ -110,6 +110,9 @@ def stop_worker() -> None:
 
 def run_once() -> bool:
     """Run one persisted job only when the shared model slot is available."""
+    from app.licensing.service import get_service, LicenseBlocked
+    if not get_service().status()["active"]:
+        return False
     with execution_slot(wait=False) as slot:
         if slot is None:
             return False
@@ -175,8 +178,9 @@ def run_once() -> bool:
                     ).values(payload=json.dumps(payload, ensure_ascii=False)))
                 _execute_job(task_id, job_id, slot, slot.check)
             except Exception as exc:
-                _finish(task_id, job_id, "queued" if str(exc) == "EXECUTION_LOCK_LOST" else "failed", error=str(exc))
-                if str(exc) != "EXECUTION_LOCK_LOST":
+                retryable = str(exc) == "EXECUTION_LOCK_LOST" or isinstance(exc, LicenseBlocked)
+                _finish(task_id, job_id, "queued" if retryable else "failed", error=str(exc))
+                if not retryable:
                     _LOG.exception("Graph build job %s failed", job_id)
         return True
 
@@ -192,6 +196,8 @@ def _execute_job(task_id: str, job_id: str, slot, check) -> None:
     active_fact_ids = [int(item["id"]) for item in facts if item.get("id") is not None]
 
     def progress(event: dict) -> None:
+        from app.licensing.service import require_license
+        require_license()
         check()
         _update_progress(task_id, job_id, event)
 

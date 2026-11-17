@@ -777,10 +777,14 @@ def _apply_pre_report_checkpoint_proposal(row: dict) -> bool:
             return False
         from app.workflow.controller import planner as workflow_planner
 
+        before = _load(row.get("before_json"), {})
+        expected_version = before.get("plan_version")
+        version_constraint = {"expected_plan_version": int(expected_version)} if str(expected_version or "").isdigit() else {}
         revised = workflow_planner.revise_final_plan_structure(
             int(plan_id), structure,
             instruction=str(after.get("instruction") or "按用户确认目录调整"),
             refine=False,
+            **version_constraint,
         )
         short_term.update_task(
             task_id, plan_id=int(plan_id), plan_title=revised.title,

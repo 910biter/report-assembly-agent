@@ -6,6 +6,7 @@ from unittest.mock import patch
 from app.agents.base import BaseAgent
 from app.config import settings
 from app.model_connection import Connection
+from app.runtime_profiles import stage_profile
 from app.gateway import (
     OpenAICompatibleGateway,
     _completion_was_truncated,
@@ -17,7 +18,42 @@ from app.llm_queue import PRIORITY_INTERACTIVE, llm_priority, submit_llm_call
 from app.context import _select_evidence_candidates
 from app.retrieval.reranker import rerank
 from app.graph.service import _fact_batches
-from app.writing.writer import WriterAgent, _pack_writer_evidence
+import pytest
+
+from app.writing.writer import WriterAgent, _pack_writer_evidence, _pack_writer_prompt
+
+
+def test_writer_expands_evidence_only_when_default_is_insufficient(monkeypatch):
+    import app.writing.writer as writer
+    import app.model_connection as model_connection
+    import app.vllm_capacity as vllm_capacity
+    monkeypatch.setattr(writer, "_writer_prompt_token_budget", lambda: 10)
+    monkeypatch.setattr(writer, "count_tokens", lambda text: len(text))
+    monkeypatch.setattr(writer, "capacity", lambda: (100, 50))
+    monkeypatch.setattr(writer.settings, "safety_margin_tokens", 1)
+    monkeypatch.setattr(model_connection, "load_connection", lambda: object())
+    monkeypatch.setattr(vllm_capacity, "estimate_request_input", lambda *_: 10)
+    build = lambda facts, inferences: "fixed" + "".join(facts + inferences)
+    facts, _, budget = _pack_writer_prompt(build, ["1. fact", "2. fact"], [], {})
+    assert facts == ["1. fact", "2. fact"]
+    assert budget == 70
+    facts, _, budget = _pack_writer_prompt(build, [], [], {})
+    assert facts == []
+    assert budget == 10
+
+
+def test_writer_fails_before_generation_if_evidence_cannot_fit(monkeypatch):
+    import app.writing.writer as writer
+    import app.model_connection as model_connection
+    import app.vllm_capacity as vllm_capacity
+    monkeypatch.setattr(writer, "_writer_prompt_token_budget", lambda: 1)
+    monkeypatch.setattr(writer, "count_tokens", lambda text: len(text))
+    monkeypatch.setattr(writer, "capacity", lambda: (100, 50))
+    monkeypatch.setattr(writer.settings, "safety_margin_tokens", 1)
+    monkeypatch.setattr(model_connection, "load_connection", lambda: object())
+    monkeypatch.setattr(vllm_capacity, "estimate_request_input", lambda *_: 70)
+    with pytest.raises(ValueError, match="WRITER_EVIDENCE_CONTEXT_NOT_FIT"):
+        _pack_writer_prompt(lambda f, i: "fixed", ["1. fact"], [], {})
 
 
 class _Response:
@@ -143,18 +179,17 @@ class VllmGatewayTests(unittest.TestCase):
         )
         self.assertEqual(ranked[0][1].id, 2)
 
-    def test_graph_batches_preserve_all_facts_with_output_capacity_guard(self):
+    def test_graph_batches_preserve_all_facts_with_batch_guard(self):
         facts = [{"id": index, "content": f"fact-{index}"} for index in range(1, 121)]
-        with patch.object(settings, "graph_output_tokens", 4096):
-            batches = _fact_batches(facts)
+        batches = _fact_batches(facts)
         self.assertGreater(len(batches), 1)
         self.assertEqual([item["id"] for batch in batches for item in batch], list(range(1, 121)))
-        self.assertTrue(all(len(batch) <= 51 for batch in batches))
+        self.assertTrue(all(len(batch) <= settings.graph_facts_per_batch for batch in batches))
 
     def test_structured_agents_disable_unbounded_hidden_thinking_by_default(self):
         self.assertFalse(BaseAgent.thinking)
-        self.assertEqual(BaseAgent.output_token_limit, settings.structured_output_tokens)
-        self.assertEqual(WriterAgent.output_token_limit, settings.writer_output_tokens)
+        self.assertFalse(WriterAgent.thinking)
+        self.assertGreater(stage_profile("writer").output_tokens, settings.writer_output_tokens)
 
     def test_queue_propagates_caller_context(self):
         marker = contextvars.ContextVar("test_queue_marker", default="missing")

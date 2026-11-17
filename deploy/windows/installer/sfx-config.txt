@@ -1,0 +1,5 @@
+;!@Install@!UTF-8!
+Title="AI Report Assembly"
+ExecuteFile="powershell.exe"
+ExecuteParameters="-NoLogo -NoProfile -ExecutionPolicy Bypass -File setup-native.ps1"
+;!@InstallEnd@!

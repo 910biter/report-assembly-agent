@@ -1,0 +1,28 @@
+ARG SOURCE_IMAGE=report-assembly-agent:offline
+FROM ${SOURCE_IMAGE} AS source
+
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    VIRTUAL_ENV=/opt/venv \
+    PATH=/opt/venv/bin:$PATH \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    HOME=/home/ira \
+    HF_HOME=/opt/models/hf
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates ffmpeg libgomp1 python3.12 \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --uid 10001 --home-dir /home/ira ira \
+    && mkdir -p /home/ira/.cache/docling
+
+COPY --from=source /opt/venv /opt/venv
+COPY --from=source /opt/models /opt/models
+COPY --from=source /home/ira/.cache/whisper /home/ira/.cache/whisper
+
+RUN ln -s /opt/models/docling /home/ira/.cache/docling/models \
+    && chown -R ira:ira /home/ira
+
+USER ira
+WORKDIR /opt/app

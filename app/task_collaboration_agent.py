@@ -30,10 +30,12 @@ _SYSTEM_PROMPT = """你是报告整编系统的任务协作助手。根据用户
 
 工作方法：
 1. 先区分咨询、依据核验、提出修改和确认继续。咨询时读取相关产物后直接回答；明确要求修改或确认上一条建议时调用相应 propose_* 工具。工具只准备提案，用户接受后才执行；prepared 后简要提示核对。
-2. 按问题选择读取工具。任务全貌先看 read_task_map 或相应索引；模板用 read_task_template；材料用 read_materials，摘要不足再用 search_material_units；具体事实和句子的依据用 search_fact_evidence、read_fact_evidence。页面引用只用于定位，先用 read_current_focus 核对真实对象。回答注明可定位的文件、页段或对象，工具结果截断时说明已覆盖范围并按需继续检索。
+2. 按问题选择读取工具。任务全貌先看 read_task_map 或相应索引；模板用 read_task_template；材料概览用 read_materials。用户要求原文位置、直接引文或逐项核验时，继续调用 search_material_units 或 read_fact_evidence，依据实际返回的文件、页码和段落回答；若检索结果不能定位，就明确说明未找到可核对位置，而不是只引用摘要文件名。具体事实和句子的依据用 search_fact_evidence、read_fact_evidence。页面引用只用于定位，先用 read_current_focus 核对真实对象。工具结果截断时说明已覆盖范围并按需继续检索。
 3. requirement_review_pending 阶段先读材料理解结果；用户委托拟定需求时，按真实材料形成完整草案并调用 propose_task_requirements。directory_review_pending 阶段读取最终目录并讨论结构；修改目录时形成完整可执行提案。用户要求在检查点确认并继续时调用 propose_checkpoint_continue。
 4. 章节拆分、合并使用专用结构工具；批量修改章节标题使用 propose_section_titles 提交一张覆盖全部目标的提案。已有确认决定是持续约束；新指示与之不同，先说明变化，再按最新明确要求准备提案。
-5. 事实、推论、目录、正文和质量判断以任务工具结果为依据；保持真实性、溯源与任务隔离。简单问题直接答，复杂问题清晰分点，用户界面只呈现可读结论与依据。"""
+5. 事实、推论、目录、正文和质量判断以任务工具结果为依据；保持真实性、溯源与任务隔离。简单问题直接答，复杂问题清晰分点，用户界面只呈现可读结论与依据。
+6. 材料理解摘要是阅读线索，不是逐条核验的原文证据。依据工具返回的 coverage/scope 说明已理解几份材料、当前检索了多少可用单元；不能把搜索未命中说成全部材料都没有。
+7. coverage.completeness 为 unknown 时，必须明确说“阅读范围未记录，覆盖完整性无法确认”；不得表述为“全部读完”“无缺失”或“无受限材料”。limited_context 大于 0 时说明部分材料只分析了部分单元；只有 completeness 为 known 且没有未理解材料时，才可说明理解输入覆盖已记录的材料单元。"""
 
 
 @dataclass
@@ -212,6 +214,7 @@ def _build_agent() -> Agent[TaskAgentDeps, str]:
                 "instruction": ctx.deps.user_message,
                 "new_structure": structure,
                 "required_chapter_count": len(structure),
+                "preserved_titles": [*titles[:index], *titles[index + 1:]],
             },
             confirmation_required=True,
             reason=f"将“{titles[index]}”拆分为 {len(replacements)} 章，其他章节保持不变",
@@ -238,6 +241,7 @@ def _build_agent() -> Agent[TaskAgentDeps, str]:
                 "instruction": ctx.deps.user_message,
                 "new_structure": structure,
                 "required_chapter_count": len(structure),
+                "preserved_titles": [*titles[:indices[0]], *titles[indices[-1] + 1:]],
             },
             confirmation_required=True,
             reason=f"合并 {len(indices)} 个连续章节，其他章节保持不变",
@@ -484,15 +488,19 @@ def run_task_collaboration_agent(
     }
     memory_payload = decision_memory or {}
     input_budget = max(1024, int(settings.interactive_input_tokens))
+    current_message_tokens = count_tokens(user_message)
+    if current_message_tokens > input_budget - max(512, input_budget // 4):
+        raise ValueError("USER_MESSAGE_EXCEEDS_INTERACTIVE_CONTEXT")
+    background_budget = max(256, input_budget - current_message_tokens - 512)
     prompt = (
-        f"当前任务主题：{_cap_prompt_text(context.theme, 384)}\n"
-        f"当前完整报告要求：{_cap_prompt_text(context.user_requirements, input_budget // 4)}\n"
+        f"当前任务主题：{_cap_prompt_text(context.theme, background_budget // 8)}\n"
+        f"当前报告要求摘要：{_cap_prompt_text(context.user_requirements, background_budget // 3)}\n"
         f"可读取的任务产物：{_cap_prompt_json(context.available_artifacts, 192)}\n"
-        f"当前页面焦点：{_cap_prompt_json(focus_payload, input_budget // 4)}\n"
+        f"当前页面焦点：{_cap_prompt_json(focus_payload, background_budget // 8)}\n"
         f"当前任务阶段：{context.stage_label}\n"
-        f"结构化决策记忆：{_cap_prompt_json(memory_payload, input_budget // 5)}\n"
-        f"最近对话：\n{_cap_prompt_text(history_text, input_budget // 5) or '无'}\n\n"
-        f"用户本轮消息：{_cap_prompt_text(user_message, input_budget // 5)}"
+        f"结构化决策记忆：{_cap_prompt_json(memory_payload, background_budget // 5)}\n"
+        f"最近对话：\n{_cap_prompt_text(history_text, background_budget // 5) or '无'}\n\n"
+        f"用户本轮消息：{user_message}"
     )
     result = _run_agent(prompt, deps)
     tool_trace = list(deps.tool_trace)
