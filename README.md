@@ -1,128 +1,125 @@
-# Report Assembly Agent
+# 报告整编智能体
 
-面向多来源材料的可追溯报告整编系统。材料经解析、理解、证据提取与分析后形成报告；用户可在任务检查点和报告审阅中介入。
+Report Assembly Agent 是一个面向多来源材料的报告工作台。它将文档解析、事实提取、分析规划、报告撰写和审阅串联起来，并保留正文到材料的溯源关系。用户可以在需求和目录阶段与助手协作，也可以对生成的报告进行编辑、版本对比和增量更新。
 
-## 项目文档
+## 核心能力
 
-- [当前产品契约](docs/CURRENT_PRODUCT_CONTRACT.md)：任务模式、状态流程、交互、版本与证据边界。
-- [当前代码地图](docs/CODEBASE_MAP.md)：主链路和模块入口。
-- [模型运行与上下文约定](docs/MODEL_RUNTIME_ARCHITECTURE.md)：阶段预算、并发与硬件复测原则。
-- [vLLM 生成服务](docs/VLLM_DEPLOYMENT.md)：部署配置和服务启动。
-- [模板与软风格学习架构](docs/template-style-learning.md)：版式、风格画像、范例检索与渲染边界。
+- **材料理解与证据溯源**：解析上传材料，提取事实及其来源，供分析、写作和人工核验使用。
+- **协作规划与报告生成**：支持自动生成，也支持用户参与需求和目录确认；报告按计划组织事实与推断。
+- **模板学习**：从参考材料学习文体和结构；有适用 Word 母版时可用于版式输出。
+- **报告工作区**：支持正文编辑、证据查看、版本审阅、增量更新和 Word 导出。
+- **材料库与资料解析**：管理和复用材料，通过助手讨论材料内容；知识图谱按用户操作构建。
+- **多用户与队列**：管理员创建账号，用户使用各自的材料和任务；任务通过持久队列调度。
 
-## 推理资源边界
-
-管理员在系统设置中配置 vLLM 地址（含 `/v1`）、模型名称和 Key，无需配置或下载 Tokenizer。上下文上限设为 `0` 时通过根路径 `/tokenize` 读取服务实际 `max_model_len`；显式上限不能超过该窗口。最大输出仍由管理员指定，各阶段分别预留输出空间。
-
-装箱只使用本地估算；首次、带工具或接近容量边界的最终请求使用 `/tokenize` 复核同一消息与聊天模板。结果短期缓存，通过实际 `usage.prompt_tokens` 校准估算。计量失败冷却30秒后重试，降级写入调用审计和设置页；未探明窗口且未设置上限时明确报错。超容量请求不会静默删证据或缩减输出，应由阶段重新装箱或拆批。
-
-有效配置以部署环境为准；代码默认值位于 app/config.py。各工作负载的输出预留、输入上限和批次策略由 app/runtime_profiles.py 提供，不能用某一个阶段的 token 比例代表全流程。
+## 工作流程
 
 ```text
-阶段可用输入 = 物理上下文窗口 - 阶段输出预留 - Prompt 开销 - 安全余量
+材料上传与解析 → 材料理解 → 事实与证据提取 → 分析推断
+    → 最终规划与目录 → 分单元撰写 → 质量检查 → 报告审阅与导出
 ```
 
-修改模型、量化、vLLM max-model-len、并发或显卡后，使用相同 benchmark 输入复测 Prefill、Decode、TTFT、端到端耗时、显存和报告质量。具体运行默认值不是远端机器的实际配置。
+协作规划可在需求和目录检查点暂停，由用户与助手讨论后继续。模板主要提供表达、结构或版式参考；报告中的业务事实以任务材料及其证据为依据。具体阶段、失败处理和版本约定以[产品契约](docs/CURRENT_PRODUCT_CONTRACT.md)和代码实现为准。
 
-材料事实必须保持来源链；模型语义判断不得不可逆地删除原始内容。遇到实现与产品契约不一致时，先确认属于代码缺陷还是产品决定变化，再分别修正，不要在多份文档复制同一份流程描述。
-# 离线部署授权
+## 运行架构
 
-Windows 和 Linux 共用离线许可证协议，无需 TPM 或授权服务器。安装完成后须
-由管理员登录 `/license` 激活，普通用户仅能查看联系管理员的提示。未授权、
-到期、时间回退或授权记录异常时，业务 API 与后台模型执行被阻止；登录、
-授权和最小健康检查保持可用。必须启用现有多用户登录并初始化管理员账号。
+| 组件 | 职责 |
+| --- | --- |
+| Vue 3 + TypeScript | 工作台、任务与报告界面 |
+| FastAPI + Python | API、任务调度、各阶段智能体与报告处理 |
+| PostgreSQL | 任务、材料、证据、报告、账号和配置等业务数据 |
+| Docling / OCR / Whisper | 文档解析、图文识别和音频转写 |
+| 本地 Embedding + Qdrant | 向量索引与检索；向量不可用时部分检索路径可回退词法检索 |
+| 独立模型服务 | 报告生成和分析；通过管理员设置接入 vLLM 或兼容 API |
 
-许可证绑定产品、安装 ID、设备公钥和宿主机标识。同一许可证重复导入不会
-重新计时；续期须使用更高代次的新编号，从成功激活起按签发期限计算自然月（UTC，
-月末取目标月份最后一天），剩余期限不累加。旧许可证不能回退当前授权。
-API 返回 `403 LICENSE_REQUIRED` 时，前端进入授权页。
+模型推理服务与应用独立部署。应用容器和本地解析、Embedding 默认使用 CPU；自行部署 vLLM 所需的 GPU 和驱动由模型服务环境提供。
 
-授权状态位于 `runtime/license`，Windows 安装对应
-`%ProgramData%\ReportAssemblyAgent\runtime\license`。正常升级必须保留该目录。
-Docker 使用持久 runtime 卷，并只读挂载宿主机 `/etc/machine-id` 为
-`/run/ira-host-machine-id`；镜像不携带客户身份或激活记录。Windows 使用
-机器范围 DPAPI，仍依靠服务数据目录 ACL 限制访问；Linux 使用权限受限的软件
-设备密钥。更换宿主机或丢失设备密钥需要重新申请授权。
+## 部署与启动
 
-## 内部签发流程
+### 离线安装包
 
-内部工具为 `tools/license_issuer.py`，不随应用镜像分发。先在独立受限目录
-生成加密签发私钥，密码交互输入；私钥和密码均不得提交 Git 或传给客户。
+项目提供 Linux Docker 离线交付和 Windows 原生安装的构建脚本。Linux 安装包需要目标机已有可用的 Docker Engine 和 Compose；镜像包含应用运行环境及相关模型资源，不包含生成式推理模型。首次启动后，管理员需完成登录、离线授权和模型接入配置。
+
+- Linux 镜像、安装包构建与数据持久化：[Docker 离线部署](deploy/docker/README.md)
+- Windows 原生安装与构建：[Windows 部署说明](deploy/windows/README.md)
+- 源码部署与依赖：[部署指南](deploy/DEPLOY.md)
+
+安装包、模型权重、客户数据和签发私钥不属于源码仓库。升级或迁移前应备份数据库、上传材料、运行数据和授权状态；卸载应用不应替代备份。
+
+### 源码开发
+
+以下是源码开发的基本入口；PostgreSQL、Qdrant、解析与 Embedding 所需模型需事先准备。环境变量及完整依赖说明见[部署指南](deploy/DEPLOY.md)。
 
 ```bash
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+cp deploy/env.example .env
+```
+
+按实际环境调整 `.env` 中的数据库、Qdrant 和本地模型路径，准备原生授权组件后启动：
+
+```bash
+.venv/bin/pip install -r tools/license-build-requirements.txt
+.venv/bin/python tools/build_license_native.py --output .native-build
+cp .native-build/app/licensing/_trust*.so app/licensing/
+.venv/bin/python run.py
+```
+
+应用默认监听端口 `8000`，可通过 `IRA_HOST` 和 `IRA_PORT` 调整。启动后可检查应用进程：
+
+```bash
+curl -fsS http://127.0.0.1:8000/api/health
+```
+
+前端独立开发与构建：
+
+```bash
+cd frontend
+npm ci
+npm run dev
+# 或运行 npm run build 生成前端构建产物
+```
+
+应用启动不代表模型或所有依赖均已就绪；使用前还需检查数据库、向量服务、授权与模型接入。面向公网部署时应配置 HTTPS 和适当的访问控制；内网 HTTP 测试设置不适用于公网。
+
+## 模型接入与上下文
+
+管理员在系统设置中配置模型服务地址、模型名称、密钥和必要的容量信息。vLLM 可通过 `/tokenize` 提供请求计数和上下文窗口信息；兼容服务未提供该接口时使用保守估算，不要求用户提供 Tokenizer。服务返回的实际使用量可用于校准估算。
+
+系统按阶段组织输入并预留输出空间。Writer 默认沿用常规额度，必要时可扩展输入，最终根据请求实际计量及安全余量调整输出；超出模型容量或无法装入必要证据时，需明确处理而不是把未处理内容当作事实缺失。各阶段具体预算与实现见 `app/runtime_profiles.py`、`app/vllm_capacity.py` 和[模型运行约定](docs/MODEL_RUNTIME_ARCHITECTURE.md)。
+
+## 离线授权
+
+Windows 和 Linux 使用离线许可证协议。管理员登录后在授权页面导入许可证；未授权、到期或检测到时间异常时，主要业务功能受限，普通用户看到联系管理员的提示。授权绑定安装身份和设备信息；升级时应保留 `runtime/license` 及相关持久数据。
+
+内部签发工具是 `tools/license_issuer.py`，不应随客户安装包分发。私钥、密码、客户申请和签发台账须存放在受限位置，不能提交 Git：
+
+```bash
+# 内部环境：创建加密签发密钥及公钥映射
 python tools/license_issuer.py keygen \
   --key /secure/issuer/issuer.private.pem --output /secure/issuer/public.json
-```
 
-将生成的公钥映射更新到 `app/licensing/_trust.pyx` 后重新编译发布版本。
-轮换密钥时保留仍在使用的旧公钥；公钥不需要保密。管理员从授权页复制安装
-识别码，完整保存为 `request.txt`，签发时严格核对客户和安装归属：
-
-```bash
+# 根据管理员导出的安装申请签发；密码通过交互输入
 python tools/license_issuer.py issue \
-  --key /secure/issuer/issuer.private.pem \
-  --request request.txt --generation 1 --months 12 --customer customer-name \
-  --output customer.license
+  --key /secure/issuer/issuer.private.pem --request request.txt \
+  --generation 1 --months 12 --customer customer-name --output customer.license
 ```
 
-将 `customer.license` 交给管理员导入。工具在私钥目录写入 `issuance.jsonl`
-台账，拒绝对同一安装签发重复或较低代次。续期改用下一代次和新输出文件；
-`--months` 支持 3、6、12、36、60、120，省略时默认 3。现有三个月许可证继续有效。
-签发结果显示期限、安装实例和代次，台账记录期限；管理员激活后可查看期限、激活时间和到期时间。
-生成日期不会开始授权计时。自动化可使用权限受限的 `--password-file`，
-不要在命令行直接传密码。备份私钥、密码和签发台账，建议分开保管。
+签发期限支持 3、6、12、36、60、120 个月，默认 3 个月；续期需使用新许可证及更高代次。公钥编译在原生信任组件中，发布前需按签发密钥更新并构建；私钥不进入应用。时间回退恢复、密钥轮换及平台差异应依据工具帮助和部署说明操作。
 
-```bash
-python tools/license_issuer.py inspect \
-  --request customer.license --trust /secure/issuer/public.json \
-  --output inspected-license.json
-```
+离线软件保护可提高伪造和跨安装复制的难度，但不能防止拥有机器管理员权限的攻击者修改程序、克隆系统或回滚完整快照，也不提供可信时间或远程吊销。
 
-## 原生授权组件构建
+## 代码导航
 
-运行时不再读取 `trusted_keys.json`。公钥和验签入口编译在 `_trust` 原生模块中；
-缺失、损坏或以 Python 文件冒充该模块时拒绝授权，没有 Python 验签降级路径。
-开发机器须先用运行服务的同版本 Python 构建：
+| 路径 | 内容 |
+| --- | --- |
+| `app/api/` | API 与页面服务 |
+| `app/workflow/` | 任务阶段、检查点、队列和工作区 |
+| `app/parsing/`、`app/evidence/`、`app/analysis/` | 材料解析、证据提取与分析 |
+| `app/planning/`、`app/writing/` | 报告规划、叙事计划与正文生成 |
+| `app/retrieval/`、`app/graph/` | 检索与关系网络 |
+| `app/memory/`、`app/template_engine/` | 材料、风格与模板相关能力 |
+| `app/licensing/`、`app/auth/` | 离线授权与账号访问控制 |
+| `frontend/`、`web/spa/` | Vue 前端源码与构建产物 |
+| `deploy/`、`tools/`、`tests/` | 部署脚本、内部工具和测试 |
 
-```bash
-python -m pip install -r tools/license-build-requirements.txt
-python tools/build_license_native.py --output .native-build
-# Linux 源码开发部署仅复制原生信任模块，避免旧编译产物遮蔽后续源码修改
-cp .native-build/app/licensing/_trust*.so app/licensing/
-```
-
-Docker 多阶段构建自动编译，并在最终镜像移除 protocol/service/storage 的 Python
-源文件及 `_trust.pyx`，只保留对应原生模块。最终镜像不包含编译器和签发私钥。
-Windows 构建机需要 MSVC C++ Build Tools，`build-native-bundle.ps1` 必须传入
-`-LicenseBuildPython`，指向装有构建依赖、与捆绑 Python 版本及架构一致的解释器。
-客户离线安装不需要编译器。安装目录仅管理员和 SYSTEM 可写，普通用户仅可读执行；
-Docker 程序目录为 root 所有，应用以 ira 用户运行，仅数据目录可写。
-
-原生编译提高替换和逆向成本，不提供硬件信任根。Python 调用层和原生二进制仍可能
-被管理员篡改。尚未配置发行者代码签名证书，安装包的 SHA256 只用于传输完整性检查，
-不能等同于发行者身份验证；正式发行需另行配置 Windows Authenticode / 包签名。
-
-## 时间与异常恢复
-
-服务每 30 秒持久保存最高观察时间，运行期间结合单调时钟检测回退，容许
-300 秒校时偏差但不会因此延长授权。许可证签发时间同时作为激活时间下界。
-若服务器曾被误设为未来时间，先校正时间，再由管理员导出恢复请求。内部
-审核后签发一次性、状态绑定的时间恢复凭证（七天内有效）：
-
-```bash
-python tools/license_issuer.py recover-clock \
-  --key /secure/issuer/issuer.private.pem \
-  --request license-clock-recovery-request.json --output clock-recovery.license
-```
-
-管理员在时间异常页面导入。恢复不改变原激活日期和到期日期，不能用普通
-新许可证绕过时间异常。授权文件损坏须恢复一致的身份与状态备份；禁止通过
-删除记录尝试重新计时。报告因授权暂停后，由用户续期后点击继续；图谱队列
-续期后可继续调度。模板学习暂停保留上传文件，同一服务进程续期后重新学习；
-模板任务原有内存状态不跨进程持久化，重启后的模板恢复不在本机制保证范围内。
-
-保护范围：签名防伪造及字段修改；绑定防普通跨安装/跨机器复制；本地校验防
-旧证重放、常见改时钟及状态误改。无 TPM、无联网且客户拥有 root/管理员权限
-时，完整系统克隆、快照回滚或修改程序可绕过软件保护。本版本未宣称提供
-原生代码混淆、可信 UTC、远程吊销或管理员级防破解。迁移到新机器时旧机器
-的离线授权不能远程撤销。
+更多内容：[代码地图](docs/CODEBASE_MAP.md) · [产品契约](docs/CURRENT_PRODUCT_CONTRACT.md) · [模型接入](docs/model-connection.md) · [模板学习](docs/template-style-learning.md) · [vLLM 部署](docs/VLLM_DEPLOYMENT.md)
